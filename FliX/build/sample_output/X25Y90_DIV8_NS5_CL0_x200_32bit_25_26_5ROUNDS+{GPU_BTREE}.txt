@@ -1,0 +1,338 @@
+ --> Build Size defined at Top of File 33554432 Free memory: 50653954048 Total mem: 50936283136
+  update experiment batches for tree_awad_full
+  bits: 32
+  build_size_log: 25
+  probe_size_log: 26
+  batch_count: 5
+  alternating_insert_delete: 0
+  insert_before_delete: 1
+  total_inserts_percentage_of_build_size: 200
+  total_deletes_percentage_of_build_size: 200
+  insert_batch_size: 13421772
+  delete_batch_size: 13421772
+  parameters: 
+    node_size: 16
+    bulk_load: full
+Non Shifting Dense Range (Same Dense Range Always) X: 25 Percent of distribution receives Y: 90 of the insert keys per batch 
+Cache incomplete, regenerating keys...
+Generating Hybrid-Dense keys with 33554432 uniform keys and 67108864 dense keys...
+Generating Dense-Pattern + Uniform keys per batch...
+Calculated Range for x: 25 Percent of distribution Length of Range per batch: 1073741823, Minkey 2 and Maxkey 4294967292 
+x: 25 Percent of distributio receives y: 90 of the insert keys per batch 
+*************PRINT BATCH HERE **********
+Batch 1: Dense Region [2, 1073741825]
+*************PRINT BATCH HERE **********
+Batch 2: Dense Region [2, 1073741825]
+*************PRINT BATCH HERE **********
+Batch 3: Dense Region [2, 1073741825]
+*************PRINT BATCH HERE **********
+Batch 4: Dense Region [2, 1073741825]
+*************PRINT BATCH HERE **********
+Batch 5: Dense Region [2, 1073741825]
+Saved generated keys to cache: data_cache/keys_cache.txt
+FINISHED HYBRID DENSE GEN: Build Size: 33554432
+Shifted Dense Key Range: NO
+Percentage Distribution Dense Keys: 25%
+Percentage New Keys from Dense Region: 90%
+Total Generated Keys: 100663292
+ input key_generation_size: 100663296
+ input insert_batch_size:    13421772
+ ------------------------------------------ 
+generated key set of size 100663292
+ -> run 0
+----> Update step 0: Active Range [0, 33554432) -> This Round Updates starts at [33554432]
+----> step 0: No Updates Probe only
+       Sort: 6.61914ms- probe_size: 67108864
+    --Probe Time: -> 59.0305 ms
+    --Probe Miss Time: -> 57.5805 ms
+    ---------------------- 
+----> Update step 1: Active Range [0, 33554432) -> This Round Updates starts at [33554432]
+----> step 1: insert
+Performing Dummy Insert Round
+Dummy insert size: 10
+      Recorded insert batch 0: [33554432, 46976204)
+      insert size: 13421772
+     -> 154.429 ms
+       Sort: 6.62221ms- probe_size: 67108864
+    --Probe Time: -> 66.8477 ms
+    --Probe Miss Time: -> 65.3947 ms
+    ---------------------- 
+----> Update step 2: Active Range [0, 46976204) -> This Round Updates starts at [46976204]
+----> step 2: insert
+      Recorded insert batch 1: [46976204, 60397976)
+      insert size: 13421772
+     -> 32.8971 ms
+       Sort: 6.62221ms- probe_size: 67108864
+    --Probe Time: -> 66.8437 ms
+    --Probe Miss Time: -> 65.3957 ms
+    ---------------------- 
+----> Update step 3: Active Range [0, 60397976) -> This Round Updates starts at [60397976]
+----> step 3: insert
+      Recorded insert batch 2: [60397976, 73819748)
+      insert size: 13421772
+     -> 32.3713 ms
+       Sort: 6.62115ms- probe_size: 67108864
+    --Probe Time: -> 66.8559 ms
+    --Probe Miss Time: -> 65.3967 ms
+    ---------------------- 
+----> Update step 4: Active Range [0, 73819748) -> This Round Updates starts at [73819748]
+----> step 4: insert
+      Recorded insert batch 3: [73819748, 87241520)
+      insert size: 13421772
+     -> 32.5387 ms
+       Sort: 6.62016ms- probe_size: 67108864
+    --Probe Time: -> 66.8518 ms
+    --Probe Miss Time: -> 64.9298 ms
+    ---------------------- 
+----> Update step 5: Active Range [0, 87241520) -> This Round Updates starts at [87241520]
+----> step 5: insert
+      Recorded insert batch 4: [87241520, 100663292)
+      insert size: 13421772
+     -> 31.7096 ms
+       Sort: 6.61709ms- probe_size: 67108864
+    --Probe Time: -> 66.8488 ms
+    --Probe Miss Time: -> 0 ms
+    ---------------------- 
+----> Update step 6: Active Range [0, 100663292) -> This Round Updates starts at [100663292]
+----> step 6: delete
+---- Recorded delete batch 0: [87241520, 100663292)
+delete size: 13421772
+     -> 17.8043 ms
+       Sort: 6.61709ms- probe_size: 67108864
+    --Probe Time: -> 66.8477 ms
+    --Probe Miss Time: -> 65.3906 ms
+    ---------------------- 
+----> Update step 7: Active Range [0, 87241520) -> This Round Updates starts at [87241520]
+----> step 7: delete
+---- Recorded delete batch 1: [73819748, 87241520)
+delete size: 13421772
+     -> 17.6759 ms
+       Sort: 6.61296ms- probe_size: 67108864
+    --Probe Time: -> 66.8447 ms
+    --Probe Miss Time: -> 65.3998 ms
+    ---------------------- 
+----> Update step 8: Active Range [0, 73819748) -> This Round Updates starts at [73819748]
+----> step 8: delete
+---- Recorded delete batch 2: [60397976, 73819748)
+delete size: 13421772
+     -> 17.6769 ms
+       Sort: 6.61606ms- probe_size: 67108864
+    --Probe Time: -> 66.8477 ms
+    --Probe Miss Time: -> 64.9472 ms
+    ---------------------- 
+----> Update step 9: Active Range [0, 60397976) -> This Round Updates starts at [60397976]
+----> step 9: delete
+---- Recorded delete batch 3: [46976204, 60397976)
+delete size: 13421772
+     -> 17.685 ms
+       Sort: 6.61606ms- probe_size: 67108864
+    --Probe Time: -> 66.8477 ms
+    --Probe Miss Time: -> 65.3936 ms
+    ---------------------- 
+----> Update step 10: Active Range [0, 46976204) -> This Round Updates starts at [46976204]
+----> step 10: delete
+---- Recorded delete batch 4: [33554432, 46976204)
+delete size: 13421772
+     -> 17.7238 ms
+       Sort: 6.6089ms- probe_size: 67108864
+    --Probe Time: -> 66.8447 ms
+    --Probe Miss Time: -> 65.3015 ms
+    ---------------------- 
+ -> run 1
+----> Update step 0: Active Range [0, 33554432) -> This Round Updates starts at [33554432]
+----> step 0: No Updates Probe only
+       Sort: 6.61501ms- probe_size: 67108864
+    --Probe Time: -> 59.0275 ms
+    --Probe Miss Time: -> 57.5826 ms
+    ---------------------- 
+----> Update step 1: Active Range [0, 33554432) -> This Round Updates starts at [33554432]
+----> step 1: insert
+Performing Dummy Insert Round
+Dummy insert size: 10
+      Recorded insert batch 0: [33554432, 46976204)
+      insert size: 13421772
+     -> 136.856 ms
+       Sort: 6.62938ms- probe_size: 67108864
+    --Probe Time: -> 66.6092 ms
+    --Probe Miss Time: -> 65.3865 ms
+    ---------------------- 
+----> Update step 2: Active Range [0, 46976204) -> This Round Updates starts at [46976204]
+----> step 2: insert
+      Recorded insert batch 1: [46976204, 60397976)
+      insert size: 13421772
+     -> 31.9157 ms
+       Sort: 6.62547ms- probe_size: 67108864
+    --Probe Time: -> 66.8447 ms
+    --Probe Miss Time: -> 64.5948 ms
+    ---------------------- 
+----> Update step 3: Active Range [0, 60397976) -> This Round Updates starts at [60397976]
+----> step 3: insert
+      Recorded insert batch 2: [60397976, 73819748)
+      insert size: 13421772
+     -> 31.2792 ms
+       Sort: 6.62118ms- probe_size: 67108864
+    --Probe Time: -> 66.8467 ms
+    --Probe Miss Time: -> 65.3855 ms
+    ---------------------- 
+----> Update step 4: Active Range [0, 73819748) -> This Round Updates starts at [73819748]
+----> step 4: insert
+      Recorded insert batch 3: [73819748, 87241520)
+      insert size: 13421772
+     -> 29.8423 ms
+       Sort: 6.61811ms- probe_size: 67108864
+    --Probe Time: -> 66.8385 ms
+    --Probe Miss Time: -> 65.3884 ms
+    ---------------------- 
+----> Update step 5: Active Range [0, 87241520) -> This Round Updates starts at [87241520]
+----> step 5: insert
+      Recorded insert batch 4: [87241520, 100663292)
+      insert size: 13421772
+     -> 29.1044 ms
+       Sort: 6.61402ms- probe_size: 67108864
+    --Probe Time: -> 66.8404 ms
+    --Probe Miss Time: -> 0 ms
+    ---------------------- 
+----> Update step 6: Active Range [0, 100663292) -> This Round Updates starts at [100663292]
+----> step 6: delete
+---- Recorded delete batch 0: [87241520, 100663292)
+delete size: 13421772
+     -> 17.6808 ms
+       Sort: 6.62528ms- probe_size: 67108864
+    --Probe Time: -> 66.8385 ms
+    --Probe Miss Time: -> 65.3885 ms
+    ---------------------- 
+----> Update step 7: Active Range [0, 87241520) -> This Round Updates starts at [87241520]
+----> step 7: delete
+---- Recorded delete batch 1: [73819748, 87241520)
+delete size: 13421772
+     -> 17.6668 ms
+       Sort: 6.60275ms- probe_size: 67108864
+    --Probe Time: -> 66.8375 ms
+    --Probe Miss Time: -> 65.3926 ms
+    ---------------------- 
+----> Update step 8: Active Range [0, 73819748) -> This Round Updates starts at [73819748]
+----> step 8: delete
+---- Recorded delete batch 2: [60397976, 73819748)
+delete size: 13421772
+     -> 17.6745 ms
+       Sort: 6.62528ms- probe_size: 67108864
+    --Probe Time: -> 66.8252 ms
+    --Probe Miss Time: -> 65.3742 ms
+    ---------------------- 
+----> Update step 9: Active Range [0, 60397976) -> This Round Updates starts at [60397976]
+----> step 9: delete
+---- Recorded delete batch 3: [46976204, 60397976)
+delete size: 13421772
+     -> 17.679 ms
+       Sort: 6.62016ms- probe_size: 67108864
+    --Probe Time: -> 66.5569 ms
+    --Probe Miss Time: -> 65.3711 ms
+    ---------------------- 
+----> Update step 10: Active Range [0, 46976204) -> This Round Updates starts at [46976204]
+----> step 10: delete
+---- Recorded delete batch 4: [33554432, 46976204)
+delete size: 13421772
+     -> 17.6671 ms
+       Sort: 6.60685ms- probe_size: 67108864
+    --Probe Time: -> 66.818 ms
+    --Probe Miss Time: -> 65.366 ms
+    ---------------------- 
+ -> run 2
+----> Update step 0: Active Range [0, 33554432) -> This Round Updates starts at [33554432]
+----> step 0: No Updates Probe only
+       Sort: 6.60992ms- probe_size: 67108864
+    --Probe Time: -> 59.0049 ms
+    --Probe Miss Time: -> 57.5621 ms
+    ---------------------- 
+----> Update step 1: Active Range [0, 33554432) -> This Round Updates starts at [33554432]
+----> step 1: insert
+Performing Dummy Insert Round
+Dummy insert size: 10
+      Recorded insert batch 0: [33554432, 46976204)
+      insert size: 13421772
+     -> 137.274 ms
+       Sort: 6.62208ms- probe_size: 67108864
+    --Probe Time: -> 66.8201 ms
+    --Probe Miss Time: -> 65.3711 ms
+    ---------------------- 
+----> Update step 2: Active Range [0, 46976204) -> This Round Updates starts at [46976204]
+----> step 2: insert
+      Recorded insert batch 1: [46976204, 60397976)
+      insert size: 13421772
+     -> 32.2165 ms
+       Sort: 6.62509ms- probe_size: 67108864
+    --Probe Time: -> 66.8242 ms
+    --Probe Miss Time: -> 65.367 ms
+    ---------------------- 
+----> Update step 3: Active Range [0, 60397976) -> This Round Updates starts at [60397976]
+----> step 3: insert
+      Recorded insert batch 2: [60397976, 73819748)
+      insert size: 13421772
+     -> 31.7236 ms
+       Sort: 6.61709ms- probe_size: 67108864
+    --Probe Time: -> 66.8232 ms
+    --Probe Miss Time: -> 65.3752 ms
+    ---------------------- 
+----> Update step 4: Active Range [0, 73819748) -> This Round Updates starts at [73819748]
+----> step 4: insert
+      Recorded insert batch 3: [73819748, 87241520)
+      insert size: 13421772
+     -> 30.2346 ms
+       Sort: 6.61299ms- probe_size: 67108864
+    --Probe Time: -> 66.823 ms
+    --Probe Miss Time: -> 65.3752 ms
+    ---------------------- 
+----> Update step 5: Active Range [0, 87241520) -> This Round Updates starts at [87241520]
+----> step 5: insert
+      Recorded insert batch 4: [87241520, 100663292)
+      insert size: 13421772
+     -> 29.3646 ms
+       Sort: 6.62221ms- probe_size: 67108864
+    --Probe Time: -> 66.8213 ms
+    --Probe Miss Time: -> 0 ms
+    ---------------------- 
+----> Update step 6: Active Range [0, 100663292) -> This Round Updates starts at [100663292]
+----> step 6: delete
+---- Recorded delete batch 0: [87241520, 100663292)
+delete size: 13421772
+     -> 17.6773 ms
+       Sort: 6.61299ms- probe_size: 67108864
+    --Probe Time: -> 66.8178 ms
+    --Probe Miss Time: -> 65.3763 ms
+    ---------------------- 
+----> Update step 7: Active Range [0, 87241520) -> This Round Updates starts at [87241520]
+----> step 7: delete
+---- Recorded delete batch 1: [73819748, 87241520)
+delete size: 13421772
+     -> 17.6761 ms
+       Sort: 6.62096ms- probe_size: 67108864
+    --Probe Time: -> 66.8201 ms
+    --Probe Miss Time: -> 65.3669 ms
+    ---------------------- 
+----> Update step 8: Active Range [0, 73819748) -> This Round Updates starts at [73819748]
+----> step 8: delete
+---- Recorded delete batch 2: [60397976, 73819748)
+delete size: 13421772
+     -> 17.669 ms
+       Sort: 6.62518ms- probe_size: 67108864
+    --Probe Time: -> 66.8242 ms
+    --Probe Miss Time: -> 65.3732 ms
+    ---------------------- 
+----> Update step 9: Active Range [0, 60397976) -> This Round Updates starts at [60397976]
+----> step 9: delete
+---- Recorded delete batch 3: [46976204, 60397976)
+delete size: 13421772
+     -> 17.6858 ms
+       Sort: 6.62323ms- probe_size: 67108864
+    --Probe Time: -> 66.8264 ms
+    --Probe Miss Time: -> 65.3773 ms
+    ---------------------- 
+----> Update step 10: Active Range [0, 46976204) -> This Round Updates starts at [46976204]
+----> step 10: delete
+---- Recorded delete batch 4: [33554432, 46976204)
+delete size: 13421772
+     -> 17.6752 ms
+       Sort: 6.60992ms- probe_size: 67108864
+    --Probe Time: -> 66.8313 ms
+    --Probe Miss Time: -> 65.3751 ms
+    ---------------------- 

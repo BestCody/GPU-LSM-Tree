@@ -1,0 +1,12 @@
+comment_directory/
+backup_long_versions_for_paper/
+KeepOlderFiles/
+KEEP_benchmarks_updates/
+backup*/
+
+build/*
+!build/
+!build/runscripts_experiments/
+!build/runscripts_experiments/**
+!build/sample_output/
+!build/sample_output/**
