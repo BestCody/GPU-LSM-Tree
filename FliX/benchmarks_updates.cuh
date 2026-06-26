@@ -75,13 +75,6 @@ constexpr bool shift_insert_range = false;
 #include <iostream>
 #include <vector>
 
-/**
- * Checks successor/ceiling results:
- * For each a[i], expected = first key in sorted(generated_keys[0:d_end_point)) that is >= a[i].
- * Asserts b[i] == expected for all i; prints first mismatch and aborts.
- */
-
-
 inline void cuda_check_impl(cudaError_t e, const char* expr, const char* file, int line) {
   if (e != cudaSuccess) {
     std::fprintf(stderr, "CUDA error %s at %s:%d: %s\n", expr, file, line, cudaGetErrorString(e));

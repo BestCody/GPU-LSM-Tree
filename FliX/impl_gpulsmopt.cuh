@@ -120,7 +120,7 @@ inline void finalize_lookup(const std::uint8_t* found,
     check_cuda(cudaGetLastError());
 }
 
-} // namespace gpulsmopt_adapter_detail
+}
 
 template <typename key_type_>
 class gpulsmopt final {
@@ -137,7 +137,7 @@ public:
     static constexpr operation_support can_lookup = operation_support::async;
     static constexpr operation_support can_lower_bound_rank = operation_support::none;
     static constexpr operation_support can_multi_lookup = operation_support::none;
-    static constexpr operation_support can_range_lookup = operation_support::none;
+    static constexpr operation_support can_range_lookup = operation_support::async;
     static constexpr operation_support can_insert = operation_support::async;
     static constexpr operation_support can_delete = operation_support::async;
     static constexpr operation_support can_update = operation_support::async;
@@ -225,7 +225,17 @@ public:
         lookup(keys, result, size, stream);
     }
 
-    void range_lookup_sum(const key_type*, const key_type*, value_type*, size_t, cudaStream_t) {}
+    void range_lookup_sum(const key_type* lower, const key_type* upper, value_type* result, size_t size, cudaStream_t stream) {
+        ensure_built();
+        if (size == 0) return;
+        DeviceRangeOutputBatch batch;
+        batch.lo = reinterpret_cast<const std::uint32_t*>(lower);
+        batch.hi = reinterpret_cast<const std::uint32_t*>(upper);
+        batch.query_count = size;
+        batch.out_sums = reinterpret_cast<std::uint32_t*>(result);
+        batch.out_counts = nullptr;
+        dictionary_->range(batch, stream);
+    }
 
     void insert(const key_type* update_list, const smallsize* offsets, size_t size, cudaStream_t stream) {
         ensure_built();
@@ -244,9 +254,14 @@ public:
         dictionary_->erase(batch, stream);
     }
 
-    void lookups_successor(const key_type*, key_type* result, size_t size, cudaStream_t stream) {
+    void lookups_successor(const key_type* keys, key_type* result, size_t size, cudaStream_t stream) {
+        ensure_built();
         if (size == 0) return;
-        cudaMemsetAsync(result, 0, size * sizeof(key_type), stream);
+        DeviceSuccessorBatch batch;
+        batch.queries = reinterpret_cast<const std::uint32_t*>(keys);
+        batch.count = size;
+        batch.out_keys = reinterpret_cast<std::uint32_t*>(result);
+        dictionary_->successor(batch, stream);
     }
 
 private:

@@ -684,13 +684,6 @@ __global__ void seg_build_segment_metadata_kernel(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Merge / repack kernels (net-new; not present in segmented_sheet.cuh).
-// ---------------------------------------------------------------------------
-
-// One block per merge group: gather all valid (seq 0) records from each of the
-// group's source segments into its candidate slice. Order within the slice is
-// arbitrary; a stable key sort follows.
 __global__ void seg_merge_gather_kernel(
     const std::uint32_t* pool_keys, const std::uint32_t* pool_values,
     const std::uint8_t* pool_valid, const std::uint32_t* group_src_seg,
@@ -948,15 +941,13 @@ __global__ void range_count_live_kernel(
   if (i < live_count) atomicAdd(&query_counts[candidate_queries[i]], 1u);
 }
 
-__global__ void range_scatter_live_kernel(
-    const std::uint32_t* candidate_keys,
+__global__ void range_sum_live_kernel(
+    const std::uint32_t* candidate_queries,
     const std::uint32_t* candidate_values, std::size_t live_count,
-    std::size_t output_capacity, std::uint32_t* out_keys,
-    std::uint32_t* out_values) {
+    std::uint32_t* query_sums) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= live_count || i >= output_capacity) return;
-  out_keys[i] = candidate_keys[i];
-  out_values[i] = candidate_values[i];
+  if (i < live_count)
+    atomicAdd(&query_sums[candidate_queries[i]], candidate_values[i]);
 }
 
 struct RangeTombstonePredicate {
@@ -966,7 +957,115 @@ struct RangeTombstonePredicate {
   }
 };
 
-}  // namespace gpulsmopt_detail
+// Smallest key >= q stored in one segment, or kEmptyKey if none.
+__device__ inline std::uint32_t seg_segment_ceiling(
+    std::uint32_t seg_id, std::uint32_t q, const std::uint32_t* pool_keys,
+    const std::uint8_t* pool_valid, const std::uint32_t* seg_bucket_max) {
+  const std::size_t meta_base =
+      static_cast<std::size_t>(seg_id) * kSegmentBuckets;
+  const std::size_t slot_base =
+      static_cast<std::size_t>(seg_id) * kSegmentSlots;
+  std::uint32_t best = kEmptyKey;
+  for (std::size_t b =
+           lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, q);
+       b < kSegmentBuckets; ++b) {
+    const std::size_t start = slot_base + b * kBucketSlots;
+    for (int lane = 0; lane < kBucketSlots; ++lane) {
+      const std::size_t pos = start + lane;
+      if (pool_valid[pos] && pool_keys[pos] >= q && pool_keys[pos] < best)
+        best = pool_keys[pos];
+    }
+    if (best != kEmptyKey) break;
+  }
+  return best;
+}
+
+// Smallest sheet key >= q (ignoring run shadowing), or kEmptyKey if none.
+__device__ inline std::uint32_t seg_sheet_ceiling(
+    std::uint32_t q, const std::uint32_t* dir_boundary,
+    const std::uint32_t* dir_seg_id, std::size_t dir_count,
+    const std::uint32_t* pool_keys, const std::uint8_t* pool_valid,
+    const std::uint32_t* seg_bucket_max) {
+  std::uint32_t best = kEmptyKey;
+  for (std::size_t ord = lower_bound_u32(dir_boundary, dir_count, q);
+       ord < dir_count && best == kEmptyKey; ++ord) {
+    best = seg_segment_ceiling(dir_seg_id[ord], q, pool_keys, pool_valid,
+                               seg_bucket_max);
+  }
+  return best;
+}
+
+constexpr int kSuccessorCachedRuns = 32;
+__global__ void successor_kernel(
+    const std::uint32_t* queries, std::size_t query_count,
+    std::uint32_t* out_keys, const std::uint32_t* dir_boundary,
+    const std::uint32_t* dir_seg_id, std::size_t dir_count,
+    const std::uint32_t* pool_keys, const std::uint8_t* pool_valid,
+    const std::uint32_t* seg_bucket_max, const std::uint32_t* const* run_keys,
+    const std::uint32_t* const* run_ops, const std::uint32_t* const* run_seqs,
+    const std::size_t* run_sizes, std::size_t run_count) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= query_count) return;
+
+  const std::uint32_t q = queries[i];
+  const std::size_t cached =
+      run_count < kSuccessorCachedRuns ? run_count : kSuccessorCachedRuns;
+  std::uint32_t run_pos[kSuccessorCachedRuns];
+  for (std::size_t r = 0; r < cached; ++r) {
+    run_pos[r] = static_cast<std::uint32_t>(
+        lower_bound_u32(run_keys[r], run_sizes[r], q));
+  }
+  std::uint32_t sheet = seg_sheet_ceiling(q, dir_boundary, dir_seg_id, dir_count,
+                                          pool_keys, pool_valid, seg_bucket_max);
+
+  std::uint32_t cursor = q;
+  std::uint32_t result = 0;
+  while (true) {
+    std::uint32_t cand = sheet;
+    bool cand_has_run = false;
+    std::uint32_t cand_seq = 0;
+    std::uint8_t cand_op = kTombstone;
+    for (std::size_t r = 0; r < run_count; ++r) {
+      const std::size_t n = run_sizes[r];
+      std::size_t p;
+      if (r < cached) {
+        p = run_pos[r];
+        while (p < n && run_keys[r][p] < cursor) ++p;
+        run_pos[r] = static_cast<std::uint32_t>(p);
+      } else {
+        p = lower_bound_u32(run_keys[r], n, cursor);
+      }
+      if (p >= n) continue;
+      const std::uint32_t k = run_keys[r][p];
+      if (k < cand) {
+        cand = k;
+        cand_has_run = true;
+        cand_seq = run_seqs[r][p];
+        cand_op = static_cast<std::uint8_t>(run_ops[r][p]);
+      } else if (k == cand) {
+        const std::uint32_t s = run_seqs[r][p];
+        if (!cand_has_run || s > cand_seq) {
+          cand_has_run = true;
+          cand_seq = s;
+          cand_op = static_cast<std::uint8_t>(run_ops[r][p]);
+        }
+      }
+    }
+    if (cand == kEmptyKey) break;
+    if (!cand_has_run || cand_op == kInsert) {
+      result = cand;
+      break;
+    }
+    cursor = cand + 1u;
+    if (sheet < cursor) {
+      sheet = seg_sheet_ceiling(cursor, dir_boundary, dir_seg_id, dir_count,
+                                pool_keys, pool_valid, seg_bucket_max);
+    }
+  }
+  out_keys[i] = result;
+}
+
+}
 
 class GPULSMOpt {
  public:
@@ -977,7 +1076,7 @@ class GPULSMOpt {
     std::vector<std::uint32_t> seg_id;
     std::vector<std::uint32_t> boundary;
     std::vector<std::uint32_t> live;
-    std::vector<std::uint32_t> prefix;  // size == seg_id.size() + 1
+    std::vector<std::uint32_t> prefix;
   };
 
   explicit GPULSMOpt(const DictionaryConfig& config)
@@ -1134,6 +1233,22 @@ class GPULSMOpt {
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
+  void successor(const DeviceSuccessorBatch& batch, cudaStream_t stream) {
+    if (batch.count == 0) return;
+    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    const int block = 128;
+    const int grid = static_cast<int>((batch.count + block - 1) / block);
+    gpulsmopt_detail::successor_kernel<<<grid, block, 0, stream>>>(
+        batch.queries, batch.count, batch.out_keys,
+        raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
+        h_dir_seg_id_.size(), raw_or_null(pool_keys_), raw_or_null(pool_valid_),
+        raw_or_null(seg_bucket_max_), raw_or_null(run_key_ptrs_),
+        raw_or_null(run_op_ptrs_), raw_or_null(run_seq_ptrs_),
+        raw_or_null(run_sizes_), runs_.size());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  }
+
   void range(const DeviceRangeOutputBatch& batch, cudaStream_t stream) {
     if (batch.query_count == 0) return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
@@ -1145,6 +1260,7 @@ class GPULSMOpt {
     scratch_range_source_cursors_.resize(descriptor_count);
     scratch_range_query_totals_.resize(batch.query_count);
     scratch_range_query_offsets_.resize(batch.query_count);
+    scratch_range_query_sums_.resize(batch.query_count);
 
     const int block = 256;
     const int count_grid =
@@ -1190,8 +1306,6 @@ class GPULSMOpt {
 
     resize_range_candidates(candidate_count);
     if (candidate_count > 0) {
-      // The sheet-source gather uses atomic cursors seeded at the source
-      // offsets; runs index deterministically from the offsets directly.
       CUDA_CHECK(cudaMemcpyAsync(
           raw_or_null(scratch_range_source_cursors_),
           raw_or_null(scratch_range_source_offsets_),
@@ -1267,40 +1381,42 @@ class GPULSMOpt {
           static_cast<std::size_t>(filtered_end - live_begin);
       resize_range_candidates(live_count);
 
+      // Per-query sum of the surviving values
+      thrust::fill(policy, scratch_range_query_sums_.begin(),
+                   scratch_range_query_sums_.end(), 0u);
       thrust::fill(policy, scratch_range_query_totals_.begin(),
                    scratch_range_query_totals_.end(), 0u);
-      const int live_grid = static_cast<int>((live_count + block - 1) / block);
       if (live_count > 0) {
+        const int live_grid = static_cast<int>((live_count + block - 1) / block);
+        gpulsmopt_detail::range_sum_live_kernel<<<live_grid, block, 0, stream>>>(
+            raw_or_null(scratch_range_candidate_queries_),
+            raw_or_null(scratch_range_candidate_values_), live_count,
+            raw_or_null(scratch_range_query_sums_));
+        CUDA_CHECK(cudaGetLastError());
         gpulsmopt_detail::range_count_live_kernel<<<live_grid, block, 0, stream>>>(
             raw_or_null(scratch_range_candidate_queries_), live_count,
             raw_or_null(scratch_range_query_totals_));
         CUDA_CHECK(cudaGetLastError());
       }
-      thrust::exclusive_scan(policy, scratch_range_query_totals_.begin(),
-                             scratch_range_query_totals_.end(),
-                             scratch_range_query_offsets_.begin());
       CUDA_CHECK(cudaMemcpyAsync(
-          batch.out_counts, raw_or_null(scratch_range_query_totals_),
+          batch.out_sums, raw_or_null(scratch_range_query_sums_),
           batch.query_count * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice,
           stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          batch.out_offsets, raw_or_null(scratch_range_query_offsets_),
-          batch.query_count * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice,
-          stream));
-      if (live_count > 0) {
-        gpulsmopt_detail::range_scatter_live_kernel<<<live_grid, block, 0, stream>>>(
-            raw_or_null(scratch_range_candidate_keys_),
-            raw_or_null(scratch_range_candidate_values_), live_count,
-            batch.output_capacity, batch.out_keys, batch.out_values);
-        CUDA_CHECK(cudaGetLastError());
+      if (batch.out_counts) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            batch.out_counts, raw_or_null(scratch_range_query_totals_),
+            batch.query_count * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice,
+            stream));
       }
     } else {
-      CUDA_CHECK(cudaMemsetAsync(batch.out_counts, 0,
+      CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
                                  batch.query_count * sizeof(std::uint32_t),
                                  stream));
-      CUDA_CHECK(cudaMemsetAsync(batch.out_offsets, 0,
-                                 batch.query_count * sizeof(std::uint32_t),
-                                 stream));
+      if (batch.out_counts) {
+        CUDA_CHECK(cudaMemsetAsync(batch.out_counts, 0,
+                                   batch.query_count * sizeof(std::uint32_t),
+                                   stream));
+      }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1372,10 +1488,11 @@ class GPULSMOpt {
         scratch_query_winners_, scratch_query_values_, scratch_query_found_,
         scratch_range_source_counts_, scratch_range_source_offsets_,
         scratch_range_source_cursors_, scratch_range_query_totals_,
-        scratch_range_query_offsets_, scratch_range_candidate_queries_,
-        scratch_range_candidate_keys_, scratch_range_candidate_values_,
-        scratch_range_candidate_ops_, scratch_range_candidate_seqs_,
-        scratch_range_seq_sort_keys_, scratch_range_group_sort_keys_);
+        scratch_range_query_offsets_, scratch_range_query_sums_,
+        scratch_range_candidate_queries_, scratch_range_candidate_keys_,
+        scratch_range_candidate_values_, scratch_range_candidate_ops_,
+        scratch_range_candidate_seqs_, scratch_range_seq_sort_keys_,
+        scratch_range_group_sort_keys_);
     return total;
   }
 
@@ -1421,8 +1538,6 @@ class GPULSMOpt {
   static std::size_t device_bytes_all(const Vecs&... vecs) {
     return (std::size_t{0} + ... + device_bytes(vecs));
   }
-
-  // ---- Run-layer batch helpers (unchanged) -------------------------------
 
   void fill_constant_ops(thrust::device_vector<std::uint32_t>& ops,
                          std::uint32_t op, cudaStream_t stream) {
@@ -1740,8 +1855,6 @@ class GPULSMOpt {
     return count;
   }
 
-  // ---- Segmented bottom layer -------------------------------------------
-
   void initialize_segmented_storage(cudaStream_t stream) {
     pool_capacity_ = 0;
     free_ids_.clear();
@@ -1879,7 +1992,6 @@ class GPULSMOpt {
       CUDA_CHECK(cudaGetLastError());
     }
 
-    // 2. Run-length-encode ordinals -> (dirty ordinal, incoming count).
     seg_dirty_ord_.resize(incoming_count);
     seg_dirty_count_.resize(incoming_count);
     auto rle_end = thrust::reduce_by_key(
@@ -1900,8 +2012,6 @@ class GPULSMOpt {
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // 3. Per-dirty-segment host metadata: incoming slice into the resolved
-    //    incoming array, plus the segment's current directory entry.
     std::vector<std::uint32_t> dirty_seg_id(m), dirty_old_boundary(m),
         dirty_old_live(m), dirty_in_begin(m), dirty_in_end(m);
     std::uint32_t in_acc = 0;
@@ -1918,8 +2028,6 @@ class GPULSMOpt {
     upload_vec(seg_d_dirty_in_begin_, dirty_in_begin, stream);
     upload_vec(seg_d_dirty_in_end_, dirty_in_end, stream);
 
-    // 3b. Classify each dirty segment: in-place fast path (no bucket would
-    //     overflow its 32 slots) vs. full rebuild + 1->k split.
     seg_slow_.resize(m);
     seg_new_live_.resize(m);
     gpulsmopt_detail::seg_classify_inplace_kernel<<<static_cast<unsigned>(m), 256, 0,
@@ -1940,7 +2048,6 @@ class GPULSMOpt {
                                stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // 3c. Partition dirty segments into fast (edit in place) and slow (rebuild).
     std::vector<int> is_fast(m), slow_index(m, -1);
     std::vector<std::uint32_t> fast_seg_id, fast_in_begin, fast_in_end;
     std::vector<std::size_t> slow_j;
@@ -1957,8 +2064,6 @@ class GPULSMOpt {
       }
     }
 
-    // 4. Fast path: edit segments in place using existing bucket gaps. Fast
-    //    segments keep their physical id and routing boundary.
     if (!fast_seg_id.empty()) {
       upload_vec(seg_fast_seg_id_, fast_seg_id, stream);
       upload_vec(seg_fast_in_begin_, fast_in_begin, stream);
@@ -1975,7 +2080,6 @@ class GPULSMOpt {
       CUDA_CHECK(cudaGetLastError());
     }
 
-    // 5. Slow path: full rebuild + 1->k split for overflowing segments only.
     const std::size_t ms = slow_j.size();
     std::vector<std::uint32_t> dirty_k, dirty_output_base, output_seg_id,
         out_boundary, out_live;
@@ -2020,7 +2124,6 @@ class GPULSMOpt {
           raw_or_null(seg_sheet_cursor_));
       CUDA_CHECK(cudaGetLastError());
 
-      // Resolve newest per (segment, key); drop tombstone winners.
       std::size_t live_count = 0;
       if (candidate_count > 0) {
         const int block = 256;
@@ -2058,7 +2161,6 @@ class GPULSMOpt {
         live_count = static_cast<std::size_t>(fend - begin);
       }
 
-      // Count survivors per slow segment.
       seg_dirty_live_.resize(ms);
       thrust::fill(policy, seg_dirty_live_.begin(), seg_dirty_live_.end(), 0u);
       if (live_count > 0) {
@@ -2075,7 +2177,6 @@ class GPULSMOpt {
                                  cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
 
-      // Decide split factor k; allocate output ids.
       dirty_k.resize(ms);
       dirty_output_base.resize(ms);
       std::vector<std::uint32_t> dirty_live_offset(ms);
@@ -2220,17 +2321,14 @@ class GPULSMOpt {
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // Greedily merge maximal runs of adjacent directory entries that start at an
-  // underfull segment and whose combined live still fits one segment. Each
-  // group is gathered (seq 0, key order) and repacked into a single segment.
   void merge_underfull_segments(cudaStream_t stream) {
     const std::size_t n = h_dir_seg_id_.size();
     if (n < 2) return;
     const std::uint32_t watermark = target_segment_live_ / 2;
 
     struct Group {
-      std::size_t begin;  // first ord (inclusive)
-      std::size_t end;    // last ord (exclusive)
+      std::size_t begin;  //inclusive
+      std::size_t end;    //exclusive
       std::uint32_t live;
     };
     std::vector<Group> groups;
@@ -2259,7 +2357,6 @@ class GPULSMOpt {
     auto policy = thrust::cuda::par.on(stream);
     const std::size_t group_count = groups.size();
 
-    // Flatten the source-segment lists and build per-group accounting.
     std::vector<std::uint32_t> group_src_seg, group_src_begin(group_count),
         group_src_end(group_count), candidate_offset(group_count);
     std::vector<std::uint32_t> dirty_live(group_count),
@@ -2281,7 +2378,7 @@ class GPULSMOpt {
       live_off += groups[g].live;
       dirty_output_base[g] = static_cast<std::uint32_t>(g);
       output_seg_id[g] = alloc_segment();
-      out_boundary[g] = h_dir_boundary_[groups[g].end - 1];  // rightmost
+      out_boundary[g] = h_dir_boundary_[groups[g].end - 1];
     }
     const std::size_t candidate_count = cand_acc;
 
@@ -2311,7 +2408,7 @@ class GPULSMOpt {
           raw_or_null(seg_cand_value_), raw_or_null(seg_sheet_cursor_));
       CUDA_CHECK(cudaGetLastError());
 
-      // Order each group's slice by key (keys are unique across the group).
+      // Order each group's slice by key
       const int block = 256;
       const int grid = static_cast<int>((candidate_count + block - 1) / block);
       gpulsmopt_detail::seg_merge_sort_keys_kernel<<<grid, block, 0, stream>>>(
@@ -2326,7 +2423,7 @@ class GPULSMOpt {
                                  payload);
     }
 
-    // Repack into one segment per group (k == 1, boundaries already set).
+    // Repack into one segment per group
     rebuild_output_segments(candidate_count, group_count, stream);
 
     std::vector<int> group_of_ord(n, -1);
@@ -2513,7 +2610,6 @@ class GPULSMOpt {
   thrust::device_vector<std::uint32_t> seg_group_src_seg_;
   thrust::device_vector<std::uint32_t> seg_group_src_begin_;
   thrust::device_vector<std::uint32_t> seg_group_src_end_;
-  // In-place fast-path scratch (improvement #1).
   thrust::device_vector<std::uint32_t> seg_slow_;
   thrust::device_vector<std::uint32_t> seg_new_live_;
   thrust::device_vector<std::uint32_t> seg_fast_seg_id_;
@@ -2539,6 +2635,7 @@ class GPULSMOpt {
   thrust::device_vector<std::uint32_t> scratch_range_source_cursors_;
   thrust::device_vector<std::uint32_t> scratch_range_query_totals_;
   thrust::device_vector<std::uint32_t> scratch_range_query_offsets_;
+  thrust::device_vector<std::uint32_t> scratch_range_query_sums_;
   thrust::device_vector<std::uint32_t> scratch_range_candidate_queries_;
   thrust::device_vector<std::uint32_t> scratch_range_candidate_keys_;
   thrust::device_vector<std::uint32_t> scratch_range_candidate_values_;

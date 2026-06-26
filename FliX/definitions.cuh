@@ -82,12 +82,6 @@ using bigsize = uint64_t;
 
 constexpr smallsize not_found = std::numeric_limits<smallsize>::max();
 
-// never generate negative keys (conflict with b+ tree)
-// never generate key 0 (conflict with b+ tree)
-// never generate MAX_KEY (conflict with b+ tree and hash table)
-// never generate MAX_KEY - 1 (conflict with hash table)
-// also reserve 1 and MAX_KEY - 2 to test out-of-range lookups
-// if the bit range is restricted, reserve (1 << bits) - 1 for out-of-range lookups instead
 template <typename key_type>
 constexpr key_type min_usable_key(uint8_t bit_restriction) {
     return 2;
