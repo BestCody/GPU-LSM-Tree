@@ -1,7 +1,7 @@
 // =============================================================================
 // File: impl_tree_awad.cuh
 // Author: Justus Henneberg
-// Description: Implements impl_tree_awad     
+// Description: Implements impl_tree_awad
 // Copyright (c) 2025 Justus Henneberg, Rosina Kharal
 // SPDX-License-Identifier: GPL-3.0-or-later
 // =============================================================================
@@ -9,48 +9,123 @@
 #ifndef IMPL_TREE_AWAD_CUH
 #define IMPL_TREE_AWAD_CUH
 
-#include "gpu_btree.h"
+#include "gpu_btree/gpu_btree.h"
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <algorithm>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <limits>
+#include <type_traits>
 
 using GpuBTree::gpu_blink_tree;
 
-// for nvtx
 struct nvtx_tree_awad_domain{ static constexpr char const* name{"tree_awad"}; };
 
+template <typename key_type, typename size_type, typename btree>
+GLOBALQUALIFIER void tree_awad_find_kernel(
+    const key_type* keys,
+    smallsize* results,
+    const size_type keys_count,
+    btree tree,
+    bool concurrent = false)
+{
+    auto thread_id = threadIdx.x + blockIdx.x * blockDim.x;
 
-template <typename key_type>
-GLOBALQUALIFIER void tree_awad_make_upper_exclusive(const key_type* upper,
-                                                    key_type* upper_exclusive,
-                                                    std::size_t size) {
-  auto i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= size) return;
+    auto block = cooperative_groups::this_thread_block();
+    auto tile = cooperative_groups::tiled_partition<btree::branching_factor>(block);
 
-  auto value = upper[i];
-  upper_exclusive[i] = value == std::numeric_limits<key_type>::max()
-                           ? value
-                           : static_cast<key_type>(value + 1);
+    if ((thread_id - tile.thread_rank()) >= keys_count)
+        return;
+
+    auto key = btree::invalid_key;
+    auto value = btree::invalid_value;
+    bool to_find = false;
+    if (thread_id < keys_count)
+    {
+        key = keys[thread_id];
+        to_find = true;
+    }
+
+    using allocator_type = device_allocator_context<typename btree::allocator_type>;
+    allocator_type allocator{tree.allocator_, tile};
+
+    auto work_queue = tile.ballot(to_find);
+    while (work_queue)
+    {
+        auto cur_rank = __ffs(work_queue) - 1;
+        auto cur_key = tile.shfl(key, cur_rank);
+        auto cur_result = tree.cooperative_find(cur_key, tile, allocator, concurrent);
+        if (cur_rank == tile.thread_rank())
+        {
+            value = cur_result;
+            to_find = false;
+        }
+        work_queue = tile.ballot(to_find);
+    }
+
+    if (thread_id < keys_count)
+        results[thread_id] = value != btree::invalid_value ? value : not_found;
 }
 
-template <typename pair_type>
-GLOBALQUALIFIER void tree_awad_sum_pairs_kernel(const pair_type* pairs,
-                                                const smallsize* counts,
-                                                smallsize* result,
-                                                std::size_t stride,
-                                                std::size_t size) {
-  auto i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= size) return;
+template <typename key_type, typename size_type, typename btree>
+GLOBALQUALIFIER void tree_awad_range_lookup_kernel(
+    const key_type* lower_bounds,
+    const key_type* upper_bounds,
+    smallsize* results,
+    const size_type keys_count,
+    btree tree,
+    bool concurrent = false)
+{
+    auto thread_id = threadIdx.x + blockIdx.x * blockDim.x;
 
-  smallsize sum = 0;
-  const auto count = counts[i];
-  const auto base = i * stride;
-  for (smallsize j = 0; j < count; ++j) {
-    sum += pairs[base + j].second;
-  }
-  result[i] = sum;
+    auto block = cooperative_groups::this_thread_block();
+    auto tile = cooperative_groups::tiled_partition<btree::branching_factor>(block);
+
+    if ((thread_id - tile.thread_rank()) >= keys_count)
+        return;
+
+    auto lower_bound = btree::invalid_key;
+    auto upper_bound = btree::invalid_key;
+    bool to_find = false;
+    if (thread_id < keys_count)
+    {
+        lower_bound = lower_bounds[thread_id];
+        upper_bound = upper_bounds[thread_id];
+        to_find = true;
+    }
+
+    using allocator_type = device_allocator_context<typename btree::allocator_type>;
+    allocator_type allocator{tree.allocator_, tile};
+
+    smallsize result = 0;
+    auto work_queue = tile.ballot(to_find);
+    while (work_queue)
+    {
+        auto cur_rank = __ffs(work_queue) - 1;
+        auto cur_lower_bound = tile.shfl(lower_bound, cur_rank);
+        auto cur_upper_bound = tile.shfl(upper_bound, cur_rank);
+        auto local_result = tree.modified_aggregating_cooperative_range_query(
+            cur_lower_bound,
+            cur_upper_bound,
+            tile,
+            allocator,
+            concurrent);
+        auto cur_result = cooperative_groups::reduce(
+            tile,
+            local_result,
+            cooperative_groups::plus<smallsize>());
+
+        if (cur_rank == tile.thread_rank())
+        {
+            result = cur_result;
+            to_find = false;
+        }
+        work_queue = tile.ballot(to_find);
+    }
+
+    if (thread_id < keys_count)
+        results[thread_id] = result;
 }
 
 template <typename key_type_, bool bulk_load_full = false>
@@ -61,8 +136,7 @@ public:
     using key_type = key_type_;
 
 private:
-    using tree_type = gpu_blink_tree<key_type, smallsize, 16>;
-    using pair_type = typename tree_type::pair_type;
+    using tree_type = gpu_blink_tree<key_type, smallsize, bulk_load_full>;
     std::optional<tree_type> wrapped_tree;
 
 public:
@@ -74,7 +148,7 @@ public:
     static constexpr operation_support can_insert = operation_support::async;
     static constexpr operation_support can_delete = operation_support::async;
     static constexpr operation_support can_update = operation_support::async;
-    static constexpr operation_support can_successor = operation_support::async;
+    static constexpr operation_support can_successor = operation_support::none;
 
     static std::string short_description() {
         std::string desc = "tree_awad";
@@ -96,17 +170,16 @@ public:
     static size_t estimate_build_bytes(size_t size) {
         return sizeof(key_type) * size + sizeof(smallsize) * size +
                find_pair_sort_buffer_size<key_type, smallsize>(size) +
-               sizeof(pair_type) * size;
+               gpu_blink_tree<key_type, smallsize, bulk_load_full>::nodes_to_allocate(size, size) *
+               sizeof(GpuBTree::node_type<key_type, smallsize, tree_type::branching_factor>);
     }
 
     size_t gpu_resident_bytes() {
         if (!wrapped_tree) return 0;
-        return static_cast<size_t>(wrapped_tree.value().get_num_tree_node()) *
-               tree_type::branching_factor * sizeof(pair_type);
+        return wrapped_tree.value().compute_memory_usage_bytes();
     }
 
     void build(const key_type* keys, size_t size, size_t max_size, size_t available_memory_bytes, double* build_time_ms, size_t* build_bytes) {
-        (void)max_size;
         (void)available_memory_bytes;
         cuda_buffer<key_type> sorted_keys_buffer;
         cuda_buffer<smallsize> sorted_offsets_buffer;
@@ -132,17 +205,16 @@ public:
             cudaDeviceSynchronize(); C2EX
         }
 
+        wrapped_tree.emplace(size, max_size);
         {
             scoped_cuda_timer timer(0, build_time_ms);
-            auto built_tree = tree_type(sorted_keys_buffer.ptr(), sorted_offsets_buffer.ptr(), static_cast<typename tree_type::size_type>(size), true, cudaStream_t{});
-            wrapped_tree.emplace(built_tree);
+            wrapped_tree.value().bulk_load(sorted_keys_buffer.ptr(), sorted_offsets_buffer.ptr(), static_cast<typename tree_type::size_type>(size), true, cudaStream_t{});
         }
         if (build_bytes) *build_bytes += gpu_resident_bytes();
 
         cudaDeviceSynchronize(); C2EX
     }
 
-    // overload used by the range/point benchmarks (no separate max_size / memory budget)
     void build(const key_type* keys, size_t size, double* build_time_ms, size_t* build_bytes) {
         build(keys, size, size, std::numeric_limits<size_t>::max(), build_time_ms, build_bytes);
     }
@@ -150,7 +222,8 @@ public:
     void lookup(const key_type* keys, smallsize* result, size_t size, cudaStream_t stream) {
         nvtx3::scoped_range_in<nvtx_tree_awad_domain> launch{"launch"};
         (void)launch;
-        wrapped_tree.value().find(keys, result, static_cast<typename tree_type::size_type>(size), stream, false);
+        tree_awad_find_kernel<<<SDIV(size, 512), 512, 0, stream>>>(
+            keys, result, static_cast<typename tree_type::size_type>(size), wrapped_tree.value());
     }
 
     void multi_lookup_sum(const key_type* keys, smallsize* result, size_t size, cudaStream_t stream) {
@@ -162,34 +235,8 @@ public:
 
     void range_lookup_sum(const key_type* lower, const key_type* upper, smallsize* result, size_t size, cudaStream_t stream) {
         if (size == 0) return;
-
-        auto upper_exclusive = cuda_buffer<key_type>{};
-        upper_exclusive.alloc(size);
-        auto block_size = 512;
-        auto grid_size = SDIV(size, block_size);
-        tree_awad_make_upper_exclusive<<<grid_size, block_size, 0, stream>>>(upper, upper_exclusive.ptr(), size);
-        C2EX
-
-        auto counts_buffer = cuda_buffer<smallsize>{};
-        counts_buffer.alloc(size);
-        wrapped_tree.value().range_query(lower, upper_exclusive.ptr(), nullptr, counts_buffer.ptr(), 0, static_cast<typename tree_type::size_type>(size), stream, false);
-        cudaStreamSynchronize(stream); C2EX
-
-        auto counts = counts_buffer.download(size);
-        auto max_count = smallsize{0};
-        for (auto count : counts) {
-            max_count = std::max(max_count, count);
-        }
-
-        if (max_count == 0) {
-            cudaMemsetAsync(result, 0, size * sizeof(smallsize), stream); C2EX
-            return;
-        }
-
-        auto pair_buffer = cuda_buffer<pair_type>{};
-        pair_buffer.alloc(static_cast<size_t>(size) * max_count);
-        wrapped_tree.value().range_query(lower, upper_exclusive.ptr(), pair_buffer.ptr(), counts_buffer.ptr(), max_count, static_cast<typename tree_type::size_type>(size), stream, false);
-        tree_awad_sum_pairs_kernel<<<grid_size, block_size, 0, stream>>>(pair_buffer.ptr(), counts_buffer.ptr(), result, max_count, size);
+        tree_awad_range_lookup_kernel<<<SDIV(size, 512), 512, 0, stream>>>(
+            lower, upper, result, static_cast<typename tree_type::size_type>(size), wrapped_tree.value());
         C2EX
     }
 
@@ -206,9 +253,10 @@ public:
     }
 
     void lookups_successor(const key_type* keys, key_type* result, size_t size, cudaStream_t stream) {
-        nvtx3::scoped_range_in<nvtx_tree_awad_domain> launch{"launch"};
-        (void)launch;
-        wrapped_tree.value().successor(keys, result, static_cast<typename tree_type::size_type>(size), stream, false);
+        (void)keys;
+        (void)result;
+        (void)size;
+        (void)stream;
     }
 };
 

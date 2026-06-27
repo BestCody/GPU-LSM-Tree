@@ -35,8 +35,8 @@
 #include <device_bump_allocator.hpp>
 #include <slab_alloc.hpp>
 
-// #define DEBUG_LOCKS
-//  #define DEBUG_STRUCTURE
+//#define DEBUG_LOCKS
+// #define DEBUG_STRUCTURE
 
 #ifdef DEBUG_STRUCTURE
 #define DEBUG_STRUCTURE_PRINT(fmt, ...)         \
@@ -60,38 +60,101 @@
 
 namespace GpuBTree {
 
-template <typename Key,
-          typename Value,
-          int B              = 16,
-          typename Allocator = device_bump_allocator<node_type<Key, Value, B>>>
+// EDIT jh: fixed branching factor to 16, allocator to device_bump_allocator
+template <typename Key, typename Value, bool bulk_load_full = false>
 struct gpu_blink_tree {
   using size_type                        = uint32_t;
   using key_type                         = Key;
   using value_type                       = Value;
   using pair_type                        = pair_type<Key, Value>;
+  static auto constexpr B = 16;
   static auto constexpr branching_factor = B;
 
   static constexpr key_type invalid_key     = std::numeric_limits<key_type>::max();
   static constexpr value_type invalid_value = std::numeric_limits<key_type>::max();
 
-  using allocator_type                = Allocator;
+  static constexpr size_t nodes_to_allocate(size_t initial_elements, size_t max_elements) {
+      // EDIT jh: allocate enough nodes for bulk load plus 16 more to approximate the iterated rounding-up
+      // elements / 8 rounded up for leaves plus 1/7 for inner nodes, geometric series
+      size_t bulk_load_estimate = (initial_elements + 8) / 7 + 16;
+      size_t final_estimate = (max_elements + 8) / 7 + 16;
+
+      return std::max(bulk_load_estimate, final_estimate);
+  }
+
+  using allocator_type                = device_bump_allocator<node_type<Key, Value, B>>;
   using device_allocator_context_type = device_allocator_context<allocator_type>;
-  gpu_blink_tree() : allocator_{} {
+  gpu_blink_tree(size_t initial_elements, size_t max_elements) : allocator_{nodes_to_allocate(initial_elements, max_elements)} {
     static_assert(sizeof(Key) == sizeof(Value),
                   "Size of key must be the same as the size of the value");
     allocate();
   }
-  // Bulk build is only supported for device_bump_allocator
-  gpu_blink_tree(const Key* keys,
+
+  // EDIT jh: delegate to appropriate function based on template parameter
+  void bulk_load(const Key* keys,
                  const Value* values,
                  const size_type num_keys,
                  const bool sorted_input = false,
-                 cudaStream_t stream     = 0)
-      : allocator_{} {
-    static_assert(sizeof(Key) == sizeof(Value),
-                  "Size of key must be the same as the size of the value");
-    allocate();
+                 cudaStream_t stream     = 0) {
+    if constexpr (bulk_load_full) {
+      full_bulk_load(keys, values, num_keys, sorted_input, stream);
+    } else {
+      reference_bulk_load(keys, values, num_keys, sorted_input, stream);
+    }
+  }
 
+  // EDIT jh: standard implementation only supports filling nodes to 8/15 entries
+  void full_bulk_load(const Key* keys,
+                 const Value* values,
+                 const size_type num_keys,
+                 const bool sorted_input = false,
+                 cudaStream_t stream     = 0) {
+    static constexpr uint32_t bulk_build_branching_factor     = 15;
+
+    size_type num_keys_and_zero = num_keys + 1;  // tree must include the minimum possible key
+
+    uint32_t num_leaves = (num_keys_and_zero % bulk_build_branching_factor)
+                              ? num_keys_and_zero / bulk_build_branching_factor + 1
+                              : num_keys_and_zero / bulk_build_branching_factor;
+    uint32_t num_nodes          = num_leaves;
+    uint32_t num_interior_nodes = num_leaves;
+
+    uint32_t tree_height = 0;
+    for (tree_height = 0; num_interior_nodes != 1; tree_height++) {
+      int frac = (num_interior_nodes % bulk_build_branching_factor) ? 1 : 0;
+      num_interior_nodes /= bulk_build_branching_factor;
+      num_interior_nodes += frac;
+      num_nodes += num_interior_nodes;
+      if (num_interior_nodes == 1) break;
+    }
+    tree_height += 2;
+
+    static_assert(branching_factor == 16);
+
+    const uint32_t block_size = 256;
+    const uint32_t num_blocks = (num_nodes * 32 + block_size - 1) / block_size;
+
+    if (!sorted_input) {
+      std::cout << "Only sorted input is supported" << std::endl;
+      std::terminate();
+    }
+    kernels::full_bulk_build_kernel<<<num_blocks, block_size, 0, stream>>>(
+        keys,
+        values,
+        num_keys_and_zero,
+        num_nodes,
+        num_leaves,
+        tree_height,
+        bulk_build_branching_factor,
+        *this);
+  }
+
+  // Bulk build is only supported for device_bump_allocator
+  void reference_bulk_load(const Key* keys,
+                 const Value* values,
+                 const size_type num_keys,
+                 const bool sorted_input = false,
+                 cudaStream_t stream     = 0) {
     // Build a half-full tree
     static constexpr uint32_t bulk_build_branching_factor     = 8;
     static constexpr uint32_t log_bulk_build_branching_factor = 3;
@@ -235,18 +298,6 @@ struct gpu_blink_tree {
         keys, values, num_keys, *this, concurrent);
   }
 
-  // successor (smallest key >= keys[i]) of each query, or invalid_key if none
-  void successor(const Key* keys,
-                 Key* successors,
-                 const size_type num_keys,
-                 cudaStream_t stream = 0,
-                 bool concurrent     = false) const {
-    const uint32_t block_size = 512;
-    const uint32_t num_blocks = (num_keys + block_size - 1) / block_size;
-    kernels::successor_kernel<<<num_blocks, block_size, 0, stream>>>(
-        keys, successors, num_keys, *this, concurrent);
-  }
-
   void erase(const Key* keys,
              const size_type num_keys,
              cudaStream_t stream = 0,
@@ -314,49 +365,6 @@ struct gpu_blink_tree {
     return value;
   }
 
-  // smallest key >= query in the tree (successor / ceiling), or invalid_key if none
-  template <typename tile_type, typename DeviceAllocator>
-  DEVICE_QUALIFIER Key cooperative_successor(const Key& query,
-                                             const tile_type& tile,
-                                             DeviceAllocator& allocator,
-                                             bool concurrent = false) {
-    using node_type         = btree_node<pair_type, tile_type, branching_factor>;
-    auto successor          = node_type::invalid_key;
-    auto current_node_index = *d_root_index_;
-    while (true) {
-      node_type current_node = node_type(
-          reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)), tile);
-      if (concurrent) {
-        current_node.load(cuda_memory_order::memory_order_relaxed);
-        traverse_side_links(current_node, current_node_index, query, tile, allocator);
-      } else {
-        current_node.load();
-      }
-      bool is_leaf = current_node.is_leaf();
-      if (is_leaf) {
-        // ceiling is in this leaf, else the low key of a following sibling
-        successor = current_node.get_first_geq(query);
-        while (successor == node_type::invalid_key &&
-               current_node.get_high_key() != node_type::invalid_key) {
-          current_node_index = current_node.get_sibling_index();
-          current_node       = node_type(
-              reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)),
-              tile);
-          if (concurrent) {
-            current_node.load(cuda_memory_order::memory_order_relaxed);
-          } else {
-            current_node.load();
-          }
-          successor = current_node.get_first_geq(query);
-        }
-        return successor;
-      } else {
-        current_node_index = current_node.find_next(query);
-      }
-    }
-    return successor;
-  }
-
   // Range query that includes [lower_bound, upper_bound)
   template <typename tile_type, typename DeviceAllocator>
   DEVICE_QUALIFIER size_type cooperative_range_query(const Key& lower_bound,
@@ -407,6 +415,53 @@ struct gpu_blink_tree {
       }
     }
     return count;
+  }
+
+  // MODIFICATION jh: upper bound is now inclusive, added aggregation
+  template <typename tile_type, typename DeviceAllocator>
+  DEVICE_QUALIFIER value_type modified_aggregating_cooperative_range_query(const Key& lower_bound,
+                                                                           const Key& upper_bound,
+                                                                           const tile_type& tile,
+                                                                           DeviceAllocator& allocator,
+                                                                           bool concurrent = false)
+  {
+    using node_type         = btree_node<pair_type, tile_type, branching_factor>;
+    auto current_node_index = *d_root_index_;
+    value_type sum          = 0;
+    while (true) {
+      node_type current_node = node_type(
+          reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)), tile);
+      if (concurrent) {
+        current_node.load(cuda_memory_order::memory_order_relaxed);
+        traverse_side_links(current_node, current_node_index, lower_bound, tile, allocator);
+      } else {
+        current_node.load();
+      }
+      bool is_leaf = current_node.is_leaf();
+      if (is_leaf) {
+        bool keep_traversing = true;
+        do {
+          sum += current_node.modified_aggregating_get_in_range(lower_bound, upper_bound);
+          keep_traversing = upper_bound >= current_node.get_high_key();
+          if (keep_traversing) {
+            current_node_index = current_node.get_sibling_index();
+            current_node       = node_type(
+                reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)),
+                tile);
+            if (concurrent) {
+              current_node.load(cuda_memory_order::memory_order_relaxed);
+            } else {
+              current_node.load();
+            }
+          }
+        } while (keep_traversing);
+
+        return sum;
+      } else {
+        current_node_index = current_node.find_next(lower_bound);
+      }
+    }
+    return sum;
   }
 
   template <typename tile_type, typename DeviceAllocator>
@@ -794,6 +849,7 @@ struct gpu_blink_tree {
 
   size_type get_num_tree_node() { return allocator_.get_allocated_count(); }
 
+
   template <typename Func>
   bool validate_tree_structure(const std::vector<key_type>& keys,
                                Func to_value,
@@ -1134,6 +1190,13 @@ struct gpu_blink_tree {
     return tree_size_gbs;
   }
 
+  // MODIFIED jh: get the size of the tree, copied from above
+  std::size_t compute_memory_usage_bytes() {
+    auto num_nodes         = get_num_tree_node();
+    double tree_size_bytes = num_nodes * sizeof(node_type<Key, Value, B>);
+    return tree_size_bytes;
+  }
+
  private:
   template <typename key_type,
             typename value_type,
@@ -1174,6 +1237,7 @@ struct gpu_blink_tree {
                                                     const uint32_t,
                                                     const uint32_t,
                                                     btree);
+
   template <typename btree>
   friend __global__ void kernels::initialize_kernel(btree);
 
@@ -1190,12 +1254,6 @@ struct gpu_blink_tree {
                                               const size_type,
                                               const btree,
                                               const bool);
-  template <typename key_type, typename size_type, typename btree>
-  friend __global__ void kernels::successor_kernel(const key_type*,
-                                                   key_type*,
-                                                   const size_type,
-                                                   btree,
-                                                   const bool);
   template <typename key_type, typename pair_type, typename size_type, typename btree>
   friend __global__ void kernels::range_query_kernel(const key_type*,
                                                      const key_type*,
@@ -1242,6 +1300,8 @@ struct gpu_blink_tree {
     cuda_try(cudaDeviceSynchronize());
   }
 
+// MODIFICATION jh: public is required to write custom kernels
+public:
   std::shared_ptr<size_type> root_index_;
 
   size_type* d_snapshot_index_;
@@ -1252,5 +1312,5 @@ struct gpu_blink_tree {
   size_type* d_root_index_;
 
   allocator_type allocator_;
-};  // namespace GpuBTree
+};
 }  // namespace GpuBTree

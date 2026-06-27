@@ -754,6 +754,7 @@ public:
     static constexpr operation_support can_insert = operation_support::async;
     static constexpr operation_support can_delete = operation_support::async;
     static constexpr operation_support can_update = operation_support::async;
+    static constexpr operation_support can_successor = operation_support::async;
 
     static std::string short_description()
     {

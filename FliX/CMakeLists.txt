@@ -42,7 +42,7 @@ else()
 endif()
 
 if(DEFINED IFDEFS AND (IFDEFS MATCHES "GPU_BTREE" OR FLIX_NEEDS_OPTIX))
-  include_directories(../btree)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/gpu_btree)
 endif()
 
 #SET(IFDEFS "" CACHE STRING "ifdefs")

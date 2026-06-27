@@ -1,4 +1,4 @@
-﻿/*
+/*
  *   Copyright 2022 The Regents of the University of California, Davis
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,8 @@
 #include <cstdint>
 
 // 67108864 is 8 Gibs when sizeof(T) = 128
-template <class T, std::size_t MaxTCount = 67108864>
+// template <class T, std::size_t MaxTCount = 67108864>
+template <class T>
 struct device_bump_allocator {
   using size_type       = uint32_t;
   using difference_type = uint32_t;
@@ -26,8 +27,9 @@ struct device_bump_allocator {
   using value_type   = T;
   using pointer_type = uint32_t;
 
-  device_bump_allocator() {
-    d_buffer_     = cuda_allocator<T>().allocate(max_size_);
+  // EDIT jh: passed allocation size in constructor
+  device_bump_allocator(std::size_t num_items) {
+    d_buffer_     = cuda_allocator<T>().allocate(num_items);
     d_slab_count_ = cuda_allocator<uint32_t>().allocate(1);
     cuda_try(cudaMemset(d_slab_count_, 0x00, sizeof(uint32_t)));
 
@@ -48,19 +50,12 @@ struct device_bump_allocator {
     pointer_type new_slab_index       = 0;
     if (tile.thread_rank() == elected_lane) {
       new_slab_index = atomicAdd(d_slab_count_, n);
-      cuda_assert(new_slab_index != max_size_);
     }
     return tile.shfl(new_slab_index, elected_lane);
   }
   DEVICE_QUALIFIER void deallocate(pointer_type p, std::size_t n) noexcept {}
 
   HOST_DEVICE_QUALIFIER value_type* address(pointer_type ptr) const {
-#ifdef __CUDA_ARCH__
-    cuda_assert(ptr < max_size_);
-
-#else
-    assert(ptr < max_size_);
-#endif
     return d_buffer_ + ptr;
   }
 
@@ -75,20 +70,18 @@ struct device_bump_allocator {
   void copy_buffer(T* buffer, std::size_t bytes_count) const {
     cuda_try(cudaMemcpy(buffer, d_buffer_, bytes_count, cudaMemcpyDeviceToHost));
   }
-
   HOST_DEVICE_QUALIFIER T* get_raw_buffer() { return d_buffer_; }
 
- private:
+private:
   T* d_buffer_;
   std::shared_ptr<T> buffer_;
   uint32_t* d_slab_count_;
   std::shared_ptr<uint32_t> slab_count_;
-  static constexpr uint64_t max_size_ = MaxTCount;
 };
 
-template <class T, std::size_t MaxTCount>
-struct device_allocator_context<device_bump_allocator<T, MaxTCount>> {
-  using allocator_type = device_bump_allocator<T, MaxTCount>;
+template <class T>
+struct device_allocator_context<device_bump_allocator<T>> {
+  using allocator_type = device_bump_allocator<T>;
   using value_type     = typename allocator_type::value_type;
   using pointer        = typename allocator_type::pointer_type;
   using size_type      = typename allocator_type::size_type;

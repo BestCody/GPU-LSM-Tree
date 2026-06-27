@@ -1,4 +1,4 @@
-﻿/*
+/*
  *   Copyright 2022 The Regents of the University of California, Davis
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -322,17 +322,16 @@ struct btree_node {
     }
     return __popc(in_range_ballot);
   }
+  // MODIFIED jh: upper bound is now inclusive, added warp aggregation
+  DEVICE_QUALIFIER value_type modified_aggregating_get_in_range(const key_type& lower_bound,
+                                                                const key_type& upper_bound) const {
+    bool is_valid_lane   = tile_.thread_rank() != metadata_lane_;
+    bool in_range        = lane_pair_.first >= lower_bound && lane_pair_.first <= upper_bound;
+    auto in_range_ballot = tile_.ballot(in_range && is_valid_lane);
+    auto first_lane      = __ffs(in_range_ballot) - 1;
 
-  // smallest key >= query in the node (node-local ceiling), or invalid_key if none
-  DEVICE_QUALIFIER key_type get_first_geq(const key_type& query) const {
-    bool is_valid_lane = tile_.thread_rank() != metadata_lane_;
-    bool valid_key     = lane_pair_.first != invalid_key;
-    bool geq           = lane_pair_.first >= query && valid_key && is_valid_lane;
-    auto geq_ballot    = tile_.ballot(geq);
-    if (geq_ballot == 0) { return invalid_key; }
-    // keys are sorted ascending across lanes, so the lowest matching lane holds the ceiling
-    auto first_lane = __ffs(geq_ballot) - 1;
-    return get_key_from_lane(first_lane);
+    value_type value = is_valid_lane && in_range ? lane_pair_.second : 0;
+    return value;
   }
   template <typename T>
   DEVICE_QUALIFIER T mask_meta_bit(const T& data) const {

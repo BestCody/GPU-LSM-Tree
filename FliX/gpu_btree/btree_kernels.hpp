@@ -1,4 +1,4 @@
-﻿/*
+/*
  *   Copyright 2022 The Regents of the University of California, Davis
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +20,8 @@
 
 #include <memory_reclaimer.hpp>
 
-// #define DEBUG_CONCURRENT_KERNELS_OPS
-//  #define DEBUG_QS_ENTER_EXIST
+//#define DEBUG_CONCURRENT_KERNELS_OPS
+// #define DEBUG_QS_ENTER_EXIST
 
 namespace GpuBTree {
 namespace kernels {
@@ -67,9 +67,14 @@ __global__ void concurrent_find_erase_kernel_versioned(const key_type* find_keys
   __shared__ uint32_t buffer_buffer[required_shmem];
 
   // reclaimer tile
-  __shared__ cg::block_tile_memory<btree::reclaimer_block_size_> block_tile_shemm;
-  auto thb             = cg::this_thread_block(block_tile_shemm);
+  // MODIFICATION jh: this is not required anymore for compute capability 8
+  //__shared__ cg::experimental::block_tile_memory<4, btree::reclaimer_block_size_> block_tile_shemm;
+  //auto thb             = cg::experimental::this_thread_block(block_tile_shemm);
+  //auto block_wide_tile = cg::experimental::tiled_partition<btree::reclaimer_block_size_>(thb);
+
+  auto thb             = cg::this_thread_block();
   auto block_wide_tile = cg::tiled_partition<btree::reclaimer_block_size_>(thb);
+
   auto reclaimer =
       reclaimer_type{tree.host_reclaimer_, &buffer_buffer[0], gridDim.x, block_wide_tile};
 
@@ -189,9 +194,14 @@ __global__ void concurrent_insert_range_kernel(const key_type* keys,
   __shared__ uint32_t buffer_buffer[required_shmem];
 
   // reclaimer tile
-  __shared__ cg::block_tile_memory<btree::reclaimer_block_size_> block_tile_shemm;
-  auto thb             = cg::this_thread_block(block_tile_shemm);
+  // MODIFICATION jh: this is not required anymore for compute capability 8
+  //__shared__ cg::experimental::block_tile_memory<4, btree::reclaimer_block_size_> block_tile_shemm;
+  //auto thb             = cg::experimental::this_thread_block(block_tile_shemm);
+  //auto block_wide_tile = cg::experimental::tiled_partition<btree::reclaimer_block_size_>(thb);
+
+  auto thb             = cg::this_thread_block();
   auto block_wide_tile = cg::tiled_partition<btree::reclaimer_block_size_>(thb);
+
   auto reclaimer =
       reclaimer_type{tree.host_reclaimer_, &buffer_buffer[0], gridDim.x, block_wide_tile};
 
@@ -423,11 +433,11 @@ __global__ void insert_out_of_place_kernel(const key_type* keys,
   // auto reclaimer = reclaimer_type{tree.host_reclaimer_, &buffer_buffer[0], gridDim.x};
 
   // reclaimer tile
-  // __shared__ cg::block_tile_memory<btree::reclaimer_block_size_>
+  // __shared__ cg::experimental::block_tile_memory<4, btree::reclaimer_block_size_>
   //     block_tile_shemm;
-  // auto thb = cg::this_thread_block(block_tile_shemm);
+  // auto thb = cg::experimental::this_thread_block(block_tile_shemm);
   // auto block_wide_tile =
-  //     cg::tiled_partition<btree::reclaimer_block_size_>(thb);
+  //     cg::experimental::tiled_partition<btree::reclaimer_block_size_>(thb);
 
   // iterate to perform insertions
   for (auto thread_id = threadIdx.x + block_id * block_size;
@@ -571,45 +581,6 @@ __global__ void find_kernel(const key_type* keys,
   }
 
   if (thread_id < keys_count) { values[thread_id] = value; }
-}
-template <typename key_type, typename size_type, typename btree>
-__global__ void successor_kernel(const key_type* keys,
-                                 key_type* successors,
-                                 const size_type keys_count,
-                                 btree tree,
-                                 bool concurrent = false) {
-  auto thread_id = threadIdx.x + blockIdx.x * blockDim.x;
-
-  auto block = cg::this_thread_block();
-  auto tile  = cg::tiled_partition<btree::branching_factor>(block);
-
-  if ((thread_id - tile.thread_rank()) >= keys_count) { return; }
-
-  auto key     = btree::invalid_key;
-  auto result  = btree::invalid_key;
-  bool to_find = false;
-  if (thread_id < keys_count) {
-    key     = keys[thread_id];
-    to_find = true;
-  }
-
-  using allocator_type = device_allocator_context<typename btree::allocator_type>;
-  allocator_type allocator{tree.allocator_, tile};
-
-  auto work_queue = tile.ballot(to_find);
-  while (work_queue) {
-    auto cur_rank = __ffs(work_queue) - 1;
-    auto cur_key  = tile.shfl(key, cur_rank);
-    key_type cur_result;
-    cur_result = tree.cooperative_successor(cur_key, tile, allocator, concurrent);
-    if (cur_rank == tile.thread_rank()) {
-      result  = cur_result;
-      to_find = false;
-    }
-    work_queue = tile.ballot(to_find);
-  }
-
-  if (thread_id < keys_count) { successors[thread_id] = result; }
 }
 template <typename key_type, typename pair_type, typename size_type, typename btree>
 __global__ void range_query_kernel(const key_type* lower_bounds,
@@ -1023,6 +994,121 @@ __global__ void bulk_build_kernel(const key_type* keys,
     }
   } else {
     if (lane_idx < 16) {
+      uint32_t to_read = local_node_idx * hB * bulk_build_branching_factor + (lane_idx / 2) * hB;
+      if (to_read < num_keys) {
+        if (to_read == 0) {
+          lane_data = (lane_idx % 2) ? 0 : 0;
+        } else {
+          lane_data = (lane_idx % 2) ? values[to_read - 1] : keys[to_read - 1];
+        }
+      }
+    }
+  }
+  node_idx++;
+  if (not_last_node) {
+    lane_data = (lane_idx == 31) ? node_idx + 1 : lane_data;
+    lane_data = (lane_idx == 30) ? keys[(local_node_idx + 1) * hB * bulk_build_branching_factor - 1]
+                                 : lane_data;
+  }
+
+  node_idx = (node_idx == num_nodes) ? 0 : node_idx;
+
+  const uint32_t bits_per_byte   = 8;
+  const uint32_t lock_bit_offset = sizeof(key_type) * bits_per_byte - 1;
+  const uint32_t leaf_bit_offset = lock_bit_offset - 1;
+  const uint32_t lock_bit_mask   = 1u << lock_bit_offset;
+  const uint32_t leaf_bit_mask   = 1u << leaf_bit_offset;
+
+  if (lane_idx == 31 && node_height == 0) {
+    lane_data = lane_data | leaf_bit_mask;     // set_leaf_bit
+    lane_data = lane_data & (~lock_bit_mask);  // unset_lock_bit
+  }
+  if (lane_idx == 31 && node_height != 0) {
+    lane_data = lane_data & (~leaf_bit_mask);  // unset_leaf_bit
+    lane_data = lane_data & (~lock_bit_mask);  // unset_lock_bit
+  }
+  using allocator_type      = typename btree::device_allocator_context_type;
+  uint32_t* raw_tree_buffer = reinterpret_cast<uint32_t*>(tree.allocator_.get_raw_buffer());
+
+  raw_tree_buffer[node_idx * btree::branching_factor * 2 + lane_idx] = lane_data;
+  if (tid == 0) { tree.allocator_.set_allocated_count(num_nodes); }
+}
+
+// EDIT jh: generalized function
+__device__ int get_node_height_gen(uint32_t& node_idx,
+                                   uint32_t num_leaves,
+                                   uint32_t b,
+                                   bool& not_last) {
+  for (int level = 0;; level++) {
+    if (node_idx < num_leaves) {
+      not_last = (node_idx != (num_leaves - 1));
+      return level;
+    }
+    node_idx -= num_leaves;
+    int frac = (num_leaves % b) ? 1 : 0;
+    num_leaves /= b;
+    num_leaves += frac;
+  }
+}
+
+// EDIT jh: generalized function
+template <typename key_type, typename value_type, typename btree>
+__global__ void full_bulk_build_kernel(const key_type* keys,
+                                       const value_type* values,
+                                       const uint32_t num_keys,
+                                       const uint32_t num_nodes,
+                                       const uint32_t num_leaves,
+                                       const uint32_t tree_height,
+                                       const uint32_t bulk_build_branching_factor,
+                                       btree tree) {
+  // TODO: Is key 0 still reserved?
+  uint32_t tid      = threadIdx.x + blockIdx.x * blockDim.x;
+  uint32_t lane_idx = threadIdx.x & 0x1F;
+  uint32_t node_idx = tid / 32;
+
+  if (node_idx >= num_nodes) return;
+
+  uint32_t local_node_idx = node_idx;
+  bool not_last_node      = false;
+
+  uint32_t node_height = get_node_height_gen(local_node_idx,
+                                             num_leaves,
+                                             bulk_build_branching_factor,
+                                             not_last_node);
+  // EDIT jh: this produces wrong results for non-powers-of-2
+  //uint32_t hB = powf(bulk_build_branching_factor, node_height);
+  uint32_t hB = 1;
+  for (int i = 0; i < node_height; i++) {
+    hB *= bulk_build_branching_factor;
+  }
+
+  uint32_t lane_data = btree::invalid_key;
+
+  if (node_height > 0) {
+    uint32_t first_node = 0;
+    uint32_t num_lev    = num_leaves;
+    for (int i = 0; i < node_height - 1; i++) {
+      first_node += num_lev;
+      int frac = (num_lev % bulk_build_branching_factor) ? 1 : 0;
+      num_lev /= bulk_build_branching_factor;
+      num_lev += frac;
+    }
+    first_node++;
+    uint32_t child_idx = first_node + local_node_idx * bulk_build_branching_factor;
+    if (lane_idx < 30) {
+      uint32_t to_read = local_node_idx * hB * bulk_build_branching_factor + (lane_idx / 2) * hB;
+      if (to_read < num_keys) {
+        child_idx = (child_idx + (lane_idx / 2));
+        if (to_read == 0) {
+          lane_data = (lane_idx % 2) ? child_idx : 0;
+        } else {
+          lane_data = (lane_idx % 2) ? child_idx : keys[to_read - 1];
+        }
+        lane_data = lane_data;
+      }
+    }
+  } else {
+    if (lane_idx < 30) {
       uint32_t to_read = local_node_idx * hB * bulk_build_branching_factor + (lane_idx / 2) * hB;
       if (to_read < num_keys) {
         if (to_read == 0) {

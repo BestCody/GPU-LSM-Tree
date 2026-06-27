@@ -1,4 +1,4 @@
-﻿/*
+/*
  *   Copyright 2022 The Regents of the University of California, Davis
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,4 +30,3 @@ struct node_type {
 }  // namespace GpuBTree
 
 #include "gpu_blink_tree.hpp"
-#include "gpu_versioned_blink_tree.hpp"

@@ -206,6 +206,22 @@ GLOBALQUALIFIER void fill_seq_u32_kernel(uint32_t *out, size_t n)
         out[i] = static_cast<uint32_t>(i);
 }
 
+template <typename T>
+void ensure_cuda_buffer_elements(cuda_buffer<T> &buffer, size_t required_elements)
+{
+    if (buffer.num_elements < required_elements)
+    {
+        buffer.resize(required_elements);
+    }
+}
+
+template <typename index_type, typename = void>
+struct benchmark_supports_successor : std::false_type {};
+
+template <typename index_type>
+struct benchmark_supports_successor<index_type, std::void_t<decltype(index_type::can_successor)>>
+    : std::bool_constant<index_type::can_successor == operation_support::async> {};
+
 template <typename key_t>
 void key_only_sort_device_timed2(const cuda_buffer<key_t> &d_keys_in,
                                  size_t n,
@@ -223,9 +239,9 @@ void key_only_sort_device_timed2(const cuda_buffer<key_t> &d_keys_in,
 
     // d_perm_in.alloc(n);
 
-    d_sorted_keys.alloc(n * sizeof(key_t));
-    d_perm_sorted.alloc(n * sizeof(uint32_t));
-    d_perm_in.alloc(n * sizeof(uint32_t));
+    ensure_cuda_buffer_elements(d_sorted_keys, n);
+    ensure_cuda_buffer_elements(d_perm_sorted, n);
+    d_perm_in.alloc(n);
 
     if (n == 0)
     {
@@ -260,8 +276,8 @@ void key_only_sort_device_timed(const cuda_buffer<key_t> &d_keys_in,
                                 double *sort_time_ms,                 // OUT: ms
                                 cudaStream_t stream)
 {
-    d_sorted_keys.alloc(n);
-    d_perm_sorted.alloc(n);
+    ensure_cuda_buffer_elements(d_sorted_keys, n);
+    ensure_cuda_buffer_elements(d_perm_sorted, n);
 
     // Build initial permutation 0..n-1
     cuda_buffer<uint32_t> d_perm_in;
@@ -274,7 +290,7 @@ void key_only_sort_device_timed(const cuda_buffer<key_t> &d_keys_in,
     const size_t aux_needed = find_pair_sort_buffer_size<key_t, uint32_t>(n);
     if (d_aux.size_in_bytes() < aux_needed)
     {
-        d_aux.alloc(aux_needed); // assume alloc() re-allocs if needed
+        d_aux.resize(aux_needed);
     }
 
     // Timed pairs sort: (key, idx) -> (sorted_key, perm_sorted)
@@ -302,7 +318,7 @@ void scatter_sorted_to_original(const cuda_buffer<T> &d_vals_sorted,
                                 cuda_buffer<T> &d_out_original,
                                 size_t n, cudaStream_t stream)
 {
-    d_out_original.alloc(n);
+    ensure_cuda_buffer_elements(d_out_original, n);
     const int TPB = 256;
     const int GRD = static_cast<int>((n + TPB - 1) / TPB);
     scatter_perm_kernel<<<GRD, TPB, 0, stream>>>(
@@ -514,10 +530,9 @@ void key_only_sort_device_timed_debug(const cuda_buffer<key_t>& d_keys_in,
     if (sort_time_ms) *sort_time_ms = 0.0;
     if (n == 0) return;
 
-    // Grow-only reuse
-    d_sorted_keys.alloc(n);
-    d_perm_sorted.alloc(n);
-    d_perm_in.alloc(n);
+    ensure_cuda_buffer_elements(d_sorted_keys, n);
+    ensure_cuda_buffer_elements(d_perm_sorted, n);
+    ensure_cuda_buffer_elements(d_perm_in, n);
 
     // Catch alloc failures early (OOM will show up here, not at kernel launch)
     CUCHECK(cudaGetLastError());
@@ -532,7 +547,7 @@ void key_only_sort_device_timed_debug(const cuda_buffer<key_t>& d_keys_in,
 
     const size_t aux_needed = find_pair_sort_buffer_size<key_t, uint32_t>(n);
     if (d_aux.size_in_bytes() < aux_needed) {
-        d_aux.alloc(aux_needed);
+        d_aux.resize(aux_needed);
     }
 
     CUCHECK(cudaGetLastError());
@@ -1143,6 +1158,7 @@ void benchmark_updates(
 
     // todo sync???
     constexpr bool supports_updates = index_type::can_update == operation_support::async;
+    constexpr bool supports_successor = benchmark_supports_successor<index_type>::value;
 
     std::vector<update_configuration> test_configuration_options{
         //{"delete-insert", 26, 27, 1, 10, 10, false, false},
@@ -1678,17 +1694,13 @@ void benchmark_updates(
                     if (did_delete_this_step && !last_deleted_keys.empty())
                     {
                         const smallsize del_probe_size = static_cast<smallsize>(last_deleted_keys.size());
-                        // std::cerr << "    --TEST Post-Delete Miss-Probe for " << del_probe_size << " keys..." << std::endl;
-                        // Upload deleted keys as probes
-                        probe_keys_buffer.upload(last_deleted_keys.data(), del_probe_size);
 
-                        // Initialize results to MISS sentinel (=2), consistent with your miss2 checks
-                        {
-                            std::vector<smallsize> init_miss_results(del_probe_size, static_cast<smallsize>(2));
-                            result_buffer.upload(init_miss_results.data(), del_probe_size);
-                        }
+                        cuda_buffer<key_type> del_probe_keys_buffer;
+                        cuda_buffer<smallsize> del_result_buffer;
+                        del_probe_keys_buffer.alloc(del_probe_size);
+                        del_result_buffer.alloc(del_probe_size);
+                        del_probe_keys_buffer.upload(last_deleted_keys.data(), del_probe_size);
 
-                        // Sort probes + lookup + scatter back
                         static cuda_buffer<key_type> d_del_sorted_keys;
                         static cuda_buffer<uint32_t> d_del_perm_sorted;
                         static cuda_buffer<uint8_t> d_del_aux;
@@ -1702,7 +1714,7 @@ void benchmark_updates(
 
                         double del_sort_time_ms = 0.0;
                         key_only_sort_device_timed<key_type>(
-                            probe_keys_buffer,
+                            del_probe_keys_buffer,
                             del_probe_size,
                             d_del_sorted_keys,
                             d_del_perm_sorted,
@@ -1733,13 +1745,13 @@ void benchmark_updates(
                             scatter_sorted_to_original<smallsize>(
                                 tmp_results_sorted,
                                 d_del_perm_sorted,
-                                result_buffer,
+                                del_result_buffer,
                                 del_probe_size, 0);
 
                         cudaDeviceSynchronize();
                         C2EX
 
-                            auto del_probe_result = result_buffer.download(del_probe_size);
+                            auto del_probe_result = del_result_buffer.download(del_probe_size);
 
                         cudaDeviceSynchronize();
                         C2EX
@@ -1959,7 +1971,7 @@ void benchmark_updates(
 
                         // SECOND APPROACH WITH NO INDEX LAYER and SORTED PROBES
 
-                        if (PERFORM_SUCCESSOR_PROBES)
+                        if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
                         {
                             // sort_time_ms = 0.0;
                             // std::vector<key_type> probe_keys;
@@ -1976,9 +1988,7 @@ void benchmark_updates(
                             result_keys_buffer.zero();
 
                             static cuda_buffer<key_type> tmp_results_sorted_keys;
-                            if (tmp_results_sorted_keys.size_in_bytes() < probe_size * sizeof(key_type)) {
-                                tmp_results_sorted_keys.alloc(probe_size);
-                            }
+                            ensure_cuda_buffer_elements(tmp_results_sorted_keys, probe_size);
                             tmp_results_sorted_keys.zero();
                                                        
 
@@ -2144,15 +2154,11 @@ void benchmark_updates(
                            //---- tmp_results_sorted_keys.zero();
 
                               static cuda_buffer<smallsize> tmp_results_sorted;
-                                if (tmp_results_sorted.size_in_bytes() < probe_size_misses * sizeof(smallsize)) {
-                                    tmp_results_sorted.alloc(probe_size_misses);
-                                }
+                                ensure_cuda_buffer_elements(tmp_results_sorted, probe_size_misses);
                              tmp_results_sorted.zero();
 
                               static cuda_buffer<key_type> tmp_results_sorted_keys;
-                            if (tmp_results_sorted_keys.size_in_bytes() < probe_size_misses * sizeof(key_type)) {
-                                tmp_results_sorted_keys.alloc(probe_size_misses);
-                            }
+                            ensure_cuda_buffer_elements(tmp_results_sorted_keys, probe_size_misses);
                             tmp_results_sorted_keys.zero();
 
 
@@ -2243,7 +2249,7 @@ void benchmark_updates(
                             }
 
                             // SUCCESSSOR ------
-                            if (PERFORM_SUCCESSOR_PROBES)
+                            if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
                             {
 #ifdef BASELINES
 #pragma message "Using BASELINE SUCCESSOR MISS in LOOKUPS"

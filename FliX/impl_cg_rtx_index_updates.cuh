@@ -1480,6 +1480,7 @@ public:
     static constexpr operation_support can_multi_lookup = operation_support::none;
     static constexpr operation_support can_range_lookup = operation_support::none;
     static constexpr operation_support can_update = operation_support::async;
+    static constexpr operation_support can_successor = operation_support::async;
 
     static constexpr smallsize key_offset_pair = compute_key_offset_bytes<key_type>();
     static constexpr smallsize node_size = compute_node_size<key_type>(cache_line, node_size_log);
