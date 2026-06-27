@@ -323,8 +323,7 @@ struct btree_node {
     return __popc(in_range_ballot);
   }
 
-  // smallest key in the node that is >= query (node-local successor / ceiling)
-  // returns invalid_key if every key in the node is < query
+  // smallest key >= query in the node (node-local ceiling), or invalid_key if none
   DEVICE_QUALIFIER key_type get_first_geq(const key_type& query) const {
     bool is_valid_lane = tile_.thread_rank() != metadata_lane_;
     bool valid_key     = lane_pair_.first != invalid_key;

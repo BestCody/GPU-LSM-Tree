@@ -760,6 +760,15 @@ public:
         return std::string("lsm_tree_ashkiani");
     }
 
+    static size_t estimate_build_bytes(size_t size) {
+        // level key+value buffers are over-provisioned ~2x; build also uses temp
+        // sort/merge buffers (keys+values, a and b) and a result buffer
+        constexpr size_t level_buffers = 2;
+        constexpr size_t temp_buffers  = 4;
+        return (sizeof(key_type) + sizeof(value_type)) * size * (level_buffers + temp_buffers)
+             + sizeof(value_type) * size;
+    }
+
     static parameters_type parameters()
     {
         return {
@@ -788,6 +797,12 @@ public:
     {
         return level_keys_buffer.size_in_bytes() + level_values_buffer.size_in_bytes() +
                staging_keys_buffer.size_in_bytes() + staging_values_buffer.size_in_bytes();
+    }
+
+    // overload used by the range/point benchmarks (no separate max_size / memory budget)
+    void build(const key_type *keys, size_t size, double *build_time_ms, size_t *build_bytes)
+    {
+        build(keys, size, size, std::numeric_limits<size_t>::max(), build_time_ms, build_bytes);
     }
 
     void build(const key_type *keys, size_t size, size_t max_size, size_t available_memory_bytes, double *build_time_ms, size_t *build_bytes)

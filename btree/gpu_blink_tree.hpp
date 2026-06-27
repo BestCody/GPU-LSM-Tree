@@ -235,8 +235,7 @@ struct gpu_blink_tree {
         keys, values, num_keys, *this, concurrent);
   }
 
-  // Writes the successor (smallest key >= keys[i]) of each query into successors[i],
-  // or invalid_key when no such key exists.
+  // successor (smallest key >= keys[i]) of each query, or invalid_key if none
   void successor(const Key* keys,
                  Key* successors,
                  const size_type num_keys,
@@ -315,16 +314,14 @@ struct gpu_blink_tree {
     return value;
   }
 
-  // Returns the smallest key in the tree that is >= query (the successor / ceiling),
-  // or invalid_key if no key is >= query. Mirrors cooperative_find's descent, then
-  // resolves the ceiling at the leaf and only walks side links across a node boundary.
+  // smallest key >= query in the tree (successor / ceiling), or invalid_key if none
   template <typename tile_type, typename DeviceAllocator>
   DEVICE_QUALIFIER Key cooperative_successor(const Key& query,
                                              const tile_type& tile,
                                              DeviceAllocator& allocator,
                                              bool concurrent = false) {
-    auto successor          = std::numeric_limits<Key>::max();
     using node_type         = btree_node<pair_type, tile_type, branching_factor>;
+    auto successor          = node_type::invalid_key;
     auto current_node_index = *d_root_index_;
     while (true) {
       node_type current_node = node_type(
@@ -337,11 +334,10 @@ struct gpu_blink_tree {
       }
       bool is_leaf = current_node.is_leaf();
       if (is_leaf) {
-        // the ceiling lives in this leaf unless query is past every key here, in which
-        // case it is the low key of a following sibling (high_key == max marks the last leaf)
+        // ceiling is in this leaf, else the low key of a following sibling
         successor = current_node.get_first_geq(query);
-        while (successor == std::numeric_limits<Key>::max() &&
-               current_node.get_high_key() != std::numeric_limits<Key>::max()) {
+        while (successor == node_type::invalid_key &&
+               current_node.get_high_key() != node_type::invalid_key) {
           current_node_index = current_node.get_sibling_index();
           current_node       = node_type(
               reinterpret_cast<pair_type*>(allocator.address(allocator_, current_node_index)),

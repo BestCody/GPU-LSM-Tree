@@ -191,7 +191,6 @@ rc::result_collector rc;
     #elif defined(GPULSMOPT)
         #pragma message "GPULSMOPT=YES"
         benchmark_updates<gpulsmopt<key32>>(rc, runs);
-        benchmark_range_query<gpulsmopt<key32>>(rc, runs);
     #else
         printf("No Baselines Selected \n");
     #endif
@@ -236,10 +235,6 @@ rc::result_collector rc;
        // benchmark_updates<rtx_index<key32>>(rc, runs);
 
 #endif
-
-
-    
-       
        /* SIMPLE RUN
         benchmark_updates<cg_rtx_index_updates<key32, 30, 50, 120>>(rc, runs);
         benchmark_updates<hashtable_warpcore<key32, 40>>(rc, runs);

@@ -29,6 +29,7 @@
 #include <filesystem> // To check file existence
 // #include "utilities.cuh"
 #include "input_generation.h"
+#include "benchmarks.cuh" // for benchmark_range_query (merged range-sum benchmark)
 
 // #define DEBUG_BENCHMARK_OUTPUT//
 //#define REBUILD_GROUPS
@@ -2391,6 +2392,12 @@ void benchmark_updates(
             end_run:;
             }
         }
+    }
+
+    // also benchmark range sums for indexes that support it
+    if constexpr (index_type::can_range_lookup == operation_support::async)
+    {
+        benchmark_range_query<index_type>(rc, runs);
     }
 }
 

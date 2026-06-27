@@ -142,6 +142,11 @@ public:
         cudaDeviceSynchronize(); C2EX
     }
 
+    // overload used by the range/point benchmarks (no separate max_size / memory budget)
+    void build(const key_type* keys, size_t size, double* build_time_ms, size_t* build_bytes) {
+        build(keys, size, size, std::numeric_limits<size_t>::max(), build_time_ms, build_bytes);
+    }
+
     void lookup(const key_type* keys, smallsize* result, size_t size, cudaStream_t stream) {
         nvtx3::scoped_range_in<nvtx_tree_awad_domain> launch{"launch"};
         (void)launch;
