@@ -9,7 +9,7 @@
 #ifndef DEFINITIONS_UPDATES_H
 #define DEFINITIONS_UPDATES_H
 
-#if !defined(GPULSMOPT)
+#if defined(FLIX_NEEDS_OPTIX)
 #include <optix.h>
 #include <optix_stubs.h>
 #endif
@@ -20,7 +20,7 @@
 #include <array>
 #include "definitions.cuh"
 #include "debug_definitions_updates.cuh"
-#if !defined(GPULSMOPT)
+#if defined(FLIX_NEEDS_OPTIX)
 #include "../ext/cudahelpers/cuda_helpers.cuh"
 #endif
 
@@ -31,7 +31,7 @@ namespace coop_g = cooperative_groups;
 #define STRINGIFY2(x) #x
 
 constexpr bool alternate_updates = false;
-#define PERFORM_SUCCESSOR_PROBES 0
+#define PERFORM_SUCCESSOR_PROBES 1
 ////----------------------------------------------------------------
 #pragma once
 

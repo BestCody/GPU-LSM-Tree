@@ -7,16 +7,29 @@
 // =============================================================================
 
 #include "result_collector.h"
-#if !defined(GPULSMOPT)
 #include "benchmarks.cuh"
+#if defined(FLIX_NEEDS_OPTIX)
 #include "benchmarks_lookups.cuh"
 #endif
 #include "benchmarks_updates.cuh"
 //#include "optix_wrapper.cuh"
-#if !defined(GPULSMOPT)
-#include "impl_binsearch.cuh"
+#if defined(HASHTABLE_WARPCORE)
 #include "impl_hashtable_warpcore.cuh"
+#endif
+#if defined(HASHTABLE_SLAB)
 #include "impl_hashtable_slab.cuh"
+#endif
+#if defined(GPU_BTREE)
+#include "impl_tree_awad.cuh"
+#endif
+#if defined(LSM_TREE)
+#include "impl_lsm_tree.cuh"
+#endif
+#if defined(GPULSMOPT)
+#include "impl_gpulsmopt.cuh"
+#endif
+#if defined(FLIX_NEEDS_OPTIX)
+#include "impl_binsearch.cuh"
 #include "impl_rtx_index.cuh"
 #include "impl_cg_rtx_index.cuh"
 #include "impl_cg_rtx_index_updates.cuh"
@@ -24,9 +37,7 @@
 #include "impl_tree_awad.cuh"
 #include "impl_rtscan.cuh"
 #include "impl_opt_sorted_array.cuh"
-#include "impl_lsm_tree.cuh"
 #endif
-#include "impl_gpulsmopt.cuh"
 #include <thrust/sort.h>
 #include <thrust/execution_policy.h>
 #include "definitions_updates.cuh"
@@ -35,7 +46,7 @@
 const char* cache_directory = nullptr;
 
 
-#if !defined(GPULSMOPT)
+#if defined(FLIX_NEEDS_OPTIX)
 template <typename key_type>
 void test_point_query(size_t runs, bool single_plane, bool run_advanced_tests, rc::result_collector& rc) {
     benchmark_point_query<cg_rtx_index_updates<key_type, 6>>(rc, runs, single_plane, run_advanced_tests, 26, std::numeric_limits<size_t>::max());
@@ -180,6 +191,7 @@ rc::result_collector rc;
     #elif defined(GPULSMOPT)
         #pragma message "GPULSMOPT=YES"
         benchmark_updates<gpulsmopt<key32>>(rc, runs);
+        benchmark_range_query<gpulsmopt<key32>>(rc, runs);
     #else
         printf("No Baselines Selected \n");
     #endif

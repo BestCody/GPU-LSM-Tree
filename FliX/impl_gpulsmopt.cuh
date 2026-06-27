@@ -155,6 +155,12 @@ public:
         };
     }
 
+    static size_t estimate_build_bytes(size_t size) {
+        // segmented sheet slot (key + value + validity byte) over-provisioned for
+        // the target fill, plus the adapter's value buffer
+        return (2 * sizeof(std::uint32_t) + 1) * size * 2 + sizeof(smallsize) * size;
+    }
+
     size_t gpu_resident_bytes() {
         size_t total = dictionary_ ? dictionary_->gpu_resident_bytes() : 0;
         total += build_values_buffer_.num_elements * sizeof(smallsize);
@@ -197,6 +203,12 @@ public:
         timer.stop();
 
         if (build_bytes) *build_bytes += gpu_resident_bytes();
+    }
+
+    // overload used by the point/range benchmarks, which pass no separate
+    // max_size / memory budget
+    void build(const key_type* keys, size_t size, double* build_time_ms, size_t* build_bytes) {
+        build(keys, size, size, std::numeric_limits<size_t>::max(), build_time_ms, build_bytes);
     }
 
     void destroy() {

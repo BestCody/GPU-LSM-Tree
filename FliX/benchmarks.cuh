@@ -215,7 +215,9 @@ void benchmark_point_query(
         if (log_probe_size > max_log_probe_size)
             continue;
 
+#if !defined(GPULSMOPT)
         nvtx3::scoped_range_in<nvtx_benchmark_domain> experiment{tc.description};
+#endif
 
         size_t build_size = size_t{1} << log_build_size;
         size_t probe_size = size_t{1} << log_probe_size;
@@ -236,7 +238,9 @@ void benchmark_point_query(
 
         std::optional<point_query_dataset<key_type, smallsize>> input_data;
         {
+#if !defined(GPULSMOPT)
             nvtx3::scoped_range_in<nvtx_benchmark_domain> gen{"input-gen"};
+#endif
             input_data.emplace(
                 seed,
                 cache_directory,
@@ -269,11 +273,15 @@ void benchmark_point_query(
             double build_time_ms = 0, sort_time_ms = 0, probe_time_ms = 0;
             size_t build_bytes = 0, gpu_resident_bytes = 0;
 
+#if !defined(GPULSMOPT)
             nvtx3::scoped_range_in<nvtx_benchmark_domain> gen{"run-" + std::to_string(run)};
+#endif
 
             index_type index;
             {
+#if !defined(GPULSMOPT)
                 nvtx3::scoped_range_in<nvtx_benchmark_domain> build{"build-phase"};
+#endif
                 index.build(build_keys_buffer, build_size, &build_time_ms, &build_bytes);
             }
 
@@ -293,12 +301,16 @@ void benchmark_point_query(
 
             cuda_timer timer(0);
             {
+#if !defined(GPULSMOPT)
                 nvtx3::scoped_range_in<nvtx_benchmark_domain> lookup{"lookup-phase"};
+#endif
 
                 key_type* probe_keys_pointer = probe_keys_buffer;
 
                 if (sort_probe) {
+#if !defined(GPULSMOPT)
                     nvtx3::scoped_range_in<nvtx_benchmark_domain> sort_batch{"sort"};
+#endif
                     timer.start();
                     untimed_sort(sort_temp_buffer.raw_ptr, sort_temp_bytes, probe_keys_buffer.ptr(), sorted_probe_keys_buffer.ptr(), probe_size);
                     timer.stop();
@@ -307,7 +319,9 @@ void benchmark_point_query(
                 }
 
                 {
+#if !defined(GPULSMOPT)
                     nvtx3::scoped_range_in<nvtx_benchmark_domain> lookup_batch{"lookup"};
+#endif
                     timer.start();
                     if (key_multiplicity > 1) {
                         index.multi_lookup_sum(probe_keys_pointer, result_buffer.ptr(), probe_size, 0);
@@ -464,7 +478,9 @@ void benchmark_range_query(
 
         std::optional<range_query_dataset<key_type, smallsize>> input_data;
         {
+#if !defined(GPULSMOPT)
             nvtx3::scoped_range_in<nvtx_benchmark_domain> gen{"input-gen"};
+#endif
             input_data.emplace(
                     seed,
                     cache_directory,
@@ -494,11 +510,15 @@ void benchmark_range_query(
             double build_time_ms = 0, sort_time_ms = 0, probe_time_ms = 0;
             size_t build_bytes = 0, gpu_resident_bytes = 0;
 
+#if !defined(GPULSMOPT)
             nvtx3::scoped_range_in<nvtx_benchmark_domain> gen{"run-" + std::to_string(run)};
+#endif
 
             index_type index;
             {
+#if !defined(GPULSMOPT)
                 nvtx3::scoped_range_in<nvtx_benchmark_domain> build{"build-phase"};
+#endif
                 index.build(build_keys_buffer, build_size, &build_time_ms, &build_bytes);
             }
 
@@ -517,24 +537,30 @@ void benchmark_range_query(
 
             cuda_timer timer(0);
             {
+#if !defined(GPULSMOPT)
                 nvtx3::scoped_range_in<nvtx_benchmark_domain> lookup{"lookup-phase"};
+#endif
 
                 key_type* lower_keys_pointer = lower_keys_buffer;
                 key_type* upper_keys_pointer = upper_keys_buffer;
 
                 if (sort_probe) {
+#if !defined(GPULSMOPT)
                     nvtx3::scoped_range_in<nvtx_benchmark_domain> sort_batch{"sort"};
+#endif
                     timer.start();
                     untimed_pair_sort(sort_temp_buffer.raw_ptr, sort_temp_bytes,
                                       lower_keys_buffer.ptr(), sorted_lower_keys_buffer.ptr(),
-                                      upper_keys_buffer.ptr(), sorted_upper_keys_buffer.ptr(), probe_size);
+                                      upper_keys_buffer.ptr(), sorted_upper_keys_buffer.ptr(), probe_size, 0);
                     timer.stop();
                     lower_keys_pointer = sorted_lower_keys_buffer;
                     upper_keys_pointer = sorted_upper_keys_buffer;
                     sort_time_ms = timer.time_ms();
                 }
                 {
+#if !defined(GPULSMOPT)
                     nvtx3::scoped_range_in<nvtx_benchmark_domain> lookup_batch{"lookup"};
+#endif
                     timer.start();
                     index.range_lookup_sum(lower_keys_pointer, upper_keys_pointer, result_buffer.ptr(), probe_size, 0);
                     timer.stop();

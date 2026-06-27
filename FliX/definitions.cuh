@@ -19,7 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#if !defined(GPULSMOPT)
+#if defined(FLIX_NEEDS_OPTIX)
 #include <optix.h>
 #include <optix_stubs.h>
 #include "../ext/cudahelpers/cuda_helpers.cuh"
@@ -102,7 +102,7 @@ constexpr key_type max_usable_key() {
     return max_usable_key<key_type>(sizeof(key_type) * 8);
 }
 
-#if !defined(GPULSMOPT)
+#if defined(FLIX_NEEDS_OPTIX)
 #define OPTIX_CHECK(call)                                               \
   {                                                                     \
     OptixResult res = call;                                             \

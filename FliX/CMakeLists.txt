@@ -6,9 +6,10 @@ endif()
 
 set(CMAKE_CUDA_STANDARD 17)
 
-set(GPULSMOPT_ONLY OFF)
-if(DEFINED IFDEFS AND IFDEFS MATCHES "GPULSMOPT")
-  set(GPULSMOPT_ONLY ON)
+set(FLIX_NEEDS_OPTIX ON)
+if(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
+   IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB)")
+  set(FLIX_NEEDS_OPTIX OFF)
 endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -24,10 +25,23 @@ mark_as_advanced(CUDA_SDK_ROOT_DIR)
 
 set(FLIX_EMBEDDED_PTX)
 set(FLIX_OPTIONAL_SOURCES)
-if(NOT GPULSMOPT_ONLY)
+set(FLIX_USE_EXTERNAL_NVTX OFF)
+set(FLIX_NVTX_FALLBACK_INCLUDE_DIR)
+
+if(FLIX_NEEDS_OPTIX)
   include(cmake/configure_optix.cmake)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/../ext/nvtx/nvtxImportedTargets.cmake)
   include_directories(${OptiX_INCLUDE})
+  add_definitions(-DFLIX_NEEDS_OPTIX)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../ext/nvtx/nvtxImportedTargets.cmake")
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../ext/nvtx/nvtxImportedTargets.cmake)
+  set(FLIX_USE_EXTERNAL_NVTX ON)
+else()
+  set(FLIX_NVTX_FALLBACK_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nvtx_stub")
+endif()
+
+if(DEFINED IFDEFS AND (IFDEFS MATCHES "GPU_BTREE" OR FLIX_NEEDS_OPTIX))
   include_directories(../btree)
 endif()
 
@@ -36,7 +50,7 @@ endif()
 #add_definitions("-DCOMBINE_INSERT_DELETE")
 add_definitions(${IFDEFS})  
 
-if(NOT GPULSMOPT_ONLY)
+if(FLIX_NEEDS_OPTIX)
   cuda_compile_and_embed(fine_granular_embedded_ptx_code device_code_fine_granular.cu)
   cuda_compile_and_embed(coarse_granular_embedded_ptx_code device_code_coarse_granular.cu)
   cuda_compile_and_embed(coarse_granular_embedded_updates_ptx_code device_code_coarse_granular_updates.cu)
@@ -119,9 +133,16 @@ target_link_libraries(index_prototype PRIVATE
         OpenMP::OpenMP_CXX
         )
 
-if(NOT GPULSMOPT_ONLY)
+if(FLIX_NVTX_FALLBACK_INCLUDE_DIR)
+  target_include_directories(index_prototype PRIVATE "${FLIX_NVTX_FALLBACK_INCLUDE_DIR}")
+endif()
+
+if(FLIX_NEEDS_OPTIX)
   target_link_libraries(index_prototype PRIVATE
           CUDA::cuda_driver
-          nvtx3-cpp
           )
+endif()
+
+if(FLIX_USE_EXTERNAL_NVTX)
+  target_link_libraries(index_prototype PRIVATE nvtx3-cpp)
 endif()

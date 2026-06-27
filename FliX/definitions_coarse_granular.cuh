@@ -11,7 +11,9 @@
 
 #include "definitions.cuh"
 
+#if defined(FLIX_NEEDS_OPTIX)
 #include "optix_wrapper.cuh"
+#endif
 
 
 namespace cg {
@@ -113,6 +115,7 @@ void set<uint64_t>(void* buffer, smallsize byte_offset, uint64_t key) {
 }
 
 
+#if defined(FLIX_NEEDS_OPTIX)
 DEVICEQUALIFIER INLINEQUALIFIER
 void trace(OptixTraversableHandle bvh, float3 origin, float3 direction) {
     constexpr uint32_t sbt_offset = 0;
@@ -142,6 +145,7 @@ DEVICEQUALIFIER INLINEQUALIFIER
 void trace_z(OptixTraversableHandle bvh, float origin_x, float origin_y, float origin_z) {
     trace(bvh, make_float3(origin_x, origin_y, origin_z), make_float3(0, 0, 1));
 }
+#endif
 
 
 template <typename key_type>
@@ -187,6 +191,7 @@ bool is_safe_to_move(key_type representative, key_type next_key) {
 }
 
 
+#if defined(FLIX_NEEDS_OPTIX)
 template <typename key_type>
 DEVICEQUALIFIER INLINEQUALIFIER
 smallsize find_partition_offset_with_rays(OptixTraversableHandle traversable, smallsize partition_count, key_type lower_bound) {
@@ -242,6 +247,7 @@ smallsize find_partition_offset_with_rays(OptixTraversableHandle traversable, sm
     // hit_regular_3: we hit a regular representative (different plane)
     return optixHitObjectGetPrimitiveIndex();
 }
+#endif
 
 }
 
