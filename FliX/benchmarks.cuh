@@ -397,7 +397,31 @@ void benchmark_range_query(
     size_t free_memory, total_memory;
     cudaMemGetInfo(&free_memory, &total_memory);
 
-#if 0
+#if defined(RANGE_BUILD_SIZE_LOG) || defined(RANGE_PROBE_SIZE_LOG) || \
+    defined(RANGE_KEY_RANGE_MULTIPLIER_LOG) || defined(RANGE_EXPECTED_HITS_LOG) || \
+    defined(RANGE_SORT_PROBE)
+#ifndef RANGE_BUILD_SIZE_LOG
+#define RANGE_BUILD_SIZE_LOG 20
+#endif
+#ifndef RANGE_PROBE_SIZE_LOG
+#define RANGE_PROBE_SIZE_LOG 14
+#endif
+#ifndef RANGE_KEY_RANGE_MULTIPLIER_LOG
+#define RANGE_KEY_RANGE_MULTIPLIER_LOG 2
+#endif
+#ifndef RANGE_EXPECTED_HITS_LOG
+#define RANGE_EXPECTED_HITS_LOG 8
+#endif
+#ifndef RANGE_SORT_PROBE
+#define RANGE_SORT_PROBE 0
+#endif
+#warning "custom range query setup is configured"
+    std::vector<range_query_configuration> configuration_options {
+        {RANGE_BUILD_SIZE_LOG, RANGE_PROBE_SIZE_LOG, RANGE_KEY_RANGE_MULTIPLIER_LOG, RANGE_EXPECTED_HITS_LOG}
+    };
+    std::vector<bool> sort_insert_options {false};
+    std::vector<bool> sort_probe_options {static_cast<bool>(RANGE_SORT_PROBE)};
+#elif 0
 #warning "a test setup is configured, pre-configured benchmarks will be skipped"
     std::vector<range_query_configuration> configuration_options { {26, 18, 3, 15}, {26, 18, 3, 10} };
     std::vector<bool> sort_insert_options {false};
