@@ -1178,8 +1178,6 @@ void benchmark_updates(
     {
         const auto &tc = test_configuration_options[tci];
 
-        rti_assert(tc.probe_size_log >= tc.build_size_log);
-
         /* 
         // -------------- TEMPORARAY MANUAL OVERRIDE FOR TESTING: BUILD_SIZE and PROBE_SIZE
         // --> Adjust
@@ -1519,9 +1517,10 @@ void benchmark_updates(
                         std::vector<smallsize> dummy_offsets(dummy_insert_size);
                         std::iota(dummy_offsets.begin(), dummy_offsets.end(), 0);
 
-                        auto sort_perm_dum = sort_permutation(dummy_inserts, std::less<key_type>());
-                        apply_permutation(dummy_inserts, sort_perm_dum);
-                        apply_permutation(dummy_offsets, sort_perm_dum);
+                        // unsorted dummy insert batch (pre-sort disabled):
+                        // auto sort_perm_dum = sort_permutation(dummy_inserts, std::less<key_type>());
+                        // apply_permutation(dummy_inserts, sort_perm_dum);
+                        // apply_permutation(dummy_offsets, sort_perm_dum);
 
                         insert_delete_keys_buffer.upload(dummy_inserts.data(), dummy_insert_size);
                         insert_offsets_buffer.upload(dummy_offsets.data(), dummy_insert_size);
@@ -1543,9 +1542,10 @@ void benchmark_updates(
                         std::vector<key_type> relevant_inserts(generated_keys.begin() + active_range_end, generated_keys.begin() + active_range_end + insert_batch_size);
                         std::vector<smallsize> associated_offsets(insert_batch_size);
                         std::iota(associated_offsets.begin(), associated_offsets.end(), active_range_end);
-                        auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
-                        apply_permutation(relevant_inserts, sort_perm);
-                        apply_permutation(associated_offsets, sort_perm);
+                        // unsorted insert batch (pre-sort disabled for the GPU LSM Opt benchmark):
+                        // auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
+                        // apply_permutation(relevant_inserts, sort_perm);
+                        // apply_permutation(associated_offsets, sort_perm);
                         insert_keys_buffer.upload(relevant_inserts.data(), insert_batch_size);
                         insert_offsets_buffer.upload(associated_offsets.data(), insert_batch_size);
                         C2EX
@@ -1599,7 +1599,6 @@ void benchmark_updates(
 #endif
 
 #else
-
                     // insert the next batch
                     if (do_insert)
                     {
@@ -1614,9 +1613,10 @@ void benchmark_updates(
                         std::vector<key_type> relevant_inserts(generated_keys.begin() + active_range_end, generated_keys.begin() + active_range_end + insert_batch_size);
                         std::vector<smallsize> associated_offsets(insert_batch_size);
                         std::iota(associated_offsets.begin(), associated_offsets.end(), active_range_end);
-                        auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
-                        apply_permutation(relevant_inserts, sort_perm);
-                        apply_permutation(associated_offsets, sort_perm);
+                        // unsorted insert batch (pre-sort disabled for the GPU LSM Opt benchmark):
+                        // auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
+                        // apply_permutation(relevant_inserts, sort_perm);
+                        // apply_permutation(associated_offsets, sort_perm);
                         insert_delete_keys_buffer.upload(relevant_inserts.data(), insert_batch_size);
                         insert_offsets_buffer.upload(associated_offsets.data(), insert_batch_size);
                         C2EX

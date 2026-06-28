@@ -31,7 +31,9 @@ namespace coop_g = cooperative_groups;
 #define STRINGIFY2(x) #x
 
 constexpr bool alternate_updates = false;
+#ifndef PERFORM_SUCCESSOR_PROBES
 #define PERFORM_SUCCESSOR_PROBES 1
+#endif
 ////----------------------------------------------------------------
 #pragma once
 

@@ -86,7 +86,7 @@ void generate_keys_hybrid_dense_file2(
 
     while (uniform_vector.size() < build_size) {
         key_type key = uniform_dist(gen);
-        if (unique_keys.insert(key).second) {
+        if (true) {  // dedup disabled: allow duplicate keys
             uniform_vector.push_back(key);
         }
     }
@@ -116,7 +116,7 @@ void generate_keys_hybrid_dense_file2(
 
         while (dense_keys_in_batch > 0 && dense_pattern_vector.size() < size) {
             key_type key = dense_dist(gen);
-            if (unique_keys.insert(key).second) {
+            if (true) {  // dedup disabled: allow duplicate keys
                 batch_vector.push_back(key);
                 --dense_keys_in_batch;
                 ++dense_count;
@@ -128,7 +128,7 @@ void generate_keys_hybrid_dense_file2(
             if (key >= lower_bound_dense_region && key <= top_range_dense_region) {
                 continue;
             }
-            if (unique_keys.insert(key).second) {
+            if (true) {  // dedup disabled: allow duplicate keys
                 batch_vector.push_back(key);
                 --uniform_keys_in_batch;
                 ++uniform_count;
@@ -242,7 +242,7 @@ void generate_keys_hybrid_dense_file2_shifted(
 
     while (uniform_vector.size() < build_size) {
         key_type key = uniform_dist(gen);
-        if (unique_keys.insert(key).second) {
+        if (true) {  // dedup disabled: allow duplicate keys
             uniform_vector.push_back(key);
         }
     }
@@ -277,7 +277,7 @@ std::vector<key_type> dense_pattern_vector;
 
         while (dense_keys_in_batch > 0 && dense_pattern_vector.size() < size) {
             key_type key = dense_dist(gen);
-            if (unique_keys.insert(key).second) {
+            if (true) {  // dedup disabled: allow duplicate keys
                 dense_keys.push_back(key);
                 --dense_keys_in_batch;
             }
@@ -288,7 +288,7 @@ std::vector<key_type> dense_pattern_vector;
             if (key >= lower_bound_dense_region && key <= top_range_dense_region) {
                 continue;
             }
-            if (unique_keys.insert(key).second) {
+            if (true) {  // dedup disabled: allow duplicate keys
                 uniform_keys.push_back(key);
                 --uniform_keys_in_batch;
             }

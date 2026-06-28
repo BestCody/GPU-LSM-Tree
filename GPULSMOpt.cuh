@@ -53,11 +53,6 @@ namespace gpulsmopt_detail {
 #define GPULSMOPT_RANGE_MAX_CANDIDATES 16777216
 #endif
 #ifndef GPULSMOPT_RUN_DRAIN_FLOOR
-// Absolute floor (in elements) for the run-buffer drain budget. The run buffer
-// is drained into the sheet when its element count exceeds
-// max(this floor, 5% of the live total). The floor avoids pathological draining
-// when the dataset is small (where 5% is a tiny absolute count); the 5% ceiling
-// keeps run data bounded as a fraction of the sheet once the dataset is large.
 #define GPULSMOPT_RUN_DRAIN_FLOOR 65536
 #endif
 
@@ -1278,10 +1273,7 @@ class GPULSMOpt {
   void lookup(const DeviceLookupBatch& batch, cudaStream_t stream) {
     if (batch.count == 0) return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    // Disabled: the run buffer is now bounded at insert time by
-    // maybe_drain_by_budget (max(floor, 5% of live total)), so forcing a drain
-    // on every lookup is no longer needed. Re-enable only for phase-separated
-    // (bulk-insert-then-bulk-query) workloads where a one-shot drain amortizes.
+    // Disabled: run buffer is bounded at insert time by maybe_drain_by_budget.
     // drain_runs_into_segments(stream);
     auto policy = thrust::cuda::par.on(stream);
     scratch_query_keys_.resize(batch.count);
@@ -2668,11 +2660,7 @@ class GPULSMOpt {
     return total;
   }
 
-  // Drain budget: keep the run buffer below max(absolute floor, 5% of the live
-  // total). The floor prevents pathological draining on small datasets (where
-  // 5% is a tiny absolute count); the 5% ceiling keeps run data bounded as a
-  // fraction of the sheet once the dataset is large. "total" uses the raw run
-  // element count (pre-dedup) plus the live sheet count as an upper estimate.
+  // True once run data exceeds max(floor, 5% of the live total).
   bool run_data_exceeds_budget() const {
     const std::size_t run_elems = total_run_elements();
     if (run_elems == 0) return false;
