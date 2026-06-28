@@ -16,6 +16,7 @@
 #include <vector>
 #include <random>
 #include <unordered_set>
+#include <unordered_map>
 #include <cmath>
 #include <random>
 #include <fstream>
@@ -1415,6 +1416,11 @@ void benchmark_updates(
             std::vector<std::pair<size_t, size_t>> insert_batches;
             insert_batches.reserve(tc.batch_count);
 
+            // host oracle of the index state (key -> newest value) so checks expect newest-wins under duplicates
+            std::unordered_map<key_type, smallsize> live_map;
+            for (size_t p = active_range_start; p < active_range_end; ++p)
+                live_map[generated_keys[p]] = static_cast<smallsize>(p);
+
             // Which inserted batch should be deleted next
             size_t next_del_idx = 0;
 
@@ -1634,6 +1640,10 @@ void benchmark_updates(
                         // smallsize total_alloc_nodes= index.allocation_buffer_total_nodes();
                         std::cerr << "After Insert  #of Used New Nodes: " << next_free << " of total available nodes: " << total_alloc_nodes << std::endl;
 #endif
+
+                        // keep the oracle in sync with this insert batch (newest value = position)
+                        for (size_t p = ins_begin; p < ins_end; ++p)
+                            live_map[generated_keys[p]] = static_cast<smallsize>(p);
                     }
 
                     // or delete the next batch
@@ -1677,6 +1687,10 @@ void benchmark_updates(
                         // smallsize total_alloc_nodes= index.allocation_buffer_total_nodes();
                         std::cerr << "After Delete  #of Used New Nodes: " << next_free << " of total available nodes: " << total_alloc_nodes << std::endl;
 #endif
+                        // keep the oracle in sync: remove() deletes every copy of each key
+                        for (size_t p = del_begin; p < del_end; ++p)
+                            live_map.erase(generated_keys[p]);
+
                         // Save the exact deleted keys for the post-delete miss-probe (at ---->>> HERE)
                         last_deleted_keys = std::move(relevant_deletes);
                         did_delete_this_step = true;
@@ -1838,6 +1852,13 @@ void benchmark_updates(
                     // ADD in a Range of Keys to Ignore (in the)
                     draw_probes(probe_size, generated_keys, begin_probe_range, active_range_end,
                                 !supports_updates, probe_keys, expected_result);
+
+                    // expected = oracle's newest-wins value per key (not_found if absent)
+                    for (size_t i = 0; i < probe_keys.size(); ++i)
+                    {
+                        auto it = live_map.find(probe_keys[i]);
+                        expected_result[i] = (it != live_map.end()) ? it->second : not_found;
+                    }
 
                     // Keep original host order for validation
                     const auto probe_keys_orig = probe_keys;
@@ -2108,6 +2129,23 @@ void benchmark_updates(
                     {
                         draw_probes(probe_size_misses, generated_keys, active_range_end, key_generation_size,
                                     supports_updates, probe_keys_misses, expected_result_misses);
+
+                        // drop "miss" probes that are actually present as duplicates, so all-misses stays valid
+                        {
+                            size_t kept = 0;
+                            for (size_t r = 0; r < probe_keys_misses.size(); ++r)
+                            {
+                                if (live_map.find(probe_keys_misses[r]) == live_map.end())
+                                {
+                                    probe_keys_misses[kept] = probe_keys_misses[r];
+                                    expected_result_misses[kept] = expected_result_misses[r];
+                                    ++kept;
+                                }
+                            }
+                            probe_keys_misses.resize(kept);
+                            expected_result_misses.resize(kept);
+                            probe_size_misses = static_cast<smallsize>(kept);
+                        }
                         // skip_miss2_checks = true;
 
                         DBG_MISS2_CERR("Probe size misses: " << probe_size_misses);
