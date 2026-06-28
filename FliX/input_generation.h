@@ -28,6 +28,10 @@
 #include "definitions_updates.cuh"
 #include "debug_definitions_updates.cuh"
 
+#ifndef FLIX_USE_KEY_CACHE
+#define FLIX_USE_KEY_CACHE 0
+#endif
+
 #define PRINT_BATCHES_GENERATED_KEYS
 //NOTE : REMAINING--- add in shifting window to Dense Keys Generation Function
 
@@ -57,6 +61,7 @@ void generate_keys_hybrid_dense_file2(
     namespace fs = std::filesystem;
     std::string full_path = "data_cache/" + filename;
 
+#if FLIX_USE_KEY_CACHE
     if (fs::exists(full_path)) {
         std::ifstream infile(full_path);
         if (infile) {
@@ -73,6 +78,7 @@ void generate_keys_hybrid_dense_file2(
             }
         }
     }
+#endif
 
     //--------------------- Step 1: Generate Uniform Keys --------------------
     std::mt19937_64 gen(42);
@@ -170,6 +176,7 @@ void generate_keys_hybrid_dense_file2(
     generated_keys.insert(generated_keys.end(), uniform_vector.begin(), uniform_vector.end());
     generated_keys.insert(generated_keys.end(), dense_pattern_vector.begin(), dense_pattern_vector.end());
 
+#if FLIX_USE_KEY_CACHE
     fs::create_directories("data_cache");
     std::ofstream outfile(full_path, std::ios::trunc);
     if (outfile) {
@@ -180,6 +187,7 @@ void generate_keys_hybrid_dense_file2(
     } else {
         std::cerr << "Failed to save keys to file: " << full_path << std::endl;
     }
+#endif
 }
 
 
@@ -214,6 +222,7 @@ void generate_keys_hybrid_dense_file2_shifted(
     namespace fs = std::filesystem;
     std::string full_path = "data_cache/" + filename;
 
+#if FLIX_USE_KEY_CACHE
     if (fs::exists(full_path)) {
         std::ifstream infile(full_path);
         if (infile) {
@@ -230,6 +239,7 @@ void generate_keys_hybrid_dense_file2_shifted(
             }
         }
     }
+#endif
 
      //--------------------- Step 1: Uniform Keys for BUILD --------------------
     std::mt19937_64 gen(42);
@@ -344,6 +354,7 @@ std::vector<key_type> dense_pattern_vector;
     generated_keys.insert(generated_keys.end(), uniform_vector.begin(), uniform_vector.end());
     generated_keys.insert(generated_keys.end(), dense_pattern_vector.begin(), dense_pattern_vector.end());
 
+#if FLIX_USE_KEY_CACHE
     fs::create_directories("data_cache");
     std::ofstream outfile(full_path, std::ios::trunc);
     if (outfile) {
@@ -354,6 +365,7 @@ std::vector<key_type> dense_pattern_vector;
     } else {
         std::cerr << "Failed to save keys to file: " << full_path << std::endl;
     }
+#endif
 }
 
 //%%------------------------------------------------------------------ DENSE KEYS GENERATION ------------------------------------------------------------------%%
@@ -598,6 +610,7 @@ struct point_query_dataset {
         std::string probe_keys_file;
         std::string expected_result_file;
 
+#if FLIX_USE_KEY_CACHE
         if (cache_directory != nullptr) {
             build_keys_file = std::string(cache_directory) + "point-build-keys-" + dataset_identifier + ".bin";
             build_values_file = std::string(cache_directory) + "point-build-values-" + dataset_identifier + ".bin";
@@ -610,6 +623,7 @@ struct point_query_dataset {
                                 (!with_values || load_binary(build_values_file, build_values));
             if (keys_existed) return;
         }
+#endif
 
         std::mt19937_64 gen(seed);
 
@@ -741,6 +755,7 @@ struct point_query_dataset {
         }
         apply_permutation(probe_keys, shuffle_perm);
 
+#if FLIX_USE_KEY_CACHE
         if (cache_directory != nullptr) {
             dump_binary(build_keys_file, build_keys);
             dump_binary(probe_keys_file, probe_keys);
@@ -749,6 +764,7 @@ struct point_query_dataset {
                 dump_binary(build_values_file, build_values);
             }
         }
+#endif
     }
 };
 
@@ -798,6 +814,7 @@ struct range_query_dataset {
         std::string lower_keys_file;
         std::string upper_keys_file;
         std::string expected_result_file;
+#if FLIX_USE_KEY_CACHE
         if (cache_directory != nullptr) {
             build_keys_file = std::string(cache_directory) + "range-build-keys-" + dataset_identifier + ".bin";
             build_values_file = std::string(cache_directory) + "range-build-values-" + dataset_identifier + ".bin";
@@ -812,6 +829,7 @@ struct range_query_dataset {
                                 (!with_values || load_binary(build_values_file, build_values));
             if (keys_existed) return;
         }
+#endif
 
         std::mt19937_64 gen(seed);
 
@@ -889,6 +907,7 @@ struct range_query_dataset {
             expected_result[i] = agg;
         }
 
+#if FLIX_USE_KEY_CACHE
         if (cache_directory != nullptr) {
             dump_binary(build_keys_file, build_keys);
             dump_binary(lower_keys_file, lower_probe_keys);
@@ -898,6 +917,7 @@ struct range_query_dataset {
                 dump_binary(build_values_file, build_values);
             }
         }
+#endif
     }
 };
 

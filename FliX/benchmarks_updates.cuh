@@ -432,6 +432,7 @@ void generate_keys_hybrid_skip_readin(
     std::vector<key_type> &generated_keys,
     const std::string &filename = "keys_cache.txt")
 {
+#if FLIX_USE_KEY_CACHE
     std::ifstream infile(filename);
     if (infile)
     {
@@ -444,6 +445,7 @@ void generate_keys_hybrid_skip_readin(
         std::cerr << "Loaded " << generated_keys.size() << " keys from cache file: " << filename << std::endl;
         return; // Use existing keys if found
     }
+#endif
 
     std::mt19937_64 gen(42); // Fixed seed for reproducibility
     std::unordered_set<key_type> unique_keys;
@@ -499,6 +501,7 @@ void generate_keys_hybrid_skip_readin(
     generated_keys.insert(generated_keys.end(), skip_pattern_vector.begin(), skip_pattern_vector.end());
     std::cerr << "Hybrid key generation completed." << std::endl;
 
+#if FLIX_USE_KEY_CACHE
     // -------------------- Step 4: Save to File --------------------
     std::ofstream outfile(filename, std::ios::trunc);
     if (outfile)
@@ -514,6 +517,7 @@ void generate_keys_hybrid_skip_readin(
     {
         std::cerr << "Failed to save keys to file!" << std::endl;
     }
+#endif
 }
 
 
@@ -638,6 +642,7 @@ void generate_keys_hybrid_skip(
 
     std::cerr << "Hybrid key generation completed." << std::endl;
 
+#if FLIX_USE_KEY_CACHE
     // -------------------- Step 4: Save to File --------------------
     std::ofstream outfile(filename, std::ios::trunc);
     if (outfile)
@@ -653,6 +658,7 @@ void generate_keys_hybrid_skip(
     {
         std::cerr << "Failed to save keys to file!" << std::endl;
     }
+#endif
 }
 
 // Generate hybrid-dense keys using uniform + dense pattern strategy and save to text file
@@ -716,6 +722,7 @@ void generate_keys_hybrid_dense(
 
     std::cerr << "Hybrid-Dense key generation completed." << std::endl;
 
+#if FLIX_USE_KEY_CACHE
     std::ofstream outfile(filename, std::ios::trunc);
     if (outfile)
     {
@@ -729,6 +736,7 @@ void generate_keys_hybrid_dense(
     {
         std::cerr << "Failed to save keys to file!" << std::endl;
     }
+#endif
 }
 
 template <typename key_type>
@@ -749,6 +757,7 @@ void generate_keys_hybrid_dense_file(
     namespace fs = std::filesystem;
     std::string full_path = "data_cache/" + filename;
 
+#if FLIX_USE_KEY_CACHE
     if (fs::exists(full_path))
     {
         std::ifstream infile(full_path);
@@ -771,6 +780,7 @@ void generate_keys_hybrid_dense_file(
             }
         }
     }
+#endif
 
     //--------------------- Step 1: Generate Uniform Keys --------------------
     std::mt19937_64 gen(42);
@@ -815,6 +825,7 @@ void generate_keys_hybrid_dense_file(
     generated_keys.insert(generated_keys.end(), uniform_vector.begin(), uniform_vector.end());
     generated_keys.insert(generated_keys.end(), dense_pattern_vector.begin(), dense_pattern_vector.end());
 
+#if FLIX_USE_KEY_CACHE
     fs::create_directories("data_cache");
     std::ofstream outfile(full_path, std::ios::trunc);
     if (outfile)
@@ -829,6 +840,7 @@ void generate_keys_hybrid_dense_file(
     {
         std::cerr << "Failed to save keys to file: " << full_path << std::endl;
     }
+#endif
 }
 
 template <typename key_type>
@@ -842,6 +854,7 @@ void generate_keys_file(
     namespace fs = std::filesystem;
 
     std::string filename = "data_cache/" + base_filename;
+#if FLIX_USE_KEY_CACHE
     if (fs::exists(filename))
     {
         std::ifstream infile(filename, std::ios::binary);
@@ -852,6 +865,7 @@ void generate_keys_file(
             return;
         }
     }
+#endif
 
     std::mt19937_64 gen(42);
     std::uniform_int_distribution<key_type> uniform_key_dist(min_usable_key + 2, max_usable_key - 3);
@@ -865,12 +879,14 @@ void generate_keys_file(
     generated_keys.resize(size);
     std::copy(generated_keys_set.begin(), generated_keys_set.end(), generated_keys.begin());
 
+#if FLIX_USE_KEY_CACHE
     fs::create_directories("data_cache");
     std::ofstream outfile(filename, std::ios::binary);
     if (outfile)
     {
         outfile.write(reinterpret_cast<const char *>(generated_keys.data()), sizeof(key_type) * size);
     }
+#endif
 }
 //--------------------------
 
