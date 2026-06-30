@@ -84,7 +84,7 @@ void generate_keys_hybrid_dense_file2(
     std::mt19937_64 gen(42);
     std::unordered_set<key_type> unique_keys;
 
-    std::cerr << "Generating Hybrid-Dense keys with " << build_size << " uniform keys and "
+    std::cerr << "Generating Hybrid-Dense distinct keys with " << build_size << " uniform keys and "
               << (size - build_size) << " dense keys..." << std::endl;
 
     std::uniform_int_distribution<key_type> uniform_dist(min_usable_key, max_usable_key);
@@ -92,7 +92,7 @@ void generate_keys_hybrid_dense_file2(
 
     while (uniform_vector.size() < build_size) {
         key_type key = uniform_dist(gen);
-        if (true) {  // dedup disabled: allow duplicate keys
+        if (unique_keys.insert(key).second) {
             uniform_vector.push_back(key);
         }
     }
@@ -122,7 +122,7 @@ void generate_keys_hybrid_dense_file2(
 
         while (dense_keys_in_batch > 0 && dense_pattern_vector.size() < size) {
             key_type key = dense_dist(gen);
-            if (true) {  // dedup disabled: allow duplicate keys
+            if (unique_keys.insert(key).second) {
                 batch_vector.push_back(key);
                 --dense_keys_in_batch;
                 ++dense_count;
@@ -134,7 +134,7 @@ void generate_keys_hybrid_dense_file2(
             if (key >= lower_bound_dense_region && key <= top_range_dense_region) {
                 continue;
             }
-            if (true) {  // dedup disabled: allow duplicate keys
+            if (unique_keys.insert(key).second) {
                 batch_vector.push_back(key);
                 --uniform_keys_in_batch;
                 ++uniform_count;
@@ -245,14 +245,14 @@ void generate_keys_hybrid_dense_file2_shifted(
     std::mt19937_64 gen(42);
     std::unordered_set<key_type> unique_keys;
 
-    std::cerr << "Generating Hybrid-Dense keys with shifting dense region..." << std::endl;
+    std::cerr << "Generating Hybrid-Dense distinct keys with shifting dense region..." << std::endl;
 
     std::uniform_int_distribution<key_type> uniform_dist(min_usable_key, max_usable_key);
     std::vector<key_type> uniform_vector;
 
     while (uniform_vector.size() < build_size) {
         key_type key = uniform_dist(gen);
-        if (true) {  // dedup disabled: allow duplicate keys
+        if (unique_keys.insert(key).second) {
             uniform_vector.push_back(key);
         }
     }
@@ -287,7 +287,7 @@ std::vector<key_type> dense_pattern_vector;
 
         while (dense_keys_in_batch > 0 && dense_pattern_vector.size() < size) {
             key_type key = dense_dist(gen);
-            if (true) {  // dedup disabled: allow duplicate keys
+            if (unique_keys.insert(key).second) {
                 dense_keys.push_back(key);
                 --dense_keys_in_batch;
             }
@@ -298,7 +298,7 @@ std::vector<key_type> dense_pattern_vector;
             if (key >= lower_bound_dense_region && key <= top_range_dense_region) {
                 continue;
             }
-            if (true) {  // dedup disabled: allow duplicate keys
+            if (unique_keys.insert(key).second) {
                 uniform_keys.push_back(key);
                 --uniform_keys_in_batch;
             }

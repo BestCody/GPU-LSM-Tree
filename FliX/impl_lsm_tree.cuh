@@ -1103,6 +1103,21 @@ public:
                         positions + insert_list_offset,
                         remaining_size * sizeof(smallsize),
                         cudaMemcpyDefault, stream);
+                    untimed_pair_sort(
+                        temp_sort_buffer.raw_ptr, temp_sort_buffer.size_in_bytes(),
+                        staging_keys_buffer.ptr(), temp_keys_buffer_a.ptr(),
+                        staging_values_buffer.ptr(), temp_values_buffer_a.ptr(),
+                        remaining_size, stream);
+                    cudaMemcpyAsync(
+                        staging_keys_buffer.ptr(),
+                        temp_keys_buffer_a.ptr(),
+                        remaining_size * sizeof(key_type),
+                        cudaMemcpyDefault, stream);
+                    cudaMemcpyAsync(
+                        staging_values_buffer.ptr(),
+                        temp_values_buffer_a.ptr(),
+                        remaining_size * sizeof(smallsize),
+                        cudaMemcpyDefault, stream);
                     insert_list_offset += remaining_size;
                 }
                 staged_insert_size = remaining_size;
@@ -1130,8 +1145,14 @@ public:
         {
             if ((newly_inserted_chunk_counter & (1u << new_level)) == 0)
                 continue;
-            merge_at_level(new_level, insert_list + insert_list_offset, positions + insert_list_offset, stream);
-            insert_list_offset += chunk_size << new_level;
+            const size_t chunk_elements = chunk_size << new_level;
+            untimed_pair_sort(
+                temp_sort_buffer.raw_ptr, temp_sort_buffer.size_in_bytes(),
+                insert_list + insert_list_offset, temp_keys_buffer_a.ptr(),
+                positions + insert_list_offset, temp_values_buffer_a.ptr(),
+                chunk_elements, stream);
+            merge_at_level(new_level, temp_keys_buffer_a.ptr(), temp_values_buffer_a.ptr(), stream);
+            insert_list_offset += chunk_elements;
         }
     }
 
