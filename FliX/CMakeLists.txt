@@ -6,6 +6,8 @@ endif()
 
 set(CMAKE_CUDA_STANDARD 17)
 
+option(FLIX_USE_KEY_CACHE "Reuse generated benchmark key caches" OFF)
+
 set(FLIX_NEEDS_OPTIX ON)
 if(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
    IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB)")
@@ -102,6 +104,15 @@ add_executable(index_prototype
 set_target_properties(index_prototype PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+if(NOT DEFINED IFDEFS OR NOT IFDEFS MATCHES "FLIX_USE_KEY_CACHE")
+  if(FLIX_USE_KEY_CACHE)
+    target_compile_definitions(index_prototype PRIVATE FLIX_USE_KEY_CACHE=1)
+  else()
+    target_compile_definitions(index_prototype PRIVATE FLIX_USE_KEY_CACHE=0)
+  endif()
+endif()
+
 # 75 TURING
 # 80 AMPERE
 # 86 AMPERE

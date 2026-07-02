@@ -166,6 +166,12 @@ public:
          std::to_string(static_cast<size_t>(GPULSMOPT_INPLACE_MAX_INCOMING))},
         {"run_drain_divisor",
          std::to_string(static_cast<size_t>(GPULSMOPT_RUN_DRAIN_DIVISOR))},
+        {"run_drain_sheet_numerator",
+         std::to_string(
+             static_cast<size_t>(GPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR))},
+        {"run_drain_sheet_denominator",
+         std::to_string(
+             static_cast<size_t>(GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR))},
         {"distinct_keys",
          std::to_string(static_cast<size_t>(GPULSMOPT_DISTINCT_KEYS))},
     };

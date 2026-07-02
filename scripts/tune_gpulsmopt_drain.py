@@ -8,6 +8,7 @@ import statistics
 import subprocess
 import sys
 import time
+from fractions import Fraction
 from pathlib import Path
 
 
@@ -47,6 +48,27 @@ def parse_divisors(text: str) -> list[int]:
     if not values:
         raise argparse.ArgumentTypeError("at least one divisor is required")
     return values
+
+
+def parse_sheet_ratios(text: str) -> list[Fraction]:
+    values = []
+    for item in text.replace(",", " ").split():
+        if item.endswith("%"):
+            value = Fraction(item[:-1]) / 100
+        else:
+            value = Fraction(item)
+        if value <= 0:
+            raise argparse.ArgumentTypeError("sheet ratios must be positive")
+        values.append(value)
+    if not values:
+        raise argparse.ArgumentTypeError("at least one ratio is required")
+    return values
+
+
+def ratio_label(value: Fraction) -> str:
+    if value.denominator == 1:
+        return f"{value.numerator}x"
+    return f"{value.numerator}_{value.denominator}x"
 
 
 def run_command(cmd: list[str], cwd: Path, log_path: Path) -> None:
@@ -149,7 +171,8 @@ def write_summary_csv(
     results: list[dict[str, object]],
 ) -> None:
     fields = [
-        "divisor",
+        "setting",
+        "mode",
         "score",
         "metric",
         "avg_ms",
@@ -167,7 +190,8 @@ def write_summary_csv(
             summary = result["summary"]
             for metric, stats in summary.items():
                 writer.writerow({
-                    "divisor": result["divisor"],
+                    "setting": result["setting"],
+                    "mode": result["mode"],
                     "score": result["score"],
                     "metric": metric,
                     "avg_ms": stats["avg"],
@@ -191,11 +215,11 @@ def print_table(results: list[dict[str, object]]) -> None:
         METRIC_NAMES["range_sum"],
         METRIC_NAMES["range_build"],
     ]
-    print("\nDivisor summary, avg ms")
-    header = ["divisor", "score"] + metric_order
+    print("\nDrain setting summary, avg ms")
+    header = ["setting", "score"] + metric_order
     print("\t".join(header))
     for result in results:
-        row = [str(result["divisor"]), f"{result['score']:.6f}"]
+        row = [str(result["setting"]), f"{result['score']:.6f}"]
         summary = result["summary"]
         for metric in metric_order:
             value = summary[metric]["avg"]
@@ -210,8 +234,14 @@ def main() -> int:
     parser.add_argument(
         "--divisors",
         type=parse_divisors,
-        default=parse_divisors("1,2,4,8,20,40"),
+        default=None,
         help="Comma or space separated values.",
+    )
+    parser.add_argument(
+        "--sheet-ratios",
+        type=parse_sheet_ratios,
+        default=None,
+        help="Run bytes as a multiple of live sheet bytes, e.g. 2,4,800%%.",
     )
     parser.add_argument(
         "--objective",
@@ -248,15 +278,37 @@ def main() -> int:
     build_root = Path(args.build_root)
     build_root.mkdir(parents=True, exist_ok=True)
 
+    if args.sheet_ratios:
+        configs = []
+        for ratio in args.sheet_ratios:
+            label = f"sheet_{ratio_label(ratio)}"
+            ifdefs = (
+                f"-DGPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR={ratio.numerator} "
+                f"-DGPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR={ratio.denominator}"
+            )
+            configs.append({
+                "setting": label,
+                "mode": "sheet_ratio",
+                "ifdefs": ifdefs,
+            })
+    else:
+        divisors = args.divisors or parse_divisors("1,2,4,8,20,40")
+        configs = [{
+            "setting": f"divisor_{divisor}",
+            "mode": "divisor",
+            "ifdefs": f"-DGPULSMOPT_RUN_DRAIN_DIVISOR={divisor}",
+        } for divisor in divisors]
+
     results = []
-    for divisor in args.divisors:
-        build_dir = build_root / f"divisor-{divisor}"
-        log_path = out_dir / f"divisor-{divisor}.log"
+    for config in configs:
+        setting = config["setting"]
+        build_dir = build_root / setting
+        log_path = out_dir / f"{setting}.log"
         if build_dir.exists() and not args.keep_builds:
             shutil.rmtree(build_dir)
         build_dir.mkdir(parents=True, exist_ok=True)
 
-        ifdefs = f"{args.ifdefs} -DGPULSMOPT_RUN_DRAIN_DIVISOR={divisor}"
+        ifdefs = f"{args.ifdefs} {config['ifdefs']}"
         cmake_cmd = [
             "cmake",
             "-S",
@@ -280,14 +332,15 @@ def main() -> int:
             updates_path.unlink()
         run_command(run_cmd, build_dir, log_path)
         if not updates_path.exists():
-            raise RuntimeError(f"missing updates.csv for divisor {divisor}")
+            raise RuntimeError(f"missing updates.csv for {setting}")
 
-        copied_csv = out_dir / f"updates_divisor_{divisor}.csv"
+        copied_csv = out_dir / f"updates_{setting}.csv"
         shutil.copy2(updates_path, copied_csv)
         summary = summarize_csv(copied_csv)
         score = objective_score(summary, args.objective)
         results.append({
-            "divisor": divisor,
+            "setting": setting,
+            "mode": config["mode"],
             "score": score,
             "summary": summary,
             "updates_csv": str(copied_csv),
@@ -306,7 +359,7 @@ def main() -> int:
         encoding="utf-8",
     )
     print_table(results)
-    print(f"\nBest divisor for {args.objective}: {results[0]['divisor']}")
+    print(f"\nBest setting for {args.objective}: {results[0]['setting']}")
     print(f"Summary CSV: {out_dir / 'summary.csv'}")
     print(f"Raw CSVs/logs: {out_dir}")
     return 0

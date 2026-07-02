@@ -60,6 +60,12 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_RUN_DRAIN_DIVISOR
 #define GPULSMOPT_RUN_DRAIN_DIVISOR 20
 #endif
+#ifndef GPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR
+#define GPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR 0
+#endif
+#ifndef GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR
+#define GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR 1
+#endif
 #ifndef GPULSMOPT_DISTINCT_KEYS
 #define GPULSMOPT_DISTINCT_KEYS 1
 #endif
@@ -75,7 +81,13 @@ constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
 constexpr std::size_t kRunsPerClass = 4;
 constexpr std::size_t kRunDrainDivisor = GPULSMOPT_RUN_DRAIN_DIVISOR;
+constexpr std::size_t kRunDrainSheetNumerator =
+    GPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR;
+constexpr std::size_t kRunDrainSheetDenominator =
+    GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR;
 static_assert(kRunDrainDivisor >= 1, "drain divisor must be positive");
+static_assert(kRunDrainSheetDenominator >= 1,
+              "sheet drain denominator must be positive");
 
 struct DeviceUpdateBatch {
   const std::uint32_t *keys = nullptr;
@@ -2757,7 +2769,7 @@ private:
   void compute_max_size_class() {
     const std::size_t run_budget = std::max<std::size_t>(
         batch_size_ * gpulsmopt_detail::kRunsPerClass,
-        max_elements_ / gpulsmopt_detail::kRunDrainDivisor);
+        configured_run_budget());
     std::size_t class_capacity = std::max<std::size_t>(1, batch_size_);
     max_size_class_ = 0;
     while (class_capacity < run_budget &&
@@ -3624,11 +3636,42 @@ private:
     const std::size_t run_elems = total_run_elements();
     if (run_elems == 0)
       return false;
-    const std::size_t total = run_elems + sheet_live_count_;
-    const std::size_t threshold =
-        std::max<std::size_t>(
-            run_drain_floor_, total / gpulsmopt_detail::kRunDrainDivisor);
+    const std::size_t threshold = run_drain_threshold(run_elems);
     return run_elems > threshold;
+  }
+
+  std::size_t scaled_sheet_budget(std::size_t base) const {
+    constexpr std::size_t num =
+        gpulsmopt_detail::kRunDrainSheetNumerator;
+    constexpr std::size_t den =
+        gpulsmopt_detail::kRunDrainSheetDenominator;
+    if constexpr (num == 0) {
+      return 0;
+    } else {
+      if (base > std::numeric_limits<std::size_t>::max() / num)
+        return std::numeric_limits<std::size_t>::max();
+      const std::size_t scaled = base * num;
+      return scaled / den + static_cast<std::size_t>(scaled % den != 0);
+    }
+  }
+
+  std::size_t configured_run_budget() const {
+    if constexpr (gpulsmopt_detail::kRunDrainSheetNumerator == 0) {
+      return max_elements_ / gpulsmopt_detail::kRunDrainDivisor;
+    } else {
+      return scaled_sheet_budget(max_elements_);
+    }
+  }
+
+  std::size_t run_drain_threshold(std::size_t run_elems) const {
+    if constexpr (gpulsmopt_detail::kRunDrainSheetNumerator == 0) {
+      const std::size_t total = run_elems + sheet_live_count_;
+      return std::max<std::size_t>(
+          run_drain_floor_, total / gpulsmopt_detail::kRunDrainDivisor);
+    } else {
+      return std::max<std::size_t>(
+          run_drain_floor_, scaled_sheet_budget(sheet_live_count_));
+    }
   }
 
   void maybe_drain_by_budget(cudaStream_t stream) {
