@@ -72,44 +72,23 @@ namespace gpulsmopt_detail {
 #define GPULSMOPT_DISTINCT_KEYS 1
 #endif
 
-// ---- v2 rewrite knobs (disjoint unsorted runs + tier-2 + sheet) ----------
-// Slots per run block. Runs are unsorted and scanned by compute sized to the
-// run, so this bounds the scan cost; splits keep runs at/under it.
-// "Fatter runs" (Step 2): a large capacity keeps the run COUNT small, so
-// routing is cheap (few disjoint ranges) and a bulk insert mostly APPENDS
-// (fast path) instead of shattering into thousands of tiny runs + splits.
+// Run-layer tuning.
 #ifndef GPULSMOPT_RUN_CAPACITY
 #define GPULSMOPT_RUN_CAPACITY (1 << 22)
 #endif
-// Max number of overlapping tier-2 generations before a merge-down flattens
-// them into the disjoint sheet (bounds read amplification).
+// Tier-2 generations before merge-down.
 #ifndef GPULSMOPT_TIER2_FANOUT
 #define GPULSMOPT_TIER2_FANOUT 4
 #endif
-// Drain-rarely budget (Step 3): the run layer buffers up to this many live
-// entries before draining to the sheet. Large => the expensive sheet merge
-// is amortized over many inserts instead of firing every step. Reads scan the
-// buffered (unsorted) runs meanwhile, so this trades read cost for insert cost.
+// Run-layer flush threshold.
 #ifndef GPULSMOPT_RUN_FLUSH_BUDGET
 #define GPULSMOPT_RUN_FLUSH_BUDGET (1 << 26)
 #endif
-// Tier-2 (L2) write-combining buffer. Disabled (0) => the run layer (L1)
-// drains STRAIGHT to the sheet: no intermediate flush-copy, no overlapping
-// generations to scan on reads. Set to 1 to restore the two-stage
-// flush->tier2->merge path (worth it only for churn/update-heavy workloads
-// where combining cancels writes before they reach the sheet).
+// 0 drains the run layer directly to the sheet.
 #ifndef GPULSMOPT_ENABLE_TIER2
 #define GPULSMOPT_ENABLE_TIER2 0
 #endif
-// Batch->run routing method (both run-centric; benchmark A vs B):
-//   0 = BRUTE FORCE, O(runs*batch): each run scans the whole unsorted batch and
-//       pulls the records in its range. No batch sort.
-//   1 = SMART, sort the batch once, then each run binary-searches its slice and
-//       pulls it (coalesced). Trades a radix sort for O(log) per-run lookup.
-// The experiment: does the dumb O(runs*batch) scan beat the sorted pull on the
-// GPU? See [[gpulsmopt-compute-scales-with-size]]. Answer at the bulky/fat-run
-// operating point: B wins decisively (A launches one block per run and starves
-// the GPU when runs are few), so B is the default. Force A with =0.
+// 0 scans per run; 1 sorts once and slices per run.
 #ifndef GPULSMOPT_ROUTE_METHOD
 #define GPULSMOPT_ROUTE_METHOD 1
 #endif
@@ -889,7 +868,7 @@ __global__ void seg_merge_sort_keys_kernel(const std::uint32_t *cand_seg,
 
 
 
-// Smallest key >= q stored in one segment, or kEmptyKey if none.
+// Segment ceiling key.
 __device__ inline std::uint32_t seg_segment_ceiling(
     std::uint32_t seg_id, std::uint32_t q, const std::uint32_t *pool_keys,
     const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max) {
@@ -913,7 +892,7 @@ __device__ inline std::uint32_t seg_segment_ceiling(
   return best;
 }
 
-// Smallest sheet key >= q (ignoring run shadowing), or kEmptyKey if none.
+// Sheet ceiling key.
 __device__ inline std::uint32_t
 seg_sheet_ceiling(std::uint32_t q, const std::uint32_t *dir_boundary,
                   const std::uint32_t *dir_seg_id, std::size_t dir_count,
@@ -929,14 +908,7 @@ seg_sheet_ceiling(std::uint32_t q, const std::uint32_t *dir_boundary,
   return best;
 }
 
-// ---------------------------------------------------------------------------
-// v2 run-layer primitives (disjoint, unsorted, tombstone-append).
-// A "run" is a contiguous block of kRunCapacity slots in run_pool_*; entries
-// [0, size) are live and stored UNSORTED. Runs own disjoint key ranges routed
-// via run_boundary (inclusive upper bound per run ordinal).
-// ---------------------------------------------------------------------------
-
-// Route a key to its run ordinal (first run whose upper bound >= key).
+// Route key to a run ordinal.
 __device__ __host__ inline std::size_t
 rl_route_key(const std::uint32_t *run_boundary, std::size_t run_count,
              std::uint32_t key) {
@@ -946,7 +918,7 @@ rl_route_key(const std::uint32_t *run_boundary, std::size_t run_count,
   return ord;
 }
 
-// Partition predicate over (key,value,op) tuples: true for live inserts.
+// Tuple predicate for live inserts.
 struct TupleOpIsInsert {
   template <class Tuple>
   __host__ __device__ bool operator()(const Tuple &t) const {
@@ -954,7 +926,7 @@ struct TupleOpIsInsert {
   }
 };
 
-// Count how many batch elements route to each run ordinal.
+// Count batch elements per run ordinal.
 __global__ void rl_histogram_kernel(const std::uint32_t *ordinal, std::size_t n,
                                     std::uint32_t *counts) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -962,19 +934,13 @@ __global__ void rl_histogram_kernel(const std::uint32_t *ordinal, std::size_t n,
     atomicAdd(&counts[ordinal[i]], 1u);
 }
 
-// ---------------------------------------------------------------------------
-// Routing method A = BRUTE FORCE, O(runs * batch): compute is assigned per run,
-// and each run scans the ENTIRE unsorted batch to pull the records in its range
-// (boundary[run-1], boundary[run]]. No sort, no per-element routing index. This
-// is the flipped-index "locations look for the query" form; we benchmark it
-// against method B (sort once, each run binary-searches its slice) to see
-// whether the dumb-but-simple scan beats the smart sorted pull on the GPU.
+// Method A scans each run against the batch.
 __device__ inline bool rl_in_run_range(std::uint32_t key, std::uint32_t hi,
                                        bool has_lo, std::uint32_t lo) {
   return key <= hi && (!has_lo || key > lo);
 }
 
-// Pass 1: one block per run counts how many batch records fall in its range.
+// Method A count pass.
 __global__ void rl_run_count_kernel(const std::uint32_t *keys, std::size_t n,
                                     const std::uint32_t *boundary, std::size_t r,
                                     std::uint32_t *counts) {
@@ -998,10 +964,7 @@ __global__ void rl_run_count_kernel(const std::uint32_t *keys, std::size_t n,
     counts[run] = s_cnt;
 }
 
-// Pass 2 (fast path): one block per FAST run scans the batch and appends its
-// matching records into the run block, at old_size + a block-local slot. Keys
-// within a single batch are distinct, so the atomic ordering among matches is
-// irrelevant; cross-batch recency is preserved by seeding at old_size.
+// Method A fast append pass.
 __global__ void rl_run_append_kernel(
     const std::uint8_t *is_fast, const std::uint32_t *boundary,
     const std::uint32_t *run_start, const std::uint32_t *old_size, std::size_t r,
@@ -1030,8 +993,7 @@ __global__ void rl_run_append_kernel(
   }
 }
 
-// Slow path: one block scans the batch and compacts a single overflowing run's
-// matching records into out_keys/out_vals for the rebuild+split.
+// Method A overflow gather.
 __global__ void rl_run_gather_kernel(const std::uint32_t *keys,
                                      const std::uint32_t *values, std::size_t n,
                                      std::uint32_t lo, std::uint32_t hi,
@@ -1050,9 +1012,7 @@ __global__ void rl_run_gather_kernel(const std::uint32_t *keys,
   }
 }
 
-// Resolve still-unanswered queries against the sheet (which holds only live
-// inserts). Answered queries (found in an overlay layer, including tombstones)
-// are left untouched.
+// Resolve unanswered queries against the sheet.
 __global__ void sheet_lookup_answered_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
     std::uint8_t *out_found, const std::uint8_t *answered,
@@ -1077,16 +1037,7 @@ __global__ void sheet_lookup_answered_kernel(
   out_value[i] = found ? value : 0u;
 }
 
-// ---------------------------------------------------------------------------
-// v2 point lookup over ONE layer (run layer OR one tier-2 generation), warp-
-// parallel (#4b). The layer is a set of disjoint, key-ordered blocks:
-// dir_boundary[b] is the inclusive upper key of block b, dir_start[b] its base
-// offset into keys/values/ops, dir_size[b] its live count. A query routes to
-// exactly one block and its warp's 32 lanes scan that unsorted block
-// cooperatively, picking the newest (highest slot) live match via ballot. On a
-// live match the query is answered (insert -> value+found=1, tombstone ->
-// found=0); already-answered queries are skipped so callers chain layers
-// newest -> oldest -> sheet for correct recency.
+// Warp lookup for one overlay layer.
 __global__ void layer_lookup_warp_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
     std::uint8_t *out_found, std::uint8_t *answered, const std::uint32_t *keys,
@@ -1132,14 +1083,7 @@ __global__ void layer_lookup_warp_kernel(
   }
 }
 
-// ---------------------------------------------------------------------------
-// v2 upgrade #1: direct layered range/count/successor over a pre-resolved
-// overlay snapshot (run layer + tier-2 flattened once per query batch into two
-// sorted, distinct key arrays: live inserts and tombstones). No mutation of the
-// structure -- reads only, so range/count/successor no longer force a merge.
-//
-// prefix[] has n+1 entries; prefix[j] = sum of the first j values. Range over
-// [lo,hi] = prefix[upper_bound(keys,hi)] - prefix[lower_bound(keys,lo)].
+// Overlay range helpers.
 __device__ inline std::uint32_t
 overlay_prefix_range(const std::uint32_t *prefix, const std::uint32_t *keys,
                      std::size_t n, std::uint32_t lo, std::uint32_t hi) {
@@ -1160,9 +1104,7 @@ __device__ inline std::uint32_t overlay_count_range(const std::uint32_t *keys,
   return static_cast<std::uint32_t>(e - b);
 }
 
-// Point-lookup each key in the sheet; write its live value (0 if absent) and a
-// present flag. Used to price tombstones that shadow a value already in the
-// sheet (subtract on range-sum / range-count).
+// Sheet values for tombstone accounting.
 __global__ void sheet_point_values_kernel(
     const std::uint32_t *keys, std::size_t n, const std::uint32_t *dir_boundary,
     const std::uint32_t *dir_seg_id, std::size_t dir_count,
@@ -1185,8 +1127,7 @@ __global__ void sheet_point_values_kernel(
   out_flag[i] = f ? 1u : 0u;
 }
 
-// Range sum (+ optional count) over sheet + overlay. sum = sheet_sum + overlay
-// live inserts in range - sheet value of overlay-tombstoned keys in range.
+// Range sum/count over sheet plus overlay.
 __global__ void range_overlay_kernel(
     const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_sums,
     std::uint32_t *out_counts, std::size_t query_count,
@@ -1226,7 +1167,7 @@ __global__ void range_overlay_kernel(
   }
 }
 
-// Distinct range count over sheet + overlay (count() API, no sum output).
+// Distinct range count over sheet plus overlay.
 __global__ void count_overlay_kernel(
     const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_counts,
     std::size_t query_count, const std::uint32_t *dir_boundary,
@@ -1253,9 +1194,7 @@ __global__ void count_overlay_kernel(
   out_counts[i] = c;
 }
 
-// Successor (smallest live key >= q) over sheet + overlay. Considers the
-// smallest overlay live-insert >= q, and walks the sheet ceiling forward past
-// any overlay-tombstoned keys (holes).
+// Successor over sheet plus overlay.
 __global__ void successor_overlay_kernel(
     const std::uint32_t *queries, std::size_t query_count,
     std::uint32_t *out_keys, const std::uint32_t *dir_boundary,
@@ -1296,10 +1235,9 @@ __global__ void successor_overlay_kernel(
   out_keys[i] = (best == kEmptyKey) ? 0u : best;
 }
 
-// ---------------------------------------------------------------------------
-// v2 upgrade #3 (bucket split) + #4a (method-B per-run pull) device helpers.
+// Bucket split and method-B helpers.
 
-// Gather a strided sample of `s` keys from `src[0,m)` for quantile pivots.
+// Gather a strided sample for quantile pivots.
 __global__ void sample_gather_kernel(const std::uint32_t *src, std::size_t m,
                                      std::uint32_t *out, std::size_t s) {
   const std::size_t j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1311,7 +1249,7 @@ __global__ void sample_gather_kernel(const std::uint32_t *src, std::size_t m,
   out[j] = src[idx];
 }
 
-// Assign each entry to a bucket ordinal: first pivot B[c] >= key (clamped).
+// Assign each entry to a pivot bucket.
 __global__ void bucket_assign_kernel(const std::uint32_t *keys, std::size_t m,
                                      const std::uint32_t *B, std::size_t k,
                                      std::uint32_t *out_bucket) {
@@ -1324,9 +1262,7 @@ __global__ void bucket_assign_kernel(const std::uint32_t *keys, std::size_t m,
   out_bucket[i] = static_cast<std::uint32_t>(c);
 }
 
-// For routing method B: after the batch is sorted, each run i owns the
-// contiguous slice (boundary[i-1], boundary[i]] = [begin,end). The last run
-// takes the remainder so nothing is dropped (matches the routing clamp).
+// Find each run's slice in the sorted batch.
 __global__ void run_slice_bounds_kernel(const std::uint32_t *keys,
                                         std::size_t m,
                                         const std::uint32_t *boundary,
@@ -1342,8 +1278,7 @@ __global__ void run_slice_bounds_kernel(const std::uint32_t *keys,
   out_end[i] = static_cast<std::uint32_t>(e);
 }
 
-// For routing method B fast path: one block per run copies its sorted slice
-// [begin,end) directly into the run block (coalesced, no per-element routing).
+// Copy each sorted slice into its run block.
 __global__ void rl_pull_fast_kernel(
     const std::uint8_t *is_fast, const std::uint32_t *run_begin,
     const std::uint32_t *run_end, const std::uint32_t *run_start,
@@ -1394,8 +1329,7 @@ public:
   }
 
   ~GPULSMOpt() {
-    // A background drain may still be running; it must finish before we free
-    // any device memory it touches.
+    // Finish pending drain before freeing device memory.
     join_pending_drain();
   }
 
@@ -1437,7 +1371,7 @@ public:
 #endif
       need_drain = drain_needed_locked(stream);
     }
-    // Step 4: the append is done and timed; kick the drain off the hot path.
+    // Launch drain after append.
     if (need_drain)
       launch_background_drain();
   }
@@ -1449,8 +1383,7 @@ public:
     bool need_drain = false;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-      // Deferred tombstone: append a delete marker via the shared insert path.
-      // Values are unused for tombstones (batch.keys reused as a valid pointer).
+      // Append tombstones through the insert path.
       insert_records(batch.keys, batch.keys,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
                      batch.count, stream);
@@ -1470,10 +1403,7 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // #1: range/count/successor read the run layer + tier-2 + sheet DIRECTLY --
-  // no forced merge-down, no mutation, so they take only a shared lock. The
-  // overlay is flattened once per query batch into two sorted distinct key
-  // arrays (live inserts, tombstones) and combined with the sheet's prefix sums.
+  // Range APIs read through a flattened overlay.
   void count(const DeviceRangeBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
@@ -1818,10 +1748,7 @@ private:
     seg_cand_group_sort_.resize(count);
   }
 
-  // Merge sorted, distinct insert survivors sitting in scratch_incoming_keys_/
-  // scratch_incoming_values_ (count = incoming_count) into the segmented sheet.
-  // Shared by the v2 tier-2 merge-down (see merge_down). Does not clear the run
-  // layer; that is the caller's responsibility.
+  // Merge insert survivors into the segmented sheet.
   void merge_incoming_into_sheet(std::size_t incoming_count,
                                  cudaStream_t stream) {
     if (incoming_count == 0)
@@ -1951,7 +1878,7 @@ private:
       upload_vec(seg_d_dirty_in_end_, s_in_end, stream);
       upload_vec(seg_d_candidate_offset_, s_cand_off, stream);
 
-      // Gather candidates (old sheet records seq 0 + incoming seq 1).
+      // Gather old and incoming segment records.
       resize_seg_candidates(candidate_count);
       seg_sheet_cursor_.resize(ms);
       thrust::fill(policy, seg_sheet_cursor_.begin(), seg_sheet_cursor_.end(),
@@ -2264,7 +2191,7 @@ private:
     upload_vec(seg_d_output_seg_id_, output_seg_id, stream);
     upload_vec(seg_d_out_boundary_, out_boundary, stream);
 
-    // Gather the live records from each group's source segments.
+    // Gather live records from source segments.
     resize_seg_candidates(candidate_count);
     seg_sheet_cursor_.resize(group_count);
     thrust::fill(policy, seg_sheet_cursor_.begin(), seg_sheet_cursor_.end(),
@@ -2280,7 +2207,7 @@ private:
           raw_or_null(seg_cand_value_), raw_or_null(seg_sheet_cursor_));
       CUDA_CHECK(cudaGetLastError());
 
-      // Order each group's slice by key
+      // Order each group by key.
       const int block = 256;
       const int grid = static_cast<int>((candidate_count + block - 1) / block);
       gpulsmopt_detail::seg_merge_sort_keys_kernel<<<grid, block, 0, stream>>>(
@@ -2340,17 +2267,11 @@ private:
     sheet_live_count_ = total;
   }
 
-  // ======================================================================
-  // v2 run layer (disjoint, unsorted, tombstone-append) + tier-2 + merge-down
-  // ======================================================================
+  // Run layer and merge-down state.
 
-  // Flush the run layer to a tier-2 generation once its live entries exceed
-  // this; small enough to keep the run layer a bounded working set.
+  // Run flush budget.
   std::size_t run_flush_budget() const {
-    // Step 3: buffer a large working set before draining to the sheet. Capped
-    // at 3/4 of the current run-layer capacity so drain-first (maybe_drain_
-    // before) always fires BEFORE the runs fill up, avoiding a mass split; and
-    // never more than the dictionary can hold.
+    // Keep the threshold below total run capacity.
     const std::size_t cap_total =
         h_run_block_.size() *
         static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity);
@@ -2415,13 +2336,7 @@ private:
     upload_run_directory(stream);
   }
 
-  // Route + append a batch of records (op = kInsert for insert, kTombstone for
-  // erase) into the disjoint run layer. Fast runs (with room) receive their
-  // records directly; runs that would overflow are rebuilt + split.
-  //   Method A (GPULSMOPT_ROUTE_METHOD==0, default): BRUTE FORCE -- each run
-  //     scans the entire unsorted batch (O(runs*batch)) and pulls its records.
-  //   Method B (==1): radix-sort the batch once, then each run binary-searches
-  //     its contiguous slice and PULLS it (coalesced) -- the "smart" pull.
+  // Append records to the run layer.
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
                       std::size_t count, cudaStream_t stream) {
@@ -2433,7 +2348,7 @@ private:
     std::vector<std::uint32_t> h_counts(r);
 
 #if GPULSMOPT_ROUTE_METHOD == 1
-    // ---- Method B: sort once, then per-run slice bounds ----
+    // Method B: sort once, then compute run slices.
     thrust::device_vector<std::uint32_t> routeb_keys, routeb_vals;
     std::vector<std::uint32_t> h_begin(r);
     {
@@ -2467,8 +2382,7 @@ private:
     for (std::size_t i = 0; i < r; ++i)
       h_counts[i] = h_end[i] - h_begin[i];
 #else
-    // ---- Method A (brute force, O(r*count)): each run scans the whole batch
-    // and counts the records in its range. No sort, no per-element routing. ----
+    // Method A: scan the whole batch per run.
     {
       thrust::device_vector<std::uint32_t> counts(r, 0u);
       gpulsmopt_detail::rl_run_count_kernel<<<static_cast<int>(r), 256, 0,
@@ -2490,7 +2404,7 @@ private:
               ? 1u
               : 0u;
 
-    // ---- fast path: put each fast run's records into its block ----
+    // Fast path: append to runs with room.
 #if GPULSMOPT_ROUTE_METHOD == 1
     {
       thrust::device_vector<std::uint8_t> d_is_fast(is_fast);
@@ -2505,7 +2419,7 @@ private:
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 #else
-    // Method A fast path: each fast run scans the batch and appends its matches.
+    // Method A fast path.
     {
       thrust::device_vector<std::uint8_t> d_is_fast(is_fast);
       thrust::device_vector<std::uint32_t> d_oldsize(h_run_size_);
@@ -2523,7 +2437,7 @@ private:
       if (is_fast[i])
         h_run_size_[i] += h_counts[i];
 
-    // ---- slow path: rebuild + split overflowing runs ----
+    // Slow path: rebuild overflowing runs.
     std::vector<std::uint32_t> nb, nbd, nsz;
     nb.reserve(r);
     nbd.reserve(r);
@@ -2542,7 +2456,7 @@ private:
       rebuild_run_contiguous(i, keys + h_begin[i], vals + h_begin[i], op,
                              h_counts[i], stream, nb, nbd, nsz);
 #else
-      // Method A: scan the batch to gather this run's records, then rebuild.
+      // Method A overflow rebuild.
       const std::uint32_t inc = h_counts[i];
       gk_tmp.resize(inc);
       gv_tmp.resize(inc);
@@ -2569,8 +2483,7 @@ private:
     upload_run_directory(stream);
   }
 
-  // Copy the combined range gk/gv/gop[off,off+len) into a fresh run block and
-  // record it in nb/nbd/nsz with the given boundary.
+  // Copy one run into a fresh block.
   void emit_run(thrust::device_vector<std::uint32_t> &gk,
                 thrust::device_vector<std::uint32_t> &gv,
                 thrust::device_vector<std::uint8_t> &gop, std::size_t off,
@@ -2592,12 +2505,7 @@ private:
     nsz.push_back(len);
   }
 
-  // #3: split m combined entries (gk/gv/gop, arrival = index order) into
-  // disjoint, INTERNALLY-UNSORTED runs of <= run_target_fill_ via a sampled-
-  // quantile bucket partition -- no full sort of the payload. Same-key entries
-  // (an insert plus a later tombstone) share a bucket, so runs stay disjoint
-  // without deduping (duplicates are resolved at lookup / merge). Falls back to
-  // a full sort+dedup split if a bucket would overflow (rare, skewed keys).
+  // Split combined entries into bounded runs.
   void split_entries_into_runs(thrust::device_vector<std::uint32_t> &gk,
                                thrust::device_vector<std::uint32_t> &gv,
                                thrust::device_vector<std::uint8_t> &gop,
@@ -2617,7 +2525,7 @@ private:
     auto policy = thrust::cuda::par.on(stream);
     const std::size_t k = (m + target - 1) / target;
 
-    // Sampled-quantile pivots B[0..k-1] (non-decreasing, B[k-1]=top_boundary).
+    // Sampled quantile pivots.
     const std::size_t s = std::min(m, std::max<std::size_t>(k * 32, 256));
     thrust::device_vector<std::uint32_t> samp(s);
     {
@@ -2677,7 +2585,7 @@ private:
       return;
     }
 
-    // Stable group by bucket (arrival order preserved within each bucket).
+    // Stable group by bucket.
     auto payload = thrust::make_zip_iterator(
         thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
     thrust::stable_sort_by_key(policy, bucket.begin(), bucket.end(), payload);
@@ -2696,8 +2604,7 @@ private:
       nbd[last_emitted] = top_boundary; // highest run is the catch-all
   }
 
-  // Fallback / dedup split: sort combined entries by (key, arrival), keep the
-  // newest per key, and chunk into runs of run_target_fill_ (sorted runs).
+  // Sort/dedup fallback split.
   void sort_split_entries(thrust::device_vector<std::uint32_t> &gk,
                           thrust::device_vector<std::uint32_t> &gv,
                           thrust::device_vector<std::uint8_t> &gop,
@@ -2736,8 +2643,7 @@ private:
     }
   }
 
-  // Method B: rebuild an overflowing run whose incoming records are a
-  // CONTIGUOUS slice (in_keys/in_vals, length inc) of the sorted batch.
+  // Rebuild one overflowing method-B run.
   void rebuild_run_contiguous(std::size_t i, const std::uint32_t *in_keys,
                               const std::uint32_t *in_vals, std::uint8_t op,
                               std::uint32_t inc, cudaStream_t stream,
@@ -2770,9 +2676,7 @@ private:
     split_entries_into_runs(gk, gv, gop, m, old_boundary, nb, nbd, nsz, stream);
   }
 
-  // Concatenate the live run-layer entries into a new tier-2 generation and
-  // clear the run layer (keeping its directory boundaries, sizes -> 0). Cheap:
-  // no sort, no merge -- see [[gpulsmopt-run-merge-options]] Option 4.
+  // Move live runs into a tier-2 generation.
   void flush_to_tier2(cudaStream_t stream) {
     const std::size_t r = h_run_block_.size();
     std::size_t total = 0;
@@ -2814,10 +2718,7 @@ private:
     upload_run_directory(stream);
   }
 
-  // Resolved snapshot of the overlay (run layer + tier-2) for direct reads.
-  // gk holds distinct keys sorted ascending, partitioned as [inserts |
-  // tombstones]; gv the matching values (only [0,ins) meaningful). ins_prefix /
-  // tomb_* are prefix sums used by the range/count/successor kernels.
+  // Resolved overlay snapshot for direct reads.
   struct OverlayReadIndex {
     thrust::device_vector<std::uint32_t> gk, gv;
     thrust::device_vector<std::uint8_t> gop;
@@ -2827,10 +2728,7 @@ private:
     thrust::device_vector<std::uint32_t> tomb_cnt_prefix; // size (u-ins)+1
   };
 
-  // Gather run layer + all tier-2 generations and resolve every key to its
-  // newest op across layers (READ ONLY -- no flush, no sheet mutation). Outputs
-  // distinct keys sorted ascending into gk/gv/gop, partitioned [inserts (u=ins)
-  // | tombstones]. Run-layer entries carry the highest arrival (newest).
+  // Resolve overlay entries newest-first by key.
   void resolve_overlay(thrust::device_vector<std::uint32_t> &gk,
                        thrust::device_vector<std::uint32_t> &gv,
                        thrust::device_vector<std::uint8_t> &gop, std::size_t &u,
@@ -2893,7 +2791,7 @@ private:
     ins = static_cast<std::size_t>(mid - beg);
   }
 
-  // Build the per-query-batch overlay index used by range/count/successor.
+  // Build the overlay read index.
   void build_overlay_read_index(OverlayReadIndex &ix, cudaStream_t stream) {
     resolve_overlay(ix.gk, ix.gv, ix.gop, ix.u, ix.ins, stream);
     auto policy = thrust::cuda::par.on(stream);
@@ -2922,11 +2820,7 @@ private:
     }
   }
 
-  // #2: collapse the run layer back to a single empty root run (freeing the
-  // accumulated split blocks). Called after a merge-down so the run directory
-  // stays small -- smaller routing / host-device uploads on subsequent inserts
-  // (an insert-positive realization of the hot-range overlay; true gap-routed
-  // cold-skip was declined to protect the insert path, see [[gpulsmopt-priority-insertion-speed]]).
+  // Reset the run layer to one empty root run.
   void reset_run_layer_to_root(cudaStream_t stream) {
     for (std::uint32_t b : h_run_block_)
       run_free_ids_.push_back(b);
@@ -2938,11 +2832,7 @@ private:
     upload_run_directory(stream);
   }
 
-  // Step 1: after a drain, keep the disjoint run RANGES (blocks + boundaries)
-  // and just empty them (size -> 0). The next insert then routes into the
-  // existing partition and APPENDS, instead of collapsing to one root run and
-  // re-splitting its whole batch from scratch. If the layer somehow has no
-  // runs, fall back to a fresh root.
+  // Clear run sizes while keeping boundaries.
   void clear_run_layer_keep_boundaries(cudaStream_t stream) {
     if (h_run_block_.empty()) {
       reset_run_layer_to_root(stream);
@@ -2953,9 +2843,7 @@ private:
     upload_run_directory(stream);
   }
 
-  // Flatten the run layer + all tier-2 generations into the disjoint sheet:
-  // resolve every key to its newest op across layers, delete tombstoned keys
-  // from the sheet, merge insert survivors in, then collapse the overlay.
+  // Merge overlay entries into the segmented sheet.
   void merge_down(cudaStream_t stream) {
     thrust::device_vector<std::uint32_t> gk, gv;
     thrust::device_vector<std::uint8_t> gop;
@@ -2997,36 +2885,23 @@ private:
     clear_run_layer_keep_boundaries(stream);
   }
 
-  // Step 4: block until any in-flight background drain has finished. Called
-  // before every mutation so the run layer / sheet are quiescent, and before
-  // relaunching a drain so we keep at most one in flight (single-buffered).
-  // Reads don't need this explicitly -- their shared_lock already waits on the
-  // drain worker's unique_lock. NOTE: single-writer assumption (FliX drives
-  // ops sequentially); concurrent mutators would need a guard around get().
+  // Wait for any in-flight drain.
   void join_pending_drain() const {
     if (pending_drain_.valid())
       pending_drain_.get(); // waits and rethrows any worker-side exception
   }
 
-  // Step 4: run merge_down on a worker thread + private stream so the calling
-  // insert() returns as soon as the append is done. The worker takes the unique
-  // lock, so the next read/mutation transparently waits for it (deferred, LSM-
-  // style compaction). run_live_total_ was already >= budget when launched.
+  // Launch merge_down on a worker thread.
   void launch_background_drain() {
     pending_drain_ = std::async(std::launch::async, [this]() {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-      // Run on the default stream (the lock serializes it against all other
-      // ops, so no cross-stream hazards inside merge_down). The trailing sync
-      // guarantees the sheet is fully updated before the lock is released.
+      // Serialize worker work on the default stream.
       merge_down(0);
       CUDA_CHECK(cudaStreamSynchronize(0));
     });
   }
 
-  // Decide (under the lock) whether the run layer needs draining. Default
-  // (tier-2 off): report true so the caller launches a BACKGROUND drain. With
-  // tier-2 enabled: fall back to the original synchronous flush/merge here and
-  // report false.
+  // Decide whether the run layer should drain.
   bool drain_needed_locked(cudaStream_t stream) {
 #if GPULSMOPT_ENABLE_TIER2
     maybe_flush_and_merge(stream);
@@ -3039,15 +2914,13 @@ private:
 
   void maybe_flush_and_merge(cudaStream_t stream) {
 #if GPULSMOPT_ENABLE_TIER2
-    // ---- original two-stage path: L1 -> tier-2 -> sheet ----
+    // Tier-2 path.
     if (run_live_total_ >= run_flush_budget())
       flush_to_tier2(stream);
     if (tier2_.size() >= gpulsmopt_detail::kTier2Fanout)
       merge_down(stream);
 #else
-    // ---- tier-2 disabled: L1 drains straight to the sheet ----
-    // merge_down() resolves the run layer (tier-2 empty) to newest-per-key and
-    // applies it to the sheet, then resets the run layer to a single root.
+    // Direct sheet drain.
     if (run_live_total_ < run_flush_budget())
       return;
 #ifdef GPULSMOPT_PROFILE_INSERT
@@ -3069,7 +2942,7 @@ private:
 #endif
   }
 
-  // Point lookup across run layer (newest) -> tier-2 (newest gen first) -> sheet.
+  // Layered point lookup.
   void lookup_layered(const DeviceLookupBatch &batch, cudaStream_t stream) {
     const std::size_t n = batch.count;
     CUDA_CHECK(cudaMemsetAsync(batch.out_found, 0, n * sizeof(std::uint8_t),
@@ -3081,8 +2954,7 @@ private:
                                n * sizeof(std::uint8_t), stream));
     const int block = 256;
     const int grid = static_cast<int>((n + block - 1) / block);
-    // #4b: warp-per-query for the unsorted run/tier-2 layers (32 lanes scan a
-    // block cooperatively); one warp per query -> grid over warps.
+    // Warp-per-query overlay lookup.
     const int warps_per_block = block / 32;
     const int warp_grid =
         static_cast<int>((n + warps_per_block - 1) / warps_per_block);
@@ -3120,22 +2992,17 @@ private:
 
   std::size_t run_layer_live() const { return run_live_total_; }
 
-  // ---- Configuration -----------------------------------------------------
+  // Configuration.
   std::size_t max_elements_ = 0;
   std::size_t batch_size_ = 0;
   std::uint32_t target_fill_ = 23;
   std::uint32_t target_segment_live_ = 0;
   std::size_t sheet_live_count_ = 0;
   mutable std::shared_mutex snapshot_mutex_;
-  // Step 4: background drain. The worker runs merge_down while holding
-  // snapshot_mutex_, so any later read/mutation waits for it via the lock.
-  // pending_drain_ is mutable so const readers can join it.
+  // Background drain handle.
   mutable std::future<void> pending_drain_;
 
-  // ---- v2 run layer: disjoint, unsorted, tombstone-append -----------------
-  // Each run occupies one block of kRunCapacity slots in run_pool_*; entries
-  // [0, h_run_size_[ord]) are live and UNSORTED. Runs own disjoint key ranges;
-  // h_run_boundary_[ord] is the inclusive upper key bound used for routing.
+  // Run layer state.
   std::size_t run_pool_capacity_ = 0; // number of allocatable run blocks
   std::vector<std::uint32_t> run_free_ids_;
   thrust::device_vector<std::uint32_t> run_pool_keys_;
@@ -3151,11 +3018,7 @@ private:
   std::size_t run_live_total_ = 0;                   // live entries across runs
   std::uint32_t run_target_fill_ = 0;                // fill per run after split
 
-  // ---- v2 tier-2: bounded set of overlapping concatenated generations -----
-  // Each generation is a flushed snapshot of the run layer, stored as its runs
-  // concatenated (still unsorted) with a per-generation mini directory of
-  // sub-block boundaries. Capped at kTier2Fanout; merge-down flattens into the
-  // disjoint sheet. See [[gpulsmopt-run-merge-options]].
+  // Tier-2 generation state.
   struct Tier2Gen {
     thrust::device_vector<std::uint32_t> keys;
     thrust::device_vector<std::uint32_t> values;
@@ -3168,7 +3031,7 @@ private:
   };
   std::vector<Tier2Gen> tier2_;
 
-  // ---- Segmented bottom layer state --------------------------------------
+  // Segmented bottom layer state.
   std::size_t pool_capacity_ = 0;
   std::vector<std::uint32_t> free_ids_;
   thrust::device_vector<std::uint32_t> pool_keys_;
@@ -3187,12 +3050,12 @@ private:
   thrust::device_vector<std::uint32_t> d_dir_value_sum_;
   thrust::device_vector<std::uint32_t> d_dir_value_prefix_;
 
-  // ---- merge-down scratch ------------------------------------------------
+  // Merge-down scratch.
   thrust::device_vector<std::uint32_t> scratch_incoming_keys_;
   thrust::device_vector<std::uint32_t> scratch_incoming_values_;
   thrust::device_vector<std::uint32_t> scratch_delete_keys_;
 
-  // ---- Drain / merge device scratch --------------------------------------
+  // Drain and merge scratch.
   thrust::device_vector<std::uint32_t> seg_inc_ordinal_;
   thrust::device_vector<std::uint32_t> seg_dirty_ord_;
   thrust::device_vector<std::uint32_t> seg_dirty_count_;
@@ -3229,6 +3092,6 @@ private:
   thrust::device_vector<std::uint32_t> seg_cand_seq_sort_;
   thrust::device_vector<std::uint64_t> seg_cand_group_sort_;
 
-  // ---- lookup scratch (per-query "answered" flags) -----------------------
+  // Lookup scratch.
   thrust::device_vector<std::uint8_t> scratch_query_found_;
 };
