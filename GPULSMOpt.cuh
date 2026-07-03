@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
@@ -74,13 +75,31 @@ namespace gpulsmopt_detail {
 // ---- v2 rewrite knobs (disjoint unsorted runs + tier-2 + sheet) ----------
 // Slots per run block. Runs are unsorted and scanned by compute sized to the
 // run, so this bounds the scan cost; splits keep runs at/under it.
+// "Fatter runs" (Step 2): a large capacity keeps the run COUNT small, so
+// routing is cheap (few disjoint ranges) and a bulk insert mostly APPENDS
+// (fast path) instead of shattering into thousands of tiny runs + splits.
 #ifndef GPULSMOPT_RUN_CAPACITY
-#define GPULSMOPT_RUN_CAPACITY 8192
+#define GPULSMOPT_RUN_CAPACITY (1 << 22)
 #endif
 // Max number of overlapping tier-2 generations before a merge-down flattens
 // them into the disjoint sheet (bounds read amplification).
 #ifndef GPULSMOPT_TIER2_FANOUT
 #define GPULSMOPT_TIER2_FANOUT 4
+#endif
+// Drain-rarely budget (Step 3): the run layer buffers up to this many live
+// entries before draining to the sheet. Large => the expensive sheet merge
+// is amortized over many inserts instead of firing every step. Reads scan the
+// buffered (unsorted) runs meanwhile, so this trades read cost for insert cost.
+#ifndef GPULSMOPT_RUN_FLUSH_BUDGET
+#define GPULSMOPT_RUN_FLUSH_BUDGET (1 << 26)
+#endif
+// Tier-2 (L2) write-combining buffer. Disabled (0) => the run layer (L1)
+// drains STRAIGHT to the sheet: no intermediate flush-copy, no overlapping
+// generations to scan on reads. Set to 1 to restore the two-stage
+// flush->tier2->merge path (worth it only for churn/update-heavy workloads
+// where combining cancels writes before they reach the sheet).
+#ifndef GPULSMOPT_ENABLE_TIER2
+#define GPULSMOPT_ENABLE_TIER2 0
 #endif
 // Batch->run routing method (both run-centric; benchmark A vs B):
 //   0 = BRUTE FORCE, O(runs*batch): each run scans the whole unsorted batch and
@@ -88,9 +107,11 @@ namespace gpulsmopt_detail {
 //   1 = SMART, sort the batch once, then each run binary-searches its slice and
 //       pulls it (coalesced). Trades a radix sort for O(log) per-run lookup.
 // The experiment: does the dumb O(runs*batch) scan beat the sorted pull on the
-// GPU? See [[gpulsmopt-compute-scales-with-size]].
+// GPU? See [[gpulsmopt-compute-scales-with-size]]. Answer at the bulky/fat-run
+// operating point: B wins decisively (A launches one block per run and starves
+// the GPU when runs are few), so B is the default. Force A with =0.
 #ifndef GPULSMOPT_ROUTE_METHOD
-#define GPULSMOPT_ROUTE_METHOD 0
+#define GPULSMOPT_ROUTE_METHOD 1
 #endif
 
 constexpr int kBucketSlots = 32;
@@ -1372,7 +1393,14 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(0));
   }
 
+  ~GPULSMOpt() {
+    // A background drain may still be running; it must finish before we free
+    // any device memory it touches.
+    join_pending_drain();
+  }
+
   void clear(cudaStream_t stream) {
+    join_pending_drain();
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     reset_directory_to_root(stream);
@@ -1383,30 +1411,60 @@ public:
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    insert_records(batch.keys, batch.values,
-                   static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
-                   batch.count, stream);
-    maybe_flush_and_merge(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    join_pending_drain(); // finish any prior background drain before mutating
+    bool need_drain = false;
+    {
+      std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+#ifdef GPULSMOPT_PROFILE_INSERT
+      cudaEvent_t ia, ib;
+      cudaEventCreate(&ia);
+      cudaEventCreate(&ib);
+      cudaEventRecord(ia, stream);
+#endif
+      insert_records(batch.keys, batch.values,
+                     static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
+                     batch.count, stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+#ifdef GPULSMOPT_PROFILE_INSERT
+      cudaEventRecord(ib, stream);
+      cudaEventSynchronize(ib);
+      float t_records = 0.f;
+      cudaEventElapsedTime(&t_records, ia, ib);
+      printf("[prof] insert %zu keys: insert_records=%.3f ms  runs_after=%zu\n",
+             batch.count, t_records, h_run_block_.size());
+      cudaEventDestroy(ia);
+      cudaEventDestroy(ib);
+#endif
+      need_drain = drain_needed_locked(stream);
+    }
+    // Step 4: the append is done and timed; kick the drain off the hot path.
+    if (need_drain)
+      launch_background_drain();
   }
 
   void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    // Deferred tombstone: append a delete marker via the shared insert path.
-    // Values are unused for tombstones (batch.keys reused as a valid pointer).
-    insert_records(batch.keys, batch.keys,
-                   static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
-                   batch.count, stream);
-    maybe_flush_and_merge(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    join_pending_drain();
+    bool need_drain = false;
+    {
+      std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+      // Deferred tombstone: append a delete marker via the shared insert path.
+      // Values are unused for tombstones (batch.keys reused as a valid pointer).
+      insert_records(batch.keys, batch.keys,
+                     static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
+                     batch.count, stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      need_drain = drain_needed_locked(stream);
+    }
+    if (need_drain)
+      launch_background_drain();
   }
 
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
+    join_pending_drain(); // absorb any backgrounded drain here, not on inserts
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     lookup_layered(batch, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1419,6 +1477,7 @@ public:
   void count(const DeviceRangeBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
+    join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     OverlayReadIndex ix;
     build_overlay_read_index(ix, stream);
@@ -1439,6 +1498,7 @@ public:
   void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
+    join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     OverlayReadIndex ix;
     build_overlay_read_index(ix, stream);
@@ -1457,6 +1517,7 @@ public:
   void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
     if (batch.query_count == 0)
       return;
+    join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     OverlayReadIndex ix;
     build_overlay_read_index(ix, stream);
@@ -1478,18 +1539,21 @@ public:
   }
 
   void cleanup(cudaStream_t stream) {
+    join_pending_drain();
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     merge_down(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
   void maintain(cudaStream_t stream) {
+    join_pending_drain();
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     merge_down(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
   void drain_to_sheet(cudaStream_t stream) {
+    join_pending_drain();
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     merge_down(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2283,8 +2347,18 @@ private:
   // Flush the run layer to a tier-2 generation once its live entries exceed
   // this; small enough to keep the run layer a bounded working set.
   std::size_t run_flush_budget() const {
-    const std::size_t base = batch_size_ ? batch_size_ * 4 : (std::size_t{1} << 20);
-    return std::max<std::size_t>(base, std::size_t{1} << 16);
+    // Step 3: buffer a large working set before draining to the sheet. Capped
+    // at 3/4 of the current run-layer capacity so drain-first (maybe_drain_
+    // before) always fires BEFORE the runs fill up, avoiding a mass split; and
+    // never more than the dictionary can hold.
+    const std::size_t cap_total =
+        h_run_block_.size() *
+        static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity);
+    std::size_t budget = std::min<std::size_t>(
+        static_cast<std::size_t>(GPULSMOPT_RUN_FLUSH_BUDGET), cap_total * 3 / 4);
+    if (max_elements_ > 0)
+      budget = std::min(budget, max_elements_);
+    return std::max<std::size_t>(budget, std::size_t{1} << 16);
   }
 
   void grow_run_pool(std::size_t new_capacity) {
@@ -2864,6 +2938,21 @@ private:
     upload_run_directory(stream);
   }
 
+  // Step 1: after a drain, keep the disjoint run RANGES (blocks + boundaries)
+  // and just empty them (size -> 0). The next insert then routes into the
+  // existing partition and APPENDS, instead of collapsing to one root run and
+  // re-splitting its whole batch from scratch. If the layer somehow has no
+  // runs, fall back to a fresh root.
+  void clear_run_layer_keep_boundaries(cudaStream_t stream) {
+    if (h_run_block_.empty()) {
+      reset_run_layer_to_root(stream);
+      return;
+    }
+    std::fill(h_run_size_.begin(), h_run_size_.end(), 0u);
+    run_live_total_ = 0;
+    upload_run_directory(stream);
+  }
+
   // Flatten the run layer + all tier-2 generations into the disjoint sheet:
   // resolve every key to its newest op across layers, delete tombstoned keys
   // from the sheet, merge insert survivors in, then collapse the overlay.
@@ -2905,14 +2994,79 @@ private:
       }
     }
     tier2_.clear();
-    reset_run_layer_to_root(stream);
+    clear_run_layer_keep_boundaries(stream);
+  }
+
+  // Step 4: block until any in-flight background drain has finished. Called
+  // before every mutation so the run layer / sheet are quiescent, and before
+  // relaunching a drain so we keep at most one in flight (single-buffered).
+  // Reads don't need this explicitly -- their shared_lock already waits on the
+  // drain worker's unique_lock. NOTE: single-writer assumption (FliX drives
+  // ops sequentially); concurrent mutators would need a guard around get().
+  void join_pending_drain() const {
+    if (pending_drain_.valid())
+      pending_drain_.get(); // waits and rethrows any worker-side exception
+  }
+
+  // Step 4: run merge_down on a worker thread + private stream so the calling
+  // insert() returns as soon as the append is done. The worker takes the unique
+  // lock, so the next read/mutation transparently waits for it (deferred, LSM-
+  // style compaction). run_live_total_ was already >= budget when launched.
+  void launch_background_drain() {
+    pending_drain_ = std::async(std::launch::async, [this]() {
+      std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+      // Run on the default stream (the lock serializes it against all other
+      // ops, so no cross-stream hazards inside merge_down). The trailing sync
+      // guarantees the sheet is fully updated before the lock is released.
+      merge_down(0);
+      CUDA_CHECK(cudaStreamSynchronize(0));
+    });
+  }
+
+  // Decide (under the lock) whether the run layer needs draining. Default
+  // (tier-2 off): report true so the caller launches a BACKGROUND drain. With
+  // tier-2 enabled: fall back to the original synchronous flush/merge here and
+  // report false.
+  bool drain_needed_locked(cudaStream_t stream) {
+#if GPULSMOPT_ENABLE_TIER2
+    maybe_flush_and_merge(stream);
+    return false;
+#else
+    (void)stream;
+    return run_live_total_ >= run_flush_budget();
+#endif
   }
 
   void maybe_flush_and_merge(cudaStream_t stream) {
+#if GPULSMOPT_ENABLE_TIER2
+    // ---- original two-stage path: L1 -> tier-2 -> sheet ----
     if (run_live_total_ >= run_flush_budget())
       flush_to_tier2(stream);
     if (tier2_.size() >= gpulsmopt_detail::kTier2Fanout)
       merge_down(stream);
+#else
+    // ---- tier-2 disabled: L1 drains straight to the sheet ----
+    // merge_down() resolves the run layer (tier-2 empty) to newest-per-key and
+    // applies it to the sheet, then resets the run layer to a single root.
+    if (run_live_total_ < run_flush_budget())
+      return;
+#ifdef GPULSMOPT_PROFILE_INSERT
+    cudaEvent_t pa, pb;
+    cudaEventCreate(&pa);
+    cudaEventCreate(&pb);
+    cudaEventRecord(pa, stream);
+    merge_down(stream);
+    cudaEventRecord(pb, stream);
+    cudaEventSynchronize(pb);
+    float t_merge = 0.f;
+    cudaEventElapsedTime(&t_merge, pa, pb);
+    printf("[prof]   merge_down (L1->sheet, tier2 off)=%.3f ms\n", t_merge);
+    cudaEventDestroy(pa);
+    cudaEventDestroy(pb);
+#else
+    merge_down(stream);
+#endif
+#endif
   }
 
   // Point lookup across run layer (newest) -> tier-2 (newest gen first) -> sheet.
@@ -2973,6 +3127,10 @@ private:
   std::uint32_t target_segment_live_ = 0;
   std::size_t sheet_live_count_ = 0;
   mutable std::shared_mutex snapshot_mutex_;
+  // Step 4: background drain. The worker runs merge_down while holding
+  // snapshot_mutex_, so any later read/mutation waits for it via the lock.
+  // pending_drain_ is mutable so const readers can join it.
+  mutable std::future<void> pending_drain_;
 
   // ---- v2 run layer: disjoint, unsorted, tombstone-append -----------------
   // Each run occupies one block of kRunCapacity slots in run_pool_*; entries
