@@ -82,9 +82,13 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_TIER2_FANOUT
 #define GPULSMOPT_TIER2_FANOUT 4
 #endif
-// Batch->run routing method: 0 = element-route (no batch sort),
-// 1 = run-pull (requires a radix sort of the batch). Both implemented so we
-// can benchmark; see [[gpulsmopt-compute-scales-with-size]].
+// Batch->run routing method (both run-centric; benchmark A vs B):
+//   0 = BRUTE FORCE, O(runs*batch): each run scans the whole unsorted batch and
+//       pulls the records in its range. No batch sort.
+//   1 = SMART, sort the batch once, then each run binary-searches its slice and
+//       pulls it (coalesced). Trades a radix sort for O(log) per-run lookup.
+// The experiment: does the dumb O(runs*batch) scan beat the sorted pull on the
+// GPU? See [[gpulsmopt-compute-scales-with-size]].
 #ifndef GPULSMOPT_ROUTE_METHOD
 #define GPULSMOPT_ROUTE_METHOD 0
 #endif
@@ -864,35 +868,6 @@ __global__ void seg_merge_sort_keys_kernel(const std::uint32_t *cand_seg,
 
 
 
-__global__ void range_sheet_sum_kernel(
-    const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_sums,
-    std::uint32_t *out_counts, std::size_t query_count,
-    const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
-    const std::uint32_t *dir_prefix, const std::uint32_t *dir_value_prefix,
-    std::size_t dir_count, const std::uint32_t *pool_keys,
-    const std::uint32_t *pool_values, const std::uint8_t *pool_valid,
-    const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
-    const std::uint32_t *seg_bucket_value_sum) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= query_count)
-    return;
-  if (lo[i] > hi[i]) {
-    out_sums[i] = 0;
-    if (out_counts)
-      out_counts[i] = 0;
-    return;
-  }
-  out_sums[i] = seg_sheet_range_sum(
-      lo[i], hi[i], dir_boundary, dir_seg_id, dir_value_prefix, dir_count,
-      pool_keys, pool_values, pool_valid, seg_bucket_max, seg_bucket_value_sum);
-  if (out_counts) {
-    out_counts[i] = seg_sheet_range_count(
-        lo[i], hi[i], dir_boundary, dir_seg_id, dir_prefix, dir_count,
-        pool_keys, pool_valid, seg_bucket_max, seg_bucket_live);
-  }
-}
-
-
 // Smallest key >= q stored in one segment, or kEmptyKey if none.
 __device__ inline std::uint32_t seg_segment_ceiling(
     std::uint32_t seg_id, std::uint32_t q, const std::uint32_t *pool_keys,
@@ -933,63 +908,6 @@ seg_sheet_ceiling(std::uint32_t q, const std::uint32_t *dir_boundary,
   return best;
 }
 
-constexpr int kSuccessorCachedRuns = 32;
-
-
-
-
-__global__ void distinct_count_kernel(
-    const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_counts,
-    std::size_t query_count, const std::uint32_t *dir_boundary,
-    const std::uint32_t *dir_seg_id, const std::uint32_t *dir_prefix,
-    std::size_t dir_count, const std::uint32_t *pool_keys,
-    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
-    const std::uint32_t *seg_bucket_live, const std::uint32_t *const *run_keys,
-    const std::size_t *run_sizes, std::size_t run_count) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= query_count)
-    return;
-  if (lo[i] > hi[i]) {
-    out_counts[i] = 0u;
-    return;
-  }
-  std::uint32_t count = seg_sheet_range_count(
-      lo[i], hi[i], dir_boundary, dir_seg_id, dir_prefix, dir_count, pool_keys,
-      pool_valid, seg_bucket_max, seg_bucket_live);
-  for (std::size_t r = 0; r < run_count; ++r) {
-    const std::size_t n = run_sizes[r];
-    const std::size_t begin = lower_bound_u32(run_keys[r], n, lo[i]);
-    const std::size_t end = upper_bound_u32(run_keys[r], n, hi[i]);
-    count += static_cast<std::uint32_t>(end - begin);
-  }
-  out_counts[i] = count;
-}
-
-
-
-__global__ void distinct_successor_kernel(
-    const std::uint32_t *queries, std::size_t query_count,
-    std::uint32_t *out_keys, const std::uint32_t *dir_boundary,
-    const std::uint32_t *dir_seg_id, std::size_t dir_count,
-    const std::uint32_t *pool_keys, const std::uint8_t *pool_valid,
-    const std::uint32_t *seg_bucket_max, const std::uint32_t *const *run_keys,
-    const std::size_t *run_sizes, std::size_t run_count) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= query_count)
-    return;
-  const std::uint32_t q = queries[i];
-  std::uint32_t best = seg_sheet_ceiling(q, dir_boundary, dir_seg_id, dir_count,
-                                         pool_keys, pool_valid, seg_bucket_max);
-  for (std::size_t r = 0; r < run_count; ++r) {
-    const std::size_t n = run_sizes[r];
-    const std::size_t pos = lower_bound_u32(run_keys[r], n, q);
-    if (pos < n && run_keys[r][pos] < best) {
-      best = run_keys[r][pos];
-    }
-  }
-  out_keys[i] = best == kEmptyKey ? 0u : best;
-}
-
 // ---------------------------------------------------------------------------
 // v2 run-layer primitives (disjoint, unsorted, tombstone-append).
 // A "run" is a contiguous block of kRunCapacity slots in run_pool_*; entries
@@ -1007,37 +925,6 @@ rl_route_key(const std::uint32_t *run_boundary, std::size_t run_count,
   return ord;
 }
 
-// Scan one unsorted run block for `key`. Returns true if a live entry exists;
-// writes the NEWEST match (highest slot index) to *out_value/*out_op. Distinct
-// keys mean a key appears at most as one value plus one later tombstone, so the
-// last-index match is authoritative.
-__device__ inline bool
-rl_scan_run(const std::uint32_t *run_pool_keys,
-            const std::uint32_t *run_pool_values,
-            const std::uint8_t *run_pool_ops, std::size_t block,
-            std::uint32_t size, std::uint32_t key, std::uint32_t *out_value,
-            std::uint8_t *out_op) {
-  const std::size_t base = block * static_cast<std::size_t>(kRunCapacity);
-  bool found = false;
-  for (std::uint32_t i = 0; i < size; ++i) {
-    const std::size_t pos = base + i;
-    if (run_pool_keys[pos] == key) {
-      if (out_value)
-        *out_value = run_pool_values[pos];
-      if (out_op)
-        *out_op = run_pool_ops[pos];
-      found = true; // keep scanning; later slot is newer
-    }
-  }
-  return found;
-}
-
-// Stencil predicate: select batch elements whose routed ordinal equals `v`.
-struct EqU32 {
-  std::uint32_t v;
-  __host__ __device__ bool operator()(std::uint32_t x) const { return x == v; }
-};
-
 // Partition predicate over (key,value,op) tuples: true for live inserts.
 struct TupleOpIsInsert {
   template <class Tuple>
@@ -1054,63 +941,91 @@ __global__ void rl_histogram_kernel(const std::uint32_t *ordinal, std::size_t n,
     atomicAdd(&counts[ordinal[i]], 1u);
 }
 
-// Append batch elements that route to FAST runs (runs with room). cursor[ord]
-// is pre-seeded to the run's old size; slow-run elements are skipped here and
-// handled by a rebuild/split on the host.
-__global__ void rl_append_fast_kernel(
-    const std::uint32_t *ordinal, const std::uint32_t *keys,
-    const std::uint32_t *values, std::uint8_t op, std::size_t n,
-    const std::uint8_t *is_fast, const std::uint32_t *run_start,
-    std::uint32_t *cursor, std::uint32_t *pool_keys, std::uint32_t *pool_values,
-    std::uint8_t *pool_ops) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  const std::uint32_t ord = ordinal[i];
-  if (!is_fast[ord])
-    return;
-  const std::uint32_t slot = atomicAdd(&cursor[ord], 1u);
-  const std::size_t pos = static_cast<std::size_t>(run_start[ord]) + slot;
-  pool_keys[pos] = keys[i];
-  pool_values[pos] = values[i];
-  pool_ops[pos] = op;
+// ---------------------------------------------------------------------------
+// Routing method A = BRUTE FORCE, O(runs * batch): compute is assigned per run,
+// and each run scans the ENTIRE unsorted batch to pull the records in its range
+// (boundary[run-1], boundary[run]]. No sort, no per-element routing index. This
+// is the flipped-index "locations look for the query" form; we benchmark it
+// against method B (sort once, each run binary-searches its slice) to see
+// whether the dumb-but-simple scan beats the smart sorted pull on the GPU.
+__device__ inline bool rl_in_run_range(std::uint32_t key, std::uint32_t hi,
+                                       bool has_lo, std::uint32_t lo) {
+  return key <= hi && (!has_lo || key > lo);
 }
 
-// Generic point lookup over ONE layer (run layer OR one tier-2 generation).
-// The layer is a set of disjoint, key-ordered blocks: dir_boundary[b] is the
-// inclusive upper key of block b, dir_start[b] the block's base offset into
-// keys/values/ops, dir_size[b] its live entry count. A query routes to exactly
-// one block (disjoint ranges) and scans it (unsorted, newest slot wins). On any
-// live match the query is marked answered: an insert writes value+found=1, a
-// tombstone writes found=0. Already-answered queries are skipped so callers can
-// chain layers newest -> oldest for correct recency.
-__global__ void layer_lookup_kernel(
-    const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
-    std::uint8_t *out_found, std::uint8_t *answered, const std::uint32_t *keys,
-    const std::uint32_t *values, const std::uint8_t *ops,
-    const std::uint32_t *dir_boundary, const std::uint32_t *dir_start,
-    const std::uint32_t *dir_size, std::size_t dir_count) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n || dir_count == 0 || answered[i])
+// Pass 1: one block per run counts how many batch records fall in its range.
+__global__ void rl_run_count_kernel(const std::uint32_t *keys, std::size_t n,
+                                    const std::uint32_t *boundary, std::size_t r,
+                                    std::uint32_t *counts) {
+  const std::size_t run = blockIdx.x;
+  if (run >= r)
     return;
-  const std::uint32_t key = queries[i];
-  const std::size_t ord = rl_route_key(dir_boundary, dir_count, key);
-  const std::size_t base = dir_start[ord];
-  const std::uint32_t sz = dir_size[ord];
-  bool found = false;
-  std::uint32_t val = 0;
-  std::uint8_t op = kTombstone;
-  for (std::uint32_t j = 0; j < sz; ++j) {
-    if (keys[base + j] == key) {
-      val = values[base + j];
-      op = ops[base + j];
-      found = true; // later slot is newer
+  const std::uint32_t hi = boundary[run];
+  const bool has_lo = run > 0;
+  const std::uint32_t lo = has_lo ? boundary[run - 1] : 0u;
+  std::uint32_t local = 0;
+  for (std::size_t i = threadIdx.x; i < n; i += blockDim.x)
+    if (rl_in_run_range(keys[i], hi, has_lo, lo))
+      ++local;
+  __shared__ unsigned s_cnt;
+  if (threadIdx.x == 0)
+    s_cnt = 0;
+  __syncthreads();
+  atomicAdd(&s_cnt, local);
+  __syncthreads();
+  if (threadIdx.x == 0)
+    counts[run] = s_cnt;
+}
+
+// Pass 2 (fast path): one block per FAST run scans the batch and appends its
+// matching records into the run block, at old_size + a block-local slot. Keys
+// within a single batch are distinct, so the atomic ordering among matches is
+// irrelevant; cross-batch recency is preserved by seeding at old_size.
+__global__ void rl_run_append_kernel(
+    const std::uint8_t *is_fast, const std::uint32_t *boundary,
+    const std::uint32_t *run_start, const std::uint32_t *old_size, std::size_t r,
+    const std::uint32_t *keys, const std::uint32_t *values, std::uint8_t op,
+    std::size_t n, std::uint32_t *pool_keys, std::uint32_t *pool_values,
+    std::uint8_t *pool_ops) {
+  const std::size_t run = blockIdx.x;
+  if (run >= r || !is_fast[run])
+    return;
+  const std::uint32_t hi = boundary[run];
+  const bool has_lo = run > 0;
+  const std::uint32_t lo = has_lo ? boundary[run - 1] : 0u;
+  const std::size_t dst =
+      static_cast<std::size_t>(run_start[run]) + old_size[run];
+  __shared__ unsigned s_pos;
+  if (threadIdx.x == 0)
+    s_pos = 0;
+  __syncthreads();
+  for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
+    if (rl_in_run_range(keys[i], hi, has_lo, lo)) {
+      const std::size_t o = dst + atomicAdd(&s_pos, 1u);
+      pool_keys[o] = keys[i];
+      pool_values[o] = values[i];
+      pool_ops[o] = op;
     }
   }
-  if (found) {
-    answered[i] = 1;
-    out_found[i] = (op == kInsert) ? 1u : 0u;
-    out_value[i] = (op == kInsert) ? val : 0u;
+}
+
+// Slow path: one block scans the batch and compacts a single overflowing run's
+// matching records into out_keys/out_vals for the rebuild+split.
+__global__ void rl_run_gather_kernel(const std::uint32_t *keys,
+                                     const std::uint32_t *values, std::size_t n,
+                                     std::uint32_t lo, std::uint32_t hi,
+                                     std::uint8_t has_lo, std::uint32_t *out_keys,
+                                     std::uint32_t *out_vals) {
+  __shared__ unsigned s_pos;
+  if (threadIdx.x == 0)
+    s_pos = 0;
+  __syncthreads();
+  for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
+    if (rl_in_run_range(keys[i], hi, has_lo != 0, lo)) {
+      const unsigned slot = atomicAdd(&s_pos, 1u);
+      out_keys[slot] = keys[i];
+      out_vals[slot] = values[i];
+    }
   }
 }
 
@@ -1139,6 +1054,293 @@ __global__ void sheet_lookup_answered_kernel(
   }
   out_found[i] = found ? 1u : 0u;
   out_value[i] = found ? value : 0u;
+}
+
+// ---------------------------------------------------------------------------
+// v2 point lookup over ONE layer (run layer OR one tier-2 generation), warp-
+// parallel (#4b). The layer is a set of disjoint, key-ordered blocks:
+// dir_boundary[b] is the inclusive upper key of block b, dir_start[b] its base
+// offset into keys/values/ops, dir_size[b] its live count. A query routes to
+// exactly one block and its warp's 32 lanes scan that unsorted block
+// cooperatively, picking the newest (highest slot) live match via ballot. On a
+// live match the query is answered (insert -> value+found=1, tombstone ->
+// found=0); already-answered queries are skipped so callers chain layers
+// newest -> oldest -> sheet for correct recency.
+__global__ void layer_lookup_warp_kernel(
+    const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
+    std::uint8_t *out_found, std::uint8_t *answered, const std::uint32_t *keys,
+    const std::uint32_t *values, const std::uint8_t *ops,
+    const std::uint32_t *dir_boundary, const std::uint32_t *dir_start,
+    const std::uint32_t *dir_size, std::size_t dir_count) {
+  const std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t q = tid / warpSize;
+  const unsigned lane = threadIdx.x & (warpSize - 1);
+  if (q >= n || dir_count == 0 || answered[q])
+    return;
+  const std::uint32_t key = queries[q];
+  const std::size_t ord = rl_route_key(dir_boundary, dir_count, key);
+  const std::size_t base = dir_start[ord];
+  const std::uint32_t sz = dir_size[ord];
+  unsigned last_mask = 0;
+  std::uint32_t last_j0 = 0;
+  for (std::uint32_t j0 = 0; j0 < sz; j0 += warpSize) {
+    const std::uint32_t idx = j0 + lane;
+    const bool match = (idx < sz) && (keys[base + idx] == key);
+    const unsigned m = __ballot_sync(0xffffffffu, match);
+    if (m) {
+      last_mask = m;
+      last_j0 = j0;
+    }
+  }
+  if (last_mask == 0)
+    return; // not in this layer; leave for older layers / sheet
+  const unsigned newest_lane = 31u - __clz(last_mask);
+  std::uint32_t val = 0;
+  int op = kTombstone;
+  if (lane == newest_lane) {
+    const std::size_t pos = base + last_j0 + lane;
+    val = values[pos];
+    op = ops[pos];
+  }
+  val = __shfl_sync(0xffffffffu, val, newest_lane);
+  op = __shfl_sync(0xffffffffu, op, newest_lane);
+  if (lane == 0) {
+    answered[q] = 1;
+    out_found[q] = (op == kInsert) ? 1u : 0u;
+    out_value[q] = (op == kInsert) ? val : 0u;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v2 upgrade #1: direct layered range/count/successor over a pre-resolved
+// overlay snapshot (run layer + tier-2 flattened once per query batch into two
+// sorted, distinct key arrays: live inserts and tombstones). No mutation of the
+// structure -- reads only, so range/count/successor no longer force a merge.
+//
+// prefix[] has n+1 entries; prefix[j] = sum of the first j values. Range over
+// [lo,hi] = prefix[upper_bound(keys,hi)] - prefix[lower_bound(keys,lo)].
+__device__ inline std::uint32_t
+overlay_prefix_range(const std::uint32_t *prefix, const std::uint32_t *keys,
+                     std::size_t n, std::uint32_t lo, std::uint32_t hi) {
+  if (n == 0)
+    return 0;
+  const std::size_t b = lower_bound_u32(keys, n, lo);
+  const std::size_t e = upper_bound_u32(keys, n, hi);
+  return prefix[e] - prefix[b];
+}
+__device__ inline std::uint32_t overlay_count_range(const std::uint32_t *keys,
+                                                    std::size_t n,
+                                                    std::uint32_t lo,
+                                                    std::uint32_t hi) {
+  if (n == 0)
+    return 0;
+  const std::size_t b = lower_bound_u32(keys, n, lo);
+  const std::size_t e = upper_bound_u32(keys, n, hi);
+  return static_cast<std::uint32_t>(e - b);
+}
+
+// Point-lookup each key in the sheet; write its live value (0 if absent) and a
+// present flag. Used to price tombstones that shadow a value already in the
+// sheet (subtract on range-sum / range-count).
+__global__ void sheet_point_values_kernel(
+    const std::uint32_t *keys, std::size_t n, const std::uint32_t *dir_boundary,
+    const std::uint32_t *dir_seg_id, std::size_t dir_count,
+    const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
+    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
+    std::uint32_t *out_val, std::uint32_t *out_flag) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  std::uint32_t v = 0;
+  bool f = false;
+  if (dir_count > 0) {
+    std::size_t ord = lower_bound_u32(dir_boundary, dir_count, keys[i]);
+    if (ord >= dir_count)
+      ord = dir_count - 1;
+    f = seg_point_lookup(dir_seg_id[ord], keys[i], pool_keys, pool_values,
+                         pool_valid, seg_bucket_max, &v);
+  }
+  out_val[i] = f ? v : 0u;
+  out_flag[i] = f ? 1u : 0u;
+}
+
+// Range sum (+ optional count) over sheet + overlay. sum = sheet_sum + overlay
+// live inserts in range - sheet value of overlay-tombstoned keys in range.
+__global__ void range_overlay_kernel(
+    const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_sums,
+    std::uint32_t *out_counts, std::size_t query_count,
+    const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
+    const std::uint32_t *dir_prefix, const std::uint32_t *dir_value_prefix,
+    std::size_t dir_count, const std::uint32_t *pool_keys,
+    const std::uint32_t *pool_values, const std::uint8_t *pool_valid,
+    const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *seg_bucket_value_sum, const std::uint32_t *ins_keys,
+    const std::uint32_t *ins_prefix, std::size_t ins_count,
+    const std::uint32_t *tomb_keys, const std::uint32_t *tomb_val_prefix,
+    const std::uint32_t *tomb_cnt_prefix, std::size_t tomb_count) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= query_count)
+    return;
+  const std::uint32_t l = lo[i], h = hi[i];
+  if (l > h) {
+    out_sums[i] = 0;
+    if (out_counts)
+      out_counts[i] = 0;
+    return;
+  }
+  std::uint32_t sum = seg_sheet_range_sum(
+      l, h, dir_boundary, dir_seg_id, dir_value_prefix, dir_count, pool_keys,
+      pool_values, pool_valid, seg_bucket_max, seg_bucket_value_sum);
+  sum += overlay_prefix_range(ins_prefix, ins_keys, ins_count, l, h);
+  sum -= overlay_prefix_range(tomb_val_prefix, tomb_keys, tomb_count, l, h);
+  out_sums[i] = sum;
+  if (out_counts) {
+    std::uint32_t c = seg_sheet_range_count(l, h, dir_boundary, dir_seg_id,
+                                            dir_prefix, dir_count, pool_keys,
+                                            pool_valid, seg_bucket_max,
+                                            seg_bucket_live);
+    c += overlay_count_range(ins_keys, ins_count, l, h);
+    c -= overlay_prefix_range(tomb_cnt_prefix, tomb_keys, tomb_count, l, h);
+    out_counts[i] = c;
+  }
+}
+
+// Distinct range count over sheet + overlay (count() API, no sum output).
+__global__ void count_overlay_kernel(
+    const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_counts,
+    std::size_t query_count, const std::uint32_t *dir_boundary,
+    const std::uint32_t *dir_seg_id, const std::uint32_t *dir_prefix,
+    std::size_t dir_count, const std::uint32_t *pool_keys,
+    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
+    const std::uint32_t *seg_bucket_live, const std::uint32_t *ins_keys,
+    std::size_t ins_count, const std::uint32_t *tomb_keys,
+    const std::uint32_t *tomb_cnt_prefix, std::size_t tomb_count) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= query_count)
+    return;
+  const std::uint32_t l = lo[i], h = hi[i];
+  if (l > h) {
+    out_counts[i] = 0;
+    return;
+  }
+  std::uint32_t c = seg_sheet_range_count(l, h, dir_boundary, dir_seg_id,
+                                          dir_prefix, dir_count, pool_keys,
+                                          pool_valid, seg_bucket_max,
+                                          seg_bucket_live);
+  c += overlay_count_range(ins_keys, ins_count, l, h);
+  c -= overlay_prefix_range(tomb_cnt_prefix, tomb_keys, tomb_count, l, h);
+  out_counts[i] = c;
+}
+
+// Successor (smallest live key >= q) over sheet + overlay. Considers the
+// smallest overlay live-insert >= q, and walks the sheet ceiling forward past
+// any overlay-tombstoned keys (holes).
+__global__ void successor_overlay_kernel(
+    const std::uint32_t *queries, std::size_t query_count,
+    std::uint32_t *out_keys, const std::uint32_t *dir_boundary,
+    const std::uint32_t *dir_seg_id, std::size_t dir_count,
+    const std::uint32_t *pool_keys, const std::uint8_t *pool_valid,
+    const std::uint32_t *seg_bucket_max, const std::uint32_t *ins_keys,
+    std::size_t ins_count, const std::uint32_t *tomb_keys,
+    std::size_t tomb_count) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= query_count)
+    return;
+  const std::uint32_t q = queries[i];
+  std::uint32_t best = kEmptyKey;
+  if (ins_count) {
+    const std::size_t p = lower_bound_u32(ins_keys, ins_count, q);
+    if (p < ins_count && ins_keys[p] < best)
+      best = ins_keys[p];
+  }
+  std::uint32_t c = seg_sheet_ceiling(q, dir_boundary, dir_seg_id, dir_count,
+                                      pool_keys, pool_valid, seg_bucket_max);
+  while (c != kEmptyKey) {
+    if (c >= best)
+      break; // overlay insert already the answer
+    bool dead = false;
+    if (tomb_count) {
+      const std::size_t p = lower_bound_u32(tomb_keys, tomb_count, c);
+      dead = (p < tomb_count && tomb_keys[p] == c);
+    }
+    if (!dead) {
+      best = c;
+      break;
+    }
+    if (c >= kEmptyKey - 1)
+      break;
+    c = seg_sheet_ceiling(c + 1, dir_boundary, dir_seg_id, dir_count, pool_keys,
+                          pool_valid, seg_bucket_max);
+  }
+  out_keys[i] = (best == kEmptyKey) ? 0u : best;
+}
+
+// ---------------------------------------------------------------------------
+// v2 upgrade #3 (bucket split) + #4a (method-B per-run pull) device helpers.
+
+// Gather a strided sample of `s` keys from `src[0,m)` for quantile pivots.
+__global__ void sample_gather_kernel(const std::uint32_t *src, std::size_t m,
+                                     std::uint32_t *out, std::size_t s) {
+  const std::size_t j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= s)
+    return;
+  std::size_t idx = (j * m) / s;
+  if (idx >= m)
+    idx = m - 1;
+  out[j] = src[idx];
+}
+
+// Assign each entry to a bucket ordinal: first pivot B[c] >= key (clamped).
+__global__ void bucket_assign_kernel(const std::uint32_t *keys, std::size_t m,
+                                     const std::uint32_t *B, std::size_t k,
+                                     std::uint32_t *out_bucket) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= m)
+    return;
+  std::size_t c = lower_bound_u32(B, k, keys[i]);
+  if (c >= k)
+    c = k - 1;
+  out_bucket[i] = static_cast<std::uint32_t>(c);
+}
+
+// For routing method B: after the batch is sorted, each run i owns the
+// contiguous slice (boundary[i-1], boundary[i]] = [begin,end). The last run
+// takes the remainder so nothing is dropped (matches the routing clamp).
+__global__ void run_slice_bounds_kernel(const std::uint32_t *keys,
+                                        std::size_t m,
+                                        const std::uint32_t *boundary,
+                                        std::size_t r, std::uint32_t *out_begin,
+                                        std::uint32_t *out_end) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= r)
+    return;
+  const std::size_t b = (i == 0) ? 0 : upper_bound_u32(keys, m, boundary[i - 1]);
+  const std::size_t e =
+      (i + 1 == r) ? m : upper_bound_u32(keys, m, boundary[i]);
+  out_begin[i] = static_cast<std::uint32_t>(b);
+  out_end[i] = static_cast<std::uint32_t>(e);
+}
+
+// For routing method B fast path: one block per run copies its sorted slice
+// [begin,end) directly into the run block (coalesced, no per-element routing).
+__global__ void rl_pull_fast_kernel(
+    const std::uint8_t *is_fast, const std::uint32_t *run_begin,
+    const std::uint32_t *run_end, const std::uint32_t *run_start,
+    const std::uint32_t *old_size, const std::uint32_t *sorted_keys,
+    const std::uint32_t *sorted_vals, std::uint8_t op, std::uint32_t *pool_keys,
+    std::uint32_t *pool_values, std::uint8_t *pool_ops) {
+  const std::uint32_t i = blockIdx.x;
+  if (!is_fast[i])
+    return;
+  const std::uint32_t b = run_begin[i];
+  const std::uint32_t e = run_end[i];
+  const std::size_t dst = static_cast<std::size_t>(run_start[i]) + old_size[i];
+  for (std::uint32_t p = b + threadIdx.x; p < e; p += blockDim.x) {
+    const std::size_t o = dst + (p - b);
+    pool_keys[o] = sorted_keys[p];
+    pool_values[o] = sorted_vals[p];
+    pool_ops[o] = op;
+  }
 }
 
 } // namespace gpulsmopt_detail
@@ -1210,23 +1412,26 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // v1: range/count/successor first flatten the overlay into the sheet, then
-  // use the proven sheet-only kernels. Correct and simple; a follow-up can make
-  // these hit the run+tier-2 layers directly (see [[gpulsmopt-run-merge-options]]).
+  // #1: range/count/successor read the run layer + tier-2 + sheet DIRECTLY --
+  // no forced merge-down, no mutation, so they take only a shared lock. The
+  // overlay is flattened once per query batch into two sorted distinct key
+  // arrays (live inserts, tombstones) and combined with the sheet's prefix sums.
   void count(const DeviceRangeBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    merge_down(stream);
+    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    OverlayReadIndex ix;
+    build_overlay_read_index(ix, stream);
     const int block = 128;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
-    gpulsmopt_detail::distinct_count_kernel<<<grid, block, 0, stream>>>(
+    gpulsmopt_detail::count_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.lo, batch.hi, batch.out_counts, batch.count,
         raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
         raw_or_null(d_dir_prefix_), h_dir_seg_id_.size(),
         raw_or_null(pool_keys_), raw_or_null(pool_valid_),
-        raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_), nullptr,
-        nullptr, 0);
+        raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
+        raw_or_null(ix.gk), ix.ins, raw_or_null(ix.gk) + ix.ins,
+        raw_or_null(ix.tomb_cnt_prefix), ix.u - ix.ins);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1234,15 +1439,17 @@ public:
   void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    merge_down(stream);
+    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    OverlayReadIndex ix;
+    build_overlay_read_index(ix, stream);
     const int block = 128;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
-    gpulsmopt_detail::distinct_successor_kernel<<<grid, block, 0, stream>>>(
+    gpulsmopt_detail::successor_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.queries, batch.count, batch.out_keys,
         raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
         h_dir_seg_id_.size(), raw_or_null(pool_keys_), raw_or_null(pool_valid_),
-        raw_or_null(seg_bucket_max_), nullptr, nullptr, 0);
+        raw_or_null(seg_bucket_max_), raw_or_null(ix.gk), ix.ins,
+        raw_or_null(ix.gk) + ix.ins, ix.u - ix.ins);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1250,18 +1457,22 @@ public:
   void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
     if (batch.query_count == 0)
       return;
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    merge_down(stream);
+    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    OverlayReadIndex ix;
+    build_overlay_read_index(ix, stream);
     const int block = 128;
     const int grid = static_cast<int>((batch.query_count + block - 1) / block);
-    gpulsmopt_detail::range_sheet_sum_kernel<<<grid, block, 0, stream>>>(
+    gpulsmopt_detail::range_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.lo, batch.hi, batch.out_sums, batch.out_counts,
         batch.query_count, raw_or_null(d_dir_boundary_),
         raw_or_null(d_dir_seg_id_), raw_or_null(d_dir_prefix_),
         raw_or_null(d_dir_value_prefix_), h_dir_seg_id_.size(),
         raw_or_null(pool_keys_), raw_or_null(pool_values_),
         raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
-        raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_));
+        raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
+        raw_or_null(ix.gk), raw_or_null(ix.ins_prefix), ix.ins,
+        raw_or_null(ix.gk) + ix.ins, raw_or_null(ix.tomb_val_prefix),
+        raw_or_null(ix.tomb_cnt_prefix), ix.u - ix.ins);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -2131,8 +2342,12 @@ private:
   }
 
   // Route + append a batch of records (op = kInsert for insert, kTombstone for
-  // erase) into the disjoint run layer. Fast runs (with room) are atomic-
-  // appended; runs that would overflow are rebuilt+split by key. No batch sort.
+  // erase) into the disjoint run layer. Fast runs (with room) receive their
+  // records directly; runs that would overflow are rebuilt + split.
+  //   Method A (GPULSMOPT_ROUTE_METHOD==0, default): BRUTE FORCE -- each run
+  //     scans the entire unsorted batch (O(runs*batch)) and pulls its records.
+  //   Method B (==1): radix-sort the batch once, then each run binary-searches
+  //     its contiguous slice and PULLS it (coalesced) -- the "smart" pull.
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
                       std::size_t count, cudaStream_t stream) {
@@ -2140,12 +2355,13 @@ private:
       return;
     const std::uint32_t *keys = keys_in;
     const std::uint32_t *vals = values_in ? values_in : keys_in; // tomb val unused
-    // Routing method B (GPULSMOPT_ROUTE_METHOD==1): radix-sort the batch first so
-    // each run pulls a contiguous slice; method A (default, ==0) routes each
-    // element directly with no batch sort. See
-    // [[gpulsmopt-compute-scales-with-size]].
-    thrust::device_vector<std::uint32_t> routeb_keys, routeb_vals;
+    const std::size_t r = h_run_block_.size();
+    std::vector<std::uint32_t> h_counts(r);
+
 #if GPULSMOPT_ROUTE_METHOD == 1
+    // ---- Method B: sort once, then per-run slice bounds ----
+    thrust::device_vector<std::uint32_t> routeb_keys, routeb_vals;
+    std::vector<std::uint32_t> h_begin(r);
     {
       auto pol = thrust::cuda::par.on(stream);
       routeb_keys.assign(thrust::device_pointer_cast(keys),
@@ -2157,34 +2373,40 @@ private:
       keys = raw_or_null(routeb_keys);
       vals = raw_or_null(routeb_vals);
     }
-#else
-    (void)routeb_keys;
-    (void)routeb_vals;
-#endif
-    const std::size_t r = h_run_block_.size();
-
-    thrust::device_vector<std::uint32_t> ordinal(count);
+    thrust::device_vector<std::uint32_t> d_begin(r), d_end(r);
     {
       const int block = 256;
-      const int grid = static_cast<int>((count + block - 1) / block);
-      gpulsmopt_detail::seg_route_keys_kernel<<<grid, block, 0, stream>>>(
-          keys, count, raw_or_null(d_run_boundary_), r, raw_or_null(ordinal));
+      const int grid = static_cast<int>((r + block - 1) / block);
+      gpulsmopt_detail::run_slice_bounds_kernel<<<grid, block, 0, stream>>>(
+          keys, count, raw_or_null(d_run_boundary_), r, raw_or_null(d_begin),
+          raw_or_null(d_end));
       CUDA_CHECK(cudaGetLastError());
     }
-
-    thrust::device_vector<std::uint32_t> counts(r, 0u);
-    {
-      const int block = 256;
-      const int grid = static_cast<int>((count + block - 1) / block);
-      gpulsmopt_detail::rl_histogram_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(ordinal), count, raw_or_null(counts));
-      CUDA_CHECK(cudaGetLastError());
-    }
-    std::vector<std::uint32_t> h_counts(r);
-    CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), raw_or_null(counts),
-                               r * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
+    std::vector<std::uint32_t> h_end(r);
+    CUDA_CHECK(cudaMemcpyAsync(h_begin.data(), raw_or_null(d_begin),
+                               r * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_end.data(), raw_or_null(d_end),
+                               r * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                               stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::size_t i = 0; i < r; ++i)
+      h_counts[i] = h_end[i] - h_begin[i];
+#else
+    // ---- Method A (brute force, O(r*count)): each run scans the whole batch
+    // and counts the records in its range. No sort, no per-element routing. ----
+    {
+      thrust::device_vector<std::uint32_t> counts(r, 0u);
+      gpulsmopt_detail::rl_run_count_kernel<<<static_cast<int>(r), 256, 0,
+                                              stream>>>(
+          keys, count, raw_or_null(d_run_boundary_), r, raw_or_null(counts));
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), raw_or_null(counts),
+                                 r * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+#endif
 
     std::vector<std::uint8_t> is_fast(r);
     for (std::size_t i = 0; i < r; ++i)
@@ -2194,37 +2416,75 @@ private:
               ? 1u
               : 0u;
 
+    // ---- fast path: put each fast run's records into its block ----
+#if GPULSMOPT_ROUTE_METHOD == 1
     {
       thrust::device_vector<std::uint8_t> d_is_fast(is_fast);
-      thrust::device_vector<std::uint32_t> cursor(h_run_size_);
-      const int block = 256;
-      const int grid = static_cast<int>((count + block - 1) / block);
-      gpulsmopt_detail::rl_append_fast_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(ordinal), keys, vals, op, count, raw_or_null(d_is_fast),
-          raw_or_null(d_run_start_), raw_or_null(cursor),
+      thrust::device_vector<std::uint32_t> d_oldsize(h_run_size_);
+      gpulsmopt_detail::rl_pull_fast_kernel<<<static_cast<int>(r), 128, 0,
+                                              stream>>>(
+          raw_or_null(d_is_fast), raw_or_null(d_begin), raw_or_null(d_end),
+          raw_or_null(d_run_start_), raw_or_null(d_oldsize), keys, vals, op,
           raw_or_null(run_pool_keys_), raw_or_null(run_pool_values_),
           raw_or_null(run_pool_ops_));
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+#else
+    // Method A fast path: each fast run scans the batch and appends its matches.
+    {
+      thrust::device_vector<std::uint8_t> d_is_fast(is_fast);
+      thrust::device_vector<std::uint32_t> d_oldsize(h_run_size_);
+      gpulsmopt_detail::rl_run_append_kernel<<<static_cast<int>(r), 256, 0,
+                                               stream>>>(
+          raw_or_null(d_is_fast), raw_or_null(d_run_boundary_),
+          raw_or_null(d_run_start_), raw_or_null(d_oldsize), r, keys, vals, op,
+          count, raw_or_null(run_pool_keys_), raw_or_null(run_pool_values_),
+          raw_or_null(run_pool_ops_));
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+#endif
     for (std::size_t i = 0; i < r; ++i)
       if (is_fast[i])
         h_run_size_[i] += h_counts[i];
 
+    // ---- slow path: rebuild + split overflowing runs ----
     std::vector<std::uint32_t> nb, nbd, nsz;
     nb.reserve(r);
     nbd.reserve(r);
     nsz.reserve(r);
+#if GPULSMOPT_ROUTE_METHOD == 0
+    thrust::device_vector<std::uint32_t> gk_tmp, gv_tmp; // method-A gather buffer
+#endif
     for (std::size_t i = 0; i < r; ++i) {
       if (is_fast[i]) {
         nb.push_back(h_run_block_[i]);
         nbd.push_back(h_run_boundary_[i]);
         nsz.push_back(h_run_size_[i]);
-      } else {
-        rebuild_slow_run(i, keys, vals, op, ordinal, h_counts[i], stream, nb,
-                         nbd, nsz);
-        free_run_block(h_run_block_[i]);
+        continue;
       }
+#if GPULSMOPT_ROUTE_METHOD == 1
+      rebuild_run_contiguous(i, keys + h_begin[i], vals + h_begin[i], op,
+                             h_counts[i], stream, nb, nbd, nsz);
+#else
+      // Method A: scan the batch to gather this run's records, then rebuild.
+      const std::uint32_t inc = h_counts[i];
+      gk_tmp.resize(inc);
+      gv_tmp.resize(inc);
+      if (inc > 0) {
+        const std::uint32_t hi = h_run_boundary_[i];
+        const bool has_lo = i > 0;
+        const std::uint32_t lo = has_lo ? h_run_boundary_[i - 1] : 0u;
+        gpulsmopt_detail::rl_run_gather_kernel<<<1, 256, 0, stream>>>(
+            keys, vals, count, lo, hi, has_lo ? 1u : 0u, raw_or_null(gk_tmp),
+            raw_or_null(gv_tmp));
+        CUDA_CHECK(cudaGetLastError());
+      }
+      rebuild_run_contiguous(i, raw_or_null(gk_tmp), raw_or_null(gv_tmp), op,
+                             inc, stream, nb, nbd, nsz);
+#endif
+      free_run_block(h_run_block_[i]);
     }
     h_run_block_ = std::move(nb);
     h_run_boundary_ = std::move(nbd);
@@ -2235,25 +2495,189 @@ private:
     upload_run_directory(stream);
   }
 
-  // Rebuild an overflowing run: gather its old entries + its incoming, resolve
-  // duplicates (newest wins; tombstones retained until merge-down), sort by key
-  // and split into runs of run_target_fill_. Appends the new runs to nb/nbd/nsz.
-  void rebuild_slow_run(std::size_t i, const std::uint32_t *keys,
-                        const std::uint32_t *values, std::uint8_t op,
-                        thrust::device_vector<std::uint32_t> &ordinal,
-                        std::uint32_t inc, cudaStream_t stream,
-                        std::vector<std::uint32_t> &nb,
-                        std::vector<std::uint32_t> &nbd,
-                        std::vector<std::uint32_t> &nsz) {
+  // Copy the combined range gk/gv/gop[off,off+len) into a fresh run block and
+  // record it in nb/nbd/nsz with the given boundary.
+  void emit_run(thrust::device_vector<std::uint32_t> &gk,
+                thrust::device_vector<std::uint32_t> &gv,
+                thrust::device_vector<std::uint8_t> &gop, std::size_t off,
+                std::uint32_t len, std::uint32_t boundary,
+                std::vector<std::uint32_t> &nb, std::vector<std::uint32_t> &nbd,
+                std::vector<std::uint32_t> &nsz, cudaStream_t stream) {
+    auto policy = thrust::cuda::par.on(stream);
+    const std::uint32_t block = alloc_run_block();
+    const std::size_t dst =
+        static_cast<std::size_t>(block) * gpulsmopt_detail::kRunCapacity;
+    thrust::copy(policy, gk.begin() + off, gk.begin() + off + len,
+                 run_pool_keys_.begin() + dst);
+    thrust::copy(policy, gv.begin() + off, gv.begin() + off + len,
+                 run_pool_values_.begin() + dst);
+    thrust::copy(policy, gop.begin() + off, gop.begin() + off + len,
+                 run_pool_ops_.begin() + dst);
+    nb.push_back(block);
+    nbd.push_back(boundary);
+    nsz.push_back(len);
+  }
+
+  // #3: split m combined entries (gk/gv/gop, arrival = index order) into
+  // disjoint, INTERNALLY-UNSORTED runs of <= run_target_fill_ via a sampled-
+  // quantile bucket partition -- no full sort of the payload. Same-key entries
+  // (an insert plus a later tombstone) share a bucket, so runs stay disjoint
+  // without deduping (duplicates are resolved at lookup / merge). Falls back to
+  // a full sort+dedup split if a bucket would overflow (rare, skewed keys).
+  void split_entries_into_runs(thrust::device_vector<std::uint32_t> &gk,
+                               thrust::device_vector<std::uint32_t> &gv,
+                               thrust::device_vector<std::uint8_t> &gop,
+                               std::size_t m, std::uint32_t top_boundary,
+                               std::vector<std::uint32_t> &nb,
+                               std::vector<std::uint32_t> &nbd,
+                               std::vector<std::uint32_t> &nsz,
+                               cudaStream_t stream) {
+    if (m == 0)
+      return;
+    const std::uint32_t target = run_target_fill_;
+    if (m <= target) {
+      emit_run(gk, gv, gop, 0, static_cast<std::uint32_t>(m), top_boundary, nb,
+               nbd, nsz, stream);
+      return;
+    }
+    auto policy = thrust::cuda::par.on(stream);
+    const std::size_t k = (m + target - 1) / target;
+
+    // Sampled-quantile pivots B[0..k-1] (non-decreasing, B[k-1]=top_boundary).
+    const std::size_t s = std::min(m, std::max<std::size_t>(k * 32, 256));
+    thrust::device_vector<std::uint32_t> samp(s);
+    {
+      const int block = 256;
+      const int grid = static_cast<int>((s + block - 1) / block);
+      gpulsmopt_detail::sample_gather_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(gk), m, raw_or_null(samp), s);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    thrust::sort(policy, samp.begin(), samp.end());
+    std::vector<std::uint32_t> hsamp(s);
+    CUDA_CHECK(cudaMemcpyAsync(hsamp.data(), raw_or_null(samp),
+                               s * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::uint32_t> hB(k);
+    for (std::size_t c = 0; c + 1 < k; ++c) {
+      std::size_t pos = ((c + 1) * s) / k;
+      if (pos >= s)
+        pos = s - 1;
+      std::uint32_t v = hsamp[pos];
+      if (v > top_boundary)
+        v = top_boundary;
+      if (c > 0 && v < hB[c - 1])
+        v = hB[c - 1];
+      hB[c] = v;
+    }
+    hB[k - 1] = top_boundary;
+    thrust::device_vector<std::uint32_t> dB(hB);
+
+    thrust::device_vector<std::uint32_t> bucket(m);
+    {
+      const int block = 256;
+      const int grid = static_cast<int>((m + block - 1) / block);
+      gpulsmopt_detail::bucket_assign_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(gk), m, raw_or_null(dB), k, raw_or_null(bucket));
+      CUDA_CHECK(cudaGetLastError());
+    }
+    thrust::device_vector<std::uint32_t> bcount(k, 0u);
+    {
+      const int block = 256;
+      const int grid = static_cast<int>((m + block - 1) / block);
+      gpulsmopt_detail::rl_histogram_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(bucket), m, raw_or_null(bcount));
+      CUDA_CHECK(cudaGetLastError());
+    }
+    std::vector<std::uint32_t> hcount(k);
+    CUDA_CHECK(cudaMemcpyAsync(hcount.data(), raw_or_null(bcount),
+                               k * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::uint32_t maxc = 0;
+    for (auto c : hcount)
+      maxc = std::max(maxc, c);
+    if (maxc > static_cast<std::uint32_t>(gpulsmopt_detail::kRunCapacity)) {
+      sort_split_entries(gk, gv, gop, m, top_boundary, nb, nbd, nsz, stream);
+      return;
+    }
+
+    // Stable group by bucket (arrival order preserved within each bucket).
+    auto payload = thrust::make_zip_iterator(
+        thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
+    thrust::stable_sort_by_key(policy, bucket.begin(), bucket.end(), payload);
+
+    std::size_t off = 0;
+    std::size_t last_emitted = static_cast<std::size_t>(-1);
+    for (std::size_t c = 0; c < k; ++c) {
+      const std::uint32_t len = hcount[c];
+      if (len == 0)
+        continue;
+      emit_run(gk, gv, gop, off, len, hB[c], nb, nbd, nsz, stream);
+      off += len;
+      last_emitted = nb.size() - 1;
+    }
+    if (last_emitted != static_cast<std::size_t>(-1))
+      nbd[last_emitted] = top_boundary; // highest run is the catch-all
+  }
+
+  // Fallback / dedup split: sort combined entries by (key, arrival), keep the
+  // newest per key, and chunk into runs of run_target_fill_ (sorted runs).
+  void sort_split_entries(thrust::device_vector<std::uint32_t> &gk,
+                          thrust::device_vector<std::uint32_t> &gv,
+                          thrust::device_vector<std::uint8_t> &gop,
+                          std::size_t m, std::uint32_t top_boundary,
+                          std::vector<std::uint32_t> &nb,
+                          std::vector<std::uint32_t> &nbd,
+                          std::vector<std::uint32_t> &nsz, cudaStream_t stream) {
+    auto policy = thrust::cuda::par.on(stream);
+    thrust::device_vector<std::uint32_t> arr(m);
+    thrust::sequence(policy, arr.begin(), arr.end());
+    thrust::device_vector<std::uint64_t> sortk(m);
+    fill_drain_sort_keys(gk, arr, sortk, 0, m, stream);
+    auto payload = thrust::make_zip_iterator(
+        thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
+    thrust::sort_by_key(policy, sortk.begin(), sortk.end(), payload);
+    auto uend = thrust::unique_by_key(
+        policy, gk.begin(), gk.begin() + m,
+        thrust::make_zip_iterator(thrust::make_tuple(gv.begin(), gop.begin())));
+    const std::size_t u = static_cast<std::size_t>(uend.first - gk.begin());
+    if (u == 0)
+      return;
+    const std::uint32_t target = run_target_fill_;
+    const std::size_t k = (u + target - 1) / target;
+    std::vector<std::uint32_t> host_keys(u);
+    CUDA_CHECK(cudaMemcpyAsync(host_keys.data(), raw_or_null(gk),
+                               u * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::size_t c = 0; c < k; ++c) {
+      const std::size_t cs = c * target;
+      const std::size_t ce =
+          std::min((c + 1) * static_cast<std::size_t>(target), u);
+      const std::uint32_t bnd = (c + 1 == k) ? top_boundary : host_keys[ce - 1];
+      emit_run(gk, gv, gop, cs, static_cast<std::uint32_t>(ce - cs), bnd, nb,
+               nbd, nsz, stream);
+    }
+  }
+
+  // Method B: rebuild an overflowing run whose incoming records are a
+  // CONTIGUOUS slice (in_keys/in_vals, length inc) of the sorted batch.
+  void rebuild_run_contiguous(std::size_t i, const std::uint32_t *in_keys,
+                              const std::uint32_t *in_vals, std::uint8_t op,
+                              std::uint32_t inc, cudaStream_t stream,
+                              std::vector<std::uint32_t> &nb,
+                              std::vector<std::uint32_t> &nbd,
+                              std::vector<std::uint32_t> &nsz) {
     auto policy = thrust::cuda::par.on(stream);
     const std::uint32_t old_size = h_run_size_[i];
     const std::uint32_t old_boundary = h_run_boundary_[i];
-    const std::size_t total_in = static_cast<std::size_t>(old_size) + inc;
+    const std::size_t m = static_cast<std::size_t>(old_size) + inc;
     const std::size_t base =
         static_cast<std::size_t>(h_run_block_[i]) * gpulsmopt_detail::kRunCapacity;
-
-    thrust::device_vector<std::uint32_t> gk(total_in), gv(total_in);
-    thrust::device_vector<std::uint8_t> gop(total_in);
+    thrust::device_vector<std::uint32_t> gk(m), gv(m);
+    thrust::device_vector<std::uint8_t> gop(m);
     if (old_size > 0) {
       thrust::copy(policy, run_pool_keys_.begin() + base,
                    run_pool_keys_.begin() + base + old_size, gk.begin());
@@ -2263,61 +2687,13 @@ private:
                    run_pool_ops_.begin() + base + old_size, gop.begin());
     }
     if (inc > 0) {
-      auto kptr = thrust::device_pointer_cast(keys);
-      auto vptr = thrust::device_pointer_cast(values);
-      auto in_zip =
-          thrust::make_zip_iterator(thrust::make_tuple(kptr, vptr));
-      auto out_zip = thrust::make_zip_iterator(
-          thrust::make_tuple(gk.begin() + old_size, gv.begin() + old_size));
-      thrust::copy_if(policy, in_zip, in_zip + ordinal.size(), ordinal.begin(),
-                      out_zip, gpulsmopt_detail::EqU32{static_cast<std::uint32_t>(i)});
+      auto kptr = thrust::device_pointer_cast(in_keys);
+      auto vptr = thrust::device_pointer_cast(in_vals);
+      thrust::copy(policy, kptr, kptr + inc, gk.begin() + old_size);
+      thrust::copy(policy, vptr, vptr + inc, gv.begin() + old_size);
       thrust::fill(policy, gop.begin() + old_size, gop.end(), op);
     }
-
-    // Resolve duplicates by key keeping the newest arrival (higher index).
-    thrust::device_vector<std::uint32_t> arr(total_in);
-    thrust::sequence(policy, arr.begin(), arr.end());
-    thrust::device_vector<std::uint64_t> sortk(total_in);
-    fill_drain_sort_keys(gk, arr, sortk, 0, total_in, stream);
-    auto payload = thrust::make_zip_iterator(
-        thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
-    thrust::sort_by_key(policy, sortk.begin(), sortk.end(), payload);
-    auto uend = thrust::unique_by_key(
-        policy, gk.begin(), gk.end(),
-        thrust::make_zip_iterator(thrust::make_tuple(gv.begin(), gop.begin())));
-    const std::size_t u =
-        static_cast<std::size_t>(uend.first - gk.begin());
-
-    const std::uint32_t target = run_target_fill_;
-    const std::size_t k = (u + target - 1) / target;
-    if (run_free_ids_.size() < k)
-      grow_run_pool(run_pool_capacity_ + (k - run_free_ids_.size()));
-
-    std::vector<std::uint32_t> host_keys(u);
-    if (u > 0) {
-      CUDA_CHECK(cudaMemcpyAsync(host_keys.data(), raw_or_null(gk),
-                                 u * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-    for (std::size_t c = 0; c < k; ++c) {
-      const std::size_t cs = c * target;
-      const std::size_t ce = std::min((c + 1) * static_cast<std::size_t>(target), u);
-      const std::uint32_t len = static_cast<std::uint32_t>(ce - cs);
-      const std::uint32_t block = alloc_run_block();
-      const std::size_t dst =
-          static_cast<std::size_t>(block) * gpulsmopt_detail::kRunCapacity;
-      thrust::copy(policy, gk.begin() + cs, gk.begin() + ce,
-                   run_pool_keys_.begin() + dst);
-      thrust::copy(policy, gv.begin() + cs, gv.begin() + ce,
-                   run_pool_values_.begin() + dst);
-      thrust::copy(policy, gop.begin() + cs, gop.begin() + ce,
-                   run_pool_ops_.begin() + dst);
-      const std::uint32_t bnd = (c + 1 == k) ? old_boundary : host_keys[ce - 1];
-      nb.push_back(block);
-      nbd.push_back(bnd);
-      nsz.push_back(len);
-    }
+    split_entries_into_runs(gk, gv, gop, m, old_boundary, nb, nbd, nsz, stream);
   }
 
   // Concatenate the live run-layer entries into a new tier-2 generation and
@@ -2364,23 +2740,42 @@ private:
     upload_run_directory(stream);
   }
 
-  // Flatten the run layer + all tier-2 generations into the disjoint sheet:
-  // resolve every key to its newest op across layers, delete tombstoned keys
-  // from the sheet, merge insert survivors in, then clear the overlay.
-  void merge_down(cudaStream_t stream) {
-    flush_to_tier2(stream);
-    if (tier2_.empty())
-      return;
-    auto policy = thrust::cuda::par.on(stream);
-    std::size_t total = 0;
+  // Resolved snapshot of the overlay (run layer + tier-2) for direct reads.
+  // gk holds distinct keys sorted ascending, partitioned as [inserts |
+  // tombstones]; gv the matching values (only [0,ins) meaningful). ins_prefix /
+  // tomb_* are prefix sums used by the range/count/successor kernels.
+  struct OverlayReadIndex {
+    thrust::device_vector<std::uint32_t> gk, gv;
+    thrust::device_vector<std::uint8_t> gop;
+    std::size_t u = 0, ins = 0;
+    thrust::device_vector<std::uint32_t> ins_prefix;      // size ins+1
+    thrust::device_vector<std::uint32_t> tomb_val_prefix; // size (u-ins)+1
+    thrust::device_vector<std::uint32_t> tomb_cnt_prefix; // size (u-ins)+1
+  };
+
+  // Gather run layer + all tier-2 generations and resolve every key to its
+  // newest op across layers (READ ONLY -- no flush, no sheet mutation). Outputs
+  // distinct keys sorted ascending into gk/gv/gop, partitioned [inserts (u=ins)
+  // | tombstones]. Run-layer entries carry the highest arrival (newest).
+  void resolve_overlay(thrust::device_vector<std::uint32_t> &gk,
+                       thrust::device_vector<std::uint32_t> &gv,
+                       thrust::device_vector<std::uint8_t> &gop, std::size_t &u,
+                       std::size_t &ins, cudaStream_t stream) {
+    u = 0;
+    ins = 0;
+    std::size_t total = run_live_total_;
     for (auto &g : tier2_)
       total += g.keys.size();
     if (total == 0) {
-      tier2_.clear();
+      gk.clear();
+      gv.clear();
+      gop.clear();
       return;
     }
-    thrust::device_vector<std::uint32_t> gk(total), gv(total), garr(total);
-    thrust::device_vector<std::uint8_t> gop(total);
+    auto policy = thrust::cuda::par.on(stream);
+    gk.resize(total);
+    gv.resize(total);
+    gop.resize(total);
     std::size_t off = 0;
     for (auto &g : tier2_) { // oldest generation first -> lowest arrival
       const std::size_t s = g.keys.size();
@@ -2391,6 +2786,22 @@ private:
       }
       off += s;
     }
+    const std::size_t r = h_run_block_.size(); // run layer newest -> highest arr
+    for (std::size_t i = 0; i < r; ++i) {
+      const std::uint32_t s = h_run_size_[i];
+      if (s == 0)
+        continue;
+      const std::size_t bpos =
+          static_cast<std::size_t>(h_run_block_[i]) * gpulsmopt_detail::kRunCapacity;
+      thrust::copy(policy, run_pool_keys_.begin() + bpos,
+                   run_pool_keys_.begin() + bpos + s, gk.begin() + off);
+      thrust::copy(policy, run_pool_values_.begin() + bpos,
+                   run_pool_values_.begin() + bpos + s, gv.begin() + off);
+      thrust::copy(policy, run_pool_ops_.begin() + bpos,
+                   run_pool_ops_.begin() + bpos + s, gop.begin() + off);
+      off += s;
+    }
+    thrust::device_vector<std::uint32_t> garr(total);
     thrust::sequence(policy, garr.begin(), garr.end());
     thrust::device_vector<std::uint64_t> sortk(total);
     fill_drain_sort_keys(gk, garr, sortk, 0, total, stream);
@@ -2400,43 +2811,101 @@ private:
     auto uend = thrust::unique_by_key(
         policy, gk.begin(), gk.end(),
         thrust::make_zip_iterator(thrust::make_tuple(gv.begin(), gop.begin())));
-    const std::size_t u = static_cast<std::size_t>(uend.first - gk.begin());
-
+    u = static_cast<std::size_t>(uend.first - gk.begin());
     auto beg = thrust::make_zip_iterator(
         thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
     auto mid = thrust::stable_partition(policy, beg, beg + u,
                                         gpulsmopt_detail::TupleOpIsInsert{});
-    const std::size_t ins = static_cast<std::size_t>(mid - beg);
-    const std::size_t tomb = u - ins;
+    ins = static_cast<std::size_t>(mid - beg);
+  }
 
+  // Build the per-query-batch overlay index used by range/count/successor.
+  void build_overlay_read_index(OverlayReadIndex &ix, cudaStream_t stream) {
+    resolve_overlay(ix.gk, ix.gv, ix.gop, ix.u, ix.ins, stream);
+    auto policy = thrust::cuda::par.on(stream);
+    const std::size_t ins = ix.ins, u = ix.u, tomb = u - ins;
+    ix.ins_prefix.assign(ins + 1, 0u);
+    if (ins > 0)
+      thrust::inclusive_scan(policy, ix.gv.begin(), ix.gv.begin() + ins,
+                             ix.ins_prefix.begin() + 1);
+    ix.tomb_val_prefix.assign(tomb + 1, 0u);
+    ix.tomb_cnt_prefix.assign(tomb + 1, 0u);
     if (tomb > 0 && h_dir_seg_id_.size() > 0) {
-      scratch_delete_keys_.resize(tomb);
-      thrust::copy(policy, gk.begin() + ins, gk.begin() + u,
-                   scratch_delete_keys_.begin());
+      thrust::device_vector<std::uint32_t> tval(tomb), tflag(tomb);
       const int block = 256;
-      const int warps_per_block = block / 32;
-      const int grid =
-          static_cast<int>((tomb + warps_per_block - 1) / warps_per_block);
-      gpulsmopt_detail::seg_delete_keys_warp_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(scratch_delete_keys_), tomb, raw_or_null(d_dir_boundary_),
+      const int grid = static_cast<int>((tomb + block - 1) / block);
+      gpulsmopt_detail::sheet_point_values_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(ix.gk) + ins, tomb, raw_or_null(d_dir_boundary_),
           raw_or_null(d_dir_seg_id_), h_dir_seg_id_.size(),
           raw_or_null(pool_keys_), raw_or_null(pool_values_),
           raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
-          raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_));
+          raw_or_null(tval), raw_or_null(tflag));
       CUDA_CHECK(cudaGetLastError());
-      refresh_directory_live_counts(stream);
+      thrust::inclusive_scan(policy, tval.begin(), tval.end(),
+                             ix.tomb_val_prefix.begin() + 1);
+      thrust::inclusive_scan(policy, tflag.begin(), tflag.end(),
+                             ix.tomb_cnt_prefix.begin() + 1);
     }
+  }
 
-    if (ins > 0) {
-      scratch_incoming_keys_.resize(ins);
-      scratch_incoming_values_.resize(ins);
-      thrust::copy(policy, gk.begin(), gk.begin() + ins,
-                   scratch_incoming_keys_.begin());
-      thrust::copy(policy, gv.begin(), gv.begin() + ins,
-                   scratch_incoming_values_.begin());
-      merge_incoming_into_sheet(ins, stream);
+  // #2: collapse the run layer back to a single empty root run (freeing the
+  // accumulated split blocks). Called after a merge-down so the run directory
+  // stays small -- smaller routing / host-device uploads on subsequent inserts
+  // (an insert-positive realization of the hot-range overlay; true gap-routed
+  // cold-skip was declined to protect the insert path, see [[gpulsmopt-priority-insertion-speed]]).
+  void reset_run_layer_to_root(cudaStream_t stream) {
+    for (std::uint32_t b : h_run_block_)
+      run_free_ids_.push_back(b);
+    const std::uint32_t block = alloc_run_block();
+    h_run_block_ = {block};
+    h_run_boundary_ = {gpulsmopt_detail::kEmptyKey};
+    h_run_size_ = {0u};
+    run_live_total_ = 0;
+    upload_run_directory(stream);
+  }
+
+  // Flatten the run layer + all tier-2 generations into the disjoint sheet:
+  // resolve every key to its newest op across layers, delete tombstoned keys
+  // from the sheet, merge insert survivors in, then collapse the overlay.
+  void merge_down(cudaStream_t stream) {
+    thrust::device_vector<std::uint32_t> gk, gv;
+    thrust::device_vector<std::uint8_t> gop;
+    std::size_t u = 0, ins = 0;
+    resolve_overlay(gk, gv, gop, u, ins, stream);
+    if (u > 0) {
+      auto policy = thrust::cuda::par.on(stream);
+      const std::size_t tomb = u - ins;
+      if (tomb > 0 && h_dir_seg_id_.size() > 0) {
+        scratch_delete_keys_.resize(tomb);
+        thrust::copy(policy, gk.begin() + ins, gk.begin() + u,
+                     scratch_delete_keys_.begin());
+        const int block = 256;
+        const int warps_per_block = block / 32;
+        const int grid =
+            static_cast<int>((tomb + warps_per_block - 1) / warps_per_block);
+        gpulsmopt_detail::seg_delete_keys_warp_kernel<<<grid, block, 0,
+                                                        stream>>>(
+            raw_or_null(scratch_delete_keys_), tomb,
+            raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
+            h_dir_seg_id_.size(), raw_or_null(pool_keys_),
+            raw_or_null(pool_values_), raw_or_null(pool_valid_),
+            raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
+            raw_or_null(seg_bucket_value_sum_));
+        CUDA_CHECK(cudaGetLastError());
+        refresh_directory_live_counts(stream);
+      }
+      if (ins > 0) {
+        scratch_incoming_keys_.resize(ins);
+        scratch_incoming_values_.resize(ins);
+        thrust::copy(policy, gk.begin(), gk.begin() + ins,
+                     scratch_incoming_keys_.begin());
+        thrust::copy(policy, gv.begin(), gv.begin() + ins,
+                     scratch_incoming_values_.begin());
+        merge_incoming_into_sheet(ins, stream);
+      }
     }
     tier2_.clear();
+    reset_run_layer_to_root(stream);
   }
 
   void maybe_flush_and_merge(cudaStream_t stream) {
@@ -2458,13 +2927,18 @@ private:
                                n * sizeof(std::uint8_t), stream));
     const int block = 256;
     const int grid = static_cast<int>((n + block - 1) / block);
+    // #4b: warp-per-query for the unsorted run/tier-2 layers (32 lanes scan a
+    // block cooperatively); one warp per query -> grid over warps.
+    const int warps_per_block = block / 32;
+    const int warp_grid =
+        static_cast<int>((n + warps_per_block - 1) / warps_per_block);
     auto layer_pass = [&](const std::uint32_t *keys, const std::uint32_t *values,
                           const std::uint8_t *ops, const std::uint32_t *boundary,
                           const std::uint32_t *start, const std::uint32_t *size,
                           std::size_t dir_count) {
       if (dir_count == 0)
         return;
-      gpulsmopt_detail::layer_lookup_kernel<<<grid, block, 0, stream>>>(
+      gpulsmopt_detail::layer_lookup_warp_kernel<<<warp_grid, block, 0, stream>>>(
           batch.queries, n, batch.out_values, batch.out_found,
           raw_or_null(scratch_query_found_), keys, values, ops, boundary, start,
           size, dir_count);
