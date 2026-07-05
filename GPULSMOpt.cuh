@@ -88,20 +88,14 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_ENABLE_TIER2
 #define GPULSMOPT_ENABLE_TIER2 0
 #endif
-// 0 forces Method A (scan per run); 1 forces Method B (sort once + slice);
-// 2 (default) auto-selects per batch: A when count < GPULSMOPT_ROUTE_AUTO_LIMIT
-// (small batch -> skip the sort startup), B otherwise (large batch -> parallel
-// sort+slice beats A's few-block scan).
+// 0 = scan; 1 = sort/slice; 2 = auto.
 #ifndef GPULSMOPT_ROUTE_METHOD
 #define GPULSMOPT_ROUTE_METHOD 2
 #endif
 #ifndef GPULSMOPT_ROUTE_AUTO_LIMIT
 #define GPULSMOPT_ROUTE_AUTO_LIMIT (1 << 20)
 #endif
-// ST-FliX: drain the sheet with thread-per-key deletes (not warp-per-key) once
-// the tombstone batch has at least this many keys; the warp kernel routes each
-// key with a lane-0-only binary search (31 idle lanes), which loses badly at
-// scale. Small batches keep the warp for better occupancy.
+// Tombstone cutoff for thread-per-key deletes.
 #ifndef GPULSMOPT_ST_DELETE_LIMIT
 #define GPULSMOPT_ST_DELETE_LIMIT 32768
 #endif
@@ -1026,13 +1020,7 @@ __global__ void rl_run_gather_kernel(const std::uint32_t *keys,
   }
 }
 
-// Fused point lookup. The overlay (runs + tier-2) is pre-flattened newest-wins
-// into a sorted [inserts | tombstones] list (see resolve_overlay); one thread
-// per query binary-searches the inserts block, then the tombstones block, then
-// falls through to the sorted sheet. An overlay hit (insert OR tombstone)
-// shadows the sheet, exactly like the old newest->oldest layer walk, but at
-// O(log overlay) per query instead of scanning the unsorted runs. Every thread
-// writes its own answer, so no answered-flag / pre-zeroing is needed.
+// Point lookup through resolved overlay then sheet.
 __global__ void point_lookup_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
     std::uint8_t *out_found, const std::uint32_t *ins_keys,
@@ -1046,7 +1034,7 @@ __global__ void point_lookup_kernel(
   if (i >= n)
     return;
   const std::uint32_t key = queries[i];
-  // 1) overlay inserts (newest already resolved) shadow the sheet.
+  // Overlay insert hit.
   if (ins_count > 0) {
     const std::size_t p = lower_bound_u32(ins_keys, ins_count, key);
     if (p < ins_count && ins_keys[p] == key) {
@@ -1055,7 +1043,7 @@ __global__ void point_lookup_kernel(
       return;
     }
   }
-  // 2) overlay tombstones shadow the sheet (key deleted).
+  // Overlay tombstone hit.
   if (tomb_count > 0) {
     const std::size_t p = lower_bound_u32(tomb_keys, tomb_count, key);
     if (p < tomb_count && tomb_keys[p] == key) {
@@ -1064,7 +1052,7 @@ __global__ void point_lookup_kernel(
       return;
     }
   }
-  // 3) not in overlay: consult the sorted sheet.
+  // Sheet fallback.
   std::uint32_t value = 0;
   bool found = false;
   if (dir_count > 0) {
@@ -2350,9 +2338,7 @@ private:
     upload_run_directory(stream);
   }
 
-  // Append records to the run layer. UseB=true is Method B (sort once + slice),
-  // false is Method A (scan the batch per run). Both are always compiled; the
-  // auto route picks per batch size (see insert_records).
+  // Append records to the run layer.
   template <bool UseB>
   void insert_records_impl(const std::uint32_t *keys_in,
                            const std::uint32_t *values_in, std::uint8_t op,
@@ -2364,7 +2350,6 @@ private:
     const std::size_t r = h_run_block_.size();
     std::vector<std::uint32_t> h_counts(r);
 
-    // Cross-section state (only the chosen path populates its own).
     [[maybe_unused]] thrust::device_vector<std::uint32_t> routeb_keys,
         routeb_vals;                                            // Method B batch
     [[maybe_unused]] thrust::device_vector<std::uint32_t> d_begin, d_end; // slices
@@ -2496,8 +2481,7 @@ private:
     run_live_total_ = 0;
     for (auto s : h_run_size_)
       run_live_total_ += s;
-    // Fast path (nothing split): blocks/boundaries/starts are unchanged on the
-    // device — only sizes moved, so skip 3 of the 4 directory H->D copies.
+    // Fast path: only run sizes changed.
     if (any_slow)
       upload_run_directory(stream);
     else
@@ -2505,9 +2489,7 @@ private:
     overlay_dirty_ = true; // overlay changed; invalidate the cached read index
   }
 
-  // Route by batch size: Method A for small batches (skip the sort), Method B
-  // for large. GPULSMOPT_ROUTE_METHOD=0/1 forces A/B; default (2) is auto at
-  // the GPULSMOPT_ROUTE_AUTO_LIMIT (2^20) crossover.
+  // Auto-select route by batch size.
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
                       std::size_t count, cudaStream_t stream) {
@@ -2860,13 +2842,7 @@ private:
     }
   }
 
-  // Lazily-rebuilt resolved overlay, shared by every read (lookup/count/range/
-  // successor) between mutations. Any insert/delete/drain sets overlay_dirty_,
-  // so the expensive resolve+index (sort of the whole overlay) runs at most once
-  // per mutation instead of once per read. The rebuild happens here on the read
-  // side; mutators pay only a bool store. NOTE: assumes reads are sequential
-  // (single-reader) — like the rest of the read scratch, concurrent readers
-  // would race the rebuild; the mutation lock already serializes writers.
+  // Rebuild cached overlay when dirty.
   OverlayReadIndex &overlay_index(cudaStream_t stream) {
     if (overlay_dirty_) {
       build_overlay_read_index(cached_overlay_, stream);
@@ -2926,8 +2902,7 @@ private:
                      scratch_delete_keys_.begin());
         const int block = 256;
         if (tomb >= gpulsmopt_detail::kStDeleteLimit) {
-          // ST (thread/key): no lane-0 routing waste; wins for large tombstone
-          // batches (the usual drain case).
+          // Thread-per-key delete path.
           const int grid = static_cast<int>((tomb + block - 1) / block);
           gpulsmopt_detail::seg_delete_keys_kernel<<<grid, block, 0, stream>>>(
               raw_or_null(scratch_delete_keys_), tomb,
@@ -3048,10 +3023,7 @@ private:
   // Layered point lookup.
   void lookup_layered(const DeviceLookupBatch &batch, cudaStream_t stream) {
     const std::size_t n = batch.count;
-    // Binary-search the cached resolved overlay (sorted [inserts | tombstones])
-    // per query instead of scanning the unsorted runs; misses fall to the sheet.
-    // The overlay is rebuilt only when a mutation dirtied it (see overlay_index),
-    // so back-to-back reads share one sort. Empty overlay -> straight to sheet.
+    // Query cached overlay before the sheet.
     const OverlayReadIndex &ix = overlay_index(stream);
     const int block = 256;
     const int grid = static_cast<int>((n + block - 1) / block);
@@ -3089,9 +3061,7 @@ private:
   thrust::device_vector<std::uint32_t> d_run_boundary_;
   thrust::device_vector<std::uint32_t> d_run_size_;
   thrust::device_vector<std::uint32_t> d_run_start_; // block * kRunCapacity
-  // Reused insert scratch (sized to run count r ~ 4-9) — avoids a per-insert
-  // cudaMalloc/free triple on the hot small-batch path. resize/assign no-op
-  // once capacity is warm.
+  // Reused insert scratch.
   thrust::device_vector<std::uint32_t> ins_counts_;  // Method A per-run counts
   thrust::device_vector<std::uint8_t> ins_is_fast_;  // per-run "has room" flag
   thrust::device_vector<std::uint32_t> ins_oldsize_; // per-run pre-append size
@@ -3175,8 +3145,7 @@ private:
   // Lookup scratch.
   thrust::device_vector<std::uint8_t> scratch_query_found_;
 
-  // Cached resolved overlay (see overlay_index): reused across reads, rebuilt
-  // only when a mutation flips overlay_dirty_.
+  // Cached overlay read index.
   OverlayReadIndex cached_overlay_;
   bool overlay_dirty_ = true;
 };
