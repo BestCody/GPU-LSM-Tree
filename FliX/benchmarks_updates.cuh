@@ -66,6 +66,14 @@ constexpr bool shift_insert_range = true;
 constexpr bool shift_insert_range = false;
 #endif
 
+#ifndef UPDATE_INSERT_PERCENT
+#define UPDATE_INSERT_PERCENT 25
+#endif
+
+#ifndef UPDATE_DELETE_PERCENT
+#define UPDATE_DELETE_PERCENT UPDATE_INSERT_PERCENT
+#endif
+
 // probe_key_sort_timed.cuh
 
 #ifndef GLOBALQUALIFIER
@@ -1186,7 +1194,8 @@ void benchmark_updates(
         //{"batches", 16, 17, 8, 100, 100, false, true},
         // {"batches", 25, 26, 2, 100, 100, false, true},
         //{"batches", 25, 26, 8, 100, 100, false, true},
-        {"batches", init_build_size_log, init_probe_size_log, rounds, 200, 200, false, true},
+        {"batches", init_build_size_log, init_probe_size_log, rounds,
+         UPDATE_INSERT_PERCENT, UPDATE_DELETE_PERCENT, false, true},
     };
 
     // *** MAKE TRUE TRUE

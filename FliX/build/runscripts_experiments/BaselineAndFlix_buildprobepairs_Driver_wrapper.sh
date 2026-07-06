@@ -11,10 +11,10 @@ BASELINE_SCRIPT="./RunBaselinesAndFlix_buildprobe.sh"   # must accept 7 position
 #BASELINE_SCRIPT="./RunBaselinesAndFlix_buildprobe_DELs.sh"   # must accept 7 positional args:
 
 #   X Y GrowthVal NodeSizeInput CachelineSizeInput BuildSize ProbeSize
-#GrowthVal=200
+#GrowthVal=50
 
 # ---- Global params ----
-GrowthVal=200
+GrowthVal=25
 
 # Workloads: (X Y)
 declare -a WORKLOADS=(

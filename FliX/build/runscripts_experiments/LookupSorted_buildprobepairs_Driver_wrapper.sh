@@ -7,7 +7,7 @@ set -u -o pipefail
 BASELINE_SCRIPT="./LookupsSorted_VaryingRounds.sh"
 
 # ---- Global params ----
-GrowthVal=100
+GrowthVal=25
 
 # Workloads: (X Y)
 declare -a WORKLOADS=(
