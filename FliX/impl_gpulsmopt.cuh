@@ -153,11 +153,7 @@ public:
   static constexpr operation_support can_successor = operation_support::async;
 
   static std::string short_description() {
-#if GPULSMOPT_COMPACT_DG_C0
-    return "gpulsmopt_cdg_c0";
-#else
     return "gpulsmopt";
-#endif
   }
 
   static parameters_type parameters() {

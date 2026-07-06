@@ -100,7 +100,7 @@ namespace gpulsmopt_detail {
 #define GPULSMOPT_ST_DELETE_LIMIT 32768
 #endif
 #ifndef GPULSMOPT_COMPACT_DG_C0
-#define GPULSMOPT_COMPACT_DG_C0 0
+#define GPULSMOPT_COMPACT_DG_C0 1
 #endif
 #ifndef GPULSMOPT_DG_C0_SLOTS
 #define GPULSMOPT_DG_C0_SLOTS 16
