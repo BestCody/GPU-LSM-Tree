@@ -5,16 +5,19 @@
 set -u -o pipefail
 
 # ---- Config ---- Normal Script
-BASELINE_SCRIPT="./RunBaselinesAndFlix_buildprobe.sh"   # must accept 7 positional args:
+BASELINE_SCRIPT="./RunBaselinesAndFlix_buildprobe.sh"
 
 #DEL SCRIPT
 #BASELINE_SCRIPT="./RunBaselinesAndFlix_buildprobe_DELs.sh"   # must accept 7 positional args:
 
 #   X Y GrowthVal NodeSizeInput CachelineSizeInput BuildSize ProbeSize
+#   optional: InsertBatchLog DeleteBatchLog
 #GrowthVal=50
 
 # ---- Global params ----
 GrowthVal=25
+FIXED_INSERT_BATCH_LOG=""
+FIXED_DELETE_BATCH_LOG=""
 
 # Workloads: (X Y)
 declare -a WORKLOADS=(
@@ -58,6 +61,13 @@ fi
 echo "Driver: $0"
 echo "Script: $BASELINE_SCRIPT"
 echo "GrowthVal: $GrowthVal"
+if [[ -n "$FIXED_INSERT_BATCH_LOG" || -n "$FIXED_DELETE_BATCH_LOG" ]]; then
+  [[ -n "$FIXED_INSERT_BATCH_LOG" && -n "$FIXED_DELETE_BATCH_LOG" ]] || { echo "ERROR: set both fixed batch logs or neither." >&2; exit 1; }
+  [[ "$FIXED_INSERT_BATCH_LOG" =~ ^[0-9]+$ && "$FIXED_DELETE_BATCH_LOG" =~ ^[0-9]+$ ]] || { echo "ERROR: fixed batch logs must be non-negative integers." >&2; exit 1; }
+  [[ "$FIXED_INSERT_BATCH_LOG" == "$FIXED_DELETE_BATCH_LOG" ]] || { echo "ERROR: fixed insert/delete logs must match for this benchmark." >&2; exit 1; }
+  echo "Fixed insert batch log: $FIXED_INSERT_BATCH_LOG"
+  echo "Fixed delete batch log: $FIXED_DELETE_BATCH_LOG"
+fi
 echo "=============================================================="
 
 # ---- Run sweeps ----
@@ -82,13 +92,17 @@ for bp in "${BUILD_PROBE_PAIRS[@]}"; do
       NodeSizeInput="$1"; CachelineSizeInput="$2"
 
       echo "     >> NodeSizeInput=$NodeSizeInput, CachelineSizeInput=$CachelineSizeInput"
-      echo "        Running: $BASELINE_SCRIPT $Xval $Yval $GrowthVal $NodeSizeInput $CachelineSizeInput $BUILDSIZE $PROBESIZE"
+      EXTRA_ARGS=()
+      if [[ -n "$FIXED_INSERT_BATCH_LOG" ]]; then
+        EXTRA_ARGS=("$FIXED_INSERT_BATCH_LOG" "$FIXED_DELETE_BATCH_LOG")
+      fi
+      echo "        Running: $BASELINE_SCRIPT $Xval $Yval $GrowthVal $NodeSizeInput $CachelineSizeInput $BUILDSIZE $PROBESIZE ${EXTRA_ARGS[*]}"
       rm -f data_cache/*.* || true
 
       "$BASELINE_SCRIPT" \
         "$Xval" "$Yval" "$GrowthVal" \
         "$NodeSizeInput" "$CachelineSizeInput" \
-        "$BUILDSIZE" "$PROBESIZE" || {
+        "$BUILDSIZE" "$PROBESIZE" "${EXTRA_ARGS[@]}" || {
           echo "ERROR: Failure at (Build=$BUILDSIZE, Probe=$PROBESIZE) WL=($Xval,$Yval) Node=$NodeSizeInput Cacheline=$CachelineSizeInput" >&2
           exit 1
         }

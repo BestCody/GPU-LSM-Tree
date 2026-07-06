@@ -4,8 +4,8 @@ set -u -o pipefail
 cd ..
 
 # ------------------ Args ------------------
-if [[ $# -ne 7 ]]; then
-  echo "Usage: $0 Xval Yval GrowthVal NodeSizeInput CachelineSizeInput BuildSize ProbeSize" >&2
+if [[ $# -ne 7 && $# -ne 9 ]]; then
+  echo "Usage: $0 Xval Yval GrowthVal NodeSizeInput CachelineSizeInput BuildSize ProbeSize [InsertBatchLog DeleteBatchLog]" >&2
   exit 1
 fi
 
@@ -16,11 +16,18 @@ NodeSizeInput=$4
 CachelineSizeInput=$5
 BUILDSIZE=$6
 PROBESIZE=$7
+InsertBatchLog=${8:-}
+DeleteBatchLog=${9:-}
 
 # Validate numeric
 for v in "$Xval" "$Yval" "$GrowthVal" "$NodeSizeInput" "$CachelineSizeInput" "$BUILDSIZE" "$PROBESIZE"; do
   [[ "$v" =~ ^[0-9]+$ ]] || { echo "Error: all args must be non-negative integers." >&2; exit 1; }
 done
+if [[ -n "$InsertBatchLog" || -n "$DeleteBatchLog" ]]; then
+  [[ -n "$InsertBatchLog" && -n "$DeleteBatchLog" ]] || { echo "Error: provide both InsertBatchLog and DeleteBatchLog." >&2; exit 1; }
+  [[ "$InsertBatchLog" =~ ^[0-9]+$ && "$DeleteBatchLog" =~ ^[0-9]+$ ]] || { echo "Error: fixed batch logs must be non-negative integers." >&2; exit 1; }
+  [[ "$InsertBatchLog" == "$DeleteBatchLog" ]] || { echo "Error: fixed insert/delete logs must match for this benchmark." >&2; exit 1; }
+fi
 
 echo "==================== RAW ARGS ===================="
 echo "Xval=$Xval"
@@ -30,6 +37,10 @@ echo "NodeSizeInput=$NodeSizeInput"
 echo "CachelineSizeInput=$CachelineSizeInput"
 echo "BUILDSIZE=$BUILDSIZE"
 echo "PROBESIZE=$PROBESIZE"
+if [[ -n "$InsertBatchLog" ]]; then
+  echo "InsertBatchLog=$InsertBatchLog"
+  echo "DeleteBatchLog=$DeleteBatchLog"
+fi
 echo "PWD=$(pwd)"
 echo "=================================================="
 
@@ -118,11 +129,19 @@ build_and_make() {
 
 CSV_FILES=()
 
+FixedBatchFlags=""
+BatchLabel="x${GrowthVal}"
+if [[ -n "$InsertBatchLog" ]]; then
+  FixedBatchFlags="-DUPDATE_INSERT_BATCH_LOG=${InsertBatchLog} -DUPDATE_DELETE_BATCH_LOG=${DeleteBatchLog}"
+  BatchLabel="ib${InsertBatchLog}_db${DeleteBatchLog}"
+fi
+
 # NOTE: include NodeCacheString in COMMON_FLAGS so NODESIZE actually gets passed
 COMMON_FLAGS="-DDENSEKEYGEN -DXVAL=${Xval} -DYVAL=${Yval} -DTOTALRUNS=3 -DMAIN_32 -DDIV=8 \
 -DTILE_INSERTS -DTILE_INSERTS_C -DINSERTS_TILE_BULK_ONLY -DTILE_DELETES -DDELETES_TILE_BULK \
 -DMAX_NODE=${MaxNode} -DDEFINE_TILE_SIZE=32 -DINITIAL_BUILD_SIZE=${BUILDSIZE} -DINITIAL_PROBE_SIZE=${PROBESIZE} \
 -DUPDATE_INSERT_PERCENT=${GrowthVal} -DUPDATE_DELETE_PERCENT=${GrowthVal} \
+${FixedBatchFlags} \
 ${NodeCacheString}"
 
 BASE_IFDEFS_BASELINES="${COMMON_FLAGS} -DBASELINES"
@@ -137,13 +156,13 @@ rm -f data_cache/*.* || true
 for Rounds in 5 10; do
 #for Rounds in 4 6 5 8; do
   #OUT_BASENAME="X${Xval}Y${Yval}_100MB_100MP_DIV8_NS${NodeSizeInput}_CL${CachelineSizeInput}_x${GrowthVal}_32bit_${BUILDSIZE}_${PROBESIZE}_${Rounds}ROUNDS"
-  OUT_BASENAME="X${Xval}Y${Yval}_DIV8_NS${NodeSizeInput}_CL${CachelineSizeInput}_x${GrowthVal}_32bit_${BUILDSIZE}_${PROBESIZE}_${Rounds}ROUNDS"
+  OUT_BASENAME="X${Xval}Y${Yval}_DIV8_NS${NodeSizeInput}_CL${CachelineSizeInput}_${BatchLabel}_32bit_${BUILDSIZE}_${PROBESIZE}_${Rounds}ROUNDS"
   
   rm -f data_cache/*.* || true
   # Save params snapshot per round (helps catch where it changes)
   PARAM_LOG="${TARGET_DIR}/${OUT_BASENAME}_run_params.log"
   {
-    echo "RAW: Xval=$Xval Yval=$Yval GrowthVal=$GrowthVal NodeSizeInput=$NodeSizeInput CachelineSizeInput=$CachelineSizeInput BUILDSIZE=$BUILDSIZE PROBESIZE=$PROBESIZE"
+    echo "RAW: Xval=$Xval Yval=$Yval GrowthVal=$GrowthVal NodeSizeInput=$NodeSizeInput CachelineSizeInput=$CachelineSizeInput BUILDSIZE=$BUILDSIZE PROBESIZE=$PROBESIZE InsertBatchLog=${InsertBatchLog:-} DeleteBatchLog=${DeleteBatchLog:-}"
     echo "DERIVED: NodeSize=$NodeSize MaxNode=$MaxNode TileSize=$TileSize"
     echo "NodeCacheString=$NodeCacheString"
     echo "COMMON_FLAGS=$COMMON_FLAGS"

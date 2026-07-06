@@ -30,6 +30,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #ifndef CUDA_CHECK
@@ -56,44 +57,21 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_RANGE_MAX_CANDIDATES
 #define GPULSMOPT_RANGE_MAX_CANDIDATES 16777216
 #endif
-#ifndef GPULSMOPT_RUN_DRAIN_FLOOR
-#define GPULSMOPT_RUN_DRAIN_FLOOR 65536
-#endif
-#ifndef GPULSMOPT_RUN_DRAIN_DIVISOR
-#define GPULSMOPT_RUN_DRAIN_DIVISOR 20
-#endif
-#ifndef GPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR
-#define GPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR 0
-#endif
-#ifndef GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR
-#define GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR 1
-#endif
 #ifndef GPULSMOPT_DISTINCT_KEYS
 #define GPULSMOPT_DISTINCT_KEYS 1
 #endif
 
-// Run-layer tuning.
-#ifndef GPULSMOPT_RUN_CAPACITY
-#define GPULSMOPT_RUN_CAPACITY (1 << 22)
-#endif
 // Tier-2 generations before merge-down.
 #ifndef GPULSMOPT_TIER2_FANOUT
 #define GPULSMOPT_TIER2_FANOUT 4
 #endif
-// Run-layer flush threshold.
-#ifndef GPULSMOPT_RUN_FLUSH_BUDGET
-#define GPULSMOPT_RUN_FLUSH_BUDGET (1 << 26)
+// Mutable C0 flush threshold.
+#ifndef GPULSMOPT_MUTABLE_FLUSH_BUDGET
+#define GPULSMOPT_MUTABLE_FLUSH_BUDGET (1 << 26)
 #endif
-// 0 drains the run layer directly to the sheet.
+// 0 drains mutable records to the sheet.
 #ifndef GPULSMOPT_ENABLE_TIER2
-#define GPULSMOPT_ENABLE_TIER2 0
-#endif
-// 0 = scan; 1 = sort/slice; 2 = auto.
-#ifndef GPULSMOPT_ROUTE_METHOD
-#define GPULSMOPT_ROUTE_METHOD 2
-#endif
-#ifndef GPULSMOPT_ROUTE_AUTO_LIMIT
-#define GPULSMOPT_ROUTE_AUTO_LIMIT (1 << 20)
+#define GPULSMOPT_ENABLE_TIER2 1
 #endif
 // Tombstone cutoff for thread-per-key deletes.
 #ifndef GPULSMOPT_ST_DELETE_LIMIT
@@ -115,24 +93,15 @@ static_assert(GPULSMOPT_TARGET_FILL >= 1 &&
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
-constexpr std::size_t kRunsPerClass = 4;
-constexpr int kRunCapacity = GPULSMOPT_RUN_CAPACITY;
 constexpr int kDgC0Slots = GPULSMOPT_DG_C0_SLOTS;
 constexpr std::size_t kDgC0Groups = std::size_t{1} << 24;
 constexpr std::uint32_t kDgC0Empty = 0xffffffffu;
 constexpr std::uint32_t kDgC0IndexMask = 0x00ffffffu;
 constexpr std::uint32_t kDgC0MaxIndex = 0x00fffffeu;
 static_assert(kDgC0Slots >= 1, "direct-group C0 needs slots");
+static_assert(GPULSMOPT_COMPACT_DG_C0, "direct-group C0 is required");
 constexpr std::size_t kStDeleteLimit = GPULSMOPT_ST_DELETE_LIMIT;
 constexpr std::size_t kTier2Fanout = GPULSMOPT_TIER2_FANOUT;
-constexpr std::size_t kRunDrainDivisor = GPULSMOPT_RUN_DRAIN_DIVISOR;
-constexpr std::size_t kRunDrainSheetNumerator =
-    GPULSMOPT_RUN_DRAIN_SHEET_NUMERATOR;
-constexpr std::size_t kRunDrainSheetDenominator =
-    GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR;
-static_assert(kRunDrainDivisor >= 1, "drain divisor must be positive");
-static_assert(kRunDrainSheetDenominator >= 1,
-              "sheet drain denominator must be positive");
 
 struct DeviceUpdateBatch {
   const std::uint32_t *keys = nullptr;
@@ -928,16 +897,6 @@ seg_sheet_ceiling(std::uint32_t q, const std::uint32_t *dir_boundary,
   return best;
 }
 
-// Route key to a run ordinal.
-__device__ __host__ inline std::size_t
-rl_route_key(const std::uint32_t *run_boundary, std::size_t run_count,
-             std::uint32_t key) {
-  std::size_t ord = lower_bound_u32(run_boundary, run_count, key);
-  if (ord >= run_count && run_count > 0)
-    ord = run_count - 1;
-  return ord;
-}
-
 // Tuple predicate for live inserts.
 struct TupleOpIsInsert {
   template <class Tuple>
@@ -945,92 +904,6 @@ struct TupleOpIsInsert {
     return thrust::get<2>(t) == kInsert;
   }
 };
-
-// Count batch elements per run ordinal.
-__global__ void rl_histogram_kernel(const std::uint32_t *ordinal, std::size_t n,
-                                    std::uint32_t *counts) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    atomicAdd(&counts[ordinal[i]], 1u);
-}
-
-// Method A scans each run against the batch.
-__device__ inline bool rl_in_run_range(std::uint32_t key, std::uint32_t hi,
-                                       bool has_lo, std::uint32_t lo) {
-  return key <= hi && (!has_lo || key > lo);
-}
-
-// Method A count pass.
-__global__ void rl_run_count_kernel(const std::uint32_t *keys, std::size_t n,
-                                    const std::uint32_t *boundary, std::size_t r,
-                                    std::uint32_t *counts) {
-  const std::size_t run = blockIdx.x;
-  if (run >= r)
-    return;
-  const std::uint32_t hi = boundary[run];
-  const bool has_lo = run > 0;
-  const std::uint32_t lo = has_lo ? boundary[run - 1] : 0u;
-  std::uint32_t local = 0;
-  for (std::size_t i = threadIdx.x; i < n; i += blockDim.x)
-    if (rl_in_run_range(keys[i], hi, has_lo, lo))
-      ++local;
-  __shared__ unsigned s_cnt;
-  if (threadIdx.x == 0)
-    s_cnt = 0;
-  __syncthreads();
-  atomicAdd(&s_cnt, local);
-  __syncthreads();
-  if (threadIdx.x == 0)
-    counts[run] = s_cnt;
-}
-
-// Method A fast append pass.
-__global__ void rl_run_append_kernel(
-    const std::uint8_t *is_fast, const std::uint32_t *boundary,
-    const std::uint32_t *run_start, const std::uint32_t *old_size, std::size_t r,
-    const std::uint32_t *keys, const std::uint32_t *values, std::uint8_t op,
-    std::size_t n, std::uint32_t *pool_keys, std::uint32_t *pool_values,
-    std::uint8_t *pool_ops) {
-  const std::size_t run = blockIdx.x;
-  if (run >= r || !is_fast[run])
-    return;
-  const std::uint32_t hi = boundary[run];
-  const bool has_lo = run > 0;
-  const std::uint32_t lo = has_lo ? boundary[run - 1] : 0u;
-  const std::size_t dst =
-      static_cast<std::size_t>(run_start[run]) + old_size[run];
-  __shared__ unsigned s_pos;
-  if (threadIdx.x == 0)
-    s_pos = 0;
-  __syncthreads();
-  for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
-    if (rl_in_run_range(keys[i], hi, has_lo, lo)) {
-      const std::size_t o = dst + atomicAdd(&s_pos, 1u);
-      pool_keys[o] = keys[i];
-      pool_values[o] = values[i];
-      pool_ops[o] = op;
-    }
-  }
-}
-
-// Method A overflow gather.
-__global__ void rl_run_gather_kernel(const std::uint32_t *keys,
-                                     const std::uint32_t *values, std::size_t n,
-                                     std::uint32_t lo, std::uint32_t hi,
-                                     std::uint8_t has_lo, std::uint32_t *out_keys,
-                                     std::uint32_t *out_vals) {
-  __shared__ unsigned s_pos;
-  if (threadIdx.x == 0)
-    s_pos = 0;
-  __syncthreads();
-  for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
-    if (rl_in_run_range(keys[i], hi, has_lo != 0, lo)) {
-      const unsigned slot = atomicAdd(&s_pos, 1u);
-      out_keys[slot] = keys[i];
-      out_vals[slot] = values[i];
-    }
-  }
-}
 
 __global__ void dg_c0_append_kernel(
     const std::uint32_t *keys, const std::uint32_t *values, std::uint8_t op,
@@ -1071,19 +944,12 @@ __global__ void dg_c0_append_kernel(
   overflow[group] = 1u;
 }
 
-__global__ void dg_c0_point_lookup_kernel(
-    const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
-    std::uint8_t *out_found, const std::uint32_t *log_keys,
-    const std::uint32_t *log_values, const std::uint8_t *log_ops,
-    std::uint32_t log_count, const std::uint32_t *slots,
-    const std::uint8_t *overflow, const std::uint32_t *dir_boundary,
-    const std::uint32_t *dir_seg_id, std::size_t dir_count,
-    const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
-    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  const std::uint32_t key = queries[i];
+__device__ inline bool
+dg_probe_log(std::uint32_t key, const std::uint32_t *log_keys,
+             const std::uint32_t *log_values, const std::uint8_t *log_ops,
+             std::uint32_t log_count, const std::uint32_t *slots,
+             const std::uint8_t *overflow, std::uint32_t *out_value,
+             bool *out_live) {
   const std::uint32_t group = key >> 8;
   const std::uint32_t low = key & 255u;
   const std::size_t base = static_cast<std::size_t>(group) * kDgC0Slots;
@@ -1094,9 +960,9 @@ __global__ void dg_c0_point_lookup_kernel(
     const std::uint32_t idx = cur & kDgC0IndexMask;
     if (idx < log_count && log_keys[idx] == key) {
       const bool live = log_ops[idx] == kInsert;
-      out_found[i] = live ? 1u : 0u;
-      out_value[i] = live ? log_values[idx] : 0u;
-      return;
+      *out_live = live;
+      *out_value = live ? log_values[idx] : 0u;
+      return true;
     }
   }
   if (overflow[group]) {
@@ -1105,8 +971,53 @@ __global__ void dg_c0_point_lookup_kernel(
       if (log_keys[p] != key)
         continue;
       const bool live = log_ops[p] == kInsert;
-      out_found[i] = live ? 1u : 0u;
-      out_value[i] = live ? log_values[p] : 0u;
+      *out_live = live;
+      *out_value = live ? log_values[p] : 0u;
+      return true;
+    }
+  }
+  return false;
+}
+
+__global__ void dg_layered_point_lookup_kernel(
+    const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
+    std::uint8_t *out_found, const std::uint32_t *c0_keys,
+    const std::uint32_t *c0_values, const std::uint8_t *c0_ops,
+    std::uint32_t c0_count, const std::uint32_t *c0_slots,
+    const std::uint8_t *c0_overflow,
+    const std::uint32_t *const *tier_keys,
+    const std::uint32_t *const *tier_values,
+    const std::uint8_t *const *tier_ops,
+    const std::uint32_t *const *tier_slots,
+    const std::uint8_t *const *tier_overflow,
+    const std::uint32_t *tier_count, std::size_t tier_gen_count,
+    const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
+    std::size_t dir_count, const std::uint32_t *pool_keys,
+    const std::uint32_t *pool_values, const std::uint8_t *pool_valid,
+    const std::uint32_t *seg_bucket_max) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  const std::uint32_t key = queries[i];
+  std::uint32_t layer_value = 0;
+  bool layer_live = false;
+  if (c0_count > 0 &&
+      dg_probe_log(key, c0_keys, c0_values, c0_ops, c0_count, c0_slots,
+                   c0_overflow, &layer_value, &layer_live)) {
+    out_found[i] = layer_live ? 1u : 0u;
+    out_value[i] = layer_value;
+    return;
+  }
+  for (std::size_t j = tier_gen_count; j > 0; --j) {
+    const std::size_t g = j - 1;
+    const std::uint32_t count = tier_count[g];
+    if (count == 0)
+      continue;
+    if (dg_probe_log(key, tier_keys[g], tier_values[g], tier_ops[g], count,
+                     tier_slots[g], tier_overflow[g], &layer_value,
+                     &layer_live)) {
+      out_found[i] = layer_live ? 1u : 0u;
+      out_value[i] = layer_value;
       return;
     }
   }
@@ -1321,70 +1232,6 @@ __global__ void successor_overlay_kernel(
   out_keys[i] = (best == kEmptyKey) ? 0u : best;
 }
 
-// Bucket split and method-B helpers.
-
-// Gather a strided sample for quantile pivots.
-__global__ void sample_gather_kernel(const std::uint32_t *src, std::size_t m,
-                                     std::uint32_t *out, std::size_t s) {
-  const std::size_t j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= s)
-    return;
-  std::size_t idx = (j * m) / s;
-  if (idx >= m)
-    idx = m - 1;
-  out[j] = src[idx];
-}
-
-// Assign each entry to a pivot bucket.
-__global__ void bucket_assign_kernel(const std::uint32_t *keys, std::size_t m,
-                                     const std::uint32_t *B, std::size_t k,
-                                     std::uint32_t *out_bucket) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= m)
-    return;
-  std::size_t c = lower_bound_u32(B, k, keys[i]);
-  if (c >= k)
-    c = k - 1;
-  out_bucket[i] = static_cast<std::uint32_t>(c);
-}
-
-// Find each run's slice in the sorted batch.
-__global__ void run_slice_bounds_kernel(const std::uint32_t *keys,
-                                        std::size_t m,
-                                        const std::uint32_t *boundary,
-                                        std::size_t r, std::uint32_t *out_begin,
-                                        std::uint32_t *out_end) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= r)
-    return;
-  const std::size_t b = (i == 0) ? 0 : upper_bound_u32(keys, m, boundary[i - 1]);
-  const std::size_t e =
-      (i + 1 == r) ? m : upper_bound_u32(keys, m, boundary[i]);
-  out_begin[i] = static_cast<std::uint32_t>(b);
-  out_end[i] = static_cast<std::uint32_t>(e);
-}
-
-// Copy each sorted slice into its run block.
-__global__ void rl_pull_fast_kernel(
-    const std::uint8_t *is_fast, const std::uint32_t *run_begin,
-    const std::uint32_t *run_end, const std::uint32_t *run_start,
-    const std::uint32_t *old_size, const std::uint32_t *sorted_keys,
-    const std::uint32_t *sorted_vals, std::uint8_t op, std::uint32_t *pool_keys,
-    std::uint32_t *pool_values, std::uint8_t *pool_ops) {
-  const std::uint32_t i = blockIdx.x;
-  if (!is_fast[i])
-    return;
-  const std::uint32_t b = run_begin[i];
-  const std::uint32_t e = run_end[i];
-  const std::size_t dst = static_cast<std::size_t>(run_start[i]) + old_size[i];
-  for (std::uint32_t p = b + threadIdx.x; p < e; p += blockDim.x) {
-    const std::size_t o = dst + (p - b);
-    pool_keys[o] = sorted_keys[p];
-    pool_values[o] = sorted_vals[p];
-    pool_ops[o] = op;
-  }
-}
-
 } // namespace gpulsmopt_detail
 
 class GPULSMOpt {
@@ -1410,7 +1257,6 @@ public:
         static_cast<std::uint32_t>(gpulsmopt_detail::kSegmentBuckets) *
         target_fill_;
     initialize_segmented_storage(0);
-    init_run_layer(0);
     CUDA_CHECK(cudaStreamSynchronize(0));
   }
 
@@ -1424,7 +1270,8 @@ public:
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     reset_directory_to_root(stream);
-    init_run_layer(stream);
+    tier2_.clear();
+    clear_tier2_lookup_metadata();
     clear_direct_group_c0(stream);
     overlay_dirty_ = true; // sheet + overlay reset; cached read index stale
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1452,8 +1299,8 @@ public:
       cudaEventSynchronize(ib);
       float t_records = 0.f;
       cudaEventElapsedTime(&t_records, ia, ib);
-      printf("[prof] insert %zu keys: insert_records=%.3f ms  runs_after=%zu\n",
-             batch.count, t_records, h_run_block_.size());
+      printf("[prof] insert %zu keys: insert_records=%.3f ms\n", batch.count,
+             t_records);
       cudaEventDestroy(ia);
       cudaEventDestroy(ib);
 #endif
@@ -1491,13 +1338,19 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // Range APIs read through a flattened overlay.
+  // Range APIs use overlay only when mutable records exist.
   void count(const DeviceRangeBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
     join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    const OverlayReadIndex &ix = overlay_index(stream);
+    const bool no_overlay = dg_c0_log_total_ == 0 && tier2_.empty();
+    const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
+    const std::uint32_t *ins_keys = no_overlay ? nullptr : raw_or_null(ix->gk);
+    const std::uint32_t *tomb_keys =
+        no_overlay ? nullptr : raw_or_null(ix->gk) + ix->ins;
+    const std::uint32_t *tomb_cnt =
+        no_overlay ? nullptr : raw_or_null(ix->tomb_cnt_prefix);
     const int block = 128;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     gpulsmopt_detail::count_overlay_kernel<<<grid, block, 0, stream>>>(
@@ -1506,8 +1359,8 @@ public:
         raw_or_null(d_dir_prefix_), h_dir_seg_id_.size(),
         raw_or_null(pool_keys_), raw_or_null(pool_valid_),
         raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
-        raw_or_null(ix.gk), ix.ins, raw_or_null(ix.gk) + ix.ins,
-        raw_or_null(ix.tomb_cnt_prefix), ix.u - ix.ins);
+        ins_keys, no_overlay ? 0 : ix->ins, tomb_keys, tomb_cnt,
+        no_overlay ? 0 : ix->u - ix->ins);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1517,15 +1370,19 @@ public:
       return;
     join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    const OverlayReadIndex &ix = overlay_index(stream);
+    const bool no_overlay = dg_c0_log_total_ == 0 && tier2_.empty();
+    const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
+    const std::uint32_t *ins_keys = no_overlay ? nullptr : raw_or_null(ix->gk);
+    const std::uint32_t *tomb_keys =
+        no_overlay ? nullptr : raw_or_null(ix->gk) + ix->ins;
     const int block = 128;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     gpulsmopt_detail::successor_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.queries, batch.count, batch.out_keys,
         raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
         h_dir_seg_id_.size(), raw_or_null(pool_keys_), raw_or_null(pool_valid_),
-        raw_or_null(seg_bucket_max_), raw_or_null(ix.gk), ix.ins,
-        raw_or_null(ix.gk) + ix.ins, ix.u - ix.ins);
+        raw_or_null(seg_bucket_max_), ins_keys, no_overlay ? 0 : ix->ins,
+        tomb_keys, no_overlay ? 0 : ix->u - ix->ins);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1535,7 +1392,17 @@ public:
       return;
     join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    const OverlayReadIndex &ix = overlay_index(stream);
+    const bool no_overlay = dg_c0_log_total_ == 0 && tier2_.empty();
+    const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
+    const std::uint32_t *ins_keys = no_overlay ? nullptr : raw_or_null(ix->gk);
+    const std::uint32_t *ins_prefix =
+        no_overlay ? nullptr : raw_or_null(ix->ins_prefix);
+    const std::uint32_t *tomb_keys =
+        no_overlay ? nullptr : raw_or_null(ix->gk) + ix->ins;
+    const std::uint32_t *tomb_val =
+        no_overlay ? nullptr : raw_or_null(ix->tomb_val_prefix);
+    const std::uint32_t *tomb_cnt =
+        no_overlay ? nullptr : raw_or_null(ix->tomb_cnt_prefix);
     const int block = 128;
     const int grid = static_cast<int>((batch.query_count + block - 1) / block);
     gpulsmopt_detail::range_overlay_kernel<<<grid, block, 0, stream>>>(
@@ -1546,9 +1413,8 @@ public:
         raw_or_null(pool_keys_), raw_or_null(pool_values_),
         raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
         raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
-        raw_or_null(ix.gk), raw_or_null(ix.ins_prefix), ix.ins,
-        raw_or_null(ix.gk) + ix.ins, raw_or_null(ix.tomb_val_prefix),
-        raw_or_null(ix.tomb_cnt_prefix), ix.u - ix.ins);
+        ins_keys, ins_prefix, no_overlay ? 0 : ix->ins, tomb_keys, tomb_val,
+        tomb_cnt, no_overlay ? 0 : ix->u - ix->ins);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1578,10 +1444,6 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     return sheet_live_count_;
   }
-  std::size_t run_count() const {
-    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    return h_run_block_.size();
-  }
   std::size_t segment_count() const {
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     return h_dir_seg_id_.size();
@@ -1600,18 +1462,18 @@ public:
   std::size_t gpu_resident_bytes() const {
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::size_t total = device_bytes_all(
-        run_pool_keys_, run_pool_values_, run_pool_ops_, d_run_block_,
-        d_run_boundary_, d_run_size_, d_run_start_, pool_keys_, pool_values_,
-        pool_valid_, seg_bucket_max_, seg_bucket_live_, seg_bucket_value_sum_,
-        d_dir_seg_id_, d_dir_boundary_, d_dir_prefix_, d_dir_value_sum_,
-        d_dir_value_prefix_, scratch_incoming_keys_, scratch_incoming_values_,
+        pool_keys_, pool_values_, pool_valid_, seg_bucket_max_,
+        seg_bucket_live_, seg_bucket_value_sum_, d_dir_seg_id_,
+        d_dir_boundary_, d_dir_prefix_, d_dir_value_sum_, d_dir_value_prefix_,
+        scratch_incoming_keys_, scratch_incoming_values_,
         scratch_delete_keys_, scratch_query_found_, seg_cand_seg_, seg_cand_key_,
         seg_cand_value_, seg_cand_op_, seg_cand_seq_, seg_cand_group_sort_,
         dg_c0_keys_, dg_c0_values_, dg_c0_ops_, dg_c0_slots_,
-        dg_c0_overflow_);
+        dg_c0_overflow_, tier2_d_keys_, tier2_d_values_, tier2_d_ops_,
+        tier2_d_slots_, tier2_d_overflow_, tier2_d_count_);
     for (const auto &g : tier2_)
-      total += device_bytes_all(g.keys, g.values, g.ops, g.block_boundary,
-                                g.block_start, g.block_size);
+      total += device_bytes_all(g.keys, g.values, g.ops, g.slots,
+                                g.overflow);
     return total;
   }
 
@@ -2375,73 +2237,19 @@ private:
     sheet_live_count_ = total;
   }
 
-  // Run layer and merge-down state.
+  // Mutable C0 and merge-down state.
 
-  // Run flush budget.
-  std::size_t run_flush_budget() const {
-    // Keep the threshold below total run capacity.
-    const std::size_t cap_total =
-        h_run_block_.size() *
-        static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity);
+  std::size_t mutable_layer_live() const {
+    return dg_c0_log_total_;
+  }
+
+  std::size_t mutable_flush_budget() const {
     std::size_t budget = std::min<std::size_t>(
-        static_cast<std::size_t>(GPULSMOPT_RUN_FLUSH_BUDGET), cap_total * 3 / 4);
+        static_cast<std::size_t>(GPULSMOPT_MUTABLE_FLUSH_BUDGET),
+        gpulsmopt_detail::kDgC0MaxIndex);
     if (max_elements_ > 0)
       budget = std::min(budget, max_elements_);
-    return std::max<std::size_t>(budget, std::size_t{1} << 16);
-  }
-
-  void grow_run_pool(std::size_t new_capacity) {
-    if (new_capacity <= run_pool_capacity_)
-      return;
-    run_pool_keys_.resize(new_capacity * gpulsmopt_detail::kRunCapacity,
-                          gpulsmopt_detail::kEmptyKey);
-    run_pool_values_.resize(new_capacity * gpulsmopt_detail::kRunCapacity, 0u);
-    run_pool_ops_.resize(new_capacity * gpulsmopt_detail::kRunCapacity,
-                         static_cast<std::uint8_t>(gpulsmopt_detail::kInsert));
-    for (std::size_t id = run_pool_capacity_; id < new_capacity; ++id)
-      run_free_ids_.push_back(static_cast<std::uint32_t>(id));
-    run_pool_capacity_ = new_capacity;
-  }
-
-  std::uint32_t alloc_run_block() {
-    if (run_free_ids_.empty())
-      grow_run_pool(
-          std::max<std::size_t>(run_pool_capacity_ * 2, run_pool_capacity_ + 1));
-    const std::uint32_t id = run_free_ids_.back();
-    run_free_ids_.pop_back();
-    return id;
-  }
-
-  void free_run_block(std::uint32_t id) { run_free_ids_.push_back(id); }
-
-  void upload_run_directory(cudaStream_t stream) {
-    const std::size_t r = h_run_block_.size();
-    std::vector<std::uint32_t> starts(r);
-    for (std::size_t i = 0; i < r; ++i)
-      starts[i] = h_run_block_[i] *
-                  static_cast<std::uint32_t>(gpulsmopt_detail::kRunCapacity);
-    upload_vec(d_run_block_, h_run_block_, stream);
-    upload_vec(d_run_boundary_, h_run_boundary_, stream);
-    upload_vec(d_run_size_, h_run_size_, stream);
-    upload_vec(d_run_start_, starts, stream);
-  }
-
-  void init_run_layer(cudaStream_t stream) {
-    run_target_fill_ = std::max<std::uint32_t>(
-        1u, static_cast<std::uint32_t>(gpulsmopt_detail::kRunCapacity / 2));
-    run_pool_capacity_ = 0;
-    run_free_ids_.clear();
-    run_pool_keys_.clear();
-    run_pool_values_.clear();
-    run_pool_ops_.clear();
-    tier2_.clear();
-    grow_run_pool(4);
-    const std::uint32_t block = alloc_run_block();
-    h_run_block_ = {block};
-    h_run_boundary_ = {gpulsmopt_detail::kEmptyKey};
-    h_run_size_ = {0u};
-    run_live_total_ = 0;
-    upload_run_directory(stream);
+    return std::max<std::size_t>(budget, 1);
   }
 
   void ensure_direct_group_c0(cudaStream_t stream) {
@@ -2457,8 +2265,7 @@ private:
                  gpulsmopt_detail::kDgC0Empty);
     thrust::fill(policy, dg_c0_overflow_.begin(), dg_c0_overflow_.end(),
                  std::uint8_t{0});
-    const std::size_t reserve_count = std::min<std::size_t>(
-        run_flush_budget(), gpulsmopt_detail::kDgC0MaxIndex);
+    const std::size_t reserve_count = mutable_flush_budget();
     dg_c0_keys_.reserve(reserve_count);
     dg_c0_values_.reserve(reserve_count);
     dg_c0_ops_.reserve(reserve_count);
@@ -2521,410 +2328,108 @@ private:
 #endif
   }
 
-  // Append records to the run layer.
-  template <bool UseB>
-  void insert_records_impl(const std::uint32_t *keys_in,
-                           const std::uint32_t *values_in, std::uint8_t op,
-                           std::size_t count, cudaStream_t stream) {
-    if (count == 0)
+  void drain_mutable_for_space(cudaStream_t stream) {
+    if (dg_c0_log_total_ == 0)
       return;
-    const std::uint32_t *keys = keys_in;
-    const std::uint32_t *vals = values_in ? values_in : keys_in; // tomb val unused
-    const std::size_t r = h_run_block_.size();
-    std::vector<std::uint32_t> h_counts(r);
-
-    [[maybe_unused]] thrust::device_vector<std::uint32_t> routeb_keys,
-        routeb_vals;                                            // Method B batch
-    [[maybe_unused]] thrust::device_vector<std::uint32_t> d_begin, d_end; // slices
-    [[maybe_unused]] std::vector<std::uint32_t> h_begin;        // Method B starts
-    [[maybe_unused]] thrust::device_vector<std::uint32_t> gk_tmp,
-        gv_tmp; // Method A gather buffer
-
-    if constexpr (UseB) {
-      // Method B: sort once, then compute run slices.
-      {
-        auto pol = thrust::cuda::par.on(stream);
-        routeb_keys.assign(thrust::device_pointer_cast(keys),
-                           thrust::device_pointer_cast(keys) + count);
-        routeb_vals.assign(thrust::device_pointer_cast(vals),
-                           thrust::device_pointer_cast(vals) + count);
-        thrust::sort_by_key(pol, routeb_keys.begin(), routeb_keys.end(),
-                            routeb_vals.begin());
-        keys = raw_or_null(routeb_keys);
-        vals = raw_or_null(routeb_vals);
-      }
-      d_begin.resize(r);
-      d_end.resize(r);
-      {
-        const int block = 256;
-        const int grid = static_cast<int>((r + block - 1) / block);
-        gpulsmopt_detail::run_slice_bounds_kernel<<<grid, block, 0, stream>>>(
-            keys, count, raw_or_null(d_run_boundary_), r, raw_or_null(d_begin),
-            raw_or_null(d_end));
-        CUDA_CHECK(cudaGetLastError());
-      }
-      h_begin.resize(r);
-      std::vector<std::uint32_t> h_end(r);
-      CUDA_CHECK(cudaMemcpyAsync(h_begin.data(), raw_or_null(d_begin),
-                                 r * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_end.data(), raw_or_null(d_end),
-                                 r * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      for (std::size_t i = 0; i < r; ++i)
-        h_counts[i] = h_end[i] - h_begin[i];
-    } else {
-      // Method A: scan the whole batch per run.
-      ins_counts_.assign(r, 0u);
-      gpulsmopt_detail::rl_run_count_kernel<<<static_cast<int>(r), 256, 0,
-                                              stream>>>(
-          keys, count, raw_or_null(d_run_boundary_), r,
-          raw_or_null(ins_counts_));
-      CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), raw_or_null(ins_counts_),
-                                 r * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-
-    std::vector<std::uint8_t> is_fast(r);
-    for (std::size_t i = 0; i < r; ++i)
-      is_fast[i] =
-          (h_run_size_[i] + h_counts[i] <=
-           static_cast<std::uint32_t>(gpulsmopt_detail::kRunCapacity))
-              ? 1u
-              : 0u;
-
-    // Fast path: append to runs with room.
-    {
-      ins_is_fast_.assign(is_fast.begin(), is_fast.end());
-      ins_oldsize_.assign(h_run_size_.begin(), h_run_size_.end());
-      if constexpr (UseB) {
-        gpulsmopt_detail::rl_pull_fast_kernel<<<static_cast<int>(r), 128, 0,
-                                                stream>>>(
-            raw_or_null(ins_is_fast_), raw_or_null(d_begin), raw_or_null(d_end),
-            raw_or_null(d_run_start_), raw_or_null(ins_oldsize_), keys, vals, op,
-            raw_or_null(run_pool_keys_), raw_or_null(run_pool_values_),
-            raw_or_null(run_pool_ops_));
-      } else {
-        gpulsmopt_detail::rl_run_append_kernel<<<static_cast<int>(r), 256, 0,
-                                                 stream>>>(
-            raw_or_null(ins_is_fast_), raw_or_null(d_run_boundary_),
-            raw_or_null(d_run_start_), raw_or_null(ins_oldsize_), r, keys, vals,
-            op, count, raw_or_null(run_pool_keys_), raw_or_null(run_pool_values_),
-            raw_or_null(run_pool_ops_));
-      }
-      CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-    for (std::size_t i = 0; i < r; ++i)
-      if (is_fast[i])
-        h_run_size_[i] += h_counts[i];
-
-    // Slow path: rebuild overflowing runs.
-    std::vector<std::uint32_t> nb, nbd, nsz;
-    nb.reserve(r);
-    nbd.reserve(r);
-    nsz.reserve(r);
-    bool any_slow = false; // did any run split/rebuild (blocks/boundaries move)?
-    for (std::size_t i = 0; i < r; ++i) {
-      if (is_fast[i]) {
-        nb.push_back(h_run_block_[i]);
-        nbd.push_back(h_run_boundary_[i]);
-        nsz.push_back(h_run_size_[i]);
-        continue;
-      }
-      any_slow = true;
-      if constexpr (UseB) {
-        rebuild_run_contiguous(i, keys + h_begin[i], vals + h_begin[i], op,
-                               h_counts[i], stream, nb, nbd, nsz);
-      } else {
-        // Method A overflow rebuild.
-        const std::uint32_t inc = h_counts[i];
-        gk_tmp.resize(inc);
-        gv_tmp.resize(inc);
-        if (inc > 0) {
-          const std::uint32_t hi = h_run_boundary_[i];
-          const bool has_lo = i > 0;
-          const std::uint32_t lo = has_lo ? h_run_boundary_[i - 1] : 0u;
-          gpulsmopt_detail::rl_run_gather_kernel<<<1, 256, 0, stream>>>(
-              keys, vals, count, lo, hi, has_lo ? 1u : 0u, raw_or_null(gk_tmp),
-              raw_or_null(gv_tmp));
-          CUDA_CHECK(cudaGetLastError());
-        }
-        rebuild_run_contiguous(i, raw_or_null(gk_tmp), raw_or_null(gv_tmp), op,
-                               inc, stream, nb, nbd, nsz);
-      }
-      free_run_block(h_run_block_[i]);
-    }
-    h_run_block_ = std::move(nb);
-    h_run_boundary_ = std::move(nbd);
-    h_run_size_ = std::move(nsz);
-    run_live_total_ = 0;
-    for (auto s : h_run_size_)
-      run_live_total_ += s;
-    // Fast path: only run sizes changed.
-    if (any_slow)
-      upload_run_directory(stream);
-    else
-      upload_vec(d_run_size_, h_run_size_, stream);
-    overlay_dirty_ = true; // overlay changed; invalidate the cached read index
+#if GPULSMOPT_ENABLE_TIER2
+    flush_to_tier2(stream);
+    if (tier2_.size() >= gpulsmopt_detail::kTier2Fanout)
+      merge_down(stream);
+#else
+    merge_down(stream);
+#endif
   }
 
-  // Auto-select route by batch size.
+  // Append records to direct-group C0.
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
                       std::size_t count, cudaStream_t stream) {
-#if GPULSMOPT_COMPACT_DG_C0
-    if (append_direct_group_c0(keys_in, values_in, op, count, stream))
-      return;
-#endif
-#if GPULSMOPT_ROUTE_METHOD == 1
-    insert_records_impl<true>(keys_in, values_in, op, count, stream);
-#elif GPULSMOPT_ROUTE_METHOD == 0
-    insert_records_impl<false>(keys_in, values_in, op, count, stream);
-#else
-    if (count >= static_cast<std::size_t>(GPULSMOPT_ROUTE_AUTO_LIMIT))
-      insert_records_impl<true>(keys_in, values_in, op, count, stream);
-    else
-      insert_records_impl<false>(keys_in, values_in, op, count, stream);
-#endif
-  }
-
-  // Copy one run into a fresh block.
-  void emit_run(thrust::device_vector<std::uint32_t> &gk,
-                thrust::device_vector<std::uint32_t> &gv,
-                thrust::device_vector<std::uint8_t> &gop, std::size_t off,
-                std::uint32_t len, std::uint32_t boundary,
-                std::vector<std::uint32_t> &nb, std::vector<std::uint32_t> &nbd,
-                std::vector<std::uint32_t> &nsz, cudaStream_t stream) {
-    auto policy = thrust::cuda::par.on(stream);
-    const std::uint32_t block = alloc_run_block();
-    const std::size_t dst =
-        static_cast<std::size_t>(block) * gpulsmopt_detail::kRunCapacity;
-    thrust::copy(policy, gk.begin() + off, gk.begin() + off + len,
-                 run_pool_keys_.begin() + dst);
-    thrust::copy(policy, gv.begin() + off, gv.begin() + off + len,
-                 run_pool_values_.begin() + dst);
-    thrust::copy(policy, gop.begin() + off, gop.begin() + off + len,
-                 run_pool_ops_.begin() + dst);
-    nb.push_back(block);
-    nbd.push_back(boundary);
-    nsz.push_back(len);
-  }
-
-  // Split combined entries into bounded runs.
-  void split_entries_into_runs(thrust::device_vector<std::uint32_t> &gk,
-                               thrust::device_vector<std::uint32_t> &gv,
-                               thrust::device_vector<std::uint8_t> &gop,
-                               std::size_t m, std::uint32_t top_boundary,
-                               std::vector<std::uint32_t> &nb,
-                               std::vector<std::uint32_t> &nbd,
-                               std::vector<std::uint32_t> &nsz,
-                               cudaStream_t stream) {
-    if (m == 0)
-      return;
-    const std::uint32_t target = run_target_fill_;
-    if (m <= target) {
-      emit_run(gk, gv, gop, 0, static_cast<std::uint32_t>(m), top_boundary, nb,
-               nbd, nsz, stream);
-      return;
-    }
-    auto policy = thrust::cuda::par.on(stream);
-    const std::size_t k = (m + target - 1) / target;
-
-    // Sampled quantile pivots.
-    const std::size_t s = std::min(m, std::max<std::size_t>(k * 32, 256));
-    thrust::device_vector<std::uint32_t> samp(s);
-    {
-      const int block = 256;
-      const int grid = static_cast<int>((s + block - 1) / block);
-      gpulsmopt_detail::sample_gather_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(gk), m, raw_or_null(samp), s);
-      CUDA_CHECK(cudaGetLastError());
-    }
-    thrust::sort(policy, samp.begin(), samp.end());
-    std::vector<std::uint32_t> hsamp(s);
-    CUDA_CHECK(cudaMemcpyAsync(hsamp.data(), raw_or_null(samp),
-                               s * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<std::uint32_t> hB(k);
-    for (std::size_t c = 0; c + 1 < k; ++c) {
-      std::size_t pos = ((c + 1) * s) / k;
-      if (pos >= s)
-        pos = s - 1;
-      std::uint32_t v = hsamp[pos];
-      if (v > top_boundary)
-        v = top_boundary;
-      if (c > 0 && v < hB[c - 1])
-        v = hB[c - 1];
-      hB[c] = v;
-    }
-    hB[k - 1] = top_boundary;
-    thrust::device_vector<std::uint32_t> dB(hB);
-
-    thrust::device_vector<std::uint32_t> bucket(m);
-    {
-      const int block = 256;
-      const int grid = static_cast<int>((m + block - 1) / block);
-      gpulsmopt_detail::bucket_assign_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(gk), m, raw_or_null(dB), k, raw_or_null(bucket));
-      CUDA_CHECK(cudaGetLastError());
-    }
-    thrust::device_vector<std::uint32_t> bcount(k, 0u);
-    {
-      const int block = 256;
-      const int grid = static_cast<int>((m + block - 1) / block);
-      gpulsmopt_detail::rl_histogram_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(bucket), m, raw_or_null(bcount));
-      CUDA_CHECK(cudaGetLastError());
-    }
-    std::vector<std::uint32_t> hcount(k);
-    CUDA_CHECK(cudaMemcpyAsync(hcount.data(), raw_or_null(bcount),
-                               k * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::uint32_t maxc = 0;
-    for (auto c : hcount)
-      maxc = std::max(maxc, c);
-    if (maxc > static_cast<std::uint32_t>(gpulsmopt_detail::kRunCapacity)) {
-      sort_split_entries(gk, gv, gop, m, top_boundary, nb, nbd, nsz, stream);
-      return;
-    }
-
-    // Stable group by bucket.
-    auto payload = thrust::make_zip_iterator(
-        thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
-    thrust::stable_sort_by_key(policy, bucket.begin(), bucket.end(), payload);
-
     std::size_t off = 0;
-    std::size_t last_emitted = static_cast<std::size_t>(-1);
-    for (std::size_t c = 0; c < k; ++c) {
-      const std::uint32_t len = hcount[c];
-      if (len == 0)
+    while (off < count) {
+      const std::size_t budget = mutable_flush_budget();
+      if (dg_c0_log_total_ >= budget)
+        drain_mutable_for_space(stream);
+      if (dg_c0_log_total_ >= gpulsmopt_detail::kDgC0MaxIndex)
+        drain_mutable_for_space(stream);
+      const std::size_t cap_left =
+          gpulsmopt_detail::kDgC0MaxIndex - dg_c0_log_total_;
+      const std::size_t budget_left =
+          budget > dg_c0_log_total_ ? budget - dg_c0_log_total_ : cap_left;
+      std::size_t chunk = count - off;
+      chunk = std::min(chunk, cap_left);
+      chunk = std::min(chunk, budget_left);
+      if (chunk == 0) {
+        drain_mutable_for_space(stream);
         continue;
-      emit_run(gk, gv, gop, off, len, hB[c], nb, nbd, nsz, stream);
-      off += len;
-      last_emitted = nb.size() - 1;
-    }
-    if (last_emitted != static_cast<std::size_t>(-1))
-      nbd[last_emitted] = top_boundary; // highest run is the catch-all
-  }
-
-  // Sort/dedup fallback split.
-  void sort_split_entries(thrust::device_vector<std::uint32_t> &gk,
-                          thrust::device_vector<std::uint32_t> &gv,
-                          thrust::device_vector<std::uint8_t> &gop,
-                          std::size_t m, std::uint32_t top_boundary,
-                          std::vector<std::uint32_t> &nb,
-                          std::vector<std::uint32_t> &nbd,
-                          std::vector<std::uint32_t> &nsz, cudaStream_t stream) {
-    auto policy = thrust::cuda::par.on(stream);
-    thrust::device_vector<std::uint32_t> arr(m);
-    thrust::sequence(policy, arr.begin(), arr.end());
-    thrust::device_vector<std::uint64_t> sortk(m);
-    fill_drain_sort_keys(gk, arr, sortk, 0, m, stream);
-    auto payload = thrust::make_zip_iterator(
-        thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
-    thrust::sort_by_key(policy, sortk.begin(), sortk.end(), payload);
-    auto uend = thrust::unique_by_key(
-        policy, gk.begin(), gk.begin() + m,
-        thrust::make_zip_iterator(thrust::make_tuple(gv.begin(), gop.begin())));
-    const std::size_t u = static_cast<std::size_t>(uend.first - gk.begin());
-    if (u == 0)
-      return;
-    const std::uint32_t target = run_target_fill_;
-    const std::size_t k = (u + target - 1) / target;
-    std::vector<std::uint32_t> host_keys(u);
-    CUDA_CHECK(cudaMemcpyAsync(host_keys.data(), raw_or_null(gk),
-                               u * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    for (std::size_t c = 0; c < k; ++c) {
-      const std::size_t cs = c * target;
-      const std::size_t ce =
-          std::min((c + 1) * static_cast<std::size_t>(target), u);
-      const std::uint32_t bnd = (c + 1 == k) ? top_boundary : host_keys[ce - 1];
-      emit_run(gk, gv, gop, cs, static_cast<std::uint32_t>(ce - cs), bnd, nb,
-               nbd, nsz, stream);
+      }
+      const std::uint32_t *vals = values_in ? values_in + off : nullptr;
+      if (!append_direct_group_c0(keys_in + off, vals, op, chunk, stream))
+        throw std::runtime_error("direct-group C0 append failed");
+      off += chunk;
     }
   }
 
-  // Rebuild one overflowing method-B run.
-  void rebuild_run_contiguous(std::size_t i, const std::uint32_t *in_keys,
-                              const std::uint32_t *in_vals, std::uint8_t op,
-                              std::uint32_t inc, cudaStream_t stream,
-                              std::vector<std::uint32_t> &nb,
-                              std::vector<std::uint32_t> &nbd,
-                              std::vector<std::uint32_t> &nsz) {
-    auto policy = thrust::cuda::par.on(stream);
-    const std::uint32_t old_size = h_run_size_[i];
-    const std::uint32_t old_boundary = h_run_boundary_[i];
-    const std::size_t m = static_cast<std::size_t>(old_size) + inc;
-    const std::size_t base =
-        static_cast<std::size_t>(h_run_block_[i]) * gpulsmopt_detail::kRunCapacity;
-    thrust::device_vector<std::uint32_t> gk(m), gv(m);
-    thrust::device_vector<std::uint8_t> gop(m);
-    if (old_size > 0) {
-      thrust::copy(policy, run_pool_keys_.begin() + base,
-                   run_pool_keys_.begin() + base + old_size, gk.begin());
-      thrust::copy(policy, run_pool_values_.begin() + base,
-                   run_pool_values_.begin() + base + old_size, gv.begin());
-      thrust::copy(policy, run_pool_ops_.begin() + base,
-                   run_pool_ops_.begin() + base + old_size, gop.begin());
-    }
-    if (inc > 0) {
-      auto kptr = thrust::device_pointer_cast(in_keys);
-      auto vptr = thrust::device_pointer_cast(in_vals);
-      thrust::copy(policy, kptr, kptr + inc, gk.begin() + old_size);
-      thrust::copy(policy, vptr, vptr + inc, gv.begin() + old_size);
-      thrust::fill(policy, gop.begin() + old_size, gop.end(), op);
-    }
-    split_entries_into_runs(gk, gv, gop, m, old_boundary, nb, nbd, nsz, stream);
-  }
-
-  // Move live runs into a tier-2 generation.
+  // Move direct-group C0 records into a tier-2 generation.
   void flush_to_tier2(cudaStream_t stream) {
-    const std::size_t r = h_run_block_.size();
-    std::size_t total = 0;
-    for (auto s : h_run_size_)
-      total += s;
-    if (total == 0)
+    const std::size_t c0_total = dg_c0_log_total_;
+    if (c0_total == 0)
       return;
-    auto policy = thrust::cuda::par.on(stream);
+    (void)stream;
     Tier2Gen gen;
-    gen.keys.resize(total);
-    gen.values.resize(total);
-    gen.ops.resize(total);
-    std::vector<std::uint32_t> bnd, start, sz;
-    std::size_t off = 0;
-    for (std::size_t i = 0; i < r; ++i) {
-      const std::uint32_t s = h_run_size_[i];
-      if (s == 0)
-        continue;
-      const std::size_t bpos =
-          static_cast<std::size_t>(h_run_block_[i]) * gpulsmopt_detail::kRunCapacity;
-      thrust::copy(policy, run_pool_keys_.begin() + bpos,
-                   run_pool_keys_.begin() + bpos + s, gen.keys.begin() + off);
-      thrust::copy(policy, run_pool_values_.begin() + bpos,
-                   run_pool_values_.begin() + bpos + s, gen.values.begin() + off);
-      thrust::copy(policy, run_pool_ops_.begin() + bpos,
-                   run_pool_ops_.begin() + bpos + s, gen.ops.begin() + off);
-      bnd.push_back(h_run_boundary_[i]);
-      start.push_back(static_cast<std::uint32_t>(off));
-      sz.push_back(s);
-      off += s;
-    }
-    upload_vec(gen.block_boundary, bnd, stream);
-    upload_vec(gen.block_start, start, stream);
-    upload_vec(gen.block_size, sz, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    gen.log_total = static_cast<std::uint32_t>(c0_total);
+    gen.keys = std::move(dg_c0_keys_);
+    gen.values = std::move(dg_c0_values_);
+    gen.ops = std::move(dg_c0_ops_);
+    gen.slots = std::move(dg_c0_slots_);
+    gen.overflow = std::move(dg_c0_overflow_);
     tier2_.push_back(std::move(gen));
-    std::fill(h_run_size_.begin(), h_run_size_.end(), 0u);
-    run_live_total_ = 0;
-    upload_run_directory(stream);
+    dg_c0_log_total_ = 0;
+    dg_c0_keys_ = thrust::device_vector<std::uint32_t>();
+    dg_c0_values_ = thrust::device_vector<std::uint32_t>();
+    dg_c0_ops_ = thrust::device_vector<std::uint8_t>();
+    dg_c0_slots_ = thrust::device_vector<std::uint32_t>();
+    dg_c0_overflow_ = thrust::device_vector<std::uint8_t>();
+    tier2_lookup_dirty_ = true;
+    overlay_dirty_ = true;
+  }
+
+  void upload_tier2_lookup_metadata(cudaStream_t stream) {
+    if (!tier2_lookup_dirty_)
+      return;
+    std::vector<const std::uint32_t *> keys, values, slots;
+    std::vector<const std::uint8_t *> ops, overflow;
+    std::vector<std::uint32_t> count;
+    keys.reserve(tier2_.size());
+    values.reserve(tier2_.size());
+    ops.reserve(tier2_.size());
+    slots.reserve(tier2_.size());
+    overflow.reserve(tier2_.size());
+    count.reserve(tier2_.size());
+    for (const auto &g : tier2_) {
+      keys.push_back(raw_or_null(g.keys));
+      values.push_back(raw_or_null(g.values));
+      ops.push_back(raw_or_null(g.ops));
+      slots.push_back(raw_or_null(g.slots));
+      overflow.push_back(raw_or_null(g.overflow));
+      count.push_back(g.log_total);
+    }
+    upload_vec(tier2_d_keys_, keys, stream);
+    upload_vec(tier2_d_values_, values, stream);
+    upload_vec(tier2_d_ops_, ops, stream);
+    upload_vec(tier2_d_slots_, slots, stream);
+    upload_vec(tier2_d_overflow_, overflow, stream);
+    upload_vec(tier2_d_count_, count, stream);
+    tier2_lookup_dirty_ = false;
+  }
+
+  void clear_tier2_lookup_metadata() {
+    tier2_d_keys_.clear();
+    tier2_d_values_.clear();
+    tier2_d_ops_.clear();
+    tier2_d_slots_.clear();
+    tier2_d_overflow_.clear();
+    tier2_d_count_.clear();
+    tier2_lookup_dirty_ = true;
   }
 
   // Resolved overlay snapshot for direct reads.
@@ -2944,9 +2449,9 @@ private:
                        std::size_t &ins, cudaStream_t stream) {
     u = 0;
     ins = 0;
-    std::size_t total = run_live_total_ + dg_c0_log_total_;
+    std::size_t total = dg_c0_log_total_;
     for (auto &g : tier2_)
-      total += g.keys.size();
+      total += g.log_total;
     if (total == 0) {
       gk.clear();
       gv.clear();
@@ -2958,28 +2463,16 @@ private:
     gv.resize(total);
     gop.resize(total);
     std::size_t off = 0;
-    for (auto &g : tier2_) { // oldest generation first -> lowest arrival
-      const std::size_t s = g.keys.size();
+    for (auto &g : tier2_) {
+      const std::size_t s = g.log_total;
       if (s) {
-        thrust::copy(policy, g.keys.begin(), g.keys.end(), gk.begin() + off);
-        thrust::copy(policy, g.values.begin(), g.values.end(), gv.begin() + off);
-        thrust::copy(policy, g.ops.begin(), g.ops.end(), gop.begin() + off);
+        thrust::copy(policy, g.keys.begin(), g.keys.begin() + s,
+                     gk.begin() + off);
+        thrust::copy(policy, g.values.begin(), g.values.begin() + s,
+                     gv.begin() + off);
+        thrust::copy(policy, g.ops.begin(), g.ops.begin() + s,
+                     gop.begin() + off);
       }
-      off += s;
-    }
-    const std::size_t r = h_run_block_.size(); // run layer newest -> highest arr
-    for (std::size_t i = 0; i < r; ++i) {
-      const std::uint32_t s = h_run_size_[i];
-      if (s == 0)
-        continue;
-      const std::size_t bpos =
-          static_cast<std::size_t>(h_run_block_[i]) * gpulsmopt_detail::kRunCapacity;
-      thrust::copy(policy, run_pool_keys_.begin() + bpos,
-                   run_pool_keys_.begin() + bpos + s, gk.begin() + off);
-      thrust::copy(policy, run_pool_values_.begin() + bpos,
-                   run_pool_values_.begin() + bpos + s, gv.begin() + off);
-      thrust::copy(policy, run_pool_ops_.begin() + bpos,
-                   run_pool_ops_.begin() + bpos + s, gop.begin() + off);
       off += s;
     }
     if (dg_c0_log_total_ > 0) {
@@ -3046,29 +2539,6 @@ private:
       overlay_dirty_ = false;
     }
     return cached_overlay_;
-  }
-
-  // Reset the run layer to one empty root run.
-  void reset_run_layer_to_root(cudaStream_t stream) {
-    for (std::uint32_t b : h_run_block_)
-      run_free_ids_.push_back(b);
-    const std::uint32_t block = alloc_run_block();
-    h_run_block_ = {block};
-    h_run_boundary_ = {gpulsmopt_detail::kEmptyKey};
-    h_run_size_ = {0u};
-    run_live_total_ = 0;
-    upload_run_directory(stream);
-  }
-
-  // Clear run sizes while keeping boundaries.
-  void clear_run_layer_keep_boundaries(cudaStream_t stream) {
-    if (h_run_block_.empty()) {
-      reset_run_layer_to_root(stream);
-      return;
-    }
-    std::fill(h_run_size_.begin(), h_run_size_.end(), 0u);
-    run_live_total_ = 0;
-    upload_run_directory(stream);
   }
 
   // Merge overlay entries into the segmented sheet.
@@ -3142,7 +2612,7 @@ private:
 #endif
     }
     tier2_.clear();
-    clear_run_layer_keep_boundaries(stream);
+    clear_tier2_lookup_metadata();
     clear_direct_group_c0(stream);
     overlay_dirty_ = true; // overlay drained to sheet; cached read index stale
 #ifdef GPULSMOPT_PROFILE_INSERT
@@ -3177,27 +2647,27 @@ private:
     });
   }
 
-  // Decide whether the run layer should drain.
+  // Decide whether mutable records should drain.
   bool drain_needed_locked(cudaStream_t stream) {
 #if GPULSMOPT_ENABLE_TIER2
     maybe_flush_and_merge(stream);
     return false;
 #else
     (void)stream;
-    return run_live_total_ + dg_c0_log_total_ >= run_flush_budget();
+    return mutable_layer_live() >= mutable_flush_budget();
 #endif
   }
 
   void maybe_flush_and_merge(cudaStream_t stream) {
 #if GPULSMOPT_ENABLE_TIER2
     // Tier-2 path.
-    if (run_live_total_ >= run_flush_budget())
+    if (mutable_layer_live() >= mutable_flush_budget())
       flush_to_tier2(stream);
     if (tier2_.size() >= gpulsmopt_detail::kTier2Fanout)
       merge_down(stream);
 #else
     // Direct sheet drain.
-    if (run_live_total_ < run_flush_budget())
+    if (mutable_layer_live() < mutable_flush_budget())
       return;
 #ifdef GPULSMOPT_PROFILE_INSERT
     cudaEvent_t pa, pb;
@@ -3209,7 +2679,7 @@ private:
     cudaEventSynchronize(pb);
     float t_merge = 0.f;
     cudaEventElapsedTime(&t_merge, pa, pb);
-    printf("[prof]   merge_down (L1->sheet, tier2 off)=%.3f ms\n", t_merge);
+    printf("[prof]   merge_down (C0->sheet, tier2 off)=%.3f ms\n", t_merge);
     cudaEventDestroy(pa);
     cudaEventDestroy(pb);
 #else
@@ -3222,14 +2692,20 @@ private:
   void lookup_layered(const DeviceLookupBatch &batch, cudaStream_t stream) {
     const std::size_t n = batch.count;
 #if GPULSMOPT_COMPACT_DG_C0
-    if (dg_c0_log_total_ > 0 && run_live_total_ == 0 && tier2_.empty()) {
+    if (dg_c0_log_total_ > 0 || !tier2_.empty()) {
+      upload_tier2_lookup_metadata(stream);
       const int block = 256;
       const int grid = static_cast<int>((n + block - 1) / block);
-      gpulsmopt_detail::dg_c0_point_lookup_kernel<<<grid, block, 0, stream>>>(
+      gpulsmopt_detail::dg_layered_point_lookup_kernel<<<grid, block, 0,
+                                                         stream>>>(
           batch.queries, n, batch.out_values, batch.out_found,
           raw_or_null(dg_c0_keys_), raw_or_null(dg_c0_values_),
           raw_or_null(dg_c0_ops_), dg_c0_log_total_,
           raw_or_null(dg_c0_slots_), raw_or_null(dg_c0_overflow_),
+          raw_or_null(tier2_d_keys_), raw_or_null(tier2_d_values_),
+          raw_or_null(tier2_d_ops_), raw_or_null(tier2_d_slots_),
+          raw_or_null(tier2_d_overflow_), raw_or_null(tier2_d_count_),
+          tier2_.size(),
           raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
           h_dir_seg_id_.size(), raw_or_null(pool_keys_),
           raw_or_null(pool_values_), raw_or_null(pool_valid_),
@@ -3238,6 +2714,18 @@ private:
       return;
     }
 #endif
+    if (dg_c0_log_total_ == 0 && tier2_.empty()) {
+      const int block = 256;
+      const int grid = static_cast<int>((n + block - 1) / block);
+      gpulsmopt_detail::point_lookup_kernel<<<grid, block, 0, stream>>>(
+          batch.queries, n, batch.out_values, batch.out_found, nullptr,
+          nullptr, 0, nullptr, 0, raw_or_null(d_dir_boundary_),
+          raw_or_null(d_dir_seg_id_), h_dir_seg_id_.size(),
+          raw_or_null(pool_keys_), raw_or_null(pool_values_),
+          raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_));
+      CUDA_CHECK(cudaGetLastError());
+      return;
+    }
     // Query cached overlay before the sheet.
     const OverlayReadIndex &ix = overlay_index(stream);
     const int block = 256;
@@ -3251,10 +2739,6 @@ private:
     CUDA_CHECK(cudaGetLastError());
   }
 
-  std::size_t run_layer_live() const {
-    return run_live_total_ + dg_c0_log_total_;
-  }
-
   // Configuration.
   std::size_t max_elements_ = 0;
   std::size_t batch_size_ = 0;
@@ -3264,26 +2748,6 @@ private:
   mutable std::shared_mutex snapshot_mutex_;
   // Background drain handle.
   mutable std::future<void> pending_drain_;
-
-  // Run layer state.
-  std::size_t run_pool_capacity_ = 0; // number of allocatable run blocks
-  std::vector<std::uint32_t> run_free_ids_;
-  thrust::device_vector<std::uint32_t> run_pool_keys_;
-  thrust::device_vector<std::uint32_t> run_pool_values_;
-  thrust::device_vector<std::uint8_t> run_pool_ops_; // kInsert / kTombstone
-  std::vector<std::uint32_t> h_run_block_;    // pool block id per run ordinal
-  std::vector<std::uint32_t> h_run_boundary_; // inclusive upper key bound
-  std::vector<std::uint32_t> h_run_size_;     // live entry count per run
-  thrust::device_vector<std::uint32_t> d_run_block_;
-  thrust::device_vector<std::uint32_t> d_run_boundary_;
-  thrust::device_vector<std::uint32_t> d_run_size_;
-  thrust::device_vector<std::uint32_t> d_run_start_; // block * kRunCapacity
-  // Reused insert scratch.
-  thrust::device_vector<std::uint32_t> ins_counts_;  // Method A per-run counts
-  thrust::device_vector<std::uint8_t> ins_is_fast_;  // per-run "has room" flag
-  thrust::device_vector<std::uint32_t> ins_oldsize_; // per-run pre-append size
-  std::size_t run_live_total_ = 0;                   // live entries across runs
-  std::uint32_t run_target_fill_ = 0;                // fill per run after split
 
   // Direct-group C0 state.
   std::uint32_t dg_c0_log_total_ = 0;
@@ -3295,16 +2759,21 @@ private:
 
   // Tier-2 generation state.
   struct Tier2Gen {
+    std::uint32_t log_total = 0;
     thrust::device_vector<std::uint32_t> keys;
     thrust::device_vector<std::uint32_t> values;
     thrust::device_vector<std::uint8_t> ops;
-    thrust::device_vector<std::uint32_t> block_boundary; // per sub-block max key
-    thrust::device_vector<std::uint32_t> block_start;    // per sub-block offset
-    thrust::device_vector<std::uint32_t> block_size;     // per sub-block live
-    std::uint32_t range_lo = 0;
-    std::uint32_t range_hi = 0;
+    thrust::device_vector<std::uint32_t> slots;
+    thrust::device_vector<std::uint8_t> overflow;
   };
   std::vector<Tier2Gen> tier2_;
+  thrust::device_vector<const std::uint32_t *> tier2_d_keys_;
+  thrust::device_vector<const std::uint32_t *> tier2_d_values_;
+  thrust::device_vector<const std::uint8_t *> tier2_d_ops_;
+  thrust::device_vector<const std::uint32_t *> tier2_d_slots_;
+  thrust::device_vector<const std::uint8_t *> tier2_d_overflow_;
+  thrust::device_vector<std::uint32_t> tier2_d_count_;
+  bool tier2_lookup_dirty_ = true;
 
   // Segmented bottom layer state.
   std::size_t pool_capacity_ = 0;
