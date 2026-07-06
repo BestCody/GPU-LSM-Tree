@@ -74,6 +74,15 @@ constexpr bool shift_insert_range = false;
 #define UPDATE_DELETE_PERCENT UPDATE_INSERT_PERCENT
 #endif
 
+#ifdef UPDATE_INSERT_BATCH_LOG
+constexpr size_t fixed_insert_batch_size =
+    size_t{1} << UPDATE_INSERT_BATCH_LOG;
+#endif
+
+#ifdef UPDATE_DELETE_BATCH_LOG
+constexpr size_t fixed_delete_batch_size = size_t{1} << UPDATE_DELETE_BATCH_LOG;
+#endif
+
 // probe_key_sort_timed.cuh
 
 #ifndef GLOBALQUALIFIER
@@ -1232,7 +1241,6 @@ void benchmark_updates(
             const size_t constant_above_99M = 6; // to ensure we are above 99M, which seems to be a critical point for some implementations 
             size_t build_size = NinetyNineMillion + constant_above_99M  ;   
             std::cerr << " --> Build Size at top of File " << build_size << " free memory: " <<    free_memory_bytes << " total mem: " << total_memory_bytes << std::endl;
-            size_t key_generation_size = build_size * (100 + tc.total_inserts_percentage_of_build_size) / 100;
             size_t probe_size = NinetyNineMillion +2; 
 
         #else
@@ -1240,7 +1248,6 @@ void benchmark_updates(
 
             size_t build_size = ( size_t{1} << tc.build_size_log ); 
             std::cerr << " --> Build Size defined at Top of File " << build_size << " Free memory: " <<    free_memory_bytes << " Total mem: " << total_memory_bytes << std::endl;
-            size_t key_generation_size = build_size * (100 + tc.total_inserts_percentage_of_build_size) / 100;
             size_t probe_size = (size_t{1} << tc.probe_size_log);
 
 
@@ -1249,6 +1256,13 @@ void benchmark_updates(
 
         size_t insert_batch_size = build_size * tc.total_inserts_percentage_of_build_size / (100 * tc.batch_count);
         size_t delete_batch_size = build_size * tc.total_deletes_percentage_of_build_size / (100 * tc.batch_count);
+#ifdef UPDATE_INSERT_BATCH_LOG
+        insert_batch_size = fixed_insert_batch_size;
+#endif
+#ifdef UPDATE_DELETE_BATCH_LOG
+        delete_batch_size = fixed_delete_batch_size;
+#endif
+        size_t key_generation_size = build_size + insert_batch_size * tc.batch_count;
         // size_t cache_line = tc.cache_line;
         // size_t node_size_log = size_t{1} << tc.node_size_log;
 

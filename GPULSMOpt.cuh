@@ -99,6 +99,12 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_ST_DELETE_LIMIT
 #define GPULSMOPT_ST_DELETE_LIMIT 32768
 #endif
+#ifndef GPULSMOPT_COMPACT_DG_C0
+#define GPULSMOPT_COMPACT_DG_C0 0
+#endif
+#ifndef GPULSMOPT_DG_C0_SLOTS
+#define GPULSMOPT_DG_C0_SLOTS 16
+#endif
 
 constexpr int kBucketSlots = 32;
 constexpr int kSegmentBuckets = GPULSMOPT_SEGMENT_BUCKETS;
@@ -111,6 +117,12 @@ constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
 constexpr std::size_t kRunsPerClass = 4;
 constexpr int kRunCapacity = GPULSMOPT_RUN_CAPACITY;
+constexpr int kDgC0Slots = GPULSMOPT_DG_C0_SLOTS;
+constexpr std::size_t kDgC0Groups = std::size_t{1} << 24;
+constexpr std::uint32_t kDgC0Empty = 0xffffffffu;
+constexpr std::uint32_t kDgC0IndexMask = 0x00ffffffu;
+constexpr std::uint32_t kDgC0MaxIndex = 0x00fffffeu;
+static_assert(kDgC0Slots >= 1, "direct-group C0 needs slots");
 constexpr std::size_t kStDeleteLimit = GPULSMOPT_ST_DELETE_LIMIT;
 constexpr std::size_t kTier2Fanout = GPULSMOPT_TIER2_FANOUT;
 constexpr std::size_t kRunDrainDivisor = GPULSMOPT_RUN_DRAIN_DIVISOR;
@@ -1020,6 +1032,97 @@ __global__ void rl_run_gather_kernel(const std::uint32_t *keys,
   }
 }
 
+__global__ void dg_c0_append_kernel(
+    const std::uint32_t *keys, const std::uint32_t *values, std::uint8_t op,
+    std::uint32_t old_count, std::size_t n, std::uint32_t *log_keys,
+    std::uint32_t *log_values, std::uint8_t *log_ops,
+    std::uint32_t *slots, std::uint8_t *overflow) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  const std::uint32_t idx = old_count + static_cast<std::uint32_t>(i);
+  const std::uint32_t key = keys[i];
+  const std::uint32_t val = values ? values[i] : key;
+  log_keys[idx] = key;
+  log_values[idx] = val;
+  log_ops[idx] = op;
+
+  const std::uint32_t group = key >> 8;
+  const std::uint32_t low = key & 255u;
+  const std::uint32_t packed = (low << 24) | idx;
+  const std::size_t base = static_cast<std::size_t>(group) * kDgC0Slots;
+  for (int s = 0; s < kDgC0Slots; ++s) {
+    const std::uint32_t cur = slots[base + s];
+    if (cur != kDgC0Empty && (cur >> 24) == low) {
+      atomicMax(slots + base + s, packed);
+      return;
+    }
+  }
+  for (int s = 0; s < kDgC0Slots; ++s) {
+    const std::uint32_t cur =
+        atomicCAS(slots + base + s, kDgC0Empty, packed);
+    if (cur == kDgC0Empty)
+      return;
+    if ((cur >> 24) == low) {
+      atomicMax(slots + base + s, packed);
+      return;
+    }
+  }
+  overflow[group] = 1u;
+}
+
+__global__ void dg_c0_point_lookup_kernel(
+    const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
+    std::uint8_t *out_found, const std::uint32_t *log_keys,
+    const std::uint32_t *log_values, const std::uint8_t *log_ops,
+    std::uint32_t log_count, const std::uint32_t *slots,
+    const std::uint8_t *overflow, const std::uint32_t *dir_boundary,
+    const std::uint32_t *dir_seg_id, std::size_t dir_count,
+    const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
+    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  const std::uint32_t key = queries[i];
+  const std::uint32_t group = key >> 8;
+  const std::uint32_t low = key & 255u;
+  const std::size_t base = static_cast<std::size_t>(group) * kDgC0Slots;
+  for (int s = 0; s < kDgC0Slots; ++s) {
+    const std::uint32_t cur = slots[base + s];
+    if (cur == kDgC0Empty || (cur >> 24) != low)
+      continue;
+    const std::uint32_t idx = cur & kDgC0IndexMask;
+    if (idx < log_count && log_keys[idx] == key) {
+      const bool live = log_ops[idx] == kInsert;
+      out_found[i] = live ? 1u : 0u;
+      out_value[i] = live ? log_values[idx] : 0u;
+      return;
+    }
+  }
+  if (overflow[group]) {
+    for (std::uint32_t j = log_count; j > 0; --j) {
+      const std::uint32_t p = j - 1u;
+      if (log_keys[p] != key)
+        continue;
+      const bool live = log_ops[p] == kInsert;
+      out_found[i] = live ? 1u : 0u;
+      out_value[i] = live ? log_values[p] : 0u;
+      return;
+    }
+  }
+  std::uint32_t value = 0;
+  bool found = false;
+  if (dir_count > 0) {
+    std::size_t ord = lower_bound_u32(dir_boundary, dir_count, key);
+    if (ord >= dir_count)
+      ord = dir_count - 1;
+    found = seg_point_lookup(dir_seg_id[ord], key, pool_keys, pool_values,
+                             pool_valid, seg_bucket_max, &value);
+  }
+  out_found[i] = found ? 1u : 0u;
+  out_value[i] = found ? value : 0u;
+}
+
 // Point lookup through resolved overlay then sheet.
 __global__ void point_lookup_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
@@ -1322,6 +1425,7 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(stream));
     reset_directory_to_root(stream);
     init_run_layer(stream);
+    clear_direct_group_c0(stream);
     overlay_dirty_ = true; // sheet + overlay reset; cached read index stale
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1502,7 +1606,9 @@ public:
         d_dir_seg_id_, d_dir_boundary_, d_dir_prefix_, d_dir_value_sum_,
         d_dir_value_prefix_, scratch_incoming_keys_, scratch_incoming_values_,
         scratch_delete_keys_, scratch_query_found_, seg_cand_seg_, seg_cand_key_,
-        seg_cand_value_, seg_cand_op_, seg_cand_seq_, seg_cand_group_sort_);
+        seg_cand_value_, seg_cand_op_, seg_cand_seq_, seg_cand_group_sort_,
+        dg_c0_keys_, dg_c0_values_, dg_c0_ops_, dg_c0_slots_,
+        dg_c0_overflow_);
     for (const auto &g : tier2_)
       total += device_bytes_all(g.keys, g.values, g.ops, g.block_boundary,
                                 g.block_start, g.block_size);
@@ -2338,6 +2444,83 @@ private:
     upload_run_directory(stream);
   }
 
+  void ensure_direct_group_c0(cudaStream_t stream) {
+#if GPULSMOPT_COMPACT_DG_C0
+    if (!dg_c0_slots_.empty())
+      return;
+    const std::size_t slot_count =
+        gpulsmopt_detail::kDgC0Groups * gpulsmopt_detail::kDgC0Slots;
+    dg_c0_slots_.resize(slot_count);
+    dg_c0_overflow_.resize(gpulsmopt_detail::kDgC0Groups);
+    auto policy = thrust::cuda::par.on(stream);
+    thrust::fill(policy, dg_c0_slots_.begin(), dg_c0_slots_.end(),
+                 gpulsmopt_detail::kDgC0Empty);
+    thrust::fill(policy, dg_c0_overflow_.begin(), dg_c0_overflow_.end(),
+                 std::uint8_t{0});
+    const std::size_t reserve_count = std::min<std::size_t>(
+        run_flush_budget(), gpulsmopt_detail::kDgC0MaxIndex);
+    dg_c0_keys_.reserve(reserve_count);
+    dg_c0_values_.reserve(reserve_count);
+    dg_c0_ops_.reserve(reserve_count);
+#else
+    (void)stream;
+#endif
+  }
+
+  bool append_direct_group_c0(const std::uint32_t *keys_in,
+                              const std::uint32_t *values_in, std::uint8_t op,
+                              std::size_t count, cudaStream_t stream) {
+#if GPULSMOPT_COMPACT_DG_C0
+    if (count == 0)
+      return true;
+    if (count > gpulsmopt_detail::kDgC0MaxIndex - dg_c0_log_total_)
+      return false;
+    ensure_direct_group_c0(stream);
+    const std::uint32_t old_total = dg_c0_log_total_;
+    const std::size_t new_total = static_cast<std::size_t>(old_total) + count;
+    dg_c0_keys_.resize(new_total);
+    dg_c0_values_.resize(new_total);
+    dg_c0_ops_.resize(new_total);
+    const int block = 256;
+    const int grid = static_cast<int>((count + block - 1) / block);
+    gpulsmopt_detail::dg_c0_append_kernel<<<grid, block, 0, stream>>>(
+        keys_in, values_in, op, old_total, count, raw_or_null(dg_c0_keys_),
+        raw_or_null(dg_c0_values_), raw_or_null(dg_c0_ops_),
+        raw_or_null(dg_c0_slots_), raw_or_null(dg_c0_overflow_));
+    CUDA_CHECK(cudaGetLastError());
+    dg_c0_log_total_ = static_cast<std::uint32_t>(new_total);
+    overlay_dirty_ = true;
+    return true;
+#else
+    (void)keys_in;
+    (void)values_in;
+    (void)op;
+    (void)count;
+    (void)stream;
+    return false;
+#endif
+  }
+
+  void clear_direct_group_c0(cudaStream_t stream) {
+#if GPULSMOPT_COMPACT_DG_C0
+    if (dg_c0_log_total_ == 0)
+      return;
+    dg_c0_log_total_ = 0;
+    dg_c0_keys_.clear();
+    dg_c0_values_.clear();
+    dg_c0_ops_.clear();
+    if (!dg_c0_slots_.empty()) {
+      auto policy = thrust::cuda::par.on(stream);
+      thrust::fill(policy, dg_c0_slots_.begin(), dg_c0_slots_.end(),
+                   gpulsmopt_detail::kDgC0Empty);
+      thrust::fill(policy, dg_c0_overflow_.begin(), dg_c0_overflow_.end(),
+                   std::uint8_t{0});
+    }
+#else
+    (void)stream;
+#endif
+  }
+
   // Append records to the run layer.
   template <bool UseB>
   void insert_records_impl(const std::uint32_t *keys_in,
@@ -2493,6 +2676,10 @@ private:
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
                       std::size_t count, cudaStream_t stream) {
+#if GPULSMOPT_COMPACT_DG_C0
+    if (append_direct_group_c0(keys_in, values_in, op, count, stream))
+      return;
+#endif
 #if GPULSMOPT_ROUTE_METHOD == 1
     insert_records_impl<true>(keys_in, values_in, op, count, stream);
 #elif GPULSMOPT_ROUTE_METHOD == 0
@@ -2757,7 +2944,7 @@ private:
                        std::size_t &ins, cudaStream_t stream) {
     u = 0;
     ins = 0;
-    std::size_t total = run_live_total_;
+    std::size_t total = run_live_total_ + dg_c0_log_total_;
     for (auto &g : tier2_)
       total += g.keys.size();
     if (total == 0) {
@@ -2793,6 +2980,16 @@ private:
                    run_pool_values_.begin() + bpos + s, gv.begin() + off);
       thrust::copy(policy, run_pool_ops_.begin() + bpos,
                    run_pool_ops_.begin() + bpos + s, gop.begin() + off);
+      off += s;
+    }
+    if (dg_c0_log_total_ > 0) {
+      const std::size_t s = dg_c0_log_total_;
+      thrust::copy(policy, dg_c0_keys_.begin(), dg_c0_keys_.begin() + s,
+                   gk.begin() + off);
+      thrust::copy(policy, dg_c0_values_.begin(), dg_c0_values_.begin() + s,
+                   gv.begin() + off);
+      thrust::copy(policy, dg_c0_ops_.begin(), dg_c0_ops_.begin() + s,
+                   gop.begin() + off);
       off += s;
     }
     thrust::device_vector<std::uint32_t> garr(total);
@@ -2946,6 +3143,7 @@ private:
     }
     tier2_.clear();
     clear_run_layer_keep_boundaries(stream);
+    clear_direct_group_c0(stream);
     overlay_dirty_ = true; // overlay drained to sheet; cached read index stale
 #ifdef GPULSMOPT_PROFILE_INSERT
     cudaEventSynchronize(pe3);
@@ -2986,7 +3184,7 @@ private:
     return false;
 #else
     (void)stream;
-    return run_live_total_ >= run_flush_budget();
+    return run_live_total_ + dg_c0_log_total_ >= run_flush_budget();
 #endif
   }
 
@@ -3023,6 +3221,23 @@ private:
   // Layered point lookup.
   void lookup_layered(const DeviceLookupBatch &batch, cudaStream_t stream) {
     const std::size_t n = batch.count;
+#if GPULSMOPT_COMPACT_DG_C0
+    if (dg_c0_log_total_ > 0 && run_live_total_ == 0 && tier2_.empty()) {
+      const int block = 256;
+      const int grid = static_cast<int>((n + block - 1) / block);
+      gpulsmopt_detail::dg_c0_point_lookup_kernel<<<grid, block, 0, stream>>>(
+          batch.queries, n, batch.out_values, batch.out_found,
+          raw_or_null(dg_c0_keys_), raw_or_null(dg_c0_values_),
+          raw_or_null(dg_c0_ops_), dg_c0_log_total_,
+          raw_or_null(dg_c0_slots_), raw_or_null(dg_c0_overflow_),
+          raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
+          h_dir_seg_id_.size(), raw_or_null(pool_keys_),
+          raw_or_null(pool_values_), raw_or_null(pool_valid_),
+          raw_or_null(seg_bucket_max_));
+      CUDA_CHECK(cudaGetLastError());
+      return;
+    }
+#endif
     // Query cached overlay before the sheet.
     const OverlayReadIndex &ix = overlay_index(stream);
     const int block = 256;
@@ -3036,7 +3251,9 @@ private:
     CUDA_CHECK(cudaGetLastError());
   }
 
-  std::size_t run_layer_live() const { return run_live_total_; }
+  std::size_t run_layer_live() const {
+    return run_live_total_ + dg_c0_log_total_;
+  }
 
   // Configuration.
   std::size_t max_elements_ = 0;
@@ -3067,6 +3284,14 @@ private:
   thrust::device_vector<std::uint32_t> ins_oldsize_; // per-run pre-append size
   std::size_t run_live_total_ = 0;                   // live entries across runs
   std::uint32_t run_target_fill_ = 0;                // fill per run after split
+
+  // Direct-group C0 state.
+  std::uint32_t dg_c0_log_total_ = 0;
+  thrust::device_vector<std::uint32_t> dg_c0_keys_;
+  thrust::device_vector<std::uint32_t> dg_c0_values_;
+  thrust::device_vector<std::uint8_t> dg_c0_ops_;
+  thrust::device_vector<std::uint32_t> dg_c0_slots_;
+  thrust::device_vector<std::uint8_t> dg_c0_overflow_;
 
   // Tier-2 generation state.
   struct Tier2Gen {

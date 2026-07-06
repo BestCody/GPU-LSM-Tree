@@ -152,7 +152,13 @@ public:
   static constexpr operation_support can_update = operation_support::async;
   static constexpr operation_support can_successor = operation_support::async;
 
-  static std::string short_description() { return "gpulsmopt"; }
+  static std::string short_description() {
+#if GPULSMOPT_COMPACT_DG_C0
+    return "gpulsmopt_cdg_c0";
+#else
+    return "gpulsmopt";
+#endif
+  }
 
   static parameters_type parameters() {
     return {
@@ -174,6 +180,10 @@ public:
              static_cast<size_t>(GPULSMOPT_RUN_DRAIN_SHEET_DENOMINATOR))},
         {"distinct_keys",
          std::to_string(static_cast<size_t>(GPULSMOPT_DISTINCT_KEYS))},
+        {"compact_dg_c0",
+         std::to_string(static_cast<size_t>(GPULSMOPT_COMPACT_DG_C0))},
+        {"dg_c0_slots",
+         std::to_string(static_cast<size_t>(GPULSMOPT_DG_C0_SLOTS))},
     };
   }
 

@@ -10,3 +10,6 @@ build/*
 !build/runscripts_experiments/**
 !build/sample_output/
 !build/sample_output/**
+
+bench_results/
+build_gpulsmopt_*/
