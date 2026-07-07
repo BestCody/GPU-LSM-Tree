@@ -1,9 +1,3 @@
-// =============================================================================
-// File: impl_gpulsmopt.cuh
-// Description: FliX benchmark adapter for the root-level GPULSMOpt
-// implementation.
-// =============================================================================
-
 #ifndef IMPL_GPULSMOPT_CUH
 #define IMPL_GPULSMOPT_CUH
 
@@ -128,7 +122,7 @@ inline void finalize_lookup(const std::uint8_t *found, smallsize *values,
   check_cuda(cudaGetLastError());
 }
 
-} // namespace gpulsmopt_adapter_detail
+}
 
 template <typename key_type_> class gpulsmopt final {
 public:
@@ -166,23 +160,17 @@ public:
          std::to_string(static_cast<size_t>(GPULSMOPT_TARGET_FILL))},
         {"inplace_max_incoming",
          std::to_string(static_cast<size_t>(GPULSMOPT_INPLACE_MAX_INCOMING))},
-        {"enable_tier2",
-         std::to_string(static_cast<size_t>(GPULSMOPT_ENABLE_TIER2))},
-        {"tier2_fanout",
-         std::to_string(static_cast<size_t>(GPULSMOPT_TIER2_FANOUT))},
-        {"tier2_cdg_tables", "1"},
-        {"mutable_flush_budget",
-         std::to_string(static_cast<size_t>(GPULSMOPT_MUTABLE_FLUSH_BUDGET))},
+        {"c0_log", "1"},
+        {"sorted_runs", "1"},
+        {"c0_flush_budget",
+         std::to_string(static_cast<size_t>(GPULSMOPT_C0_FLUSH_BUDGET))},
         {"distinct_keys",
          std::to_string(static_cast<size_t>(GPULSMOPT_DISTINCT_KEYS))},
-        {"compact_dg_c0",
-         std::to_string(static_cast<size_t>(GPULSMOPT_COMPACT_DG_C0))},
     };
   }
 
   static size_t estimate_build_bytes(size_t size) {
-    // segmented sheet slot (key + value + validity byte) over-provisioned for
-    // the target fill, plus the adapter's value buffer
+
     return (2 * sizeof(std::uint32_t) + 1) * size * 2 +
            sizeof(smallsize) * size;
   }
@@ -233,8 +221,6 @@ public:
       *build_bytes += gpu_resident_bytes();
   }
 
-  // overload used by the point/range benchmarks, which pass no separate
-  // max_size / memory budget
   void build(const key_type *keys, size_t size, double *build_time_ms,
              size_t *build_bytes) {
     build(keys, size, size, std::numeric_limits<size_t>::max(), build_time_ms,
