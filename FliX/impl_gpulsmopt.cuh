@@ -177,8 +177,6 @@ public:
          std::to_string(static_cast<size_t>(GPULSMOPT_DISTINCT_KEYS))},
         {"compact_dg_c0",
          std::to_string(static_cast<size_t>(GPULSMOPT_COMPACT_DG_C0))},
-        {"dg_c0_slots",
-         std::to_string(static_cast<size_t>(GPULSMOPT_DG_C0_SLOTS))},
     };
   }
 
