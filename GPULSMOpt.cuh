@@ -616,8 +616,6 @@ __global__ void seg_delete_compact_kernel(
   }
 }
 
-// DEBUG: verify the sheet invariant per segment/bucket. Reports the first few
-// violations. err counts total violations.
 __global__ void directory_live_counts_kernel(
     const std::uint32_t *dir_seg_id, std::size_t dir_count,
     const std::uint32_t *seg_bucket_live, std::uint32_t *out_live) {
@@ -861,9 +859,6 @@ struct NonZeroU32 {
   }
 };
 
-// Flag each (sorted) overlay insert key 1 if it has no matching tombstone in the
-// (sorted) tombstone list, else 0. Used to build the live-insert list for
-// successor without a thrust set op.
 __global__ void mark_live_inserts_kernel(const std::uint32_t *ins_keys,
                                          std::size_t ins_count,
                                          const std::uint32_t *tomb_keys,
@@ -919,8 +914,19 @@ __global__ void point_lookup_walk_kernel(
     const std::uint32_t rc = run_cnt[r];
     const std::size_t p = lower_bound_u32(rk, rc, key);
     if (p < rc && rk[p] == key) {
-      out_found[o] = (run_ops[r][p] == kInsert) ? 1u : 0u;
-      out_value[o] = (run_ops[r][p] == kInsert) ? run_vals[r][p] : 0u;
+      bool has_ins = false, tomb = false;
+      std::uint32_t val = 0;
+      for (std::size_t q = p; q < rc && rk[q] == key; ++q) {
+        if (run_ops[r][q] == kInsert) {
+          has_ins = true;
+          val = run_vals[r][q];
+        } else {
+          tomb = true;
+        }
+      }
+      const bool live = has_ins && !tomb;
+      out_found[o] = live ? 1u : 0u;
+      out_value[o] = live ? val : 0u;
       return;
     }
   }
@@ -997,29 +1003,24 @@ __global__ void overlay_walk_override_kernel(
     const std::uint32_t rc = run_cnt[r];
     const std::size_t p = lower_bound_u32(rk, rc, q);
     if (p < rc && rk[p] == q) {
-      if (run_ops[r][p] == kInsert) {
-        out_found[i] = 1u;
-        out_value[i] = run_vals[r][p];
-      } else {
-        out_found[i] = 0u;
-        out_value[i] = 0u;
+      bool has_ins = false, tomb = false;
+      std::uint32_t val = 0;
+      for (std::size_t s = p; s < rc && rk[s] == q; ++s) {
+        if (run_ops[r][s] == kInsert) {
+          has_ins = true;
+          val = run_vals[r][s];
+        } else {
+          tomb = true;
+        }
       }
+      const bool live = has_ins && !tomb;
+      out_found[i] = live ? 1u : 0u;
+      out_value[i] = live ? val : 0u;
       return;
     }
   }
-
 }
 
-// Successor over the resolved overlay + sheet — sub-linear, NO per-tombstone
-// walk. build_overlay_read_index pre-resolves two sorted arrays: live_ins_keys
-// (overlay insert keys with no newer delete) and killed_keys (tombstone keys
-// that hit a live sheet key). Answer = min( smallest live insert >= q, smallest
-// sheet key >= q that is NOT killed ). The sheet side binary-searches the key
-// domain for the first x where (live sheet keys in [q,x]) >= 1, computed as the
-// sheet range-count (prefix sums) minus killed keys in [q,x]. killed_keys is a
-// subset of the sheet's live keys (globally-distinct workload: each key is
-// inserted once / deleted once), so the subtraction is exact and monotone. A
-// huge contiguous delete is skipped in ~32 steps, not O(deleted) as before.
 __global__ void successor_index_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_keys,
     const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
@@ -1038,8 +1039,6 @@ __global__ void successor_index_kernel(
     if (p < live_ins_count)
       best = live_ins_keys[p];
   }
-  // Sheet successor (skipping killed keys), only for keys strictly below the
-  // overlay-insert candidate found above.
   if (dir_count > 0 && q < best) {
     const std::size_t klo =
         killed_count ? lower_bound_u32(killed_keys, killed_count, q) : 0;
@@ -1350,10 +1349,6 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  // One-shot bulk load into a fresh (root-only) tree. Sorts the keys ONCE and
-  // packs the Sheet directly, skipping the C0-log append -> run-flush ->
-  // resolve_overlay churn that insert()+drain_to_sheet() would do. All records
-  // are inserts. Intended for the initial build only.
   void bulk_build(const std::uint32_t *keys, const std::uint32_t *values,
                   std::size_t n, cudaStream_t stream) {
     if (n == 0)
@@ -2264,9 +2259,6 @@ private:
       return;
     }
     auto policy = thrust::cuda::par.on(stream);
-    // Payload must NOT include k: the sort-key range (k) and the values range
-    // must be disjoint, else thrust::sort_by_key aliases them (UB) and can
-    // misalign key<->value/op. sort_by_key already permutes k in lockstep.
     auto payload = thrust::make_zip_iterator(
         thrust::make_tuple(v.begin(), op.begin()));
     thrust::sort_by_key(policy, k.begin(), k.begin() + n, payload);
@@ -2333,8 +2325,6 @@ private:
     thrust::device_vector<std::uint32_t> ins_prefix;
     thrust::device_vector<std::uint32_t> tomb_val_prefix;
     thrust::device_vector<std::uint32_t> tomb_cnt_prefix;
-    // For successor: sorted overlay insert keys still live, and sorted tombstone
-    // keys that hit a live sheet key.
     thrust::device_vector<std::uint32_t> live_ins_keys;
     std::size_t live_ins_count = 0;
     thrust::device_vector<std::uint32_t> killed_keys;
@@ -2361,9 +2351,6 @@ private:
     gv.resize(total);
     gop.resize(total);
 
-    // The runs are ALREADY key-sorted; only C0 is unsorted. So sort just C0
-    // (small) and multi-way merge the sorted sequences, instead of concatenating
-    // everything and re-sorting the (large) runs from scratch.
     struct Src {
       const std::uint32_t *k;
       const std::uint32_t *v;
@@ -2401,8 +2388,6 @@ private:
       thrust::copy(policy, thrust::device_pointer_cast(s.op),
                    thrust::device_pointer_cast(s.op) + s.n, gop.begin());
     } else {
-      // Pairwise merge, ping-ponging between gk/gv/gop and ov_m*, arranged so the
-      // LAST merge writes into gk/gv/gop (no trailing copy needed).
       const std::size_t nmerge = src.size() - 1;
       if (nmerge >= 2) {
         ov_mk_.resize(total);
@@ -2474,8 +2459,6 @@ private:
                              ix.tomb_val_prefix.begin() + 1);
       thrust::inclusive_scan(policy, tflag.begin(), tflag.end(),
                              ix.tomb_cnt_prefix.begin() + 1);
-      // Tombstone keys that actually hit the sheet, sorted (gk tombstones are
-      // already sorted by key). These are the sheet keys deleted-but-not-drained.
       ix.killed_keys.resize(tomb);
       auto kend = thrust::copy_if(policy, ix.gk.begin() + ins, ix.gk.begin() + u,
                                   tflag.begin(), ix.killed_keys.begin(),
@@ -2484,9 +2467,6 @@ private:
           static_cast<std::size_t>(kend - ix.killed_keys.begin());
       ix.killed_keys.resize(ix.killed_count);
     }
-    // Overlay insert keys with no newer delete. Distinct-key workload => an
-    // insert that also appears as a tombstone was deleted afterward, so drop it.
-    // Binary-search each insert against the sorted tombstones, then compact.
     ix.live_ins_keys.resize(ins);
     ix.live_ins_count = 0;
     if (ins > 0) {
@@ -2584,10 +2564,6 @@ private:
         scratch_incoming_values_.resize(ins);
         std::size_t live = ins;
         if (tomb > 0) {
-          // A key inserted then deleted lands in this pile as BOTH an insert and
-          // a tombstone (the delete is newer). Drop such inserts so they never
-          // reach the sheet; only inserts with no matching tombstone are live.
-          // (The read path does the same via mark_live_inserts_kernel.)
           thrust::device_vector<std::uint32_t> live_flag(ins);
           const int lblock = 256;
           const int lgrid = static_cast<int>((ins + lblock - 1) / lblock);
@@ -2856,7 +2832,6 @@ private:
   thrust::device_vector<std::uint32_t> scratch_incoming_values_;
   thrust::device_vector<std::uint32_t> scratch_delete_keys_;
 
-  // resolve_overlay merge scratch: sorted C0 copy + ping-pong merge buffer.
   thrust::device_vector<std::uint32_t> ov_c0k_;
   thrust::device_vector<std::uint32_t> ov_c0v_;
   thrust::device_vector<std::uint8_t> ov_c0op_;
