@@ -164,8 +164,8 @@ public:
         {"sorted_runs", "1"},
         {"c0_flush_budget",
          std::to_string(static_cast<size_t>(GPULSMOPT_C0_FLUSH_BUDGET))},
-        {"distinct_keys",
-         std::to_string(static_cast<size_t>(GPULSMOPT_DISTINCT_KEYS))},
+        {"lookup_flix_min_batch",
+         std::to_string(static_cast<size_t>(GPULSMOPT_LOOKUP_FLIX_MIN_BATCH))},
     };
   }
 
@@ -208,13 +208,10 @@ public:
     gpulsmopt_adapter_detail::fill_sequence(
         reinterpret_cast<std::uint32_t *>(build_values_buffer_.ptr()), size, 0);
 
-    DeviceKeyValueBatch batch;
-    batch.keys = reinterpret_cast<const std::uint32_t *>(keys);
-    batch.values =
-        reinterpret_cast<const std::uint32_t *>(build_values_buffer_.ptr());
-    batch.count = size;
-    dictionary_->insert(batch, 0);
-    dictionary_->drain_to_sheet(0);
+    dictionary_->bulk_build(
+        reinterpret_cast<const std::uint32_t *>(keys),
+        reinterpret_cast<const std::uint32_t *>(build_values_buffer_.ptr()),
+        size, 0);
     timer.stop();
 
     if (build_bytes)

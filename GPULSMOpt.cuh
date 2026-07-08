@@ -1,33 +1,27 @@
 #pragma once
 #include "gpu_dictionary_adapter.cuh"
 
-#include <cub/cub.cuh>
-#include <cub/device/device_merge.cuh>
 #include <cuda_runtime.h>
 
-#include <thrust/binary_search.h>
 #include <thrust/copy.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
-#include <thrust/functional.h>
 #include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
+#include <thrust/merge.h>
 #include <thrust/partition.h>
 #include <thrust/reduce.h>
-#include <thrust/remove.h>
 #include <thrust/scan.h>
 #include <thrust/scatter.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
-#include <thrust/merge.h>
 #include <thrust/tuple.h>
-#include <thrust/unique.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <future>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
@@ -56,15 +50,11 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_INPLACE_MAX_INCOMING
 #define GPULSMOPT_INPLACE_MAX_INCOMING 1024
 #endif
-#ifndef GPULSMOPT_RANGE_MAX_CANDIDATES
-#define GPULSMOPT_RANGE_MAX_CANDIDATES 16777216
-#endif
-#ifndef GPULSMOPT_DISTINCT_KEYS
-#define GPULSMOPT_DISTINCT_KEYS 1
-#endif
-
 #ifndef GPULSMOPT_C0_FLUSH_BUDGET
 #define GPULSMOPT_C0_FLUSH_BUDGET (1 << 18)
+#endif
+#ifndef GPULSMOPT_LOOKUP_FLIX_MIN_BATCH
+#define GPULSMOPT_LOOKUP_FLIX_MIN_BATCH (1 << 22)
 #endif
 
 constexpr int kBucketSlots = 32;
@@ -78,34 +68,28 @@ constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
 constexpr std::uint32_t kC0LogMaxIndex = 0x00fffffeu;
 
-struct DeviceUpdateBatch {
-  const std::uint32_t *keys = nullptr;
-  const std::uint32_t *values = nullptr;
-  const std::uint8_t *ops = nullptr;
-  std::size_t count = 0;
-};
-
 struct DeviceKeyBatch {
   const std::uint32_t *keys = nullptr;
   std::size_t count = 0;
 };
 
-struct LessU32 {
-  __host__ __device__ bool operator()(std::uint32_t a,
-                                      std::uint32_t b) const {
-    return a < b;
+struct FastDirtyIndex {
+  const std::uint32_t *slow;
+  __host__ __device__ bool operator()(std::uint32_t i) const {
+    return slow[i] == 0u;
+  }
+};
+
+struct SlowDirtyIndex {
+  const std::uint32_t *slow;
+  __host__ __device__ bool operator()(std::uint32_t i) const {
+    return slow[i] != 0u;
   }
 };
 
 __host__ __device__ inline std::uint32_t ceil_div_u32(std::uint32_t a,
                                                       std::uint32_t b) {
   return (a + b - 1) / b;
-}
-
-__host__ __device__ inline std::uint64_t drain_sort_key(std::uint32_t key,
-                                                        std::uint32_t seq) {
-  return (static_cast<std::uint64_t>(key) << 32) |
-         static_cast<std::uint64_t>(UINT32_MAX - seq);
 }
 
 __host__ __device__ inline std::size_t
@@ -140,16 +124,6 @@ upper_bound_u32(const std::uint32_t *data, std::size_t n, std::uint32_t key) {
   return first;
 }
 
-__global__ void fill_drain_sort_keys_kernel(const std::uint32_t *keys,
-                                            const std::uint32_t *seqs,
-                                            std::uint64_t *sort_keys,
-                                            std::size_t n) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    sort_keys[i] = drain_sort_key(keys[i], seqs[i]);
-  }
-}
-
 __global__ void seg_route_keys_kernel(const std::uint32_t *keys, std::size_t n,
                                       const std::uint32_t *dir_boundary,
                                       std::size_t dir_count,
@@ -161,6 +135,128 @@ __global__ void seg_route_keys_kernel(const std::uint32_t *keys, std::size_t n,
   if (ord >= dir_count)
     ord = dir_count - 1;
   out_ordinal[i] = static_cast<std::uint32_t>(ord);
+}
+
+__global__ void seg_make_dirty_plan_kernel(
+    const std::uint32_t *dirty_ord, const std::uint32_t *dirty_count,
+    std::size_t dirty_len, const std::uint32_t *dir_seg_id,
+    const std::uint32_t *dir_boundary, const std::uint32_t *dir_prefix,
+    std::uint32_t *dirty_seg_id, std::uint32_t *dirty_old_boundary,
+    std::uint32_t *dirty_old_live, std::uint32_t *dirty_in_begin,
+    std::uint32_t *dirty_in_end) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= dirty_len)
+    return;
+  const std::uint32_t ord = dirty_ord[i];
+  const std::uint32_t begin = dirty_in_begin[i];
+  dirty_in_end[i] = begin + dirty_count[i];
+  dirty_seg_id[i] = dir_seg_id[ord];
+  dirty_old_boundary[i] = dir_boundary[ord];
+  dirty_old_live[i] = dir_prefix[ord + 1] - dir_prefix[ord];
+}
+
+__global__ void seg_gather_dirty_plan_kernel(
+    const std::uint32_t *indices, std::size_t count,
+    const std::uint32_t *dirty_seg_id,
+    const std::uint32_t *dirty_old_boundary,
+    const std::uint32_t *dirty_old_live,
+    const std::uint32_t *dirty_in_begin,
+    const std::uint32_t *dirty_in_end, std::uint32_t *out_seg_id,
+    std::uint32_t *out_old_boundary, std::uint32_t *out_old_live,
+    std::uint32_t *out_in_begin, std::uint32_t *out_in_end) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const std::uint32_t j = indices[i];
+  out_seg_id[i] = dirty_seg_id[j];
+  out_in_begin[i] = dirty_in_begin[j];
+  out_in_end[i] = dirty_in_end[j];
+  if (out_old_boundary)
+    out_old_boundary[i] = dirty_old_boundary[j];
+  if (out_old_live)
+    out_old_live[i] = dirty_old_live[j];
+}
+
+__global__ void seg_make_slow_counts_kernel(
+    const std::uint32_t *slow_old_live, const std::uint32_t *slow_in_begin,
+    const std::uint32_t *slow_in_end, std::size_t slow_count,
+    std::uint32_t *slow_inc_count, std::uint32_t *slow_cand_count) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= slow_count)
+    return;
+  const std::uint32_t inc = slow_in_end[i] - slow_in_begin[i];
+  slow_inc_count[i] = inc;
+  slow_cand_count[i] = slow_old_live[i] + inc;
+}
+
+__global__ void seg_slow_totals_kernel(
+    const std::uint32_t *old_offset, const std::uint32_t *old_live,
+    const std::uint32_t *inc_offset, const std::uint32_t *inc_count,
+    const std::uint32_t *cand_offset, const std::uint32_t *cand_count,
+    std::size_t slow_count, std::uint32_t *totals) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  if (slow_count == 0) {
+    totals[0] = 0u;
+    totals[1] = 0u;
+    totals[2] = 0u;
+    return;
+  }
+  const std::size_t i = slow_count - 1;
+  totals[0] = old_offset[i] + old_live[i];
+  totals[1] = inc_offset[i] + inc_count[i];
+  totals[2] = cand_offset[i] + cand_count[i];
+}
+
+__global__ void seg_make_dirty_k_kernel(const std::uint32_t *dirty_live,
+                                        std::size_t dirty_count,
+                                        std::uint32_t target_live,
+                                        std::uint32_t *dirty_k) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= dirty_count)
+    return;
+  const std::uint32_t live = dirty_live[i];
+  const std::uint32_t k = ceil_div_u32(live, target_live);
+  dirty_k[i] = k == 0u ? 1u : k;
+}
+
+__global__ void seg_output_total_kernel(const std::uint32_t *output_base,
+                                        const std::uint32_t *dirty_k,
+                                        std::size_t dirty_count,
+                                        std::uint32_t *total) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  if (dirty_count == 0) {
+    total[0] = 0u;
+    return;
+  }
+  const std::size_t i = dirty_count - 1;
+  total[0] = output_base[i] + dirty_k[i];
+}
+
+__global__ void seg_output_plan_kernel(
+    const std::uint32_t *dirty_live, const std::uint32_t *dirty_k,
+    const std::uint32_t *dirty_output_base, std::size_t dirty_count,
+    std::uint32_t *out_dirty, std::uint32_t *out_local,
+    std::uint32_t *out_k, std::uint32_t *out_live) {
+  const std::size_t s = blockIdx.x;
+  if (s >= dirty_count)
+    return;
+  const std::uint32_t live = dirty_live[s];
+  const std::uint32_t k = dirty_k[s];
+  const std::uint32_t base = dirty_output_base[s];
+  const std::uint32_t per = k == 0 ? 1u : ceil_div_u32(live, k);
+  for (std::uint32_t local = threadIdx.x; local < k; local += blockDim.x) {
+    const std::uint32_t o = base + local;
+    const std::uint32_t lo_raw = local * per;
+    const std::uint32_t hi_raw = (local + 1u) * per;
+    const std::uint32_t lo = lo_raw < live ? lo_raw : live;
+    const std::uint32_t hi = hi_raw < live ? hi_raw : live;
+    out_dirty[o] = static_cast<std::uint32_t>(s);
+    out_local[o] = local;
+    out_k[o] = k;
+    out_live[o] = hi - lo;
+  }
 }
 
 __device__ inline bool seg_point_lookup(std::uint32_t seg_id, std::uint32_t key,
@@ -185,29 +281,6 @@ __device__ inline bool seg_point_lookup(std::uint32_t seg_id, std::uint32_t key,
     return true;
   }
   return false;
-}
-
-__device__ inline bool seg_sheet_contains(std::uint32_t key,
-                                          const std::uint32_t *dir_boundary,
-                                          const std::uint32_t *dir_seg_id,
-                                          std::size_t dir_count,
-                                          const std::uint32_t *pool_keys,
-                                          const std::uint8_t *pool_valid,
-                                          const std::uint32_t *seg_bucket_max) {
-  std::size_t ord = lower_bound_u32(dir_boundary, dir_count, key);
-  if (ord >= dir_count)
-    ord = dir_count - 1;
-  const std::uint32_t seg_id = dir_seg_id[ord];
-  const std::size_t meta_base =
-      static_cast<std::size_t>(seg_id) * kSegmentBuckets;
-  const std::size_t bucket =
-      lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, key);
-  if (bucket >= kSegmentBuckets)
-    return false;
-  const std::size_t start =
-      static_cast<std::size_t>(seg_id) * kSegmentSlots + bucket * kBucketSlots;
-  const std::size_t p = lower_bound_u32(pool_keys + start, kBucketSlots, key);
-  return p < kBucketSlots && pool_keys[start + p] == key && pool_valid[start + p];
 }
 
 __device__ inline std::uint32_t seg_range_count_one(
@@ -337,66 +410,10 @@ __device__ inline std::uint32_t seg_sheet_range_count(
   return total;
 }
 
-__global__ void seg_gather_candidates_kernel(
-    const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
-    const std::uint8_t *pool_valid, const std::uint32_t *dirty_seg_id,
-    const std::uint32_t *candidate_offset, const std::uint32_t *dirty_old_live,
-    const std::uint32_t *dirty_incoming_begin,
-    const std::uint32_t *dirty_incoming_end, const std::uint32_t *incoming_keys,
-    const std::uint32_t *incoming_values, std::size_t dirty_count,
-    std::uint32_t *cand_seg, std::uint32_t *cand_key, std::uint32_t *cand_value,
-    std::uint32_t *cand_op, std::uint32_t *cand_seq,
-    std::uint32_t *sheet_cursor) {
-  const std::size_t m = blockIdx.x;
-  if (m >= dirty_count)
-    return;
-  const std::size_t seg_base =
-      static_cast<std::size_t>(dirty_seg_id[m]) * kSegmentSlots;
-  const std::uint32_t base = candidate_offset[m];
-
-  for (std::size_t p = threadIdx.x; p < kSegmentSlots; p += blockDim.x) {
-    if (!pool_valid[seg_base + p])
-      continue;
-    const std::uint32_t out = base + atomicAdd(&sheet_cursor[m], 1u);
-    cand_seg[out] = static_cast<std::uint32_t>(m);
-    cand_key[out] = pool_keys[seg_base + p];
-    cand_value[out] = pool_values[seg_base + p];
-    cand_op[out] = kInsert;
-    cand_seq[out] = 0u;
-  }
-
-  const std::size_t begin = dirty_incoming_begin[m];
-  const std::size_t end = dirty_incoming_end[m];
-  const std::size_t inc_out =
-      static_cast<std::size_t>(base) + dirty_old_live[m];
-  for (std::size_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
-    const std::size_t out = inc_out + (i - begin);
-    cand_seg[out] = static_cast<std::uint32_t>(m);
-    cand_key[out] = incoming_keys[i];
-    cand_value[out] = incoming_values[i];
-    cand_op[out] = kInsert;
-    cand_seq[out] = 1u;
-  }
-}
-
-__global__ void seg_make_resolve_keys_kernel(const std::uint32_t *cand_seg,
-                                             const std::uint32_t *cand_key,
-                                             const std::uint32_t *cand_seq,
-                                             std::size_t count,
-                                             std::uint32_t *seq_sort,
-                                             std::uint64_t *group_sort) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  seq_sort[i] = UINT32_MAX - cand_seq[i];
-  group_sort[i] = (static_cast<std::uint64_t>(cand_seg[i]) << 32) | cand_key[i];
-}
-
 __global__ void seg_classify_inplace_kernel(
     const std::uint32_t *dirty_seg_id, const std::uint32_t *dirty_in_begin,
     const std::uint32_t *dirty_in_end, std::size_t dirty_count,
-    const std::uint32_t *incoming_keys, const std::uint32_t *pool_keys,
-    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
+    const std::uint32_t *incoming_keys, const std::uint32_t *seg_bucket_max,
     const std::uint32_t *seg_bucket_live, std::uint32_t *seg_slow,
     std::uint32_t *seg_new_live) {
   const std::size_t m = blockIdx.x;
@@ -404,7 +421,6 @@ __global__ void seg_classify_inplace_kernel(
     return;
   const std::uint32_t seg = dirty_seg_id[m];
   const std::size_t meta = static_cast<std::size_t>(seg) * kSegmentBuckets;
-  const std::size_t slot_base = static_cast<std::size_t>(seg) * kSegmentSlots;
   const std::uint32_t in_begin = dirty_in_begin[m];
   const std::uint32_t in_count = dirty_in_end[m] - in_begin;
 
@@ -434,21 +450,7 @@ __global__ void seg_classify_inplace_kernel(
             ? in_count
             : upper_bound_u32(incoming_keys + in_begin, in_count,
                               seg_bucket_max[meta + b]);
-    const std::size_t base =
-        slot_base + static_cast<std::size_t>(b) * kBucketSlots;
-    int inserts_new = 0;
-    for (std::size_t i = in_begin + begin; i < in_begin + end; ++i) {
-      const std::uint32_t key = incoming_keys[i];
-      bool exists = false;
-      for (int lane = 0; lane < kBucketSlots; ++lane) {
-        if (pool_valid[base + lane] && pool_keys[base + lane] == key) {
-          exists = true;
-          break;
-        }
-      }
-      if (!exists)
-        ++inserts_new;
-    }
+    const int inserts_new = static_cast<int>(end - begin);
     const int new_live =
         static_cast<int>(seg_bucket_live[meta + b]) + inserts_new;
     if (new_live > kBucketSlots)
@@ -513,14 +515,9 @@ __global__ void seg_apply_inplace_kernel(
         wk = kk;
         wv = ev[t];
         ++t;
-      } else if (kk > nk) {
-        wk = nk;
-        wv = incoming_values[ib];
-        ++ib;
       } else {
         wk = nk;
         wv = incoming_values[ib];
-        ++t;
         ++ib;
       }
       pool_keys[base + o] = wk;
@@ -619,6 +616,8 @@ __global__ void seg_delete_compact_kernel(
   }
 }
 
+// DEBUG: verify the sheet invariant per segment/bucket. Reports the first few
+// violations. err counts total violations.
 __global__ void directory_live_counts_kernel(
     const std::uint32_t *dir_seg_id, std::size_t dir_count,
     const std::uint32_t *seg_bucket_live, std::uint32_t *out_live) {
@@ -632,14 +631,6 @@ __global__ void directory_live_counts_kernel(
     live += seg_bucket_live[meta + b];
   }
   out_live[ord] = live;
-}
-
-__global__ void seg_count_survivors_kernel(const std::uint32_t *cand_seg,
-                                           std::size_t live_count,
-                                           std::uint32_t *dirty_live) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < live_count)
-    atomicAdd(&dirty_live[cand_seg[i]], 1u);
 }
 
 __global__ void seg_output_boundaries_kernel(
@@ -857,46 +848,34 @@ __global__ void seg_gather_group_ordered_kernel(
   }
 }
 
-__device__ inline std::uint32_t seg_segment_ceiling(
-    std::uint32_t seg_id, std::uint32_t q, const std::uint32_t *pool_keys,
-    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max) {
-  const std::size_t meta_base =
-      static_cast<std::size_t>(seg_id) * kSegmentBuckets;
-  const std::size_t slot_base =
-      static_cast<std::size_t>(seg_id) * kSegmentSlots;
-
-  for (std::size_t b =
-           lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, q);
-       b < kSegmentBuckets; ++b) {
-    const std::size_t start = slot_base + b * kBucketSlots;
-    const std::size_t p = lower_bound_u32(pool_keys + start, kBucketSlots, q);
-    if (p < kBucketSlots && pool_valid[start + p])
-      return pool_keys[start + p];
-  }
-  return kEmptyKey;
-}
-
-__device__ inline std::uint32_t
-seg_sheet_ceiling(std::uint32_t q, const std::uint32_t *dir_boundary,
-                  const std::uint32_t *dir_seg_id, std::size_t dir_count,
-                  const std::uint32_t *pool_keys,
-                  const std::uint8_t *pool_valid,
-                  const std::uint32_t *seg_bucket_max) {
-  std::uint32_t best = kEmptyKey;
-  for (std::size_t ord = lower_bound_u32(dir_boundary, dir_count, q);
-       ord < dir_count && best == kEmptyKey; ++ord) {
-    best = seg_segment_ceiling(dir_seg_id[ord], q, pool_keys, pool_valid,
-                               seg_bucket_max);
-  }
-  return best;
-}
-
 struct TupleOpIsInsert {
   template <class Tuple>
   __host__ __device__ bool operator()(const Tuple &t) const {
     return thrust::get<2>(t) == kInsert;
   }
 };
+
+struct NonZeroU32 {
+  __host__ __device__ bool operator()(std::uint32_t x) const {
+    return x != 0u;
+  }
+};
+
+// Flag each (sorted) overlay insert key 1 if it has no matching tombstone in the
+// (sorted) tombstone list, else 0. Used to build the live-insert list for
+// successor without a thrust set op.
+__global__ void mark_live_inserts_kernel(const std::uint32_t *ins_keys,
+                                         std::size_t ins_count,
+                                         const std::uint32_t *tomb_keys,
+                                         std::size_t tomb_count,
+                                         std::uint32_t *out_flag) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= ins_count)
+    return;
+  const std::uint32_t k = ins_keys[i];
+  const std::size_t p = lower_bound_u32(tomb_keys, tomb_count, k);
+  out_flag[i] = (p < tomb_count && tomb_keys[p] == k) ? 0u : 1u;
+}
 
 __global__ void c0_log_append_kernel(
     const std::uint32_t *keys, const std::uint32_t *values, std::uint8_t op,
@@ -1031,68 +1010,66 @@ __global__ void overlay_walk_override_kernel(
 
 }
 
-__global__ void successor_walk_kernel(
+// Successor over the resolved overlay + sheet — sub-linear, NO per-tombstone
+// walk. build_overlay_read_index pre-resolves two sorted arrays: live_ins_keys
+// (overlay insert keys with no newer delete) and killed_keys (tombstone keys
+// that hit a live sheet key). Answer = min( smallest live insert >= q, smallest
+// sheet key >= q that is NOT killed ). The sheet side binary-searches the key
+// domain for the first x where (live sheet keys in [q,x]) >= 1, computed as the
+// sheet range-count (prefix sums) minus killed keys in [q,x]. killed_keys is a
+// subset of the sheet's live keys (globally-distinct workload: each key is
+// inserted once / deleted once), so the subtraction is exact and monotone. A
+// huge contiguous delete is skipped in ~32 steps, not O(deleted) as before.
+__global__ void successor_index_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_keys,
-    const std::uint32_t *const *run_keys, const std::uint8_t *const *run_ops,
-    const std::uint32_t *run_cnt, int num_runs,
     const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
-    std::size_t dir_count, const std::uint32_t *pool_keys,
-    const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max) {
+    const std::uint32_t *dir_prefix, std::size_t dir_count,
+    const std::uint32_t *pool_keys, const std::uint8_t *pool_valid,
+    const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *killed_keys, std::size_t killed_count,
+    const std::uint32_t *live_ins_keys, std::size_t live_ins_count) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
   const std::uint32_t q = queries[i];
   std::uint32_t best = kEmptyKey;
-
-  std::uint32_t cur = q;
-  while (true) {
-    std::uint32_t cand = kEmptyKey;
-    for (int r = 0; r < num_runs; ++r) {
-      const std::uint32_t rc = run_cnt[r];
-      const std::size_t p = lower_bound_u32(run_keys[r], rc, cur);
-      if (p < rc && run_keys[r][p] < cand)
-        cand = run_keys[r][p];
-    }
-    if (cand == kEmptyKey)
-      break;
-    bool ins = false;
-    for (int r = 0; r < num_runs; ++r) {
-      const std::uint32_t rc = run_cnt[r];
-      const std::size_t p = lower_bound_u32(run_keys[r], rc, cand);
-      if (p < rc && run_keys[r][p] == cand) {
-        ins = (run_ops[r][p] == kInsert);
-        break;
-      }
-    }
-    if (ins) {
-      best = cand;
-      break;
-    }
-    if (cand >= kEmptyKey - 1)
-      break;
-    cur = cand + 1;
+  if (live_ins_count > 0) {
+    const std::size_t p = lower_bound_u32(live_ins_keys, live_ins_count, q);
+    if (p < live_ins_count)
+      best = live_ins_keys[p];
   }
-
-  std::uint32_t c = seg_sheet_ceiling(q, dir_boundary, dir_seg_id, dir_count,
-                                      pool_keys, pool_valid, seg_bucket_max);
-  while (c != kEmptyKey && c < best) {
-    bool dead = false;
-    for (int r = 0; r < num_runs; ++r) {
-      const std::uint32_t rc = run_cnt[r];
-      const std::size_t p = lower_bound_u32(run_keys[r], rc, c);
-      if (p < rc && run_keys[r][p] == c) {
-        dead = (run_ops[r][p] != kInsert);
-        break;
+  // Sheet successor (skipping killed keys), only for keys strictly below the
+  // overlay-insert candidate found above.
+  if (dir_count > 0 && q < best) {
+    const std::size_t klo =
+        killed_count ? lower_bound_u32(killed_keys, killed_count, q) : 0;
+    std::uint32_t lo = q;
+    std::uint32_t hi = (best == kEmptyKey) ? (kEmptyKey - 1) : (best - 1);
+    std::uint32_t sheet_ans = kEmptyKey;
+    while (lo <= hi) {
+      const std::uint32_t mid = lo + (hi - lo) / 2;
+      const std::uint32_t sc = seg_sheet_range_count(
+          q, mid, dir_boundary, dir_seg_id, dir_prefix, dir_count, pool_keys,
+          pool_valid, seg_bucket_max, seg_bucket_live);
+      const std::uint32_t kc =
+          killed_count ? static_cast<std::uint32_t>(
+                             upper_bound_u32(killed_keys, killed_count, mid) -
+                             klo)
+                       : 0u;
+      const std::uint32_t live = sc > kc ? sc - kc : 0u;
+      if (live >= 1u) {
+        sheet_ans = mid;
+        if (mid == 0)
+          break;
+        hi = mid - 1;
+      } else {
+        if (mid == kEmptyKey - 1)
+          break;
+        lo = mid + 1;
       }
     }
-    if (!dead) {
-      best = c;
-      break;
-    }
-    if (c >= kEmptyKey - 1)
-      break;
-    c = seg_sheet_ceiling(c + 1, dir_boundary, dir_seg_id, dir_count, pool_keys,
-                          pool_valid, seg_bucket_max);
+    if (sheet_ans < best)
+      best = sheet_ans;
   }
   out_keys[i] = (best == kEmptyKey) ? 0u : best;
 }
@@ -1208,15 +1185,7 @@ __global__ void count_overlay_kernel(
 
 class GPULSMOpt {
 public:
-  using DeviceUpdateBatch = gpulsmopt_detail::DeviceUpdateBatch;
   using DeviceKeyBatch = gpulsmopt_detail::DeviceKeyBatch;
-
-  struct DirectorySnapshot {
-    std::vector<std::uint32_t> seg_id;
-    std::vector<std::uint32_t> boundary;
-    std::vector<std::uint32_t> live;
-    std::vector<std::uint32_t> prefix;
-  };
 
   explicit GPULSMOpt(const DictionaryConfig &config)
       : max_elements_(config.max_elements), batch_size_(config.batch_size),
@@ -1232,13 +1201,7 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(0));
   }
 
-  ~GPULSMOpt() {
-
-    join_pending_drain();
-  }
-
   void clear(cudaStream_t stream) {
-    join_pending_drain();
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     reset_directory_to_root(stream);
@@ -1252,8 +1215,6 @@ public:
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    join_pending_drain();
-    bool need_drain = false;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
 #ifdef GPULSMOPT_PROFILE_INSERT
@@ -1276,18 +1237,13 @@ public:
       cudaEventDestroy(ia);
       cudaEventDestroy(ib);
 #endif
-      need_drain = drain_needed_locked(stream);
+      maybe_flush_and_merge(stream);
     }
-
-    if (need_drain)
-      launch_background_drain();
   }
 
   void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    join_pending_drain();
-    bool need_drain = false;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
 
@@ -1295,16 +1251,13 @@ public:
                      static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
                      batch.count, stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      need_drain = drain_needed_locked(stream);
+      maybe_flush_and_merge(stream);
     }
-    if (need_drain)
-      launch_background_drain();
   }
 
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     lookup_layered(batch, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1313,7 +1266,6 @@ public:
   void count(const DeviceRangeBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
@@ -1339,17 +1291,24 @@ public:
   void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    refresh_read_view(stream);
+    const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
+    const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
+    const std::uint32_t *killed =
+        no_overlay ? nullptr : raw_or_null(ix->killed_keys);
+    const std::size_t killed_count = no_overlay ? 0 : ix->killed_count;
+    const std::uint32_t *live_ins =
+        no_overlay ? nullptr : raw_or_null(ix->live_ins_keys);
+    const std::size_t live_ins_count = no_overlay ? 0 : ix->live_ins_count;
     const int block = 128;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
-    gpulsmopt_detail::successor_walk_kernel<<<grid, block, 0, stream>>>(
-        batch.queries, batch.count, batch.out_keys, raw_or_null(read_run_keys_),
-        raw_or_null(read_run_ops_), raw_or_null(read_run_cnt_), num_read_runs_,
+    gpulsmopt_detail::successor_index_kernel<<<grid, block, 0, stream>>>(
+        batch.queries, batch.count, batch.out_keys,
         raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
-        h_dir_seg_id_.size(), raw_or_null(pool_keys_), raw_or_null(pool_valid_),
-        raw_or_null(seg_bucket_max_));
+        raw_or_null(d_dir_prefix_), h_dir_seg_id_.size(),
+        raw_or_null(pool_keys_), raw_or_null(pool_valid_),
+        raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_), killed,
+        killed_count, live_ins, live_ins_count);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -1357,7 +1316,6 @@ public:
   void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
     if (batch.query_count == 0)
       return;
-    join_pending_drain();
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
@@ -1386,24 +1344,36 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
-  void cleanup(cudaStream_t stream) {
-    join_pending_drain();
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    merge_down(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-  }
-
-  void maintain(cudaStream_t stream) {
-    join_pending_drain();
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    merge_down(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-  }
-
   void drain_to_sheet(cudaStream_t stream) {
-    join_pending_drain();
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     merge_down(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  }
+
+  // One-shot bulk load into a fresh (root-only) tree. Sorts the keys ONCE and
+  // packs the Sheet directly, skipping the C0-log append -> run-flush ->
+  // resolve_overlay churn that insert()+drain_to_sheet() would do. All records
+  // are inserts. Intended for the initial build only.
+  void bulk_build(const std::uint32_t *keys, const std::uint32_t *values,
+                  std::size_t n, cudaStream_t stream) {
+    if (n == 0)
+      return;
+    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+    auto policy = thrust::cuda::par.on(stream);
+    scratch_incoming_keys_.resize(n);
+    scratch_incoming_values_.resize(n);
+    thrust::copy(policy, thrust::device_pointer_cast(keys),
+                 thrust::device_pointer_cast(keys) + n,
+                 scratch_incoming_keys_.begin());
+    thrust::copy(policy, thrust::device_pointer_cast(values),
+                 thrust::device_pointer_cast(values) + n,
+                 scratch_incoming_values_.begin());
+    thrust::sort_by_key(policy, scratch_incoming_keys_.begin(),
+                        scratch_incoming_keys_.end(),
+                        scratch_incoming_values_.begin());
+    merge_incoming_into_sheet(n, stream);
+    overlay_dirty_ = true;
+    read_view_dirty_ = true;
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
@@ -1432,29 +1402,12 @@ public:
         pool_keys_, pool_values_, pool_valid_, seg_bucket_max_,
         seg_bucket_live_, seg_bucket_value_sum_, d_dir_seg_id_,
         d_dir_boundary_, d_dir_prefix_, d_dir_value_sum_, d_dir_value_prefix_,
-        scratch_incoming_keys_, scratch_incoming_values_,
-        scratch_delete_keys_, scratch_query_found_, seg_cand_seg_, seg_cand_key_,
-        seg_cand_value_, seg_cand_op_, seg_cand_seq_, seg_cand_group_sort_,
+        scratch_incoming_keys_, scratch_incoming_values_, scratch_delete_keys_,
+        seg_cand_seg_, seg_cand_key_, seg_cand_value_,
         c0_log_keys_, c0_log_values_, c0_log_ops_);
     for (const auto &g : runs_)
       total += device_bytes_all(g.keys, g.values, g.ops);
     return total;
-  }
-
-  DirectorySnapshot directory_snapshot() const {
-    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    DirectorySnapshot snap;
-    snap.seg_id = h_dir_seg_id_;
-    snap.boundary = h_dir_boundary_;
-    snap.live = h_dir_live_;
-    snap.prefix.resize(h_dir_live_.size() + 1);
-    std::uint32_t acc = 0;
-    snap.prefix[0] = 0;
-    for (std::size_t i = 0; i < h_dir_live_.size(); ++i) {
-      acc += h_dir_live_[i];
-      snap.prefix[i + 1] = acc;
-    }
-    return snap;
   }
 
 private:
@@ -1472,21 +1425,6 @@ private:
   template <class... Vecs>
   static std::size_t device_bytes_all(const Vecs &...vecs) {
     return (std::size_t{0} + ... + device_bytes(vecs));
-  }
-
-  void fill_drain_sort_keys(const thrust::device_vector<std::uint32_t> &keys,
-                            const thrust::device_vector<std::uint32_t> &seqs,
-                            thrust::device_vector<std::uint64_t> &sort_keys,
-                            std::size_t offset, std::size_t count,
-                            cudaStream_t stream) {
-    if (count == 0)
-      return;
-    const int block = 256;
-    const int grid = static_cast<int>((count + block - 1) / block);
-    gpulsmopt_detail::fill_drain_sort_keys_kernel<<<grid, block, 0, stream>>>(
-        raw_or_null(keys) + offset, raw_or_null(seqs) + offset,
-        raw_or_null(sort_keys) + offset, count);
-    CUDA_CHECK(cudaGetLastError());
   }
 
   void refresh_directory_live_counts(cudaStream_t stream) {
@@ -1655,10 +1593,29 @@ private:
     seg_cand_seg_.resize(count);
     seg_cand_key_.resize(count);
     seg_cand_value_.resize(count);
-    seg_cand_op_.resize(count);
-    seg_cand_seq_.resize(count);
-    seg_cand_seq_sort_.resize(count);
-    seg_cand_group_sort_.resize(count);
+  }
+
+  void prepare_dirty_plan(std::size_t dirty_count, cudaStream_t stream) {
+    auto policy = thrust::cuda::par.on(stream);
+    seg_d_dirty_seg_id_.resize(dirty_count);
+    seg_d_dirty_old_boundary_.resize(dirty_count);
+    seg_d_dirty_old_live_.resize(dirty_count);
+    seg_d_dirty_in_begin_.resize(dirty_count);
+    seg_d_dirty_in_end_.resize(dirty_count);
+    thrust::exclusive_scan(policy, seg_dirty_count_.begin(),
+                           seg_dirty_count_.begin() + dirty_count,
+                           seg_d_dirty_in_begin_.begin());
+    const int block = 256;
+    const int grid = static_cast<int>((dirty_count + block - 1) / block);
+    gpulsmopt_detail::seg_make_dirty_plan_kernel<<<grid, block, 0, stream>>>(
+        raw_or_null(seg_dirty_ord_), raw_or_null(seg_dirty_count_),
+        dirty_count, raw_or_null(d_dir_seg_id_), raw_or_null(d_dir_boundary_),
+        raw_or_null(d_dir_prefix_), raw_or_null(seg_d_dirty_seg_id_),
+        raw_or_null(seg_d_dirty_old_boundary_),
+        raw_or_null(seg_d_dirty_old_live_),
+        raw_or_null(seg_d_dirty_in_begin_),
+        raw_or_null(seg_d_dirty_in_end_));
+    CUDA_CHECK(cudaGetLastError());
   }
 
   void merge_incoming_into_sheet(std::size_t incoming_count,
@@ -1687,76 +1644,59 @@ private:
                               seg_dirty_ord_.begin(), seg_dirty_count_.begin());
     const std::size_t m =
         static_cast<std::size_t>(rle_end.first - seg_dirty_ord_.begin());
+    if (m == 0)
+      return;
 
-    std::vector<std::uint32_t> dirty_ord(m), dirty_in_count(m);
-    CUDA_CHECK(cudaMemcpyAsync(dirty_ord.data(), raw_or_null(seg_dirty_ord_),
-                               m * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        dirty_in_count.data(), raw_or_null(seg_dirty_count_),
-        m * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<std::uint32_t> dirty_seg_id(m), dirty_old_boundary(m),
-        dirty_old_live(m), dirty_in_begin(m), dirty_in_end(m);
-    std::uint32_t in_acc = 0;
-    for (std::size_t j = 0; j < m; ++j) {
-      const std::uint32_t ord = dirty_ord[j];
-      dirty_seg_id[j] = h_dir_seg_id_[ord];
-      dirty_old_boundary[j] = h_dir_boundary_[ord];
-      dirty_old_live[j] = h_dir_live_[ord];
-      dirty_in_begin[j] = in_acc;
-      in_acc += dirty_in_count[j];
-      dirty_in_end[j] = in_acc;
-    }
-    upload_vec(seg_d_dirty_seg_id_, dirty_seg_id, stream);
-    upload_vec(seg_d_dirty_in_begin_, dirty_in_begin, stream);
-    upload_vec(seg_d_dirty_in_end_, dirty_in_end, stream);
-
+    prepare_dirty_plan(m, stream);
     seg_slow_.resize(m);
     seg_new_live_.resize(m);
     gpulsmopt_detail::seg_classify_inplace_kernel<<<static_cast<unsigned>(m),
                                                     256, 0, stream>>>(
         raw_or_null(seg_d_dirty_seg_id_), raw_or_null(seg_d_dirty_in_begin_),
         raw_or_null(seg_d_dirty_in_end_), m,
-        raw_or_null(scratch_incoming_keys_), raw_or_null(pool_keys_),
-        raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
+        raw_or_null(scratch_incoming_keys_), raw_or_null(seg_bucket_max_),
         raw_or_null(seg_bucket_live_), raw_or_null(seg_slow_),
         raw_or_null(seg_new_live_));
     CUDA_CHECK(cudaGetLastError());
-    std::vector<std::uint32_t> seg_slow(m), seg_new_live(m);
-    CUDA_CHECK(cudaMemcpyAsync(seg_slow.data(), raw_or_null(seg_slow_),
-                               m * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(seg_new_live.data(), raw_or_null(seg_new_live_),
-                               m * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<int> is_fast(m), slow_index(m, -1);
-    std::vector<std::uint32_t> fast_seg_id, fast_in_begin, fast_in_end;
-    std::vector<std::size_t> slow_j;
-    for (std::size_t j = 0; j < m; ++j) {
-      if (seg_slow[j] == 0) {
-        is_fast[j] = 1;
-        fast_seg_id.push_back(dirty_seg_id[j]);
-        fast_in_begin.push_back(dirty_in_begin[j]);
-        fast_in_end.push_back(dirty_in_end[j]);
-      } else {
-        is_fast[j] = 0;
-        slow_index[j] = static_cast<int>(slow_j.size());
-        slow_j.push_back(j);
-      }
-    }
+    seg_plan_index_.resize(m);
+    thrust::sequence(policy, seg_plan_index_.begin(),
+                     seg_plan_index_.begin() + m);
+    seg_fast_index_.resize(m);
+    auto fast_end = thrust::copy_if(
+        policy, seg_plan_index_.begin(), seg_plan_index_.begin() + m,
+        seg_fast_index_.begin(),
+        gpulsmopt_detail::FastDirtyIndex{raw_or_null(seg_slow_)});
+    const std::size_t fast_count =
+        static_cast<std::size_t>(fast_end - seg_fast_index_.begin());
+    seg_slow_index_.resize(m);
+    auto slow_end = thrust::copy_if(
+        policy, seg_plan_index_.begin(), seg_plan_index_.begin() + m,
+        seg_slow_index_.begin(),
+        gpulsmopt_detail::SlowDirtyIndex{raw_or_null(seg_slow_)});
+    const std::size_t ms =
+        static_cast<std::size_t>(slow_end - seg_slow_index_.begin());
 
-    if (!fast_seg_id.empty()) {
-      upload_vec(seg_fast_seg_id_, fast_seg_id, stream);
-      upload_vec(seg_fast_in_begin_, fast_in_begin, stream);
-      upload_vec(seg_fast_in_end_, fast_in_end, stream);
+    if (fast_count > 0) {
+      seg_fast_seg_id_.resize(fast_count);
+      seg_fast_in_begin_.resize(fast_count);
+      seg_fast_in_end_.resize(fast_count);
+      const int block = 256;
+      const int grid = static_cast<int>((fast_count + block - 1) / block);
+      gpulsmopt_detail::seg_gather_dirty_plan_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(seg_fast_index_), fast_count,
+          raw_or_null(seg_d_dirty_seg_id_),
+          raw_or_null(seg_d_dirty_old_boundary_),
+          raw_or_null(seg_d_dirty_old_live_),
+          raw_or_null(seg_d_dirty_in_begin_),
+          raw_or_null(seg_d_dirty_in_end_), raw_or_null(seg_fast_seg_id_),
+          nullptr, nullptr, raw_or_null(seg_fast_in_begin_),
+          raw_or_null(seg_fast_in_end_));
+      CUDA_CHECK(cudaGetLastError());
       gpulsmopt_detail::seg_apply_inplace_kernel<<<
-          static_cast<unsigned>(fast_seg_id.size()), 256, 0, stream>>>(
+          static_cast<unsigned>(fast_count), 256, 0, stream>>>(
           raw_or_null(seg_fast_seg_id_), raw_or_null(seg_fast_in_begin_),
-          raw_or_null(seg_fast_in_end_), fast_seg_id.size(),
+          raw_or_null(seg_fast_in_end_), fast_count,
           raw_or_null(scratch_incoming_keys_),
           raw_or_null(scratch_incoming_values_), raw_or_null(pool_keys_),
           raw_or_null(pool_values_), raw_or_null(pool_valid_),
@@ -1765,50 +1705,74 @@ private:
       CUDA_CHECK(cudaGetLastError());
     }
 
-    const std::size_t ms = slow_j.size();
 #ifdef GPULSMOPT_PROFILE_INSERT
     printf("[prof]     sheet_merge segs: dirty=%zu fast=%zu slow=%zu "
            "(incoming=%zu)\n",
-           m, fast_seg_id.size(), ms, incoming_count);
+           m, fast_count, ms, incoming_count);
 #endif
     std::vector<std::uint32_t> dirty_k, dirty_output_base, output_seg_id,
         out_boundary, out_live;
     if (ms > 0) {
-      std::vector<std::uint32_t> s_seg_id(ms), s_old_boundary(ms),
-          s_old_live(ms), s_in_begin(ms), s_in_end(ms), s_cand_off(ms),
-          s_old_off(ms), s_inc_off(ms);
-      std::uint32_t cand_acc = 0, old_acc = 0, inc_acc = 0;
-      for (std::size_t s = 0; s < ms; ++s) {
-        const std::size_t j = slow_j[s];
-        s_seg_id[s] = dirty_seg_id[j];
-        s_old_boundary[s] = dirty_old_boundary[j];
-        s_old_live[s] = dirty_old_live[j];
-        s_in_begin[s] = dirty_in_begin[j];
-        s_in_end[s] = dirty_in_end[j];
-        s_cand_off[s] = cand_acc;
-        const std::uint32_t inc = dirty_in_end[j] - dirty_in_begin[j];
-        cand_acc += dirty_old_live[j] + inc;
-        s_old_off[s] = old_acc;
-        old_acc += dirty_old_live[j];
-        s_inc_off[s] = inc_acc;
-        inc_acc += inc;
-      }
-      const std::size_t candidate_count = cand_acc;
-      const std::size_t total_old = old_acc;
-      const std::size_t total_inc = inc_acc;
-      upload_vec(seg_d_dirty_seg_id_, s_seg_id, stream);
-      upload_vec(seg_d_dirty_old_boundary_, s_old_boundary, stream);
-      upload_vec(seg_d_dirty_old_live_, s_old_live, stream);
-      upload_vec(seg_d_dirty_in_begin_, s_in_begin, stream);
-      upload_vec(seg_d_dirty_in_end_, s_in_end, stream);
-      upload_vec(seg_d_candidate_offset_, s_cand_off, stream);
-      upload_vec(seg_d_old_offset_, s_old_off, stream);
-      upload_vec(seg_d_inc_offset_, s_inc_off, stream);
+      seg_slow_seg_id_.resize(ms);
+      seg_slow_old_boundary_.resize(ms);
+      seg_slow_old_live_.resize(ms);
+      seg_slow_in_begin_.resize(ms);
+      seg_slow_in_end_.resize(ms);
+      const int block = 256;
+      const int grid = static_cast<int>((ms + block - 1) / block);
+      gpulsmopt_detail::seg_gather_dirty_plan_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(seg_slow_index_), ms,
+          raw_or_null(seg_d_dirty_seg_id_),
+          raw_or_null(seg_d_dirty_old_boundary_),
+          raw_or_null(seg_d_dirty_old_live_),
+          raw_or_null(seg_d_dirty_in_begin_),
+          raw_or_null(seg_d_dirty_in_end_), raw_or_null(seg_slow_seg_id_),
+          raw_or_null(seg_slow_old_boundary_),
+          raw_or_null(seg_slow_old_live_),
+          raw_or_null(seg_slow_in_begin_),
+          raw_or_null(seg_slow_in_end_));
+      CUDA_CHECK(cudaGetLastError());
+
+      seg_slow_inc_count_.resize(ms);
+      seg_slow_cand_count_.resize(ms);
+      gpulsmopt_detail::seg_make_slow_counts_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(seg_slow_old_live_), raw_or_null(seg_slow_in_begin_),
+          raw_or_null(seg_slow_in_end_), ms,
+          raw_or_null(seg_slow_inc_count_),
+          raw_or_null(seg_slow_cand_count_));
+      CUDA_CHECK(cudaGetLastError());
+
+      seg_d_candidate_offset_.resize(ms);
+      seg_d_old_offset_.resize(ms);
+      seg_d_inc_offset_.resize(ms);
+      thrust::exclusive_scan(policy, seg_slow_cand_count_.begin(),
+                             seg_slow_cand_count_.begin() + ms,
+                             seg_d_candidate_offset_.begin());
+      thrust::exclusive_scan(policy, seg_slow_old_live_.begin(),
+                             seg_slow_old_live_.begin() + ms,
+                             seg_d_old_offset_.begin());
+      thrust::exclusive_scan(policy, seg_slow_inc_count_.begin(),
+                             seg_slow_inc_count_.begin() + ms,
+                             seg_d_inc_offset_.begin());
+
+      seg_plan_total_.resize(3);
+      gpulsmopt_detail::seg_slow_totals_kernel<<<1, 1, 0, stream>>>(
+          raw_or_null(seg_d_old_offset_), raw_or_null(seg_slow_old_live_),
+          raw_or_null(seg_d_inc_offset_), raw_or_null(seg_slow_inc_count_),
+          raw_or_null(seg_d_candidate_offset_),
+          raw_or_null(seg_slow_cand_count_), ms,
+          raw_or_null(seg_plan_total_));
+      CUDA_CHECK(cudaGetLastError());
+      std::uint32_t totals[3] = {0u, 0u, 0u};
+      CUDA_CHECK(cudaMemcpyAsync(totals, raw_or_null(seg_plan_total_),
+                                 3 * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      const std::size_t total_old = totals[0];
+      const std::size_t total_inc = totals[1];
+      const std::size_t candidate_count = totals[2];
 
       resize_seg_candidates(candidate_count);
-      seg_cand_group_sort_.resize(candidate_count);
-      std::size_t live_count = 0;
-#if GPULSMOPT_DISTINCT_KEYS
       seg_old_seg_.resize(total_old);
       seg_old_key_.resize(total_old);
       seg_old_value_.resize(total_old);
@@ -1821,7 +1785,7 @@ private:
         gpulsmopt_detail::seg_gather_old_ordered_kernel<<<
             static_cast<unsigned>(ms), 256, 0, stream>>>(
             raw_or_null(pool_keys_), raw_or_null(pool_values_),
-            raw_or_null(seg_bucket_live_), raw_or_null(seg_d_dirty_seg_id_),
+            raw_or_null(seg_bucket_live_), raw_or_null(seg_slow_seg_id_),
             raw_or_null(seg_d_old_offset_), ms, raw_or_null(seg_old_seg_),
             raw_or_null(seg_old_key_), raw_or_null(seg_old_value_));
         CUDA_CHECK(cudaGetLastError());
@@ -1836,7 +1800,7 @@ private:
                                                   0, stream>>>(
             raw_or_null(scratch_incoming_keys_),
             raw_or_null(scratch_incoming_values_),
-            raw_or_null(seg_d_dirty_in_begin_), raw_or_null(seg_d_dirty_in_end_),
+            raw_or_null(seg_slow_in_begin_), raw_or_null(seg_slow_in_end_),
             raw_or_null(seg_d_inc_offset_), ms, raw_or_null(seg_inc_seg_),
             raw_or_null(seg_inc_key_), raw_or_null(seg_inc_value_));
         CUDA_CHECK(cudaGetLastError());
@@ -1856,151 +1820,114 @@ private:
           thrust::make_zip_iterator(thrust::make_tuple(seg_old_seg_.begin(),
                                                        seg_old_key_.begin(),
                                                        seg_old_value_.begin())),
-          seg_cand_group_sort_.begin(),
+          thrust::make_discard_iterator(),
           thrust::make_zip_iterator(thrust::make_tuple(seg_cand_seg_.begin(),
                                                        seg_cand_key_.begin(),
                                                        seg_cand_value_.begin())));
-      live_count = candidate_count;
-#else
-      seg_sheet_cursor_.resize(ms);
-      thrust::fill(policy, seg_sheet_cursor_.begin(), seg_sheet_cursor_.end(),
-                   0u);
-      gpulsmopt_detail::seg_gather_candidates_kernel<<<
-          static_cast<unsigned>(ms), 256, 0, stream>>>(
-          raw_or_null(pool_keys_), raw_or_null(pool_values_),
-          raw_or_null(pool_valid_), raw_or_null(seg_d_dirty_seg_id_),
-          raw_or_null(seg_d_candidate_offset_),
-          raw_or_null(seg_d_dirty_old_live_),
-          raw_or_null(seg_d_dirty_in_begin_), raw_or_null(seg_d_dirty_in_end_),
-          raw_or_null(scratch_incoming_keys_),
-          raw_or_null(scratch_incoming_values_), ms, raw_or_null(seg_cand_seg_),
-          raw_or_null(seg_cand_key_), raw_or_null(seg_cand_value_),
-          raw_or_null(seg_cand_op_), raw_or_null(seg_cand_seq_),
-          raw_or_null(seg_sheet_cursor_));
-      CUDA_CHECK(cudaGetLastError());
-      if (candidate_count > 0) {
-        const int block = 256;
-        const int grid =
-            static_cast<int>((candidate_count + block - 1) / block);
-        gpulsmopt_detail::
-            seg_make_resolve_keys_kernel<<<grid, block, 0, stream>>>(
-                raw_or_null(seg_cand_seg_), raw_or_null(seg_cand_key_),
-                raw_or_null(seg_cand_seq_), candidate_count,
-                raw_or_null(seg_cand_seq_sort_),
-                raw_or_null(seg_cand_group_sort_));
-        CUDA_CHECK(cudaGetLastError());
-        auto payload1 = thrust::make_zip_iterator(
-            thrust::make_tuple(seg_cand_group_sort_.begin(),
-                               seg_cand_seg_.begin(), seg_cand_key_.begin(),
-                               seg_cand_value_.begin(), seg_cand_op_.begin()));
-        thrust::stable_sort_by_key(policy, seg_cand_seq_sort_.begin(),
-                                   seg_cand_seq_sort_.begin() + candidate_count,
-                                   payload1);
-        auto payload2 = thrust::make_zip_iterator(
-            thrust::make_tuple(seg_cand_seg_.begin(), seg_cand_key_.begin(),
-                               seg_cand_value_.begin(), seg_cand_op_.begin()));
-        thrust::stable_sort_by_key(
-            policy, seg_cand_group_sort_.begin(),
-            seg_cand_group_sort_.begin() + candidate_count, payload2);
-        auto uend = thrust::unique_by_key(
-            policy, seg_cand_group_sort_.begin(),
-            seg_cand_group_sort_.begin() + candidate_count, payload2);
-        const std::size_t unique_count =
-            static_cast<std::size_t>(uend.first - seg_cand_group_sort_.begin());
-        auto begin = thrust::make_zip_iterator(
-            thrust::make_tuple(seg_cand_seg_.begin(), seg_cand_key_.begin(),
-                               seg_cand_value_.begin(), seg_cand_op_.begin()));
-        auto fend =
-            thrust::remove_if(policy, begin, begin + unique_count,
-                              gpulsmopt_detail::DrainTombstonePredicate{});
-        live_count = static_cast<std::size_t>(fend - begin);
-      }
-#endif
-
+      const std::size_t live_count = candidate_count;
       seg_dirty_live_.resize(ms);
-      thrust::fill(policy, seg_dirty_live_.begin(), seg_dirty_live_.end(), 0u);
-      if (live_count > 0) {
-        const int block = 256;
-        const int grid = static_cast<int>((live_count + block - 1) / block);
-        gpulsmopt_detail::
-            seg_count_survivors_kernel<<<grid, block, 0, stream>>>(
-                raw_or_null(seg_cand_seg_), live_count,
-                raw_or_null(seg_dirty_live_));
-        CUDA_CHECK(cudaGetLastError());
-      }
-      std::vector<std::uint32_t> dirty_live(ms);
-      CUDA_CHECK(cudaMemcpyAsync(
-          dirty_live.data(), raw_or_null(seg_dirty_live_),
-          ms * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+      thrust::copy(policy, seg_slow_cand_count_.begin(),
+                   seg_slow_cand_count_.begin() + ms,
+                   seg_dirty_live_.begin());
+      seg_d_dirty_live_offset_.resize(ms);
+      thrust::copy(policy, seg_d_candidate_offset_.begin(),
+                   seg_d_candidate_offset_.begin() + ms,
+                   seg_d_dirty_live_offset_.begin());
+      seg_d_dirty_k_.resize(ms);
+      gpulsmopt_detail::seg_make_dirty_k_kernel<<<grid, block, 0, stream>>>(
+          raw_or_null(seg_dirty_live_), ms, target_segment_live_,
+          raw_or_null(seg_d_dirty_k_));
+      CUDA_CHECK(cudaGetLastError());
+      seg_d_dirty_output_base_.resize(ms);
+      thrust::exclusive_scan(policy, seg_d_dirty_k_.begin(),
+                             seg_d_dirty_k_.begin() + ms,
+                             seg_d_dirty_output_base_.begin());
+      seg_plan_total_.resize(1);
+      gpulsmopt_detail::seg_output_total_kernel<<<1, 1, 0, stream>>>(
+          raw_or_null(seg_d_dirty_output_base_),
+          raw_or_null(seg_d_dirty_k_), ms, raw_or_null(seg_plan_total_));
+      CUDA_CHECK(cudaGetLastError());
+      std::uint32_t output_total = 0u;
+      CUDA_CHECK(cudaMemcpyAsync(&output_total, raw_or_null(seg_plan_total_),
+                                 sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-
-      dirty_k.resize(ms);
-      dirty_output_base.resize(ms);
-      std::vector<std::uint32_t> dirty_live_offset(ms);
-      std::uint32_t out_acc = 0, live_off = 0;
-      for (std::size_t s = 0; s < ms; ++s) {
-        const std::uint32_t L = dirty_live[s];
-        const std::uint32_t k = std::max<std::uint32_t>(
-            1, (L + target_segment_live_ - 1) / target_segment_live_);
-        dirty_k[s] = k;
-        dirty_output_base[s] = out_acc;
-        out_acc += k;
-        dirty_live_offset[s] = live_off;
-        live_off += L;
-      }
-      const std::size_t output_count = out_acc;
+      const std::size_t output_count = output_total;
       output_seg_id.resize(output_count);
-      out_boundary.assign(output_count, 0u);
-      out_live.resize(output_count);
-      std::vector<std::uint32_t> out_dirty(output_count),
-          out_local(output_count), out_k(output_count);
-      for (std::size_t s = 0; s < ms; ++s) {
-        const std::uint32_t k = dirty_k[s];
-        const std::uint32_t L = dirty_live[s];
-        const std::uint32_t per = k == 0 ? 1u : (L + k - 1) / k;
-        for (std::uint32_t local = 0; local < k; ++local) {
-          const std::size_t o = dirty_output_base[s] + local;
-          output_seg_id[o] = alloc_segment();
-          out_dirty[o] = static_cast<std::uint32_t>(s);
-          out_local[o] = local;
-          out_k[o] = k;
-          const std::uint32_t lo = std::min<std::uint32_t>(local * per, L);
-          const std::uint32_t hi =
-              std::min<std::uint32_t>((local + 1) * per, L);
-          out_live[o] = hi - lo;
-        }
-      }
-
-      upload_vec(seg_d_dirty_live_offset_, dirty_live_offset, stream);
-      upload_vec(seg_d_dirty_k_, dirty_k, stream);
-      upload_vec(seg_d_dirty_output_base_, dirty_output_base, stream);
+      for (std::size_t o = 0; o < output_count; ++o)
+        output_seg_id[o] = alloc_segment();
       upload_vec(seg_d_output_seg_id_, output_seg_id, stream);
-      upload_vec(seg_d_out_dirty_, out_dirty, stream);
-      upload_vec(seg_d_out_local_, out_local, stream);
-      upload_vec(seg_d_out_k_, out_k, stream);
 
+      seg_d_out_dirty_.resize(output_count);
+      seg_d_out_local_.resize(output_count);
+      seg_d_out_k_.resize(output_count);
+      seg_d_out_live_.resize(output_count);
       seg_d_out_boundary_.resize(output_count);
       if (output_count > 0) {
-        const int block = 256;
-        const int grid = static_cast<int>((output_count + block - 1) / block);
+        gpulsmopt_detail::seg_output_plan_kernel<<<
+            static_cast<unsigned>(ms), 256, 0, stream>>>(
+            raw_or_null(seg_dirty_live_), raw_or_null(seg_d_dirty_k_),
+            raw_or_null(seg_d_dirty_output_base_), ms,
+            raw_or_null(seg_d_out_dirty_), raw_or_null(seg_d_out_local_),
+            raw_or_null(seg_d_out_k_), raw_or_null(seg_d_out_live_));
+        CUDA_CHECK(cudaGetLastError());
+        const int grid_out =
+            static_cast<int>((output_count + block - 1) / block);
         gpulsmopt_detail::
-            seg_output_boundaries_kernel<<<grid, block, 0, stream>>>(
+            seg_output_boundaries_kernel<<<grid_out, block, 0, stream>>>(
                 raw_or_null(seg_d_out_dirty_), raw_or_null(seg_d_out_local_),
                 raw_or_null(seg_d_out_k_), output_count,
                 raw_or_null(seg_dirty_live_),
                 raw_or_null(seg_d_dirty_live_offset_),
-                raw_or_null(seg_d_dirty_old_boundary_),
+                raw_or_null(seg_slow_old_boundary_),
                 raw_or_null(seg_cand_key_), raw_or_null(seg_d_out_boundary_));
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpyAsync(out_boundary.data(),
-                                   raw_or_null(seg_d_out_boundary_),
-                                   output_count * sizeof(std::uint32_t),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
       }
 
       rebuild_output_segments(live_count, output_count, stream);
+      dirty_k.resize(ms);
+      dirty_output_base.resize(ms);
+      out_boundary.resize(output_count);
+      out_live.resize(output_count);
+      CUDA_CHECK(cudaMemcpyAsync(dirty_k.data(), raw_or_null(seg_d_dirty_k_),
+                                 ms * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          dirty_output_base.data(), raw_or_null(seg_d_dirty_output_base_),
+          ms * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(out_boundary.data(),
+                                 raw_or_null(seg_d_out_boundary_),
+                                 output_count * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(out_live.data(), raw_or_null(seg_d_out_live_),
+                                 output_count * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
     }
+
+    std::vector<std::uint32_t> dirty_ord(m), seg_slow(m), seg_new_live(m);
+    CUDA_CHECK(cudaMemcpyAsync(dirty_ord.data(), raw_or_null(seg_dirty_ord_),
+                               m * sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(seg_slow.data(), raw_or_null(seg_slow_),
+                               m * sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(seg_new_live.data(), raw_or_null(seg_new_live_),
+                               m * sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    std::vector<std::uint32_t> slow_index_device(ms);
+    if (ms > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(slow_index_device.data(),
+                                 raw_or_null(seg_slow_index_),
+                                 ms * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int> is_fast(m), slow_index(m, -1);
+    for (std::size_t j = 0; j < m; ++j)
+      is_fast[j] = seg_slow[j] == 0u ? 1 : 0;
+    for (std::size_t s = 0; s < ms; ++s)
+      slow_index[slow_index_device[s]] = static_cast<int>(s);
 
     std::vector<char> is_dirty(h_dir_seg_id_.size(), 0);
     std::vector<std::size_t> ord_to_j(h_dir_seg_id_.size(), 0);
@@ -2326,10 +2253,10 @@ private:
     thrust::device_vector<std::uint8_t> ops;
   };
 
-  void sort_log_dedup(thrust::device_vector<std::uint32_t> &k,
-                      thrust::device_vector<std::uint32_t> &v,
-                      thrust::device_vector<std::uint8_t> &op, std::size_t n,
-                      cudaStream_t stream) {
+  void sort_log(thrust::device_vector<std::uint32_t> &k,
+                thrust::device_vector<std::uint32_t> &v,
+                thrust::device_vector<std::uint8_t> &op, std::size_t n,
+                cudaStream_t stream) {
     if (n == 0) {
       k.clear();
       v.clear();
@@ -2337,20 +2264,15 @@ private:
       return;
     }
     auto policy = thrust::cuda::par.on(stream);
-    thrust::device_vector<std::uint32_t> seq(n);
-    thrust::sequence(policy, seq.begin(), seq.end());
-    thrust::device_vector<std::uint64_t> sk(n);
-    fill_drain_sort_keys(k, seq, sk, 0, n, stream);
+    // Payload must NOT include k: the sort-key range (k) and the values range
+    // must be disjoint, else thrust::sort_by_key aliases them (UB) and can
+    // misalign key<->value/op. sort_by_key already permutes k in lockstep.
     auto payload = thrust::make_zip_iterator(
-        thrust::make_tuple(k.begin(), v.begin(), op.begin()));
-    thrust::sort_by_key(policy, sk.begin(), sk.end(), payload);
-    auto uend = thrust::unique_by_key(
-        policy, k.begin(), k.end(),
-        thrust::make_zip_iterator(thrust::make_tuple(v.begin(), op.begin())));
-    const std::size_t u = static_cast<std::size_t>(uend.first - k.begin());
-    k.resize(u);
-    v.resize(u);
-    op.resize(u);
+        thrust::make_tuple(v.begin(), op.begin()));
+    thrust::sort_by_key(policy, k.begin(), k.begin() + n, payload);
+    k.resize(n);
+    v.resize(n);
+    op.resize(n);
   }
 
   SortedRun merge_two_runs(SortedRun &a, SortedRun &b, cudaStream_t stream) {
@@ -2371,16 +2293,7 @@ private:
         out.keys.begin(),
         thrust::make_zip_iterator(
             thrust::make_tuple(out.values.begin(), out.ops.begin())));
-    auto uend = thrust::unique_by_key(
-        policy, out.keys.begin(), out.keys.end(),
-        thrust::make_zip_iterator(
-            thrust::make_tuple(out.values.begin(), out.ops.begin())));
-    const std::size_t u =
-        static_cast<std::size_t>(uend.first - out.keys.begin());
-    out.keys.resize(u);
-    out.values.resize(u);
-    out.ops.resize(u);
-    out.log_total = static_cast<std::uint32_t>(u);
+    out.log_total = static_cast<std::uint32_t>(na + nb);
     return out;
   }
 
@@ -2392,8 +2305,8 @@ private:
     run.keys = std::move(c0_log_keys_);
     run.values = std::move(c0_log_values_);
     run.ops = std::move(c0_log_ops_);
-    sort_log_dedup(run.keys, run.values, run.ops, c0_total, stream);
-    run.log_total = static_cast<std::uint32_t>(run.keys.size());
+    sort_log(run.keys, run.values, run.ops, c0_total, stream);
+    run.log_total = static_cast<std::uint32_t>(c0_total);
     run.level = 0;
     c0_log_count_ = 0;
     c0_log_keys_ = thrust::device_vector<std::uint32_t>();
@@ -2420,6 +2333,12 @@ private:
     thrust::device_vector<std::uint32_t> ins_prefix;
     thrust::device_vector<std::uint32_t> tomb_val_prefix;
     thrust::device_vector<std::uint32_t> tomb_cnt_prefix;
+    // For successor: sorted overlay insert keys still live, and sorted tombstone
+    // keys that hit a live sheet key.
+    thrust::device_vector<std::uint32_t> live_ins_keys;
+    std::size_t live_ins_count = 0;
+    thrust::device_vector<std::uint32_t> killed_keys;
+    std::size_t killed_count = 0;
   };
 
   void resolve_overlay(thrust::device_vector<std::uint32_t> &gk,
@@ -2441,40 +2360,86 @@ private:
     gk.resize(total);
     gv.resize(total);
     gop.resize(total);
-    std::size_t off = 0;
-    for (auto &g : runs_) {
-      const std::size_t s = g.log_total;
-      if (s) {
-        thrust::copy(policy, g.keys.begin(), g.keys.begin() + s,
-                     gk.begin() + off);
-        thrust::copy(policy, g.values.begin(), g.values.begin() + s,
-                     gv.begin() + off);
-        thrust::copy(policy, g.ops.begin(), g.ops.begin() + s,
-                     gop.begin() + off);
-      }
-      off += s;
-    }
+
+    // The runs are ALREADY key-sorted; only C0 is unsorted. So sort just C0
+    // (small) and multi-way merge the sorted sequences, instead of concatenating
+    // everything and re-sorting the (large) runs from scratch.
+    struct Src {
+      const std::uint32_t *k;
+      const std::uint32_t *v;
+      const std::uint8_t *op;
+      std::size_t n;
+    };
+    std::vector<Src> src;
+    src.reserve(runs_.size() + 1);
     if (c0_log_count_ > 0) {
       const std::size_t s = c0_log_count_;
+      ov_c0k_.resize(s);
+      ov_c0v_.resize(s);
+      ov_c0op_.resize(s);
       thrust::copy(policy, c0_log_keys_.begin(), c0_log_keys_.begin() + s,
-                   gk.begin() + off);
+                   ov_c0k_.begin());
       thrust::copy(policy, c0_log_values_.begin(), c0_log_values_.begin() + s,
-                   gv.begin() + off);
+                   ov_c0v_.begin());
       thrust::copy(policy, c0_log_ops_.begin(), c0_log_ops_.begin() + s,
-                   gop.begin() + off);
-      off += s;
+                   ov_c0op_.begin());
+      sort_log(ov_c0k_, ov_c0v_, ov_c0op_, s, stream);
+      src.push_back({raw_or_null(ov_c0k_), raw_or_null(ov_c0v_),
+                     raw_or_null(ov_c0op_), s});
     }
-    thrust::device_vector<std::uint32_t> garr(total);
-    thrust::sequence(policy, garr.begin(), garr.end());
-    thrust::device_vector<std::uint64_t> sortk(total);
-    fill_drain_sort_keys(gk, garr, sortk, 0, total, stream);
-    auto payload = thrust::make_zip_iterator(
-        thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
-    thrust::sort_by_key(policy, sortk.begin(), sortk.end(), payload);
-    auto uend = thrust::unique_by_key(
-        policy, gk.begin(), gk.end(),
-        thrust::make_zip_iterator(thrust::make_tuple(gv.begin(), gop.begin())));
-    u = static_cast<std::size_t>(uend.first - gk.begin());
+    for (auto &g : runs_)
+      if (g.log_total)
+        src.push_back({raw_or_null(g.keys), raw_or_null(g.values),
+                       raw_or_null(g.ops), g.log_total});
+
+    if (src.size() == 1) {
+      const Src &s = src[0];
+      thrust::copy(policy, thrust::device_pointer_cast(s.k),
+                   thrust::device_pointer_cast(s.k) + s.n, gk.begin());
+      thrust::copy(policy, thrust::device_pointer_cast(s.v),
+                   thrust::device_pointer_cast(s.v) + s.n, gv.begin());
+      thrust::copy(policy, thrust::device_pointer_cast(s.op),
+                   thrust::device_pointer_cast(s.op) + s.n, gop.begin());
+    } else {
+      // Pairwise merge, ping-ponging between gk/gv/gop and ov_m*, arranged so the
+      // LAST merge writes into gk/gv/gop (no trailing copy needed).
+      const std::size_t nmerge = src.size() - 1;
+      if (nmerge >= 2) {
+        ov_mk_.resize(total);
+        ov_mv_.resize(total);
+        ov_mop_.resize(total);
+      }
+      const std::uint32_t *curK = src[0].k;
+      const std::uint32_t *curV = src[0].v;
+      const std::uint8_t *curOp = src[0].op;
+      std::size_t curN = src[0].n;
+      for (std::size_t j = 0; j < nmerge; ++j) {
+        const bool to_g = (((nmerge - 1 - j) & 1u) == 0u);
+        std::uint32_t *dK = to_g ? raw_or_null(gk) : raw_or_null(ov_mk_);
+        std::uint32_t *dV = to_g ? raw_or_null(gv) : raw_or_null(ov_mv_);
+        std::uint8_t *dOp = to_g ? raw_or_null(gop) : raw_or_null(ov_mop_);
+        const Src &s = src[j + 1];
+        auto aval = thrust::make_zip_iterator(
+            thrust::make_tuple(thrust::device_pointer_cast(curV),
+                               thrust::device_pointer_cast(curOp)));
+        auto bval = thrust::make_zip_iterator(
+            thrust::make_tuple(thrust::device_pointer_cast(s.v),
+                               thrust::device_pointer_cast(s.op)));
+        auto oval = thrust::make_zip_iterator(
+            thrust::make_tuple(thrust::device_pointer_cast(dV),
+                               thrust::device_pointer_cast(dOp)));
+        thrust::merge_by_key(policy, thrust::device_pointer_cast(curK),
+                             thrust::device_pointer_cast(curK) + curN,
+                             thrust::device_pointer_cast(s.k),
+                             thrust::device_pointer_cast(s.k) + s.n, aval, bval,
+                             thrust::device_pointer_cast(dK), oval);
+        curK = dK;
+        curV = dV;
+        curOp = dOp;
+        curN += s.n;
+      }
+    }
+    u = total;
     auto beg = thrust::make_zip_iterator(
         thrust::make_tuple(gk.begin(), gv.begin(), gop.begin()));
     auto mid = thrust::stable_partition(policy, beg, beg + u,
@@ -2492,6 +2457,8 @@ private:
                              ix.ins_prefix.begin() + 1);
     ix.tomb_val_prefix.assign(tomb + 1, 0u);
     ix.tomb_cnt_prefix.assign(tomb + 1, 0u);
+    ix.killed_keys.clear();
+    ix.killed_count = 0;
     if (tomb > 0 && h_dir_seg_id_.size() > 0) {
       thrust::device_vector<std::uint32_t> tval(tomb), tflag(tomb);
       const int block = 256;
@@ -2507,7 +2474,36 @@ private:
                              ix.tomb_val_prefix.begin() + 1);
       thrust::inclusive_scan(policy, tflag.begin(), tflag.end(),
                              ix.tomb_cnt_prefix.begin() + 1);
+      // Tombstone keys that actually hit the sheet, sorted (gk tombstones are
+      // already sorted by key). These are the sheet keys deleted-but-not-drained.
+      ix.killed_keys.resize(tomb);
+      auto kend = thrust::copy_if(policy, ix.gk.begin() + ins, ix.gk.begin() + u,
+                                  tflag.begin(), ix.killed_keys.begin(),
+                                  gpulsmopt_detail::NonZeroU32{});
+      ix.killed_count =
+          static_cast<std::size_t>(kend - ix.killed_keys.begin());
+      ix.killed_keys.resize(ix.killed_count);
     }
+    // Overlay insert keys with no newer delete. Distinct-key workload => an
+    // insert that also appears as a tombstone was deleted afterward, so drop it.
+    // Binary-search each insert against the sorted tombstones, then compact.
+    ix.live_ins_keys.resize(ins);
+    ix.live_ins_count = 0;
+    if (ins > 0) {
+      thrust::device_vector<std::uint32_t> live_flag(ins);
+      const int lblock = 256;
+      const int lgrid = static_cast<int>((ins + lblock - 1) / lblock);
+      gpulsmopt_detail::mark_live_inserts_kernel<<<lgrid, lblock, 0, stream>>>(
+          raw_or_null(ix.gk), ins, raw_or_null(ix.gk) + ins, u - ins,
+          raw_or_null(live_flag));
+      CUDA_CHECK(cudaGetLastError());
+      auto lend = thrust::copy_if(policy, ix.gk.begin(), ix.gk.begin() + ins,
+                                  live_flag.begin(), ix.live_ins_keys.begin(),
+                                  gpulsmopt_detail::NonZeroU32{});
+      ix.live_ins_count =
+          static_cast<std::size_t>(lend - ix.live_ins_keys.begin());
+    }
+    ix.live_ins_keys.resize(ix.live_ins_count);
   }
 
   OverlayReadIndex &overlay_index(cudaStream_t stream) {
@@ -2541,25 +2537,7 @@ private:
         static_cast<std::size_t>(rle_end.first - seg_dirty_ord_.begin());
     if (m == 0)
       return;
-    std::vector<std::uint32_t> dirty_ord(m), dirty_cnt(m);
-    CUDA_CHECK(cudaMemcpyAsync(dirty_ord.data(), raw_or_null(seg_dirty_ord_),
-                               m * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(dirty_cnt.data(), raw_or_null(seg_dirty_count_),
-                               m * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<std::uint32_t> dseg(m), dbeg(m), dend(m);
-    std::uint32_t acc = 0;
-    for (std::size_t j = 0; j < m; ++j) {
-      dseg[j] = h_dir_seg_id_[dirty_ord[j]];
-      dbeg[j] = acc;
-      acc += dirty_cnt[j];
-      dend[j] = acc;
-    }
-    upload_vec(seg_d_dirty_seg_id_, dseg, stream);
-    upload_vec(seg_d_dirty_in_begin_, dbeg, stream);
-    upload_vec(seg_d_dirty_in_end_, dend, stream);
+    prepare_dirty_plan(m, stream);
     gpulsmopt_detail::seg_delete_compact_kernel<<<static_cast<unsigned>(m), 256,
                                                   0, stream>>>(
         raw_or_null(scratch_delete_keys_), raw_or_null(seg_d_dirty_seg_id_),
@@ -2604,11 +2582,36 @@ private:
       if (ins > 0) {
         scratch_incoming_keys_.resize(ins);
         scratch_incoming_values_.resize(ins);
-        thrust::copy(policy, gk.begin(), gk.begin() + ins,
-                     scratch_incoming_keys_.begin());
-        thrust::copy(policy, gv.begin(), gv.begin() + ins,
-                     scratch_incoming_values_.begin());
-        merge_incoming_into_sheet(ins, stream);
+        std::size_t live = ins;
+        if (tomb > 0) {
+          // A key inserted then deleted lands in this pile as BOTH an insert and
+          // a tombstone (the delete is newer). Drop such inserts so they never
+          // reach the sheet; only inserts with no matching tombstone are live.
+          // (The read path does the same via mark_live_inserts_kernel.)
+          thrust::device_vector<std::uint32_t> live_flag(ins);
+          const int lblock = 256;
+          const int lgrid = static_cast<int>((ins + lblock - 1) / lblock);
+          gpulsmopt_detail::mark_live_inserts_kernel<<<lgrid, lblock, 0,
+                                                       stream>>>(
+              raw_or_null(gk), ins, raw_or_null(gk) + ins, tomb,
+              raw_or_null(live_flag));
+          CUDA_CHECK(cudaGetLastError());
+          auto in_begin = thrust::make_zip_iterator(
+              thrust::make_tuple(gk.begin(), gv.begin()));
+          auto out_begin = thrust::make_zip_iterator(thrust::make_tuple(
+              scratch_incoming_keys_.begin(), scratch_incoming_values_.begin()));
+          auto out_end =
+              thrust::copy_if(policy, in_begin, in_begin + ins, live_flag.begin(),
+                              out_begin, gpulsmopt_detail::NonZeroU32{});
+          live = static_cast<std::size_t>(out_end - out_begin);
+        } else {
+          thrust::copy(policy, gk.begin(), gk.begin() + ins,
+                       scratch_incoming_keys_.begin());
+          thrust::copy(policy, gv.begin(), gv.begin() + ins,
+                       scratch_incoming_values_.begin());
+        }
+        if (live > 0)
+          merge_incoming_into_sheet(live, stream);
       }
 #ifdef GPULSMOPT_PROFILE_INSERT
       cudaEventRecord(pe3, stream);
@@ -2634,24 +2637,6 @@ private:
 #endif
   }
 
-  void join_pending_drain() const {
-    if (pending_drain_.valid())
-      pending_drain_.get();
-  }
-
-  void launch_background_drain() {
-    pending_drain_ = std::async(std::launch::async, [this]() {
-      std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-      merge_down(0);
-      CUDA_CHECK(cudaStreamSynchronize(0));
-    });
-  }
-
-  bool drain_needed_locked(cudaStream_t stream) {
-    maybe_flush_and_merge(stream);
-    return false;
-  }
-
   void maybe_flush_and_merge(cudaStream_t stream) {
     if (c0_log_live() >= c0_flush_budget())
       flush_c0_to_run(stream);
@@ -2667,8 +2652,8 @@ private:
       c0_sorted_keys_ = c0_log_keys_;
       c0_sorted_values_ = c0_log_values_;
       c0_sorted_ops_ = c0_log_ops_;
-      sort_log_dedup(c0_sorted_keys_, c0_sorted_values_, c0_sorted_ops_, n, stream);
-      c0_sorted_count_ = static_cast<std::uint32_t>(c0_sorted_keys_.size());
+      sort_log(c0_sorted_keys_, c0_sorted_values_, c0_sorted_ops_, n, stream);
+      c0_sorted_count_ = static_cast<std::uint32_t>(n);
     } else {
       c0_sorted_count_ = 0;
     }
@@ -2769,7 +2754,9 @@ private:
     const std::size_t nbuckets =
         h_dir_seg_id_.size() *
         static_cast<std::size_t>(gpulsmopt_detail::kSegmentBuckets);
-    const bool use_flip = !h_dir_seg_id_.empty() && n >= nbuckets;
+    const bool use_flip =
+        !h_dir_seg_id_.empty() && n >= nbuckets &&
+        n >= static_cast<std::size_t>(GPULSMOPT_LOOKUP_FLIX_MIN_BATCH);
 
     if (!use_flip && num_runs == 0) {
       const int block = 256;
@@ -2824,8 +2811,6 @@ private:
   std::size_t sheet_live_count_ = 0;
   mutable std::shared_mutex snapshot_mutex_;
 
-  mutable std::future<void> pending_drain_;
-
   std::uint32_t c0_log_count_ = 0;
   thrust::device_vector<std::uint32_t> c0_log_keys_;
   thrust::device_vector<std::uint32_t> c0_log_values_;
@@ -2871,6 +2856,14 @@ private:
   thrust::device_vector<std::uint32_t> scratch_incoming_values_;
   thrust::device_vector<std::uint32_t> scratch_delete_keys_;
 
+  // resolve_overlay merge scratch: sorted C0 copy + ping-pong merge buffer.
+  thrust::device_vector<std::uint32_t> ov_c0k_;
+  thrust::device_vector<std::uint32_t> ov_c0v_;
+  thrust::device_vector<std::uint8_t> ov_c0op_;
+  thrust::device_vector<std::uint32_t> ov_mk_;
+  thrust::device_vector<std::uint32_t> ov_mv_;
+  thrust::device_vector<std::uint8_t> ov_mop_;
+
   thrust::device_vector<std::uint32_t> seg_inc_ordinal_;
   thrust::device_vector<std::uint32_t> seg_dirty_ord_;
   thrust::device_vector<std::uint32_t> seg_dirty_count_;
@@ -2880,7 +2873,6 @@ private:
   thrust::device_vector<std::uint32_t> seg_d_dirty_in_begin_;
   thrust::device_vector<std::uint32_t> seg_d_dirty_in_end_;
   thrust::device_vector<std::uint32_t> seg_d_candidate_offset_;
-  thrust::device_vector<std::uint32_t> seg_sheet_cursor_;
   thrust::device_vector<std::uint32_t> seg_dirty_live_;
   thrust::device_vector<std::uint32_t> seg_d_dirty_live_offset_;
   thrust::device_vector<std::uint32_t> seg_d_dirty_k_;
@@ -2889,12 +2881,24 @@ private:
   thrust::device_vector<std::uint32_t> seg_d_out_dirty_;
   thrust::device_vector<std::uint32_t> seg_d_out_local_;
   thrust::device_vector<std::uint32_t> seg_d_out_k_;
+  thrust::device_vector<std::uint32_t> seg_d_out_live_;
   thrust::device_vector<std::uint32_t> seg_d_out_boundary_;
   thrust::device_vector<std::uint32_t> seg_src_seg_id_;
   thrust::device_vector<std::uint32_t> seg_src_out_base_;
   thrust::device_vector<std::uint32_t> seg_src_group_;
   thrust::device_vector<std::uint32_t> seg_slow_;
   thrust::device_vector<std::uint32_t> seg_new_live_;
+  thrust::device_vector<std::uint32_t> seg_plan_index_;
+  thrust::device_vector<std::uint32_t> seg_fast_index_;
+  thrust::device_vector<std::uint32_t> seg_slow_index_;
+  thrust::device_vector<std::uint32_t> seg_slow_seg_id_;
+  thrust::device_vector<std::uint32_t> seg_slow_old_boundary_;
+  thrust::device_vector<std::uint32_t> seg_slow_old_live_;
+  thrust::device_vector<std::uint32_t> seg_slow_in_begin_;
+  thrust::device_vector<std::uint32_t> seg_slow_in_end_;
+  thrust::device_vector<std::uint32_t> seg_slow_inc_count_;
+  thrust::device_vector<std::uint32_t> seg_slow_cand_count_;
+  thrust::device_vector<std::uint32_t> seg_plan_total_;
   thrust::device_vector<std::uint32_t> seg_fast_seg_id_;
   thrust::device_vector<std::uint32_t> seg_fast_in_begin_;
   thrust::device_vector<std::uint32_t> seg_fast_in_end_;
@@ -2902,10 +2906,6 @@ private:
   thrust::device_vector<std::uint32_t> seg_cand_seg_;
   thrust::device_vector<std::uint32_t> seg_cand_key_;
   thrust::device_vector<std::uint32_t> seg_cand_value_;
-  thrust::device_vector<std::uint32_t> seg_cand_op_;
-  thrust::device_vector<std::uint32_t> seg_cand_seq_;
-  thrust::device_vector<std::uint32_t> seg_cand_seq_sort_;
-  thrust::device_vector<std::uint64_t> seg_cand_group_sort_;
 
   thrust::device_vector<std::uint32_t> seg_old_seg_;
   thrust::device_vector<std::uint32_t> seg_old_key_;
@@ -2917,8 +2917,6 @@ private:
   thrust::device_vector<std::uint64_t> seg_inc_comp_;
   thrust::device_vector<std::uint32_t> seg_d_old_offset_;
   thrust::device_vector<std::uint32_t> seg_d_inc_offset_;
-
-  thrust::device_vector<std::uint8_t> scratch_query_found_;
 
   OverlayReadIndex cached_overlay_;
   bool overlay_dirty_ = true;
