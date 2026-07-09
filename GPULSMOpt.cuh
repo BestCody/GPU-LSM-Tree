@@ -29,6 +29,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef GPULSMOPT_PROFILE_INSERT
+#include <chrono>
+#include <cstdio>
+#endif
+
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(stmt)                                                       \
   do {                                                                         \
@@ -67,6 +72,35 @@ constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
 constexpr std::uint32_t kC0LogMaxIndex = 0x00fffffeu;
+
+#ifdef GPULSMOPT_PROFILE_INSERT
+// Wall-clock timer for one insert phase: measures from scope entry to a stream
+// sync at scope exit, accumulating into *acc (ms). Phases are sequential (no
+// overlap), so summing the buckets is valid. Compiled out of normal builds.
+struct ScopedInsertPhaseTimer {
+  cudaStream_t stream_;
+  double *acc_;
+  std::chrono::high_resolution_clock::time_point t0_;
+  ScopedInsertPhaseTimer(cudaStream_t stream, double *acc)
+      : stream_(stream), acc_(acc),
+        t0_(std::chrono::high_resolution_clock::now()) {}
+  ~ScopedInsertPhaseTimer() {
+    cudaStreamSynchronize(stream_);
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    *acc_ += std::chrono::duration<double, std::milli>(t1 - t0_).count();
+  }
+};
+#define GPULSMOPT_PROF_CAT2(a, b) a##b
+#define GPULSMOPT_PROF_CAT(a, b) GPULSMOPT_PROF_CAT2(a, b)
+#define GPULSMOPT_PROF_PHASE(acc)                                              \
+  gpulsmopt_detail::ScopedInsertPhaseTimer GPULSMOPT_PROF_CAT(prof_phase_,     \
+                                                              __LINE__)(       \
+      stream, &(acc))
+#else
+#define GPULSMOPT_PROF_PHASE(acc)                                              \
+  do {                                                                         \
+  } while (false)
+#endif
 
 struct DeviceKeyBatch {
   const std::uint32_t *keys = nullptr;
@@ -1217,26 +1251,41 @@ public:
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
 #ifdef GPULSMOPT_PROFILE_INSERT
-      cudaEvent_t ia, ib;
-      cudaEventCreate(&ia);
-      cudaEventCreate(&ib);
-      cudaEventRecord(ia, stream);
+      reset_insert_prof_();
+      const auto prof_t0 = std::chrono::high_resolution_clock::now();
 #endif
       insert_records(batch.keys, batch.values,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
                      batch.count, stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
-#ifdef GPULSMOPT_PROFILE_INSERT
-      cudaEventRecord(ib, stream);
-      cudaEventSynchronize(ib);
-      float t_records = 0.f;
-      cudaEventElapsedTime(&t_records, ia, ib);
-      printf("[prof] insert %zu keys: insert_records=%.3f ms\n", batch.count,
-             t_records);
-      cudaEventDestroy(ia);
-      cudaEventDestroy(ib);
-#endif
       maybe_flush_and_merge(stream);
+#ifdef GPULSMOPT_PROFILE_INSERT
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      const auto prof_t1 = std::chrono::high_resolution_clock::now();
+      const double total =
+          std::chrono::duration<double, std::milli>(prof_t1 - prof_t0).count();
+      const double measured = prof_append_ms_ + prof_flushsort_ms_ +
+                              prof_runmerge_ms_ + prof_resolve_ms_ +
+                              prof_delete_ms_ + prof_sheetmerge_ms_;
+      const double other = total - measured;
+      auto pct = [total](double x) {
+        return total > 0.0 ? 100.0 * x / total : 0.0;
+      };
+      printf("[prof] insert %zu keys: total=%.3f ms\n", batch.count, total);
+      printf("[prof]   append      = %.3f ms (%5.1f%%)\n", prof_append_ms_,
+             pct(prof_append_ms_));
+      printf("[prof]   flush_sort  = %.3f ms (%5.1f%%)\n", prof_flushsort_ms_,
+             pct(prof_flushsort_ms_));
+      printf("[prof]   run_merge   = %.3f ms (%5.1f%%)\n", prof_runmerge_ms_,
+             pct(prof_runmerge_ms_));
+      printf("[prof]   resolve     = %.3f ms (%5.1f%%)\n", prof_resolve_ms_,
+             pct(prof_resolve_ms_));
+      printf("[prof]   tomb_delete = %.3f ms (%5.1f%%)\n", prof_delete_ms_,
+             pct(prof_delete_ms_));
+      printf("[prof]   sheet_merge = %.3f ms (%5.1f%%)\n", prof_sheetmerge_ms_,
+             pct(prof_sheetmerge_ms_));
+      printf("[prof]   other/host  = %.3f ms (%5.1f%%)\n", other, pct(other));
+#endif
     }
   }
 
@@ -2166,15 +2215,18 @@ private:
     ensure_c0_log(stream);
     const std::uint32_t old_total = c0_log_count_;
     const std::size_t new_total = static_cast<std::size_t>(old_total) + count;
-    c0_log_keys_.resize(new_total);
-    c0_log_values_.resize(new_total);
-    c0_log_ops_.resize(new_total);
-    const int block = 256;
-    const int grid = static_cast<int>((count + block - 1) / block);
-    gpulsmopt_detail::c0_log_append_kernel<<<grid, block, 0, stream>>>(
-        keys_in, values_in, op, old_total, count, raw_or_null(c0_log_keys_),
-        raw_or_null(c0_log_values_), raw_or_null(c0_log_ops_));
-    CUDA_CHECK(cudaGetLastError());
+    {
+      GPULSMOPT_PROF_PHASE(prof_append_ms_);
+      c0_log_keys_.resize(new_total);
+      c0_log_values_.resize(new_total);
+      c0_log_ops_.resize(new_total);
+      const int block = 256;
+      const int grid = static_cast<int>((count + block - 1) / block);
+      gpulsmopt_detail::c0_log_append_kernel<<<grid, block, 0, stream>>>(
+          keys_in, values_in, op, old_total, count, raw_or_null(c0_log_keys_),
+          raw_or_null(c0_log_values_), raw_or_null(c0_log_ops_));
+      CUDA_CHECK(cudaGetLastError());
+    }
     c0_log_count_ = static_cast<std::uint32_t>(new_total);
     overlay_dirty_ = true;
     read_view_dirty_ = true;
@@ -2297,7 +2349,10 @@ private:
     run.keys = std::move(c0_log_keys_);
     run.values = std::move(c0_log_values_);
     run.ops = std::move(c0_log_ops_);
-    sort_log(run.keys, run.values, run.ops, c0_total, stream);
+    {
+      GPULSMOPT_PROF_PHASE(prof_flushsort_ms_);
+      sort_log(run.keys, run.values, run.ops, c0_total, stream);
+    }
     run.log_total = static_cast<std::uint32_t>(c0_total);
     run.level = 0;
     c0_log_count_ = 0;
@@ -2308,8 +2363,11 @@ private:
     while (runs_.size() >= 2 &&
            runs_[runs_.size() - 1].level == runs_[runs_.size() - 2].level) {
       const std::size_t nlast = runs_.size() - 1;
-      SortedRun merged =
-          merge_two_runs(runs_[nlast - 1], runs_[nlast], stream);
+      SortedRun merged;
+      {
+        GPULSMOPT_PROF_PHASE(prof_runmerge_ms_);
+        merged = merge_two_runs(runs_[nlast - 1], runs_[nlast], stream);
+      }
       runs_.pop_back();
       runs_.pop_back();
       runs_.push_back(std::move(merged));
@@ -2529,37 +2587,26 @@ private:
   }
 
   void merge_down(cudaStream_t stream) {
-#ifdef GPULSMOPT_PROFILE_INSERT
-    cudaEvent_t pe0, pe1, pe2, pe3;
-    cudaEventCreate(&pe0);
-    cudaEventCreate(&pe1);
-    cudaEventCreate(&pe2);
-    cudaEventCreate(&pe3);
-    cudaEventRecord(pe0, stream);
-#endif
     thrust::device_vector<std::uint32_t> gk, gv;
     thrust::device_vector<std::uint8_t> gop;
     std::size_t u = 0, ins = 0;
-    resolve_overlay(gk, gv, gop, u, ins, stream);
-#ifdef GPULSMOPT_PROFILE_INSERT
-    cudaEventRecord(pe1, stream);
-    cudaEventRecord(pe2, stream);
-    cudaEventRecord(pe3, stream);
-#endif
+    {
+      GPULSMOPT_PROF_PHASE(prof_resolve_ms_);
+      resolve_overlay(gk, gv, gop, u, ins, stream);
+    }
     if (u > 0) {
       auto policy = thrust::cuda::par.on(stream);
       const std::size_t tomb = u - ins;
       if (tomb > 0 && h_dir_seg_id_.size() > 0) {
+        GPULSMOPT_PROF_PHASE(prof_delete_ms_);
         scratch_delete_keys_.resize(tomb);
         thrust::copy(policy, gk.begin() + ins, gk.begin() + u,
                      scratch_delete_keys_.begin());
         apply_sheet_deletes(tomb, stream);
         refresh_directory_live_counts(stream);
       }
-#ifdef GPULSMOPT_PROFILE_INSERT
-      cudaEventRecord(pe2, stream);
-#endif
       if (ins > 0) {
+        GPULSMOPT_PROF_PHASE(prof_sheetmerge_ms_);
         scratch_incoming_keys_.resize(ins);
         scratch_incoming_values_.resize(ins);
         std::size_t live = ins;
@@ -2589,28 +2636,11 @@ private:
         if (live > 0)
           merge_incoming_into_sheet(live, stream);
       }
-#ifdef GPULSMOPT_PROFILE_INSERT
-      cudaEventRecord(pe3, stream);
-#endif
     }
     runs_.clear();
     clear_c0_log(stream);
     overlay_dirty_ = true;
     read_view_dirty_ = true;
-#ifdef GPULSMOPT_PROFILE_INSERT
-    cudaEventSynchronize(pe3);
-    float t_res = 0.f, t_tomb = 0.f, t_inc = 0.f;
-    cudaEventElapsedTime(&t_res, pe0, pe1);
-    cudaEventElapsedTime(&t_tomb, pe1, pe2);
-    cudaEventElapsedTime(&t_inc, pe2, pe3);
-    printf("[prof]   merge_down phases: resolve=%.3f tomb_delete=%.3f "
-           "sheet_merge=%.3f ms (u=%zu ins=%zu)\n",
-           t_res, t_tomb, t_inc, u, ins);
-    cudaEventDestroy(pe0);
-    cudaEventDestroy(pe1);
-    cudaEventDestroy(pe2);
-    cudaEventDestroy(pe3);
-#endif
   }
 
   void maybe_flush_and_merge(cudaStream_t stream) {
@@ -2791,6 +2821,20 @@ private:
   thrust::device_vector<std::uint32_t> c0_log_keys_;
   thrust::device_vector<std::uint32_t> c0_log_values_;
   thrust::device_vector<std::uint8_t> c0_log_ops_;
+
+#ifdef GPULSMOPT_PROFILE_INSERT
+  // Per-insert phase accumulators (ms), reset at the top of insert().
+  double prof_append_ms_ = 0.0;      // C0 log append kernel
+  double prof_flushsort_ms_ = 0.0;   // sort_log when flushing C0 -> run
+  double prof_runmerge_ms_ = 0.0;    // binary-counter run merges
+  double prof_resolve_ms_ = 0.0;     // resolve_overlay (drain)
+  double prof_delete_ms_ = 0.0;      // apply_sheet_deletes + dir refresh (drain)
+  double prof_sheetmerge_ms_ = 0.0;  // merge_incoming_into_sheet (drain)
+  void reset_insert_prof_() {
+    prof_append_ms_ = prof_flushsort_ms_ = prof_runmerge_ms_ = 0.0;
+    prof_resolve_ms_ = prof_delete_ms_ = prof_sheetmerge_ms_ = 0.0;
+  }
+#endif
 
   thrust::device_vector<std::uint32_t> lookup_sorted_queries_;
   thrust::device_vector<std::uint32_t> lookup_permutation_;
