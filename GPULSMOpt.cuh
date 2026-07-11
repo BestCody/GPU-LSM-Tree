@@ -64,6 +64,15 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_LOOKUP_FLIX_MIN_BATCH
 #define GPULSMOPT_LOOKUP_FLIX_MIN_BATCH (1 << 22)
 #endif
+#ifndef GPULSMOPT_SPLIT_FILL
+#define GPULSMOPT_SPLIT_FILL 32
+#endif
+#ifndef GPULSMOPT_WINDOW_MAX_BUCKETS
+#define GPULSMOPT_WINDOW_MAX_BUCKETS 32
+#endif
+#ifndef GPULSMOPT_WINDOW_SLACK
+#define GPULSMOPT_WINDOW_SLACK 0
+#endif
 
 constexpr int kBucketSlots = 32;
 constexpr int kSegmentBuckets = GPULSMOPT_SEGMENT_BUCKETS;
@@ -71,6 +80,12 @@ constexpr int kSegmentSlots = kSegmentBuckets * kBucketSlots;
 static_assert(GPULSMOPT_TARGET_FILL >= 1 &&
                   GPULSMOPT_TARGET_FILL <= kBucketSlots,
               "target fill must fit a bucket");
+static_assert(GPULSMOPT_SPLIT_FILL >= GPULSMOPT_TARGET_FILL &&
+                  GPULSMOPT_SPLIT_FILL <= kBucketSlots,
+              "split trigger must sit between target fill and bucket size");
+static_assert(GPULSMOPT_WINDOW_SLACK >= 0 &&
+                  GPULSMOPT_WINDOW_SLACK < kBucketSlots,
+              "window slack must leave usable bucket space");
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
@@ -308,7 +323,8 @@ __global__ void ds_bucket_merge_kernel(
     const std::uint32_t *dirty_list, std::size_t dirty_count,
     const std::uint32_t *cnt, const std::uint32_t *base,
     const std::uint32_t *staged_keys, const std::uint32_t *staged_values,
-    const std::uint32_t *slow_flag, const std::uint32_t *dir_seg_id,
+    const std::uint32_t *slow_flag, const std::uint8_t *exclude,
+    const std::uint32_t *dir_seg_id,
     std::uint32_t *pool_keys, std::uint32_t *pool_values,
     std::uint8_t *pool_valid, std::uint32_t *seg_bucket_max,
     std::uint32_t *seg_bucket_live, std::uint32_t *seg_bucket_value_sum,
@@ -321,7 +337,7 @@ __global__ void ds_bucket_merge_kernel(
   const int lane = threadIdx.x & (kBucketSlots - 1);
   const std::uint32_t g = dirty_list[w];
   const std::uint32_t ord = g / kSegmentBuckets;
-  if (slow_flag[ord])
+  if (slow_flag[ord] || exclude[g])
     return;
   const std::uint32_t bucket = g % kSegmentBuckets;
   const std::uint32_t seg = dir_seg_id[ord];
@@ -378,6 +394,87 @@ __global__ void ds_bucket_merge_kernel(
     seg_bucket_value_sum[meta] += inc_sum;
     atomicAdd(ord_live_delta + ord, static_cast<std::uint32_t>(incoming));
     atomicAdd(ord_value_delta + ord, inc_sum);
+  }
+}
+
+// one warp removes a bucket's share of a large delete batch in place:
+// broadcast-match the staged delete keys, compact the survivors (order
+// preserved), clear the freed tail slots. Deletes only shrink buckets, so
+// there is no overflow path at all.
+__global__ void ds_bucket_delete_kernel(
+    const std::uint32_t *dirty_list, std::size_t dirty_count,
+    const std::uint32_t *cnt, const std::uint32_t *base,
+    const std::uint32_t *staged_keys, const std::uint32_t *dir_seg_id,
+    std::uint32_t *pool_keys, std::uint32_t *pool_values,
+    std::uint8_t *pool_valid, std::uint32_t *seg_bucket_max,
+    std::uint32_t *seg_bucket_live, std::uint32_t *seg_bucket_value_sum,
+    std::uint32_t *ord_live_delta, std::uint32_t *ord_value_delta) {
+  const std::size_t w =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
+      kBucketSlots;
+  if (w >= dirty_count)
+    return;
+  const int lane = threadIdx.x & (kBucketSlots - 1);
+  const std::uint32_t g = dirty_list[w];
+  const std::uint32_t ord = g / kSegmentBuckets;
+  const std::uint32_t bucket = g % kSegmentBuckets;
+  const std::uint32_t seg = dir_seg_id[ord];
+  const std::size_t meta =
+      static_cast<std::size_t>(seg) * kSegmentBuckets + bucket;
+  const std::size_t slot =
+      static_cast<std::size_t>(seg) * kSegmentSlots +
+      static_cast<std::size_t>(bucket) * kBucketSlots;
+  const int live = static_cast<int>(seg_bucket_live[meta]);
+  const std::uint32_t del_n = cnt[g];
+  const std::uint32_t del0 = base[g];
+  std::uint32_t key = kEmptyKey;
+  std::uint32_t val = 0u;
+  if (lane < live) {
+    key = pool_keys[slot + lane];
+    val = pool_values[slot + lane];
+  }
+  bool matched = false;
+  for (std::uint32_t chunk = 0; chunk < del_n;
+       chunk += static_cast<std::uint32_t>(kBucketSlots)) {
+    const std::uint32_t idx = chunk + static_cast<std::uint32_t>(lane);
+    const std::uint32_t del_key =
+        idx < del_n ? staged_keys[del0 + idx] : kEmptyKey;
+#pragma unroll
+    for (int j = 0; j < kBucketSlots; ++j) {
+      const std::uint32_t broadcast = __shfl_sync(0xffffffffu, del_key, j);
+      matched |= (lane < live && key == broadcast);
+    }
+  }
+  const bool survive = lane < live && !matched;
+  const unsigned ballot = __ballot_sync(0xffffffffu, survive);
+  const int new_live = __popc(ballot);
+  const int removed = live - new_live;
+  if (removed == 0)
+    return;
+  const std::uint32_t removed_sum =
+      warp_add_u32(matched && lane < live ? val : 0u);
+  const int pos = __popc(ballot & ((1u << lane) - 1u));
+  if (survive) {
+    pool_keys[slot + pos] = key;
+    pool_values[slot + pos] = val;
+  }
+  if (lane >= new_live && lane < live) {
+    pool_keys[slot + lane] = kEmptyKey;
+    pool_values[slot + lane] = 0u;
+    pool_valid[slot + lane] = 0u;
+  }
+  if (lane == 0) {
+    seg_bucket_live[meta] = static_cast<std::uint32_t>(new_live);
+    seg_bucket_value_sum[meta] -= removed_sum;
+    atomicAdd(ord_live_delta + ord,
+              0u - static_cast<std::uint32_t>(removed));
+    atomicAdd(ord_value_delta + ord, 0u - removed_sum);
+  }
+  if (new_live > 0) {
+    const int last_src = 31 - __clz(static_cast<int>(ballot));
+    const std::uint32_t new_max = __shfl_sync(0xffffffffu, key, last_src);
+    if (lane == 0)
+      seg_bucket_max[meta] = new_max;
   }
 }
 
@@ -997,8 +1094,12 @@ __global__ void seg_make_dirty_k_kernel(const std::uint32_t *dirty_live,
   if (i >= dirty_count)
     return;
   const std::uint32_t live = dirty_live[i];
+  // split once a segment passes the split trigger (not only at hard-full)
+  // so its buckets regain headroom for the destination-partitioned inserts
+  constexpr std::uint32_t split_trigger =
+      static_cast<std::uint32_t>(kSegmentBuckets) * GPULSMOPT_SPLIT_FILL;
   const std::uint32_t k =
-      live <= kSegmentSlots ? 1u : ceil_div_u32(live, target_live);
+      live <= split_trigger ? 1u : ceil_div_u32(live, target_live);
   dirty_k[i] = k == 0u ? 1u : k;
 }
 
@@ -1450,6 +1551,244 @@ __global__ void ds_absorb_repack_kernel(
   }
   if (threadIdx.x == 0)
     out_value_sum[s] = static_cast<std::uint32_t>(s_sum);
+}
+
+// classify each overflowing segment: segments past the split trigger (or
+// whose overflow cannot be fixed by small windows of adjacent buckets) go to
+// the residue list; otherwise emit repack windows covering every overflowing
+// bucket and release the segment's other dirty buckets back to the fast path
+__global__ void ds_plan_windows_kernel(
+    const std::uint32_t *slow_list, std::uint32_t *counters,
+    const std::uint32_t *cnt, const std::uint32_t *dir_seg_id,
+    const std::uint32_t *seg_bucket_live, std::uint32_t *slow_flag,
+    std::uint32_t *residue_list, std::uint32_t *window_ord,
+    std::uint32_t *window_span, std::uint8_t *exclude) {
+  __shared__ std::uint32_t s_load[kSegmentBuckets];
+  __shared__ std::uint32_t s_win[kSegmentBuckets / 2];
+  const std::uint32_t slow_count = counters[1];
+  for (std::uint32_t idx = blockIdx.x; idx < slow_count; idx += gridDim.x) {
+    const std::uint32_t ord = slow_list[idx];
+    const std::uint32_t seg = dir_seg_id[ord];
+    const std::size_t meta = static_cast<std::size_t>(seg) * kSegmentBuckets;
+    const std::size_t g0 = static_cast<std::size_t>(ord) * kSegmentBuckets;
+    for (int b = threadIdx.x; b < kSegmentBuckets; b += blockDim.x)
+      s_load[b] = seg_bucket_live[meta + b] + cnt[g0 + b];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const std::uint32_t split_trigger =
+          static_cast<std::uint32_t>(kSegmentBuckets) * GPULSMOPT_SPLIT_FILL;
+      std::uint32_t total = 0;
+      for (int b = 0; b < kSegmentBuckets; ++b)
+        total += s_load[b];
+      bool fail = total > split_trigger;
+      int win_count = 0;
+      if (!fail) {
+        const std::uint32_t cap =
+            static_cast<std::uint32_t>(kBucketSlots - GPULSMOPT_WINDOW_SLACK);
+        int b = 0;
+        int min_lo = 0;
+        while (b < kSegmentBuckets) {
+          if (s_load[b] <= static_cast<std::uint32_t>(kBucketSlots)) {
+            ++b;
+            continue;
+          }
+          int lo = b, hi = b;
+          std::uint32_t sum = s_load[b];
+          while (sum > cap * static_cast<std::uint32_t>(hi - lo + 1) &&
+                 hi - lo + 1 < GPULSMOPT_WINDOW_MAX_BUCKETS) {
+            const bool can_left = lo > min_lo;
+            const bool can_right = hi + 1 < kSegmentBuckets;
+            if (!can_left && !can_right)
+              break;
+            const bool go_left =
+                can_left && (!can_right || s_load[lo - 1] <= s_load[hi + 1]);
+            if (go_left)
+              sum += s_load[--lo];
+            else
+              sum += s_load[++hi];
+          }
+          if (sum > cap * static_cast<std::uint32_t>(hi - lo + 1)) {
+            fail = true;
+            break;
+          }
+          s_win[win_count++] = (static_cast<std::uint32_t>(lo) << 8) |
+                               static_cast<std::uint32_t>(hi);
+          min_lo = hi + 1;
+          b = hi + 1;
+        }
+      }
+      if (fail) {
+        residue_list[atomicAdd(counters + 2, 1u)] = ord;
+      } else {
+        slow_flag[ord] = 0u;
+        for (int t = 0; t < win_count; ++t) {
+          const std::uint32_t slot = atomicAdd(counters + 3, 1u);
+          window_ord[slot] = ord;
+          window_span[slot] = s_win[t];
+          const int win_lo = static_cast<int>(s_win[t] >> 8);
+          const int win_hi = static_cast<int>(s_win[t] & 0xffu);
+          for (int x = win_lo; x <= win_hi; ++x)
+            exclude[g0 + x] = 1u;
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// repack one window of adjacent buckets entirely in shared memory: sort the
+// window's staged pairs, merge with the window's live entries, redistribute
+// evenly across the window's buckets
+__global__ void ds_window_repack_kernel(
+    const std::uint32_t *counters, const std::uint32_t *window_ord,
+    const std::uint32_t *window_span, const std::uint32_t *cnt,
+    const std::uint32_t *base, const std::uint32_t *staged_keys,
+    const std::uint32_t *staged_values, const std::uint32_t *dir_seg_id,
+    std::uint32_t *pool_keys, std::uint32_t *pool_values,
+    std::uint8_t *pool_valid, std::uint32_t *seg_bucket_max,
+    std::uint32_t *seg_bucket_live, std::uint32_t *seg_bucket_value_sum,
+    std::uint32_t *ord_live_delta, std::uint32_t *ord_value_delta) {
+  constexpr int kWinCap = GPULSMOPT_WINDOW_MAX_BUCKETS * kBucketSlots;
+  __shared__ std::uint32_t s_old_key[kWinCap];
+  __shared__ std::uint32_t s_old_val[kWinCap];
+  __shared__ std::uint32_t s_inc_key[kWinCap];
+  __shared__ std::uint32_t s_inc_val[kWinCap];
+  __shared__ std::uint32_t s_live[GPULSMOPT_WINDOW_MAX_BUCKETS];
+  __shared__ std::uint32_t s_old_prefix[GPULSMOPT_WINDOW_MAX_BUCKETS + 1];
+  __shared__ unsigned long long s_inc_sum;
+  const std::uint32_t window_count = counters[3];
+  for (std::uint32_t widx = blockIdx.x; widx < window_count;
+       widx += gridDim.x) {
+    const std::uint32_t ord = window_ord[widx];
+    const std::uint32_t span = window_span[widx];
+    const int lo = static_cast<int>(span >> 8);
+    const int hi = static_cast<int>(span & 0xffu);
+    const std::uint32_t w = static_cast<std::uint32_t>(hi - lo + 1);
+    const std::uint32_t seg = dir_seg_id[ord];
+    const std::size_t meta0 =
+        static_cast<std::size_t>(seg) * kSegmentBuckets + lo;
+    const std::size_t g0 = static_cast<std::size_t>(ord) * kSegmentBuckets +
+                           static_cast<std::size_t>(lo);
+    const std::size_t slot0 =
+        static_cast<std::size_t>(seg) * kSegmentSlots +
+        static_cast<std::size_t>(lo) * kBucketSlots;
+    if (threadIdx.x == 0) {
+      std::uint32_t acc = 0;
+      for (std::uint32_t x = 0; x < w; ++x) {
+        s_live[x] = seg_bucket_live[meta0 + x];
+        s_old_prefix[x] = acc;
+        acc += s_live[x];
+      }
+      s_old_prefix[w] = acc;
+      s_inc_sum = 0;
+    }
+    __syncthreads();
+    const std::uint32_t old_n = s_old_prefix[w];
+    const std::uint32_t stage0 = base[g0];
+    const std::uint32_t inc_n =
+        base[g0 + w - 1] + cnt[g0 + w - 1] - stage0;
+    const std::uint32_t total = old_n + inc_n;
+    const std::uint32_t fill = ceil_div_u32(total, w);
+    for (std::uint32_t p = threadIdx.x;
+         p < w * static_cast<std::uint32_t>(kBucketSlots); p += blockDim.x) {
+      const std::uint32_t x = p / kBucketSlots;
+      const std::uint32_t j = p % kBucketSlots;
+      if (j < s_live[x]) {
+        s_old_key[s_old_prefix[x] + j] = pool_keys[slot0 + p];
+        s_old_val[s_old_prefix[x] + j] = pool_values[slot0 + p];
+      }
+    }
+    std::uint32_t n2 = 1;
+    while (n2 < inc_n)
+      n2 <<= 1;
+    for (std::uint32_t p = threadIdx.x; p < n2; p += blockDim.x) {
+      if (p < inc_n) {
+        const std::uint32_t value = staged_values[stage0 + p];
+        s_inc_key[p] = staged_keys[stage0 + p];
+        s_inc_val[p] = value;
+        atomicAdd(&s_inc_sum, static_cast<unsigned long long>(value));
+      } else {
+        s_inc_key[p] = kEmptyKey;
+        s_inc_val[p] = 0u;
+      }
+    }
+    __syncthreads();
+    for (std::uint32_t k = 2; k <= n2; k <<= 1) {
+      for (std::uint32_t j = k >> 1; j > 0; j >>= 1) {
+        for (std::uint32_t p = threadIdx.x; p < n2; p += blockDim.x) {
+          const std::uint32_t q = p ^ j;
+          if (q > p) {
+            const bool up = ((p & k) == 0);
+            if ((s_inc_key[p] > s_inc_key[q]) == up) {
+              const std::uint32_t tk = s_inc_key[p];
+              const std::uint32_t tv = s_inc_val[p];
+              s_inc_key[p] = s_inc_key[q];
+              s_inc_val[p] = s_inc_val[q];
+              s_inc_key[q] = tk;
+              s_inc_val[q] = tv;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+    for (std::uint32_t r = threadIdx.x; r < total; r += blockDim.x) {
+      const std::uint32_t i =
+          seg_merge_partition(s_inc_key, inc_n, s_old_key, old_n, r);
+      const std::uint32_t j = r - i;
+      std::uint32_t key;
+      std::uint32_t value;
+      if (i < inc_n && (j >= old_n || s_inc_key[i] <= s_old_key[j])) {
+        key = s_inc_key[i];
+        value = s_inc_val[i];
+      } else {
+        key = s_old_key[j];
+        value = s_old_val[j];
+      }
+      const std::uint32_t x = r / fill;
+      const std::uint32_t slot = r % fill;
+      const std::size_t pos =
+          slot0 + static_cast<std::size_t>(x) * kBucketSlots + slot;
+      pool_keys[pos] = key;
+      pool_values[pos] = value;
+      pool_valid[pos] = 1u;
+    }
+    __syncthreads();
+    for (std::uint32_t p = threadIdx.x;
+         p < w * static_cast<std::uint32_t>(kBucketSlots); p += blockDim.x) {
+      const std::uint32_t x = p / kBucketSlots;
+      const std::uint32_t slot = p % kBucketSlots;
+      const std::uint32_t first = x * fill;
+      const std::uint32_t cnt_b =
+          first >= total ? 0u : (total - first < fill ? total - first : fill);
+      if (slot >= cnt_b) {
+        pool_keys[slot0 + p] = kEmptyKey;
+        pool_values[slot0 + p] = 0u;
+        pool_valid[slot0 + p] = 0u;
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < w) {
+      const std::uint32_t x = threadIdx.x;
+      const std::uint32_t first = x * fill;
+      const std::uint32_t cnt_b =
+          first >= total ? 0u : (total - first < fill ? total - first : fill);
+      const std::size_t start =
+          slot0 + static_cast<std::size_t>(x) * kBucketSlots;
+      std::uint32_t bucket_sum = 0;
+      for (std::uint32_t l = 0; l < cnt_b; ++l)
+        bucket_sum += pool_values[start + l];
+      seg_bucket_live[meta0 + x] = cnt_b;
+      if (cnt_b > 0)
+        seg_bucket_max[meta0 + x] = pool_keys[start + cnt_b - 1];
+      seg_bucket_value_sum[meta0 + x] = bucket_sum;
+    }
+    if (threadIdx.x == 0) {
+      atomicAdd(ord_live_delta + ord, inc_n);
+      atomicAdd(ord_value_delta + ord, static_cast<std::uint32_t>(s_inc_sum));
+    }
+    __syncthreads();
+  }
 }
 
 __global__ void seg_merge_pack_output_kernel(
@@ -2040,7 +2379,8 @@ public:
       const double measured = prof_append_ms_ + prof_flushsort_ms_ +
                               prof_runmerge_ms_ + prof_resolve_ms_ +
                               prof_delete_ms_ + prof_sheetmerge_ms_ +
-                              prof_route_ms_ + prof_bucket_ms_;
+                              prof_route_ms_ + prof_bucket_ms_ +
+                              prof_window_ms_;
       const double other = total - measured;
       auto pct = [total](double x) {
         return total > 0.0 ? 100.0 * x / total : 0.0;
@@ -2050,6 +2390,8 @@ public:
              pct(prof_route_ms_));
       printf("[prof]   bucket_fast = %.3f ms (%5.1f%%)\n", prof_bucket_ms_,
              pct(prof_bucket_ms_));
+      printf("[prof]   window      = %.3f ms (%5.1f%%)\n", prof_window_ms_,
+             pct(prof_window_ms_));
       printf("[prof]   append      = %.3f ms (%5.1f%%)\n", prof_append_ms_,
              pct(prof_append_ms_));
       printf("[prof]   flush_sort  = %.3f ms (%5.1f%%)\n", prof_flushsort_ms_,
@@ -2072,12 +2414,26 @@ public:
       return;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-
+#ifdef GPULSMOPT_PROFILE_INSERT
+      reset_insert_prof_();
+      const auto prof_t0 = std::chrono::high_resolution_clock::now();
+#endif
       insert_records(batch.keys, batch.keys,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
                      batch.count, stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
       maybe_flush_and_merge(stream);
+#ifdef GPULSMOPT_PROFILE_INSERT
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      const auto prof_t1 = std::chrono::high_resolution_clock::now();
+      const double total =
+          std::chrono::duration<double, std::milli>(prof_t1 - prof_t0).count();
+      printf("[prof] delete %zu keys: total=%.3f ms (route=%.3f bucket=%.3f "
+             "flush_sort=%.3f resolve=%.3f tomb=%.3f sheet=%.3f)\n",
+             batch.count, total, prof_route_ms_, prof_bucket_ms_,
+             prof_flushsort_ms_, prof_resolve_ms_, prof_delete_ms_,
+             prof_sheetmerge_ms_);
+#endif
     }
   }
 
@@ -2237,7 +2593,7 @@ public:
         sort_key_output_, sort_payload_input_, sort_payload_output_,
         sort_temp_storage_, radix_first_, ds_dest_, ds_cnt_cursor_, ds_base_,
         ds_dirty_, ds_staged_keys_, ds_staged_values_, ds_meta_,
-        ds_slow_list_, ds_slow_plan_);
+        ds_slow_list_, ds_slow_plan_, ds_residue_, ds_window_, ds_exclude_);
     for (const auto &g : runs_)
       total += device_bytes_all(g.keys, g.values, g.ops);
     for (const auto &g : run_buffer_pool_)
@@ -3289,6 +3645,9 @@ private:
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
                       std::size_t count, cudaStream_t stream) {
+    if (op == static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone) &&
+        try_scatter_sheet_delete(keys_in, count, stream))
+      return;
     if (try_scatter_sheet_insert(keys_in, values_in, op, count, stream))
       return;
     if (try_direct_run(keys_in, values_in, op, count, stream))
@@ -3491,20 +3850,26 @@ private:
     const std::size_t total_buckets =
         dir_count * static_cast<std::size_t>(gpulsmopt_detail::kSegmentBuckets);
 
+    const std::size_t window_cap = std::min(count, total_buckets);
     ds_dest_.resize_discard(count);
     ds_cnt_cursor_.resize_discard(2 * total_buckets);
     ds_base_.resize_discard(total_buckets);
     ds_dirty_.resize_discard(std::min(count, total_buckets));
     ds_staged_keys_.resize_discard(count);
     ds_staged_values_.resize_discard(count);
-    ds_meta_.resize_discard(3 * dir_count + 2);
+    ds_meta_.resize_discard(3 * dir_count + 4);
     ds_slow_list_.resize_discard(dir_count);
+    ds_residue_.resize_discard(dir_count);
+    ds_window_.resize_discard(2 * window_cap);
+    ds_exclude_.resize_discard(total_buckets);
     std::uint32_t *cnt = ds_cnt_cursor_.data();
     std::uint32_t *cursor = cnt + total_buckets;
     std::uint32_t *slow_flag = ds_meta_.data();
     std::uint32_t *live_delta = slow_flag + dir_count;
     std::uint32_t *value_delta = live_delta + dir_count;
     std::uint32_t *counters = value_delta + dir_count;
+    std::uint32_t *window_ord = ds_window_.data();
+    std::uint32_t *window_span = window_ord + window_cap;
 
     const int block = 256;
     const int key_grid = static_cast<int>((count + block - 1) / block);
@@ -3514,7 +3879,9 @@ private:
       CUDA_CHECK(cudaMemsetAsync(
           cnt, 0, 2 * total_buckets * sizeof(std::uint32_t), stream));
       CUDA_CHECK(cudaMemsetAsync(
-          slow_flag, 0, (3 * dir_count + 2) * sizeof(std::uint32_t), stream));
+          slow_flag, 0, (3 * dir_count + 4) * sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(ds_exclude_.data(), 0, total_buckets,
+                                 stream));
       gpulsmopt_detail::ds_route_kernel<<<key_grid, block, 0, stream>>>(
           keys_in, count, radix_first_.data(), raw_or_null(d_dir_boundary_),
           dir_count, raw_or_null(d_dir_seg_id_), raw_or_null(seg_bucket_max_),
@@ -3549,6 +3916,14 @@ private:
     if (num_dirty == 0)
       return true;
     {
+      GPULSMOPT_PROF_PHASE(prof_window_ms_);
+      gpulsmopt_detail::ds_plan_windows_kernel<<<512, block, 0, stream>>>(
+          ds_slow_list_.data(), counters, cnt, raw_or_null(d_dir_seg_id_),
+          raw_or_null(seg_bucket_live_), slow_flag, ds_residue_.data(),
+          window_ord, window_span, ds_exclude_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    {
       GPULSMOPT_PROF_PHASE(prof_bucket_ms_);
       const std::size_t warps_per_block =
           block / gpulsmopt_detail::kBucketSlots;
@@ -3558,18 +3933,32 @@ private:
                                                  stream>>>(
           ds_dirty_.data(), num_dirty, cnt, ds_base_.data(),
           ds_staged_keys_.data(), ds_staged_values_.data(), slow_flag,
+          ds_exclude_.data(), raw_or_null(d_dir_seg_id_),
+          raw_or_null(pool_keys_), raw_or_null(pool_values_),
+          raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
+          raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
+          live_delta, value_delta);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    {
+      GPULSMOPT_PROF_PHASE(prof_window_ms_);
+      gpulsmopt_detail::ds_window_repack_kernel<<<2048, block, 0, stream>>>(
+          counters, window_ord, window_span, cnt, ds_base_.data(),
+          ds_staged_keys_.data(), ds_staged_values_.data(),
           raw_or_null(d_dir_seg_id_), raw_or_null(pool_keys_),
           raw_or_null(pool_values_), raw_or_null(pool_valid_),
           raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
           raw_or_null(seg_bucket_value_sum_), live_delta, value_delta);
       CUDA_CHECK(cudaGetLastError());
     }
-    std::vector<std::uint32_t> meta_host(2 * dir_count + 2);
+    std::vector<std::uint32_t> meta_host(2 * dir_count + 4);
     CUDA_CHECK(cudaMemcpyAsync(meta_host.data(), live_delta,
-                               (2 * dir_count + 2) * sizeof(std::uint32_t),
+                               (2 * dir_count + 4) * sizeof(std::uint32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const std::uint32_t num_slow = meta_host[2 * dir_count + 1];
+    const std::uint32_t num_residue = meta_host[2 * dir_count + 2];
+    const std::uint32_t num_windows = meta_host[2 * dir_count + 3];
     for (std::size_t ord = 0; ord < dir_count; ++ord) {
       const std::uint32_t live_add = meta_host[ord];
       if (live_add == 0)
@@ -3581,49 +3970,52 @@ private:
     read_view_dirty_ = true;
 
 #ifdef GPULSMOPT_PROFILE_INSERT
-    printf("[prof]     scatter: dirty_buckets=%u slow_segs=%u (incoming=%zu)\n",
-           num_dirty, num_slow, count);
+    printf("[prof]     scatter: dirty_buckets=%u slow=%u windows=%u "
+           "residue=%u (incoming=%zu)\n",
+           num_dirty, num_slow, num_windows, num_residue, count);
 #endif
-    if (num_slow == 0) {
+    if (num_residue == 0) {
       recompute_sheet_live_count();
       upload_directory_metadata(stream);
       return true;
     }
     {
       GPULSMOPT_PROF_PHASE(prof_sheetmerge_ms_);
-      // gather every overflowing segment's staged pairs into one compact
+      // gather every residue segment's staged pairs into one compact
       // buffer, then sort it once (small subset of the batch)
-      ds_slow_plan_.resize_discard(3 * static_cast<std::size_t>(num_slow));
+      ds_slow_plan_.resize_discard(3 * static_cast<std::size_t>(num_residue));
       std::uint32_t *starts = ds_slow_plan_.data();
-      std::uint32_t *lens = starts + num_slow;
-      std::uint32_t *dsts = lens + num_slow;
-      const int slow_grid = static_cast<int>((num_slow + block - 1) / block);
+      std::uint32_t *lens = starts + num_residue;
+      std::uint32_t *dsts = lens + num_residue;
+      const int slow_grid =
+          static_cast<int>((num_residue + block - 1) / block);
       gpulsmopt_detail::ds_slow_ranges_kernel<<<slow_grid, block, 0,
                                                 stream>>>(
-          ds_slow_list_.data(), num_slow, ds_base_.data(), cnt, starts, lens);
+          ds_residue_.data(), num_residue, ds_base_.data(), cnt, starts,
+          lens);
       CUDA_CHECK(cudaGetLastError());
-      std::vector<std::uint32_t> plan_host(2 * num_slow);
-      std::vector<std::uint32_t> slow_ords(num_slow);
+      std::vector<std::uint32_t> plan_host(2 * num_residue);
+      std::vector<std::uint32_t> slow_ords(num_residue);
       CUDA_CHECK(cudaMemcpyAsync(plan_host.data(), starts,
-                                 2 * num_slow * sizeof(std::uint32_t),
+                                 2 * num_residue * sizeof(std::uint32_t),
                                  cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(slow_ords.data(), ds_slow_list_.data(),
-                                 num_slow * sizeof(std::uint32_t),
+      CUDA_CHECK(cudaMemcpyAsync(slow_ords.data(), ds_residue_.data(),
+                                 num_residue * sizeof(std::uint32_t),
                                  cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      std::vector<std::uint32_t> dst_host(num_slow);
+      std::vector<std::uint32_t> dst_host(num_residue);
       std::size_t total_slow = 0;
-      for (std::size_t s = 0; s < num_slow; ++s) {
+      for (std::size_t s = 0; s < num_residue; ++s) {
         dst_host[s] = static_cast<std::uint32_t>(total_slow);
-        total_slow += plan_host[num_slow + s];
+        total_slow += plan_host[num_residue + s];
       }
       CUDA_CHECK(cudaMemcpyAsync(dsts, dst_host.data(),
-                                 num_slow * sizeof(std::uint32_t),
+                                 num_residue * sizeof(std::uint32_t),
                                  cudaMemcpyHostToDevice, stream));
       resize_reuse(scratch_incoming_keys_, total_slow);
       resize_reuse(scratch_incoming_values_, total_slow);
       gpulsmopt_detail::ds_slow_gather_kernel<<<
-          static_cast<unsigned>(num_slow), block, 0, stream>>>(
+          static_cast<unsigned>(num_residue), block, 0, stream>>>(
           starts, lens, dsts, ds_staged_keys_.data(),
           ds_staged_values_.data(), raw_or_null(scratch_incoming_keys_),
           raw_or_null(scratch_incoming_values_));
@@ -3632,14 +4024,17 @@ private:
                         raw_or_null(scratch_incoming_values_), total_slow,
                         stream);
 
-      // segments with room absorb their overflow via an in-place repack
-      // across their own 256 buckets; only genuinely full segments split
+      // segments below the split trigger absorb their overflow via an
+      // in-place repack across their own 256 buckets; segments past it
+      // split so their buckets regain headroom
+      const std::uint32_t split_trigger =
+          static_cast<std::uint32_t>(gpulsmopt_detail::kSegmentBuckets) *
+          GPULSMOPT_SPLIT_FILL;
       std::vector<std::pair<std::uint32_t, std::uint32_t>> absorb, split;
-      for (std::size_t s = 0; s < num_slow; ++s) {
+      for (std::size_t s = 0; s < num_residue; ++s) {
         const std::uint32_t ord = slow_ords[s];
-        const std::uint32_t len = plan_host[num_slow + s];
-        if (h_dir_live_[ord] + len <=
-            static_cast<std::uint32_t>(gpulsmopt_detail::kSegmentSlots))
+        const std::uint32_t len = plan_host[num_residue + s];
+        if (h_dir_live_[ord] + len <= split_trigger)
           absorb.emplace_back(ord, len);
         else
           split.emplace_back(ord, len);
@@ -3757,6 +4152,116 @@ private:
                                   raw_or_null(scratch_incoming_values_),
                                   total_split, stream);
       }
+    }
+    return true;
+  }
+
+  bool try_scatter_sheet_delete(const std::uint32_t *keys_in,
+                                std::size_t count, cudaStream_t stream) {
+    const std::size_t threshold = 4 * c0_flush_budget();
+    if (count < threshold ||
+        count > std::numeric_limits<std::uint32_t>::max())
+      return false;
+    if (h_dir_seg_id_.empty())
+      return false;
+    // deleting straight from the sheet is only correct when nothing is
+    // pending in the C0 log or the runs, so drain them first
+    if (c0_log_count_ > 0 || !runs_.empty())
+      merge_down(stream);
+    const std::size_t dir_count = h_dir_seg_id_.size();
+    const std::size_t total_buckets =
+        dir_count * static_cast<std::size_t>(gpulsmopt_detail::kSegmentBuckets);
+
+    ds_dest_.resize_discard(count);
+    ds_cnt_cursor_.resize_discard(2 * total_buckets);
+    ds_base_.resize_discard(total_buckets);
+    ds_dirty_.resize_discard(std::min(count, total_buckets));
+    ds_staged_keys_.resize_discard(count);
+    ds_staged_values_.resize_discard(count);
+    ds_meta_.resize_discard(3 * dir_count + 4);
+    std::uint32_t *cnt = ds_cnt_cursor_.data();
+    std::uint32_t *cursor = cnt + total_buckets;
+    std::uint32_t *live_delta = ds_meta_.data() + dir_count;
+    std::uint32_t *value_delta = live_delta + dir_count;
+    std::uint32_t *counters = value_delta + dir_count;
+
+    const int block = 256;
+    const int key_grid = static_cast<int>((count + block - 1) / block);
+    std::uint32_t num_dirty = 0;
+    {
+      GPULSMOPT_PROF_PHASE(prof_route_ms_);
+      CUDA_CHECK(cudaMemsetAsync(
+          cnt, 0, 2 * total_buckets * sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          ds_meta_.data(), 0, (3 * dir_count + 4) * sizeof(std::uint32_t),
+          stream));
+      gpulsmopt_detail::ds_route_kernel<<<key_grid, block, 0, stream>>>(
+          keys_in, count, radix_first_.data(), raw_or_null(d_dir_boundary_),
+          dir_count, raw_or_null(d_dir_seg_id_), raw_or_null(seg_bucket_max_),
+          ds_dest_.data(), cnt, ds_dirty_.data(), counters);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaMemcpyAsync(&num_dirty, counters, sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (num_dirty > 0) {
+        std::size_t scan_bytes = 0;
+        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+            nullptr, scan_bytes, cnt, ds_base_.data(),
+            static_cast<int>(total_buckets), stream));
+        ensure_sort_temp(scan_bytes);
+        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+            sort_temp_storage_.data(), scan_bytes, cnt, ds_base_.data(),
+            static_cast<int>(total_buckets), stream));
+        gpulsmopt_detail::ds_scatter_kernel<<<key_grid, block, 0, stream>>>(
+            keys_in, keys_in, count, ds_dest_.data(), ds_base_.data(),
+            cursor, ds_staged_keys_.data(), ds_staged_values_.data());
+        CUDA_CHECK(cudaGetLastError());
+      }
+    }
+    if (num_dirty == 0)
+      return true;
+    {
+      GPULSMOPT_PROF_PHASE(prof_bucket_ms_);
+      const std::size_t warps_per_block =
+          block / gpulsmopt_detail::kBucketSlots;
+      const int delete_grid = static_cast<int>(
+          (num_dirty + warps_per_block - 1) / warps_per_block);
+      gpulsmopt_detail::ds_bucket_delete_kernel<<<delete_grid, block, 0,
+                                                  stream>>>(
+          ds_dirty_.data(), num_dirty, cnt, ds_base_.data(),
+          ds_staged_keys_.data(), raw_or_null(d_dir_seg_id_),
+          raw_or_null(pool_keys_), raw_or_null(pool_values_),
+          raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
+          raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
+          live_delta, value_delta);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    std::vector<std::uint32_t> meta_host(2 * dir_count);
+    CUDA_CHECK(cudaMemcpyAsync(meta_host.data(), live_delta,
+                               2 * dir_count * sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint32_t watermark = target_segment_live_ / 2;
+    for (std::size_t ord = 0; ord < dir_count; ++ord) {
+      const std::uint32_t live_delta_v = meta_host[ord];
+      if (live_delta_v == 0)
+        continue;
+      h_dir_live_[ord] += live_delta_v;
+      h_dir_value_sum_[ord] += meta_host[dir_count + ord];
+      if (h_dir_live_[ord] < watermark)
+        sheet_fragmented_ = true;
+    }
+    recompute_sheet_live_count();
+    upload_directory_metadata(stream);
+    overlay_dirty_ = true;
+    read_view_dirty_ = true;
+#ifdef GPULSMOPT_PROFILE_INSERT
+    printf("[prof]     scatter_delete: dirty_buckets=%u (batch=%zu)\n",
+           num_dirty, count);
+#endif
+    if (sheet_fragmented_) {
+      merge_underfull_segments(stream);
+      sheet_fragmented_ = false;
     }
     return true;
   }
@@ -4374,10 +4879,11 @@ private:
   double prof_sheetmerge_ms_ = 0.0;
   double prof_route_ms_ = 0.0;
   double prof_bucket_ms_ = 0.0;
+  double prof_window_ms_ = 0.0;
   void reset_insert_prof_() {
     prof_append_ms_ = prof_flushsort_ms_ = prof_runmerge_ms_ = 0.0;
     prof_resolve_ms_ = prof_delete_ms_ = prof_sheetmerge_ms_ = 0.0;
-    prof_route_ms_ = prof_bucket_ms_ = 0.0;
+    prof_route_ms_ = prof_bucket_ms_ = prof_window_ms_ = 0.0;
   }
 #endif
 
@@ -4441,6 +4947,9 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> ds_meta_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> ds_slow_list_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> ds_slow_plan_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> ds_residue_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> ds_window_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> ds_exclude_;
 
   thrust::device_vector<std::uint32_t> ov_c0k_;
   thrust::device_vector<std::uint32_t> ov_c0v_;
