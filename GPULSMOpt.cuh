@@ -1439,34 +1439,31 @@ __device__ inline std::uint32_t seg_merge_partition(
   return low;
 }
 
-// in-place segment repack for the destination-partitioned insert path:
-// merges a segment's live entries with its (sorted) share of overflow keys
-// and redistributes them evenly across the segment's own buckets
-__global__ void ds_absorb_repack_kernel(
-    const std::uint32_t *seg_ids, const std::uint32_t *boundaries,
-    const std::uint32_t *old_offset, const std::uint32_t *in_begin,
-    const std::uint32_t *in_end, std::size_t absorb_count,
-    const std::uint32_t *inc_keys, const std::uint32_t *inc_values,
-    std::uint32_t *old_keys, std::uint32_t *old_values,
-    std::uint32_t *pool_keys, std::uint32_t *pool_values,
-    std::uint8_t *pool_valid, std::uint32_t *seg_bucket_max,
-    std::uint32_t *seg_bucket_live, std::uint32_t *seg_bucket_value_sum,
-    std::uint32_t *out_value_sum) {
-  const std::size_t s = blockIdx.x;
-  if (s >= absorb_count)
+// residue machinery for the destination-partitioned insert path: a shared
+// coalesced gather pulls each residue segment's live entries into a
+// contiguous scratch, then chunked absorb blocks repack segments in place
+// and split blocks write rank ranges straight into preallocated child
+// segments (host only splices the directory afterwards)
+
+constexpr int kDsGatherChunks = 8;
+constexpr int kDsAbsorbChunks = 8;
+
+__global__ void ds_gather_old_kernel(
+    const std::uint32_t *seg_ids, const std::uint32_t *old_offset,
+    std::size_t seg_count, const std::uint32_t *pool_keys,
+    const std::uint32_t *pool_values, const std::uint32_t *seg_bucket_live,
+    std::uint32_t *old_keys, std::uint32_t *old_values) {
+  const std::size_t i = blockIdx.x / kDsGatherChunks;
+  if (i >= seg_count)
     return;
-  const std::uint32_t seg = seg_ids[s];
-  const std::uint32_t boundary = boundaries[s];
-  const std::size_t meta_base =
-      static_cast<std::size_t>(seg) * kSegmentBuckets;
+  const std::uint32_t chunk = blockIdx.x % kDsGatherChunks;
+  const std::uint32_t seg = seg_ids[i];
+  const std::size_t meta = static_cast<std::size_t>(seg) * kSegmentBuckets;
   const std::size_t slot_base = static_cast<std::size_t>(seg) * kSegmentSlots;
   __shared__ std::uint32_t s_live[kSegmentBuckets];
-  __shared__ std::uint32_t s_prefix[kSegmentBuckets + 1];
-  __shared__ unsigned long long s_sum;
+  __shared__ std::uint32_t s_prefix[kSegmentBuckets];
   for (int b = threadIdx.x; b < kSegmentBuckets; b += blockDim.x)
-    s_live[b] = seg_bucket_live[meta_base + b];
-  if (threadIdx.x == 0)
-    s_sum = 0;
+    s_live[b] = seg_bucket_live[meta + b];
   __syncthreads();
   if (threadIdx.x == 0) {
     std::uint32_t acc = 0;
@@ -1474,45 +1471,188 @@ __global__ void ds_absorb_repack_kernel(
       s_prefix[b] = acc;
       acc += s_live[b];
     }
-    s_prefix[kSegmentBuckets] = acc;
   }
   __syncthreads();
-  const std::uint32_t old_total = s_prefix[kSegmentBuckets];
-  const std::uint32_t scratch_base = old_offset[s];
-  for (std::size_t p = threadIdx.x; p < kSegmentSlots; p += blockDim.x) {
-    const std::uint32_t b = static_cast<std::uint32_t>(p / kBucketSlots);
-    const std::uint32_t j = static_cast<std::uint32_t>(p % kBucketSlots);
+  constexpr std::uint32_t chunk_slots = kSegmentSlots / kDsGatherChunks;
+  const std::uint32_t begin = chunk * chunk_slots;
+  const std::uint32_t out_base = old_offset[i];
+  for (std::uint32_t p = begin + threadIdx.x; p < begin + chunk_slots;
+       p += blockDim.x) {
+    const std::uint32_t b = p / kBucketSlots;
+    const std::uint32_t j = p % kBucketSlots;
     if (j < s_live[b]) {
-      const std::size_t dst = scratch_base + s_prefix[b] + j;
+      const std::size_t dst =
+          static_cast<std::size_t>(out_base) + s_prefix[b] + j;
       old_keys[dst] = pool_keys[slot_base + p];
       old_values[dst] = pool_values[slot_base + p];
     }
   }
-  __syncthreads();
-  const std::uint32_t ib = in_begin[s];
-  const std::uint32_t inc_n = in_end[s] - ib;
-  const std::uint32_t total = old_total + inc_n;
+}
+
+__device__ inline void ds_merge_pick(const std::uint32_t *inc_k,
+                                     const std::uint32_t *inc_v,
+                                     std::uint32_t inc_n,
+                                     const std::uint32_t *old_k,
+                                     const std::uint32_t *old_v,
+                                     std::uint32_t old_n, std::uint32_t rank,
+                                     std::uint32_t &key, std::uint32_t &value) {
+  const std::uint32_t p = seg_merge_partition(inc_k, inc_n, old_k, old_n, rank);
+  const std::uint32_t q = rank - p;
+  if (p < inc_n && (q >= old_n || inc_k[p] <= old_k[q])) {
+    key = inc_k[p];
+    value = inc_v[p];
+  } else {
+    key = old_k[q];
+    value = old_v[q];
+  }
+}
+
+__global__ void ds_absorb_write_kernel(
+    const std::uint32_t *seg_ids, const std::uint32_t *boundaries,
+    const std::uint32_t *totals, const std::uint32_t *old_offset,
+    const std::uint32_t *in_begin, const std::uint32_t *in_end,
+    std::size_t absorb_count, const std::uint32_t *inc_keys,
+    const std::uint32_t *inc_values, const std::uint32_t *old_keys,
+    const std::uint32_t *old_values, std::uint32_t *pool_keys,
+    std::uint32_t *pool_values, std::uint8_t *pool_valid,
+    std::uint32_t *seg_bucket_max, std::uint32_t *seg_bucket_live,
+    std::uint32_t *seg_bucket_value_sum, std::uint32_t *out_value_sum) {
+  const std::size_t i = blockIdx.x / kDsAbsorbChunks;
+  if (i >= absorb_count)
+    return;
+  const std::uint32_t chunk = blockIdx.x % kDsAbsorbChunks;
+  constexpr std::uint32_t chunk_buckets = kSegmentBuckets / kDsAbsorbChunks;
+  const std::uint32_t seg = seg_ids[i];
+  const std::uint32_t boundary = boundaries[i];
+  const std::uint32_t total = totals[i];
+  const std::uint32_t ib = in_begin[i];
+  const std::uint32_t inc_n = in_end[i] - ib;
+  const std::uint32_t old_n = total - inc_n;
   const std::uint32_t fill = ceil_div_u32(total, kSegmentBuckets);
+  const std::size_t meta = static_cast<std::size_t>(seg) * kSegmentBuckets;
+  const std::size_t slot_base = static_cast<std::size_t>(seg) * kSegmentSlots;
   const std::uint32_t *inc_k = inc_keys + ib;
   const std::uint32_t *inc_v = inc_values + ib;
-  const std::uint32_t *old_k = old_keys + scratch_base;
-  const std::uint32_t *old_v = old_values + scratch_base;
+  const std::uint32_t *old_k = old_keys + old_offset[i];
+  const std::uint32_t *old_v = old_values + old_offset[i];
+  const std::uint32_t bucket_lo = chunk * chunk_buckets;
+  const std::uint32_t rank_lo = bucket_lo * fill;
+  const std::uint32_t rank_hi_raw = (bucket_lo + chunk_buckets) * fill;
+  const std::uint32_t rank_hi = rank_hi_raw < total ? rank_hi_raw : total;
+  __shared__ unsigned long long s_sum;
+  if (threadIdx.x == 0)
+    s_sum = 0;
+  __syncthreads();
   std::uint32_t my_sum = 0;
-  for (std::uint32_t r = threadIdx.x; r < total; r += blockDim.x) {
-    const std::uint32_t i =
-        seg_merge_partition(inc_k, inc_n, old_k, old_total, r);
-    const std::uint32_t j = r - i;
+  for (std::uint32_t r = rank_lo + threadIdx.x; r < rank_hi;
+       r += blockDim.x) {
     std::uint32_t key;
     std::uint32_t value;
-    if (i < inc_n && (j >= old_total || inc_k[i] <= old_k[j])) {
-      key = inc_k[i];
-      value = inc_v[i];
-    } else {
-      key = old_k[j];
-      value = old_v[j];
-    }
+    ds_merge_pick(inc_k, inc_v, inc_n, old_k, old_v, old_n, r, key, value);
     const std::uint32_t bucket = r / fill;
     const std::uint32_t slot = r % fill;
+    const std::size_t pos =
+        slot_base + static_cast<std::size_t>(bucket) * kBucketSlots + slot;
+    pool_keys[pos] = key;
+    pool_values[pos] = value;
+    pool_valid[pos] = 1u;
+    my_sum += value;
+  }
+  atomicAdd(&s_sum, static_cast<unsigned long long>(my_sum));
+  __syncthreads();
+  const std::uint32_t slots_lo = bucket_lo * kBucketSlots;
+  for (std::uint32_t p = slots_lo + threadIdx.x;
+       p < slots_lo + chunk_buckets * kBucketSlots; p += blockDim.x) {
+    const std::uint32_t b = p / kBucketSlots;
+    const std::uint32_t slot = p % kBucketSlots;
+    const std::uint32_t first = b * fill;
+    const std::uint32_t cnt_b =
+        first >= total ? 0u : (total - first < fill ? total - first : fill);
+    if (slot >= cnt_b) {
+      pool_keys[slot_base + p] = kEmptyKey;
+      pool_values[slot_base + p] = 0u;
+      pool_valid[slot_base + p] = 0u;
+    }
+  }
+  __syncthreads();
+  for (std::uint32_t b = bucket_lo + threadIdx.x;
+       b < bucket_lo + chunk_buckets; b += blockDim.x) {
+    const std::uint32_t first = b * fill;
+    const std::uint32_t cnt_b =
+        first >= total ? 0u : (total - first < fill ? total - first : fill);
+    const std::size_t start =
+        slot_base + static_cast<std::size_t>(b) * kBucketSlots;
+    std::uint32_t bucket_sum = 0;
+    for (std::uint32_t l = 0; l < cnt_b; ++l)
+      bucket_sum += pool_values[start + l];
+    seg_bucket_live[meta + b] = cnt_b;
+    seg_bucket_max[meta + b] =
+        cnt_b ? pool_keys[start + cnt_b - 1] : boundary;
+    seg_bucket_value_sum[meta + b] = bucket_sum;
+  }
+  if (threadIdx.x == 0 && s_sum)
+    atomicAdd(out_value_sum + i, static_cast<std::uint32_t>(s_sum));
+}
+
+// one block per split child: merge its rank range of (old + incoming) and
+// write it into a preallocated segment packed at TARGET-style even fill
+__global__ void ds_split_write_kernel(
+    const std::uint32_t *o_src, const std::uint32_t *o_local,
+    const std::uint32_t *o_k, const std::uint32_t *o_child_seg,
+    const std::uint32_t *o_old_live, const std::uint32_t *o_old_boundary,
+    std::size_t output_count, const std::uint32_t *in_begin,
+    const std::uint32_t *in_end, const std::uint32_t *old_offset,
+    const std::uint32_t *inc_keys, const std::uint32_t *inc_values,
+    const std::uint32_t *old_keys, const std::uint32_t *old_values,
+    std::uint32_t *pool_keys, std::uint32_t *pool_values,
+    std::uint8_t *pool_valid, std::uint32_t *seg_bucket_max,
+    std::uint32_t *seg_bucket_live, std::uint32_t *seg_bucket_value_sum,
+    std::uint32_t *out_boundary, std::uint32_t *out_value_sum) {
+  const std::size_t o = blockIdx.x;
+  if (o >= output_count)
+    return;
+  const std::uint32_t i = o_src[o];
+  const std::uint32_t local = o_local[o];
+  const std::uint32_t k = o_k[o];
+  const std::uint32_t seg = o_child_seg[o];
+  const std::uint32_t old_n = o_old_live[o];
+  const std::uint32_t ib = in_begin[i];
+  const std::uint32_t inc_n = in_end[i] - ib;
+  const std::uint32_t total = old_n + inc_n;
+  const std::uint32_t per = ceil_div_u32(total, k);
+  const std::uint32_t begin = local * per;
+  const std::uint32_t end = begin + per < total ? begin + per : total;
+  const std::uint32_t cnt_child = end - begin;
+  const std::uint32_t fill = ceil_div_u32(cnt_child, kSegmentBuckets);
+  const std::size_t meta = static_cast<std::size_t>(seg) * kSegmentBuckets;
+  const std::size_t slot_base = static_cast<std::size_t>(seg) * kSegmentSlots;
+  const std::uint32_t *inc_k = inc_keys + ib;
+  const std::uint32_t *inc_v = inc_values + ib;
+  const std::uint32_t *old_k = old_keys + old_offset[i];
+  const std::uint32_t *old_v = old_values + old_offset[i];
+  __shared__ std::uint32_t s_boundary;
+  __shared__ unsigned long long s_sum;
+  if (threadIdx.x == 0) {
+    s_sum = 0;
+    if (local + 1 == k) {
+      s_boundary = o_old_boundary[o];
+    } else {
+      std::uint32_t key;
+      std::uint32_t value;
+      ds_merge_pick(inc_k, inc_v, inc_n, old_k, old_v, old_n, end - 1, key,
+                    value);
+      s_boundary = key;
+    }
+  }
+  __syncthreads();
+  std::uint32_t my_sum = 0;
+  for (std::uint32_t r = begin + threadIdx.x; r < end; r += blockDim.x) {
+    std::uint32_t key;
+    std::uint32_t value;
+    ds_merge_pick(inc_k, inc_v, inc_n, old_k, old_v, old_n, r, key, value);
+    const std::uint32_t rr = r - begin;
+    const std::uint32_t bucket = rr / fill;
+    const std::uint32_t slot = rr % fill;
     const std::size_t pos =
         slot_base + static_cast<std::size_t>(bucket) * kBucketSlots + slot;
     pool_keys[pos] = key;
@@ -1527,7 +1667,9 @@ __global__ void ds_absorb_repack_kernel(
     const std::uint32_t slot = static_cast<std::uint32_t>(p % kBucketSlots);
     const std::uint32_t first = b * fill;
     const std::uint32_t cnt_b =
-        first >= total ? 0u : (total - first < fill ? total - first : fill);
+        first >= cnt_child
+            ? 0u
+            : (cnt_child - first < fill ? cnt_child - first : fill);
     if (slot >= cnt_b) {
       pool_keys[slot_base + p] = kEmptyKey;
       pool_values[slot_base + p] = 0u;
@@ -1538,19 +1680,23 @@ __global__ void ds_absorb_repack_kernel(
   for (int b = threadIdx.x; b < kSegmentBuckets; b += blockDim.x) {
     const std::uint32_t first = b * fill;
     const std::uint32_t cnt_b =
-        first >= total ? 0u : (total - first < fill ? total - first : fill);
+        first >= cnt_child
+            ? 0u
+            : (cnt_child - first < fill ? cnt_child - first : fill);
     const std::size_t start =
         slot_base + static_cast<std::size_t>(b) * kBucketSlots;
     std::uint32_t bucket_sum = 0;
     for (std::uint32_t l = 0; l < cnt_b; ++l)
       bucket_sum += pool_values[start + l];
-    seg_bucket_live[meta_base + b] = cnt_b;
-    seg_bucket_max[meta_base + b] =
-        cnt_b ? pool_keys[start + cnt_b - 1] : boundary;
-    seg_bucket_value_sum[meta_base + b] = bucket_sum;
+    seg_bucket_live[meta + b] = cnt_b;
+    seg_bucket_max[meta + b] =
+        cnt_b ? pool_keys[start + cnt_b - 1] : s_boundary;
+    seg_bucket_value_sum[meta + b] = bucket_sum;
   }
-  if (threadIdx.x == 0)
-    out_value_sum[s] = static_cast<std::uint32_t>(s_sum);
+  if (threadIdx.x == 0) {
+    out_boundary[o] = s_boundary;
+    out_value_sum[o] = static_cast<std::uint32_t>(s_sum);
+  }
 }
 
 // classify each overflowing segment: segments past the split trigger (or
@@ -2555,6 +2701,7 @@ public:
     const std::size_t direct_count =
         std::min(max_elements_, 4 * c0_flush_budget());
     prepare_sort_storage(direct_count, c0_flush_budget(), stream);
+    prepare_scatter_storage();
     overlay_dirty_ = true;
     read_view_dirty_ = true;
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -3205,14 +3352,14 @@ private:
 
       const std::size_t old_capacity =
           ms * static_cast<std::size_t>(gpulsmopt_detail::kSegmentSlots);
-      resize_reuse(seg_old_key_, old_capacity);
-      resize_reuse(seg_old_value_, old_capacity);
+      seg_old_key_.resize_discard(old_capacity);
+      seg_old_value_.resize_discard(old_capacity);
       gpulsmopt_detail::seg_gather_old_ordered_kernel<<<
           static_cast<unsigned>(ms), 256, 0, stream>>>(
           raw_or_null(pool_keys_), raw_or_null(pool_values_),
           raw_or_null(seg_bucket_live_), raw_or_null(seg_slow_seg_id_),
           raw_or_null(seg_d_old_offset_), ms, nullptr,
-          raw_or_null(seg_old_key_), raw_or_null(seg_old_value_));
+          seg_old_key_.data(), seg_old_value_.data());
       CUDA_CHECK(cudaGetLastError());
       gpulsmopt_detail::seg_merge_pack_output_kernel<<<
           static_cast<unsigned>(max_output), 256, 0, stream>>>(
@@ -3224,8 +3371,8 @@ private:
           raw_or_null(seg_slow_in_begin_), raw_or_null(seg_slow_in_end_),
           raw_or_null(seg_d_old_offset_),
           raw_or_null(seg_d_reserved_seg_id_),
-          incoming_keys, incoming_values, raw_or_null(seg_old_key_),
-          raw_or_null(seg_old_value_),
+          incoming_keys, incoming_values, seg_old_key_.data(),
+          seg_old_value_.data(),
           raw_or_null(seg_d_output_seg_id_),
           raw_or_null(seg_d_out_boundary_), raw_or_null(seg_d_out_live_),
           raw_or_null(seg_d_out_value_sum_), raw_or_null(pool_keys_),
@@ -3749,6 +3896,48 @@ private:
     ensure_sort_temp(std::max(direct_bytes, legacy_bytes));
   }
 
+  // pre-allocate every scatter-path buffer during the (untimed) bulk build
+  // so the first large insert/delete steps don't pay cudaMalloc costs
+  void prepare_scatter_storage() {
+    const std::size_t batch_hint =
+        std::max<std::size_t>(4 * c0_flush_budget(), batch_size_);
+    // 2x headroom so directory growth from splits doesn't trigger
+    // reallocations inside timed insert steps
+    const std::size_t dir_count = 2 * h_dir_seg_id_.size();
+    const std::size_t total_buckets =
+        dir_count * static_cast<std::size_t>(gpulsmopt_detail::kSegmentBuckets);
+    ds_dest_.resize_discard(batch_hint);
+    ds_cnt_cursor_.resize_discard(2 * total_buckets);
+    ds_base_.resize_discard(total_buckets);
+    ds_dirty_.resize_discard(std::min(batch_hint, total_buckets));
+    ds_staged_keys_.resize_discard(batch_hint);
+    ds_staged_values_.resize_discard(batch_hint);
+    ds_meta_.resize_discard(3 * dir_count + 4);
+    ds_slow_list_.resize_discard(dir_count);
+    ds_residue_.resize_discard(dir_count);
+    ds_window_.resize_discard(2 * std::min(batch_hint, total_buckets));
+    ds_exclude_.resize_discard(total_buckets);
+    ds_slow_plan_.resize_discard(3 * dir_count);
+    seg_old_key_.resize_discard(max_elements_ / 2 + 1);
+    seg_old_value_.resize_discard(max_elements_ / 2 + 1);
+    resize_reuse(seg_dirty_ord_, dir_count);
+    resize_reuse(seg_slow_seg_id_, dir_count);
+    resize_reuse(seg_d_old_offset_, dir_count);
+    resize_reuse(seg_slow_old_boundary_, dir_count);
+    resize_reuse(seg_dirty_live_, dir_count);
+    resize_reuse(seg_slow_in_begin_, dir_count);
+    resize_reuse(seg_slow_in_end_, dir_count);
+    resize_reuse(seg_d_out_value_sum_, dir_count);
+    resize_reuse(seg_new_value_sum_, dir_count);
+    resize_reuse(seg_d_out_boundary_, dir_count);
+    resize_reuse(seg_d_out_dirty_, dir_count);
+    resize_reuse(seg_d_out_local_, dir_count);
+    resize_reuse(seg_d_out_k_, dir_count);
+    resize_reuse(seg_d_output_seg_id_, dir_count);
+    resize_reuse(seg_src_out_base_, dir_count);
+    resize_reuse(seg_src_seg_id_, dir_count);
+  }
+
   void sort_direct_batch(const std::uint32_t *keys,
                          const std::uint32_t *values, std::size_t n,
                          cudaStream_t stream) {
@@ -4043,114 +4232,204 @@ private:
       std::sort(split.begin(), split.end());
 
       const std::size_t absorb_count = absorb.size();
+      const std::size_t split_count = split.size();
+      const std::size_t residue_count = absorb_count + split_count;
+
+      // allocate every split child FIRST: alloc_segment can grow the pool
+      // and move the device allocations, so raw pointers come after
+      std::vector<std::uint32_t> split_k(split_count);
+      std::vector<std::uint32_t> child_seg;
+      std::size_t outputs_total = 0;
+      for (std::size_t s = 0; s < split_count; ++s) {
+        const std::uint32_t ord = split[s].first;
+        const std::uint32_t total = h_dir_live_[ord] + split[s].second;
+        std::uint32_t k =
+            gpulsmopt_detail::ceil_div_u32(total, target_segment_live_);
+        if (k < 2)
+          k = 2;
+        split_k[s] = k;
+        outputs_total += k;
+      }
+      child_seg.reserve(outputs_total);
+      for (std::size_t s = 0; s < split_count; ++s) {
+        child_seg.push_back(h_dir_seg_id_[split[s].first]);
+        for (std::uint32_t c = 1; c < split_k[s]; ++c)
+          child_seg.push_back(alloc_segment());
+      }
+
+      // combined per-residue descriptors: absorb entries first, then split
+      std::vector<std::uint32_t> r_ord(residue_count), r_seg(residue_count),
+          r_old_offset(residue_count);
+      std::vector<std::uint32_t> a_bound(absorb_count), a_total(absorb_count);
+      std::uint32_t old_acc = 0;
+      for (std::size_t i = 0; i < absorb_count; ++i) {
+        const std::uint32_t ord = absorb[i].first;
+        r_ord[i] = ord;
+        r_seg[i] = h_dir_seg_id_[ord];
+        r_old_offset[i] = old_acc;
+        old_acc += h_dir_live_[ord];
+        a_bound[i] = h_dir_boundary_[ord];
+        a_total[i] = h_dir_live_[ord] + absorb[i].second;
+      }
+      for (std::size_t s = 0; s < split_count; ++s) {
+        const std::size_t i = absorb_count + s;
+        const std::uint32_t ord = split[s].first;
+        r_ord[i] = ord;
+        r_seg[i] = h_dir_seg_id_[ord];
+        r_old_offset[i] = old_acc;
+        old_acc += h_dir_live_[ord];
+      }
+      upload_vec(seg_dirty_ord_, r_ord, stream);
+      upload_vec(seg_slow_seg_id_, r_seg, stream);
+      upload_vec(seg_d_old_offset_, r_old_offset, stream);
+      upload_vec(seg_slow_old_boundary_, a_bound, stream);
+      upload_vec(seg_dirty_live_, a_total, stream);
+      resize_reuse(seg_slow_in_begin_, residue_count);
+      resize_reuse(seg_slow_in_end_, residue_count);
+      seg_old_key_.resize_discard(old_acc);
+      seg_old_value_.resize_discard(old_acc);
+      const int residue_grid =
+          static_cast<int>((residue_count + block - 1) / block);
+      gpulsmopt_detail::ds_slow_slices_kernel<<<residue_grid, block, 0,
+                                                stream>>>(
+          raw_or_null(seg_dirty_ord_), residue_count,
+          raw_or_null(d_dir_boundary_), dir_count, direct_sort_keys_.data(),
+          total_slow, raw_or_null(seg_slow_in_begin_),
+          raw_or_null(seg_slow_in_end_));
+      CUDA_CHECK(cudaGetLastError());
+      gpulsmopt_detail::ds_gather_old_kernel<<<
+          static_cast<unsigned>(residue_count *
+                                gpulsmopt_detail::kDsGatherChunks),
+          block, 0, stream>>>(
+          raw_or_null(seg_slow_seg_id_), raw_or_null(seg_d_old_offset_),
+          residue_count, raw_or_null(pool_keys_), raw_or_null(pool_values_),
+          raw_or_null(seg_bucket_live_), seg_old_key_.data(),
+          seg_old_value_.data());
+      CUDA_CHECK(cudaGetLastError());
+
+      std::vector<std::uint32_t> a_value_sum(absorb_count);
       if (absorb_count > 0) {
-        std::vector<std::uint32_t> a_ord(absorb_count), a_seg(absorb_count),
-            a_bound(absorb_count), a_old_offset(absorb_count),
-            a_total(absorb_count);
-        std::uint32_t old_acc = 0;
-        for (std::size_t i = 0; i < absorb_count; ++i) {
-          const std::uint32_t ord = absorb[i].first;
-          a_ord[i] = ord;
-          a_seg[i] = h_dir_seg_id_[ord];
-          a_bound[i] = h_dir_boundary_[ord];
-          a_old_offset[i] = old_acc;
-          old_acc += h_dir_live_[ord];
-          a_total[i] = h_dir_live_[ord] + absorb[i].second;
-        }
-        upload_vec(seg_dirty_ord_, a_ord, stream);
-        upload_vec(seg_slow_seg_id_, a_seg, stream);
-        upload_vec(seg_slow_old_boundary_, a_bound, stream);
-        upload_vec(seg_d_old_offset_, a_old_offset, stream);
-        resize_reuse(seg_slow_in_begin_, absorb_count);
-        resize_reuse(seg_slow_in_end_, absorb_count);
         resize_reuse(seg_d_out_value_sum_, absorb_count);
-        resize_reuse(seg_old_key_, old_acc);
-        resize_reuse(seg_old_value_, old_acc);
-        const int absorb_grid =
-            static_cast<int>((absorb_count + block - 1) / block);
-        gpulsmopt_detail::ds_slow_slices_kernel<<<absorb_grid, block, 0,
-                                                  stream>>>(
-            raw_or_null(seg_dirty_ord_), absorb_count,
-            raw_or_null(d_dir_boundary_), dir_count, direct_sort_keys_.data(),
-            total_slow, raw_or_null(seg_slow_in_begin_),
-            raw_or_null(seg_slow_in_end_));
-        CUDA_CHECK(cudaGetLastError());
-        gpulsmopt_detail::ds_absorb_repack_kernel<<<
-            static_cast<unsigned>(absorb_count), 256, 0, stream>>>(
+        CUDA_CHECK(cudaMemsetAsync(raw_or_null(seg_d_out_value_sum_), 0,
+                                   absorb_count * sizeof(std::uint32_t),
+                                   stream));
+        gpulsmopt_detail::ds_absorb_write_kernel<<<
+            static_cast<unsigned>(absorb_count *
+                                  gpulsmopt_detail::kDsAbsorbChunks),
+            block, 0, stream>>>(
             raw_or_null(seg_slow_seg_id_),
-            raw_or_null(seg_slow_old_boundary_),
+            raw_or_null(seg_slow_old_boundary_), raw_or_null(seg_dirty_live_),
             raw_or_null(seg_d_old_offset_), raw_or_null(seg_slow_in_begin_),
             raw_or_null(seg_slow_in_end_), absorb_count,
             direct_sort_keys_.data(), direct_sort_values_.data(),
-            raw_or_null(seg_old_key_), raw_or_null(seg_old_value_),
+            seg_old_key_.data(), seg_old_value_.data(),
             raw_or_null(pool_keys_), raw_or_null(pool_values_),
             raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
             raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
             raw_or_null(seg_d_out_value_sum_));
         CUDA_CHECK(cudaGetLastError());
-        std::vector<std::uint32_t> a_value_sum(absorb_count);
         CUDA_CHECK(cudaMemcpyAsync(a_value_sum.data(),
                                    raw_or_null(seg_d_out_value_sum_),
                                    absorb_count * sizeof(std::uint32_t),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (std::size_t i = 0; i < absorb_count; ++i) {
-          const std::uint32_t ord = a_ord[i];
-          h_dir_live_[ord] = a_total[i];
-          h_dir_value_sum_[ord] = a_value_sum[i];
-        }
       }
-      recompute_sheet_live_count();
-      upload_directory_metadata(stream);
 
-      const std::size_t split_count = split.size();
+      std::vector<std::uint32_t> o_boundary(outputs_total),
+          o_value_sum(outputs_total);
       if (split_count > 0) {
-        std::vector<std::uint32_t> s_ord(split_count);
-        for (std::size_t i = 0; i < split_count; ++i)
-          s_ord[i] = split[i].first;
-        upload_vec(seg_dirty_ord_, s_ord, stream);
-        ds_slow_plan_.resize_discard(3 * split_count);
-        std::uint32_t *s_start = ds_slow_plan_.data();
-        std::uint32_t *s_len = s_start + split_count;
-        std::uint32_t *s_dst = s_len + split_count;
-        const int split_grid =
-            static_cast<int>((split_count + block - 1) / block);
-        gpulsmopt_detail::ds_slow_slices_kernel<<<split_grid, block, 0,
-                                                  stream>>>(
-            raw_or_null(seg_dirty_ord_), split_count,
-            raw_or_null(d_dir_boundary_), dir_count, direct_sort_keys_.data(),
-            total_slow, s_start, s_len);
-        CUDA_CHECK(cudaGetLastError());
-        std::vector<std::uint32_t> s_plan(2 * split_count);
-        CUDA_CHECK(cudaMemcpyAsync(s_plan.data(), s_start,
-                                   2 * split_count * sizeof(std::uint32_t),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::vector<std::uint32_t> s_len_host(split_count),
-            s_dst_host(split_count);
-        std::size_t total_split = 0;
-        for (std::size_t i = 0; i < split_count; ++i) {
-          s_len_host[i] = s_plan[split_count + i] - s_plan[i];
-          s_dst_host[i] = static_cast<std::uint32_t>(total_split);
-          total_split += s_len_host[i];
+        std::vector<std::uint32_t> o_src(outputs_total),
+            o_local(outputs_total), o_kvec(outputs_total),
+            o_old_live(outputs_total), o_old_bound(outputs_total);
+        std::size_t o = 0;
+        for (std::size_t s = 0; s < split_count; ++s) {
+          const std::uint32_t ord = split[s].first;
+          for (std::uint32_t local = 0; local < split_k[s]; ++local, ++o) {
+            o_src[o] = static_cast<std::uint32_t>(absorb_count + s);
+            o_local[o] = local;
+            o_kvec[o] = split_k[s];
+            o_old_live[o] = h_dir_live_[ord];
+            o_old_bound[o] = h_dir_boundary_[ord];
+          }
         }
-        CUDA_CHECK(cudaMemcpyAsync(s_len, s_len_host.data(),
-                                   split_count * sizeof(std::uint32_t),
-                                   cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(s_dst, s_dst_host.data(),
-                                   split_count * sizeof(std::uint32_t),
-                                   cudaMemcpyHostToDevice, stream));
-        resize_reuse(scratch_incoming_keys_, total_split);
-        resize_reuse(scratch_incoming_values_, total_split);
-        gpulsmopt_detail::ds_slow_gather_kernel<<<
-            static_cast<unsigned>(split_count), block, 0, stream>>>(
-            s_start, s_len, s_dst, direct_sort_keys_.data(),
-            direct_sort_values_.data(), raw_or_null(scratch_incoming_keys_),
-            raw_or_null(scratch_incoming_values_));
+        upload_vec(seg_d_out_dirty_, o_src, stream);
+        upload_vec(seg_d_out_local_, o_local, stream);
+        upload_vec(seg_d_out_k_, o_kvec, stream);
+        upload_vec(seg_d_output_seg_id_, child_seg, stream);
+        upload_vec(seg_src_out_base_, o_old_live, stream);
+        upload_vec(seg_src_seg_id_, o_old_bound, stream);
+        resize_reuse(seg_d_out_boundary_, outputs_total);
+        resize_reuse(seg_new_value_sum_, outputs_total);
+        gpulsmopt_detail::ds_split_write_kernel<<<
+            static_cast<unsigned>(outputs_total), block, 0, stream>>>(
+            raw_or_null(seg_d_out_dirty_), raw_or_null(seg_d_out_local_),
+            raw_or_null(seg_d_out_k_), raw_or_null(seg_d_output_seg_id_),
+            raw_or_null(seg_src_out_base_), raw_or_null(seg_src_seg_id_),
+            outputs_total, raw_or_null(seg_slow_in_begin_),
+            raw_or_null(seg_slow_in_end_), raw_or_null(seg_d_old_offset_),
+            direct_sort_keys_.data(), direct_sort_values_.data(),
+            seg_old_key_.data(), seg_old_value_.data(),
+            raw_or_null(pool_keys_), raw_or_null(pool_values_),
+            raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
+            raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
+            raw_or_null(seg_d_out_boundary_),
+            raw_or_null(seg_new_value_sum_));
         CUDA_CHECK(cudaGetLastError());
-        merge_incoming_into_sheet(raw_or_null(scratch_incoming_keys_),
-                                  raw_or_null(scratch_incoming_values_),
-                                  total_split, stream);
+        CUDA_CHECK(cudaMemcpyAsync(o_boundary.data(),
+                                   raw_or_null(seg_d_out_boundary_),
+                                   outputs_total * sizeof(std::uint32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(o_value_sum.data(),
+                                   raw_or_null(seg_new_value_sum_),
+                                   outputs_total * sizeof(std::uint32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+      }
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+
+      for (std::size_t i = 0; i < absorb_count; ++i) {
+        const std::uint32_t ord = absorb[i].first;
+        h_dir_live_[ord] = a_total[i];
+        h_dir_value_sum_[ord] = a_value_sum[i];
+      }
+      if (split_count > 0) {
+        // splice each split segment's children into the directory
+        std::vector<std::uint32_t> new_seg_id, new_boundary, new_live,
+            new_value_sum;
+        new_seg_id.reserve(dir_count + outputs_total);
+        new_boundary.reserve(dir_count + outputs_total);
+        new_live.reserve(dir_count + outputs_total);
+        new_value_sum.reserve(dir_count + outputs_total);
+        std::size_t s = 0, o = 0;
+        for (std::size_t ord = 0; ord < dir_count; ++ord) {
+          if (s < split_count && split[s].first == ord) {
+            const std::uint32_t total = h_dir_live_[ord] + split[s].second;
+            const std::uint32_t per =
+                gpulsmopt_detail::ceil_div_u32(total, split_k[s]);
+            for (std::uint32_t local = 0; local < split_k[s]; ++local, ++o) {
+              const std::uint32_t begin = local * per;
+              const std::uint32_t end =
+                  begin + per < total ? begin + per : total;
+              new_seg_id.push_back(child_seg[o]);
+              new_boundary.push_back(o_boundary[o]);
+              new_live.push_back(end - begin);
+              new_value_sum.push_back(o_value_sum[o]);
+            }
+            ++s;
+            continue;
+          }
+          new_seg_id.push_back(h_dir_seg_id_[ord]);
+          new_boundary.push_back(h_dir_boundary_[ord]);
+          new_live.push_back(h_dir_live_[ord]);
+          new_value_sum.push_back(h_dir_value_sum_[ord]);
+        }
+        h_dir_seg_id_ = std::move(new_seg_id);
+        h_dir_boundary_ = std::move(new_boundary);
+        h_dir_live_ = std::move(new_live);
+        h_dir_value_sum_ = std::move(new_value_sum);
+        recompute_sheet_live_count();
+        upload_directory(stream);
+      } else {
+        recompute_sheet_live_count();
+        upload_directory_metadata(stream);
       }
     }
     return true;
@@ -5004,8 +5283,8 @@ private:
   thrust::device_vector<std::uint32_t> seg_cand_key_;
   thrust::device_vector<std::uint32_t> seg_cand_value_;
 
-  thrust::device_vector<std::uint32_t> seg_old_key_;
-  thrust::device_vector<std::uint32_t> seg_old_value_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> seg_old_key_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> seg_old_value_;
   thrust::device_vector<std::uint32_t> seg_d_old_offset_;
 
   OverlayReadIndex cached_overlay_;
