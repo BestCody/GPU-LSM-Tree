@@ -101,6 +101,10 @@ constexpr int kDeltaFence = 16;
 static_assert(GPULSMOPT_DELTA_CAP > GPULSMOPT_DELTA_CAP_JITTER &&
                   GPULSMOPT_DELTA_CAP % kDeltaFence == 0,
               "delta capacity must dominate its jitter");
+static_assert(GPULSMOPT_DELTA_CAP % 256 == 0,
+              "delta merge tiling needs a 256-divisible capacity");
+// Merged entries each thread handles in one delta rewrite.
+constexpr int kDeltaLocal = GPULSMOPT_DELTA_CAP / 256;
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
@@ -224,6 +228,106 @@ upper_bound_u32(const std::uint32_t *data, std::size_t n, std::uint32_t key) {
     }
   }
   return first;
+}
+
+// Select the active ping-pong delta buffer for a segment.
+__device__ inline std::size_t seg_delta_base(std::uint32_t seg,
+                                             const std::uint8_t *active) {
+  return (2u * static_cast<std::size_t>(seg) +
+          static_cast<std::size_t>(active[seg])) *
+         static_cast<std::size_t>(kDeltaCap);
+}
+
+// Segment directory radix.
+constexpr int kDirRadixBits = 14;
+constexpr std::size_t kDirRadixSize = std::size_t{1} << kDirRadixBits;
+
+__global__ void dir_build_radix_kernel(const std::uint32_t *dir_boundary,
+                                       std::size_t dir_count,
+                                       std::uint32_t *radix_first) {
+  const std::size_t g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g > dir_count)
+    return;
+  const std::size_t bin_hi =
+      g == dir_count ? kDirRadixSize
+                     : static_cast<std::size_t>(dir_boundary[g] >>
+                                                (32 - kDirRadixBits));
+  std::size_t bin_lo;
+  if (g == 0) {
+    bin_lo = 0;
+    radix_first[0] = 0u;
+  } else {
+    bin_lo = static_cast<std::size_t>(dir_boundary[g - 1] >>
+                                      (32 - kDirRadixBits)) +
+             1;
+  }
+  for (std::size_t bin = bin_lo; bin <= bin_hi; ++bin)
+    radix_first[bin] = static_cast<std::uint32_t>(g);
+}
+
+// lower_bound over directory boundaries via one radix load.
+__device__ inline std::size_t dir_route(std::uint32_t key,
+                                        const std::uint32_t *dir_radix_first,
+                                        const std::uint32_t *dir_boundary,
+                                        std::size_t dir_count) {
+  const std::uint32_t bin = key >> (32 - kDirRadixBits);
+  std::size_t lo = dir_radix_first[bin];
+  std::size_t hi = dir_radix_first[bin + 1];
+  while (lo < hi) {
+    const std::size_t mid = (lo + hi) >> 1;
+    if (dir_boundary[mid] < key)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
+__device__ inline std::uint32_t
+block_scan_exclusive(std::uint32_t value, std::uint32_t *scratch);
+
+__global__ void directory_prefix_total_kernel(
+    const std::uint32_t *live, const std::uint32_t *value_sum,
+    std::size_t count, std::uint32_t *live_prefix,
+    std::uint32_t *value_prefix) {
+  if (blockIdx.x != 0 || threadIdx.x != 0)
+    return;
+  if (count == 0) {
+    live_prefix[0] = 0u;
+    value_prefix[0] = 0u;
+    return;
+  }
+  live_prefix[count] = live_prefix[count - 1] + live[count - 1];
+  value_prefix[count] =
+      value_prefix[count - 1] + value_sum[count - 1];
+}
+
+__global__ void seg_bucket_prefix_kernel(
+    const std::uint32_t *index, const std::uint32_t *dir_seg_id,
+    std::size_t count, const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *seg_bucket_value_sum,
+    std::uint32_t *seg_bucket_live_prefix,
+    std::uint32_t *seg_bucket_value_prefix) {
+  const std::size_t i = blockIdx.x;
+  if (i >= count)
+    return;
+  const std::uint32_t item = index ? index[i] : static_cast<std::uint32_t>(i);
+  const std::uint32_t seg = dir_seg_id ? dir_seg_id[item] : item;
+  const std::size_t meta = static_cast<std::size_t>(seg) * kSegmentBuckets;
+  const std::size_t out =
+      static_cast<std::size_t>(seg) * (kSegmentBuckets + 1);
+  const std::uint32_t b = threadIdx.x;
+  const std::uint32_t live = seg_bucket_live[meta + b];
+  const std::uint32_t sum = seg_bucket_value_sum[meta + b];
+  __shared__ std::uint32_t scratch[256];
+  const std::uint32_t live_prefix = block_scan_exclusive(live, scratch);
+  seg_bucket_live_prefix[out + b] = live_prefix;
+  if (b == kSegmentBuckets - 1)
+    seg_bucket_live_prefix[out + kSegmentBuckets] = live_prefix + live;
+  const std::uint32_t value_prefix = block_scan_exclusive(sum, scratch);
+  seg_bucket_value_prefix[out + b] = value_prefix;
+  if (b == kSegmentBuckets - 1)
+    seg_bucket_value_prefix[out + kSegmentBuckets] = value_prefix + sum;
 }
 
 // Fenced search over a segment delta.
@@ -689,22 +793,10 @@ __global__ void seg_apply_dirty_buckets_kernel(
   const std::uint32_t in_end = in_begin + dirty_bucket_count[i];
   std::uint32_t old_keys[kBucketSlots];
   std::uint32_t old_values[kBucketSlots];
+  // Buckets are stored sorted.
   for (std::uint32_t j = 0; j < live; ++j) {
     old_keys[j] = pool_keys[base + j];
     old_values[j] = pool_values[base + j];
-  }
-  // Sort the bucket before merging.
-  for (std::uint32_t j = 1; j < live; ++j) {
-    const std::uint32_t k = old_keys[j];
-    const std::uint32_t v = old_values[j];
-    std::uint32_t p = j;
-    while (p > 0 && old_keys[p - 1] > k) {
-      old_keys[p] = old_keys[p - 1];
-      old_values[p] = old_values[p - 1];
-      --p;
-    }
-    old_keys[p] = k;
-    old_values[p] = v;
   }
   std::uint32_t old = 0;
   std::uint32_t incoming = in_begin;
@@ -870,7 +962,7 @@ __global__ void seg_pull_apply_fast_kernel(
       const std::uint32_t output_count = live + incoming_count;
       const std::uint32_t incoming_begin = s_begin + b;
       const std::size_t merge_base = tile_id * kBucketSlots;
-      // Rank an entry within its unordered bucket.
+      // Rank the entry within its bucket.
       for (std::uint32_t old = lane; old < live; old += tile_size) {
         const std::uint32_t key = pool_keys[slot_base + old];
         std::uint32_t self_rank = 0;
@@ -977,7 +1069,7 @@ __global__ void seg_delete_dirty_buckets_kernel(
   std::uint32_t removed = 0;
   std::uint32_t removed_sum = 0;
   std::uint32_t max_key = 0;
-  // Match an unordered bucket against sorted deletes.
+  // Match the bucket against sorted deletes.
   for (std::uint32_t j = 0; j < live; ++j) {
     const std::uint32_t key = pool_keys[base + j];
     const std::uint32_t value = pool_values[base + j];
@@ -1119,49 +1211,59 @@ __global__ void seg_output_plan_kernel(
   }
 }
 
-// Probe the delta, then the unordered bucket.
+// Probe the larger of buckets/delta first; both are sorted.
 __device__ inline bool seg_point_lookup(
     std::uint32_t seg_id, std::uint32_t key, const std::uint32_t *pool_keys,
     const std::uint32_t *pool_values, const std::uint8_t *pool_valid,
     const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *seg_bucket_live_prefix,
     const std::uint32_t *delta_keys, const std::uint32_t *delta_values,
-    const std::uint32_t *delta_fence, const std::uint32_t *delta_count,
-    std::uint32_t *out_value) {
+    const std::uint8_t *delta_active, const std::uint32_t *delta_fence,
+    const std::uint32_t *delta_count, std::uint32_t *out_value) {
   const std::uint32_t dc = delta_count[seg_id];
-  if (dc > 0 &&
-      seg_delta_find(delta_keys + static_cast<std::size_t>(seg_id) * kDeltaCap,
-                     delta_values + static_cast<std::size_t>(seg_id) * kDeltaCap,
-                     delta_fence + static_cast<std::size_t>(seg_id) * kDeltaFence,
-                     dc, key, out_value))
+  const std::size_t dbase = seg_delta_base(seg_id, delta_active);
+  const std::uint32_t *fence =
+      delta_fence + static_cast<std::size_t>(seg_id) * kDeltaFence;
+  const std::uint32_t bucket_total =
+      seg_bucket_live_prefix[static_cast<std::size_t>(seg_id) *
+                                 (kSegmentBuckets + 1) +
+                             kSegmentBuckets];
+  const bool delta_first = dc > bucket_total;
+  if (delta_first && dc > 0 &&
+      seg_delta_find(delta_keys + dbase, delta_values + dbase, fence, dc, key,
+                     out_value))
     return true;
   const std::size_t meta_base =
       static_cast<std::size_t>(seg_id) * kSegmentBuckets;
   const std::size_t bucket =
       lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, key);
-  if (bucket >= kSegmentBuckets)
-    return false;
-  const std::size_t start =
-      static_cast<std::size_t>(seg_id) * kSegmentSlots + bucket * kBucketSlots;
-  const std::uint32_t live = seg_bucket_live[meta_base + bucket];
-  for (std::uint32_t p = 0; p < live; ++p) {
-    if (pool_keys[start + p] == key) {
+  if (bucket < kSegmentBuckets) {
+    const std::size_t start =
+        static_cast<std::size_t>(seg_id) * kSegmentSlots +
+        bucket * kBucketSlots;
+    const std::uint32_t live = seg_bucket_live[meta_base + bucket];
+    const std::size_t p = lower_bound_u32(pool_keys + start, live, key);
+    if (p < live && pool_keys[start + p] == key) {
       if (out_value)
         *out_value = pool_values[start + p];
       return true;
     }
   }
+  if (!delta_first && dc > 0 &&
+      seg_delta_find(delta_keys + dbase, delta_values + dbase, fence, dc, key,
+                     out_value))
+    return true;
   return false;
 }
 
 __device__ inline std::uint32_t seg_delta_range_count(
     std::uint32_t seg_id, std::uint32_t lo, std::uint32_t hi,
-    const std::uint32_t *delta_keys, const std::uint32_t *delta_fence,
-    const std::uint32_t *delta_count) {
+    const std::uint32_t *delta_keys, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence, const std::uint32_t *delta_count) {
   const std::uint32_t dc = delta_count[seg_id];
   if (dc == 0)
     return 0;
-  const std::uint32_t *dk =
-      delta_keys + static_cast<std::size_t>(seg_id) * kDeltaCap;
+  const std::uint32_t *dk = delta_keys + seg_delta_base(seg_id, delta_active);
   const std::uint32_t *fence =
       delta_fence + static_cast<std::size_t>(seg_id) * kDeltaFence;
   return seg_delta_upper_bound(dk, fence, dc, hi) -
@@ -1170,13 +1272,13 @@ __device__ inline std::uint32_t seg_delta_range_count(
 
 __device__ inline std::uint32_t seg_delta_range_sum(
     std::uint32_t seg_id, std::uint32_t lo, std::uint32_t hi,
-    const std::uint32_t *delta_keys, const std::uint32_t *delta_fence,
-    const std::uint32_t *delta_count, const std::uint32_t *delta_prefix) {
+    const std::uint32_t *delta_keys, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence, const std::uint32_t *delta_count,
+    const std::uint32_t *delta_prefix) {
   const std::uint32_t dc = delta_count[seg_id];
   if (dc == 0)
     return 0;
-  const std::uint32_t *dk =
-      delta_keys + static_cast<std::size_t>(seg_id) * kDeltaCap;
+  const std::uint32_t *dk = delta_keys + seg_delta_base(seg_id, delta_active);
   const std::uint32_t *fence =
       delta_fence + static_cast<std::size_t>(seg_id) * kDeltaFence;
   const std::uint32_t *prefix =
@@ -1189,11 +1291,12 @@ __device__ inline std::uint32_t seg_range_count_one(
     std::uint32_t seg_id, std::uint32_t lo, std::uint32_t hi,
     const std::uint32_t *pool_keys, const std::uint8_t *pool_valid,
     const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
-    const std::uint32_t *delta_keys, const std::uint32_t *delta_fence,
+    const std::uint32_t *seg_bucket_live_prefix, const std::uint32_t *delta_keys,
+    const std::uint8_t *delta_active, const std::uint32_t *delta_fence,
     const std::uint32_t *delta_count) {
   const std::uint32_t from_delta =
-      seg_delta_range_count(seg_id, lo, hi, delta_keys, delta_fence,
-                            delta_count);
+      seg_delta_range_count(seg_id, lo, hi, delta_keys, delta_active,
+                            delta_fence, delta_count);
   const std::size_t meta_base =
       static_cast<std::size_t>(seg_id) * kSegmentBuckets;
   const std::size_t slot_base =
@@ -1208,10 +1311,9 @@ __device__ inline std::uint32_t seg_range_count_one(
   auto scan_bucket = [&](std::size_t b) {
     const std::size_t start = slot_base + b * kBucketSlots;
     const std::uint32_t live = seg_bucket_live[meta_base + b];
-    for (std::uint32_t p = 0; p < live; ++p) {
-      const std::uint32_t k = pool_keys[start + p];
-      count += (k >= lo && k <= hi) ? 1u : 0u;
-    }
+    const std::size_t lb = lower_bound_u32(pool_keys + start, live, lo);
+    const std::size_t ub = upper_bound_u32(pool_keys + start, live, hi);
+    count += static_cast<std::uint32_t>(ub - lb);
   };
   if (first == last) {
     scan_bucket(first);
@@ -1221,8 +1323,11 @@ __device__ inline std::uint32_t seg_range_count_one(
   const std::size_t full_end = last < kSegmentBuckets ? last : kSegmentBuckets;
   if (last < kSegmentBuckets)
     scan_bucket(last);
-  for (std::size_t b = first + 1; b < full_end; ++b) {
-    count += seg_bucket_live[meta_base + b];
+  if (full_end > first + 1) {
+    const std::size_t pbase =
+        static_cast<std::size_t>(seg_id) * (kSegmentBuckets + 1);
+    count += seg_bucket_live_prefix[pbase + full_end] -
+             seg_bucket_live_prefix[pbase + first + 1];
   }
   return count + from_delta;
 }
@@ -1232,11 +1337,13 @@ __device__ inline std::uint32_t seg_range_sum_one(
     const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
     const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
     const std::uint32_t *seg_bucket_live,
-    const std::uint32_t *seg_bucket_value_sum,
-    const std::uint32_t *delta_keys, const std::uint32_t *delta_fence,
-    const std::uint32_t *delta_count, const std::uint32_t *delta_prefix) {
-  const std::uint32_t from_delta = seg_delta_range_sum(
-      seg_id, lo, hi, delta_keys, delta_fence, delta_count, delta_prefix);
+    const std::uint32_t *seg_bucket_value_prefix,
+    const std::uint32_t *delta_keys, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence, const std::uint32_t *delta_count,
+    const std::uint32_t *delta_prefix) {
+  const std::uint32_t from_delta =
+      seg_delta_range_sum(seg_id, lo, hi, delta_keys, delta_active,
+                          delta_fence, delta_count, delta_prefix);
   const std::size_t meta_base =
       static_cast<std::size_t>(seg_id) * kSegmentBuckets;
   const std::size_t slot_base =
@@ -1251,11 +1358,10 @@ __device__ inline std::uint32_t seg_range_sum_one(
   auto scan_bucket = [&](std::size_t b) {
     const std::size_t start = slot_base + b * kBucketSlots;
     const std::uint32_t live = seg_bucket_live[meta_base + b];
-    for (std::uint32_t p = 0; p < live; ++p) {
-      const std::uint32_t k = pool_keys[start + p];
-      if (k >= lo && k <= hi)
-        sum += pool_values[start + p];
-    }
+    const std::size_t lb = lower_bound_u32(pool_keys + start, live, lo);
+    const std::size_t ub = upper_bound_u32(pool_keys + start, live, hi);
+    for (std::size_t p = lb; p < ub; ++p)
+      sum += pool_values[start + p];
   };
   if (first == last) {
     scan_bucket(first);
@@ -1265,71 +1371,82 @@ __device__ inline std::uint32_t seg_range_sum_one(
   const std::size_t full_end = last < kSegmentBuckets ? last : kSegmentBuckets;
   if (last < kSegmentBuckets)
     scan_bucket(last);
-  for (std::size_t b = first + 1; b < full_end; ++b) {
-    sum += seg_bucket_value_sum[meta_base + b];
+  if (full_end > first + 1) {
+    const std::size_t pbase =
+        static_cast<std::size_t>(seg_id) * (kSegmentBuckets + 1);
+    sum += seg_bucket_value_prefix[pbase + full_end] -
+           seg_bucket_value_prefix[pbase + first + 1];
   }
   return sum + from_delta;
 }
 
 __device__ inline std::uint32_t seg_sheet_range_sum(
-    std::uint32_t lo, std::uint32_t hi, const std::uint32_t *dir_boundary,
+    std::uint32_t lo, std::uint32_t hi, const std::uint32_t *dir_radix_first,
+    const std::uint32_t *dir_boundary,
     const std::uint32_t *dir_seg_id, const std::uint32_t *dir_value_prefix,
     std::size_t dir_count, const std::uint32_t *pool_keys,
     const std::uint32_t *pool_values, const std::uint8_t *pool_valid,
     const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
-    const std::uint32_t *seg_bucket_value_sum,
-    const std::uint32_t *delta_keys, const std::uint32_t *delta_fence,
+    const std::uint32_t *seg_bucket_value_prefix,
+    const std::uint32_t *delta_keys, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence,
     const std::uint32_t *delta_count, const std::uint32_t *delta_prefix) {
-  std::size_t pl = lower_bound_u32(dir_boundary, dir_count, lo);
+  std::size_t pl = dir_route(lo, dir_radix_first, dir_boundary, dir_count);
   if (pl >= dir_count)
     return 0;
-  std::size_t pr = lower_bound_u32(dir_boundary, dir_count, hi);
+  std::size_t pr = dir_route(hi, dir_radix_first, dir_boundary, dir_count);
   if (pr >= dir_count)
     pr = dir_count - 1;
   if (pl == pr) {
     return seg_range_sum_one(dir_seg_id[pl], lo, hi, pool_keys, pool_values,
                              pool_valid, seg_bucket_max, seg_bucket_live,
-                             seg_bucket_value_sum, delta_keys, delta_fence,
-                             delta_count, delta_prefix);
+                             seg_bucket_value_prefix, delta_keys, delta_active,
+                             delta_fence, delta_count, delta_prefix);
   }
   std::uint32_t sum =
       seg_range_sum_one(dir_seg_id[pl], lo, hi, pool_keys, pool_values,
                         pool_valid, seg_bucket_max, seg_bucket_live,
-                        seg_bucket_value_sum, delta_keys, delta_fence,
-                        delta_count, delta_prefix) +
+                        seg_bucket_value_prefix, delta_keys, delta_active,
+                        delta_fence, delta_count, delta_prefix) +
       seg_range_sum_one(dir_seg_id[pr], lo, hi, pool_keys, pool_values,
                         pool_valid, seg_bucket_max, seg_bucket_live,
-                        seg_bucket_value_sum, delta_keys, delta_fence,
-                        delta_count, delta_prefix);
+                        seg_bucket_value_prefix, delta_keys, delta_active,
+                        delta_fence, delta_count, delta_prefix);
   if (pr > pl + 1)
     sum += dir_value_prefix[pr] - dir_value_prefix[pl + 1];
   return sum;
 }
 
 __device__ inline std::uint32_t seg_sheet_range_count(
-    std::uint32_t lo, std::uint32_t hi, const std::uint32_t *dir_boundary,
+    std::uint32_t lo, std::uint32_t hi, const std::uint32_t *dir_radix_first,
+    const std::uint32_t *dir_boundary,
     const std::uint32_t *dir_seg_id, const std::uint32_t *dir_prefix,
     std::size_t dir_count, const std::uint32_t *pool_keys,
     const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
-    const std::uint32_t *seg_bucket_live, const std::uint32_t *delta_keys,
+    const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *seg_bucket_live_prefix, const std::uint32_t *delta_keys,
+    const std::uint8_t *delta_active,
     const std::uint32_t *delta_fence, const std::uint32_t *delta_count) {
-  std::size_t pl = lower_bound_u32(dir_boundary, dir_count, lo);
+  std::size_t pl = dir_route(lo, dir_radix_first, dir_boundary, dir_count);
   if (pl >= dir_count)
     return 0;
-  std::size_t pr = lower_bound_u32(dir_boundary, dir_count, hi);
+  std::size_t pr = dir_route(hi, dir_radix_first, dir_boundary, dir_count);
   if (pr >= dir_count)
     pr = dir_count - 1;
   if (pl == pr) {
     return seg_range_count_one(dir_seg_id[pl], lo, hi, pool_keys, pool_valid,
-                               seg_bucket_max, seg_bucket_live, delta_keys,
-                               delta_fence, delta_count);
+                               seg_bucket_max, seg_bucket_live,
+                               seg_bucket_live_prefix, delta_keys,
+                               delta_active, delta_fence, delta_count);
   }
   std::uint32_t total =
       seg_range_count_one(dir_seg_id[pl], lo, hi, pool_keys, pool_valid,
-                          seg_bucket_max, seg_bucket_live, delta_keys,
+                          seg_bucket_max, seg_bucket_live,
+                          seg_bucket_live_prefix, delta_keys, delta_active,
                           delta_fence, delta_count) +
       seg_range_count_one(dir_seg_id[pr], lo, hi, pool_keys, pool_valid,
-                          seg_bucket_max, seg_bucket_live, delta_keys,
+                          seg_bucket_max, seg_bucket_live,
+                          seg_bucket_live_prefix, delta_keys, delta_active,
                           delta_fence, delta_count);
   if (pr > pl + 1)
     total += dir_prefix[pr] - dir_prefix[pl + 1];
@@ -1449,26 +1566,12 @@ __global__ void seg_gather_old_ordered_kernel(
     const std::uint32_t live = seg_bucket_live[meta + b];
     const std::size_t src = slot_base + static_cast<std::size_t>(b) * kBucketSlots;
     const std::uint32_t dst = base + prefix[b];
-    // Sort each bucket while gathering.
-    std::uint32_t k[kBucketSlots];
-    std::uint32_t v[kBucketSlots];
-    for (std::uint32_t j = 0; j < live; ++j) {
-      const std::uint32_t kk = pool_keys[src + j];
-      const std::uint32_t vv = pool_values[src + j];
-      std::uint32_t p = j;
-      while (p > 0 && k[p - 1] > kk) {
-        k[p] = k[p - 1];
-        v[p] = v[p - 1];
-        --p;
-      }
-      k[p] = kk;
-      v[p] = vv;
-    }
+    // Buckets are stored sorted; copy through.
     for (std::uint32_t j = 0; j < live; ++j) {
       if (old_seg)
         old_seg[dst + j] = static_cast<std::uint32_t>(m);
-      old_key[dst + j] = k[j];
-      old_value[dst + j] = v[j];
+      old_key[dst + j] = pool_keys[src + j];
+      old_value[dst + j] = pool_values[src + j];
     }
   }
 }
@@ -1532,7 +1635,7 @@ __global__ void ds_gather_old_kernel(
     }
   }
   __syncthreads();
-  // Sort buckets while gathering a segment.
+  // Buckets are stored sorted; copy them through unchanged.
   constexpr int warps_per_block = 256 / kBucketSlots;
   constexpr std::uint32_t chunk_buckets = kSegmentBuckets / kDsGatherChunks;
   const int warp = threadIdx.x / kBucketSlots;
@@ -1541,18 +1644,13 @@ __global__ void ds_gather_old_kernel(
   for (std::uint32_t b = chunk * chunk_buckets + warp;
        b < (chunk + 1) * chunk_buckets; b += warps_per_block) {
     const std::uint32_t live = s_live[b];
-    if (live == 0)
-      continue;
-    const std::size_t src =
-        slot_base + static_cast<std::size_t>(b) * kBucketSlots;
-    std::uint32_t key = lane < live ? pool_keys[src + lane] : kEmptyKey;
-    std::uint32_t val = lane < live ? pool_values[src + lane] : 0u;
-    warp_bitonic_sort_pair(key, val, lane);
     if (lane < live) {
+      const std::size_t src =
+          slot_base + static_cast<std::size_t>(b) * kBucketSlots;
       const std::size_t dst =
           static_cast<std::size_t>(out_base) + s_prefix[b] + lane;
-      old_keys[dst] = key;
-      old_values[dst] = val;
+      old_keys[dst] = pool_keys[src + lane];
+      old_values[dst] = pool_values[src + lane];
     }
   }
 }
@@ -1575,119 +1673,156 @@ __device__ inline void ds_merge_pick(const std::uint32_t *inc_k,
   }
 }
 
-// Compute an in-place block prefix sum.
-__device__ inline void delta_block_prefix(std::uint32_t *vals, std::uint32_t n,
-                                          std::uint32_t *scratch) {
-  __syncthreads();
-  const std::uint32_t chunk = ceil_div_u32(n, blockDim.x);
-  const std::uint32_t b = threadIdx.x * chunk;
-  const std::uint32_t e = b + chunk < n ? b + chunk : n;
-  std::uint32_t acc = 0;
-  for (std::uint32_t p = b; p < e; ++p) {
-    acc += vals[p];
-    vals[p] = acc;
+__device__ inline std::uint32_t
+block_scan_exclusive(std::uint32_t value, std::uint32_t *scratch) {
+  const unsigned mask = 0xffffffffu;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5;
+  std::uint32_t inclusive = value;
+#pragma unroll
+  for (std::uint32_t offset = 1; offset < 32; offset <<= 1) {
+    const std::uint32_t other =
+        __shfl_up_sync(mask, inclusive, static_cast<int>(offset));
+    if (lane >= offset)
+      inclusive += other;
   }
-  scratch[threadIdx.x] = b < n ? acc : 0u;
+  if (lane == 31u)
+    scratch[warp] = inclusive;
   __syncthreads();
-  if (threadIdx.x == 0) {
-    std::uint32_t run = 0;
-    for (std::uint32_t t = 0; t < blockDim.x; ++t) {
-      const std::uint32_t s = scratch[t];
-      scratch[t] = run;
-      run += s;
+  if (warp == 0u) {
+    std::uint32_t warp_sum = lane < (blockDim.x >> 5) ? scratch[lane] : 0u;
+#pragma unroll
+    for (std::uint32_t offset = 1; offset < 32; offset <<= 1) {
+      const std::uint32_t other =
+          __shfl_up_sync(mask, warp_sum, static_cast<int>(offset));
+      if (lane >= offset)
+        warp_sum += other;
     }
+    if (lane < (blockDim.x >> 5))
+      scratch[lane] = warp_sum;
   }
   __syncthreads();
-  const std::uint32_t offset = scratch[threadIdx.x];
-  for (std::uint32_t p = b; p < e; ++p)
-    vals[p] += offset;
+  const std::uint32_t warp_prefix = warp == 0u ? 0u : scratch[warp - 1];
+  const std::uint32_t result = warp_prefix + inclusive - value;
   __syncthreads();
+  return result;
 }
 
-// Slice a sorted batch and classify each segment.
-__global__ void delta_slice_classify_kernel(
-    const std::uint32_t *sorted_keys, std::size_t n,
-    const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
-    std::size_t dir_count, const std::uint32_t *delta_count,
-    std::uint32_t *append_ord, std::uint32_t *append_begin,
-    std::uint32_t *append_end, std::uint32_t *cons_ord,
-    std::uint32_t *cons_begin, std::uint32_t *cons_end,
-    std::uint32_t *cons_dcount, std::uint32_t *counters) {
-  const std::size_t ord = blockIdx.x * blockDim.x + threadIdx.x;
+// Fused segment delta ingestion.
+__global__ void delta_ingest_kernel(
+    const std::uint32_t *batch_keys, const std::uint32_t *batch_values,
+    std::size_t n, const std::uint32_t *dir_boundary,
+    const std::uint32_t *dir_seg_id, std::size_t dir_count,
+    std::uint32_t *delta_keys, std::uint32_t *delta_values,
+    std::uint8_t *delta_dead, std::uint8_t *delta_active,
+    std::uint32_t *delta_count,
+    std::uint32_t *delta_fence, std::uint32_t *delta_prefix,
+    std::uint32_t *dir_live, std::uint32_t *dir_value_sum,
+    std::uint32_t *absorb_ord, std::uint32_t *absorb_begin,
+    std::uint32_t *absorb_end, std::uint32_t *split_ord,
+    std::uint32_t *split_begin,
+    std::uint32_t *split_end, std::uint32_t *split_dcount,
+    std::uint32_t *counters) {
+  const std::size_t ord = blockIdx.x;
   if (ord >= dir_count)
     return;
-  const std::uint32_t begin = static_cast<std::uint32_t>(
-      ord == 0 ? 0 : upper_bound_u32(sorted_keys, n, dir_boundary[ord - 1]));
-  const std::uint32_t end = static_cast<std::uint32_t>(
-      ord + 1 == dir_count ? n
-                           : upper_bound_u32(sorted_keys, n, dir_boundary[ord]));
-  if (begin == end)
-    return;
-  const std::uint32_t seg = dir_seg_id[ord];
-  const std::uint32_t dc = delta_count[seg];
-  if (dc + (end - begin) <= seg_delta_cap(seg)) {
-    const std::uint32_t i = atomicAdd(counters, 1u);
-    append_ord[i] = static_cast<std::uint32_t>(ord);
-    append_begin[i] = begin;
-    append_end[i] = end;
-  } else {
-    const std::uint32_t i = atomicAdd(counters + 1, 1u);
-    cons_ord[i] = static_cast<std::uint32_t>(ord);
-    cons_begin[i] = begin;
-    cons_end[i] = end;
-    cons_dcount[i] = dc;
-  }
-}
-
-// Merge a sorted slice into one segment delta.
-__global__ void delta_merge_append_kernel(
-    const std::uint32_t *append_ord, const std::uint32_t *append_begin,
-    const std::uint32_t *append_end, const std::uint32_t *counters,
-    const std::uint32_t *dir_seg_id, const std::uint32_t *batch_keys,
-    const std::uint32_t *batch_values, std::uint32_t *delta_keys,
-    std::uint32_t *delta_values, std::uint32_t *delta_count,
-    std::uint32_t *delta_fence, std::uint32_t *delta_prefix,
-    std::uint32_t *out_slice_sum) {
-  const std::size_t i = blockIdx.x;
-  if (i >= counters[0])
-    return;
-  const std::uint32_t seg = dir_seg_id[append_ord[i]];
-  const std::uint32_t b = append_begin[i];
-  const std::uint32_t inc_n = append_end[i] - b;
-  const std::uint32_t old_n = delta_count[seg];
-  const std::uint32_t total = old_n + inc_n;
-  std::uint32_t *dk = delta_keys + static_cast<std::size_t>(seg) * kDeltaCap;
-  std::uint32_t *dv = delta_values + static_cast<std::size_t>(seg) * kDeltaCap;
-  std::uint32_t *prefix =
-      delta_prefix + static_cast<std::size_t>(seg) * (kDeltaCap + 1);
-  __shared__ std::uint32_t s_k[kDeltaCap];
-  __shared__ std::uint32_t s_v[kDeltaCap];
   __shared__ std::uint32_t s_scan[256];
-  __shared__ std::uint32_t s_old_sum;
-  if (threadIdx.x == 0)
-    s_old_sum = prefix[old_n];
-  for (std::uint32_t r = threadIdx.x; r < total; r += blockDim.x) {
-    std::uint32_t key, val;
-    ds_merge_pick(batch_keys + b, batch_values + b, inc_n, dk, dv, old_n, r,
-                  key, val);
-    s_k[r] = key;
-    s_v[r] = val;
+  __shared__ std::uint32_t s_info[3];
+  if (threadIdx.x == 0) {
+    const std::uint32_t begin = static_cast<std::uint32_t>(
+        ord == 0 ? 0 : upper_bound_u32(batch_keys, n, dir_boundary[ord - 1]));
+    const std::uint32_t end = static_cast<std::uint32_t>(
+        ord + 1 == dir_count
+            ? n
+            : upper_bound_u32(batch_keys, n, dir_boundary[ord]));
+    std::uint32_t cls = 0u;
+    if (end > begin) {
+      const std::uint32_t seg = dir_seg_id[ord];
+      const std::uint32_t dc = delta_count[seg];
+      if (dc + (end - begin) <= seg_delta_cap(seg)) {
+        cls = 1u;
+      } else if (dir_live[ord] + (end - begin) <= seg_split_trigger(seg)) {
+        cls = 2u;
+        const std::uint32_t i = atomicAdd(counters, 1u);
+        absorb_ord[i] = static_cast<std::uint32_t>(ord);
+        absorb_begin[i] = begin;
+        absorb_end[i] = end;
+      } else {
+        cls = 3u;
+        const std::uint32_t i = atomicAdd(counters + 1, 1u);
+        split_ord[i] = static_cast<std::uint32_t>(ord);
+        split_begin[i] = begin;
+        split_end[i] = end;
+        split_dcount[i] = dc;
+      }
+    }
+    s_info[0] = begin;
+    s_info[1] = end;
+    s_info[2] = cls;
   }
   __syncthreads();
-  for (std::uint32_t r = threadIdx.x; r < total; r += blockDim.x) {
-    dk[r] = s_k[r];
-    dv[r] = s_v[r];
+  if (s_info[2] != 1u)
+    return;
+  const std::uint32_t b = s_info[0];
+  const std::uint32_t inc_n = s_info[1] - b;
+  const std::uint32_t seg = dir_seg_id[ord];
+  const std::uint32_t act = delta_active[seg];
+  const std::uint32_t old_n = delta_count[seg];
+  const std::uint32_t total = old_n + inc_n;
+  const std::size_t src_base =
+      (2u * static_cast<std::size_t>(seg) + act) * kDeltaCap;
+  const std::size_t dst_base =
+      (2u * static_cast<std::size_t>(seg) + (act ^ 1u)) * kDeltaCap;
+  const std::uint32_t *sk = delta_keys + src_base;
+  const std::uint32_t *sv = delta_values + src_base;
+  std::uint32_t *dk = delta_keys + dst_base;
+  std::uint32_t *dv = delta_values + dst_base;
+  std::uint32_t *prefix =
+      delta_prefix + static_cast<std::size_t>(seg) * (kDeltaCap + 1);
+  const std::uint32_t old_sum = prefix[old_n];
+  const std::uint32_t chunk = ceil_div_u32(total, blockDim.x);
+  const std::uint32_t r0 = threadIdx.x * chunk;
+  const std::uint32_t r1 = r0 + chunk < total ? r0 + chunk : total;
+  std::uint32_t vals[kDeltaLocal];
+  std::uint32_t local_sum = 0;
+  if (r0 < total) {
+    std::uint32_t p =
+        seg_merge_partition(batch_keys + b, inc_n, sk, old_n, r0);
+    std::uint32_t q = r0 - p;
+    for (std::uint32_t r = r0; r < r1; ++r) {
+      std::uint32_t key, val;
+      if (p < inc_n && (q >= old_n || batch_keys[b + p] <= sk[q])) {
+        key = batch_keys[b + p];
+        val = batch_values[b + p];
+        ++p;
+      } else {
+        key = sk[q];
+        val = sv[q];
+        ++q;
+      }
+      dk[r] = key;
+      dv[r] = val;
+      delta_dead[dst_base + r] = 0u;
+      vals[r - r0] = val;
+      local_sum += val;
+    }
   }
+  const std::uint32_t tile_prefix = block_scan_exclusive(local_sum, s_scan);
+  std::uint32_t run = tile_prefix;
+  for (std::uint32_t r = r0; r < r1; ++r) {
+    run += vals[r - r0];
+    prefix[r + 1] = run;
+  }
+  __syncthreads();
   if (threadIdx.x < kDeltaFence)
     delta_fence[static_cast<std::size_t>(seg) * kDeltaFence + threadIdx.x] =
-        s_k[(threadIdx.x * total) / kDeltaFence];
-  delta_block_prefix(s_v, total, s_scan);
-  for (std::uint32_t r = threadIdx.x; r < total; r += blockDim.x)
-    prefix[r + 1] = s_v[r];
+        dk[(threadIdx.x * total) / kDeltaFence];
   if (threadIdx.x == 0) {
     prefix[0] = 0u;
     delta_count[seg] = total;
-    out_slice_sum[i] = s_v[total - 1] - s_old_sum;
+    delta_active[seg] = static_cast<std::uint8_t>(act ^ 1u);
+    dir_live[ord] += inc_n;
+    dir_value_sum[ord] += prefix[total] - old_sum;
   }
 }
 
@@ -1697,7 +1832,8 @@ __global__ void delta_inc_merge_kernel(
     const std::uint32_t *cons_end, const std::uint32_t *cons_out_off,
     std::size_t cons_count, const std::uint32_t *batch_keys,
     const std::uint32_t *batch_values, const std::uint32_t *delta_keys,
-    const std::uint32_t *delta_values, const std::uint32_t *delta_count,
+    const std::uint32_t *delta_values, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_count,
     std::uint32_t *out_keys, std::uint32_t *out_values) {
   const std::size_t i = blockIdx.x;
   if (i >= cons_count)
@@ -1708,14 +1844,28 @@ __global__ void delta_inc_merge_kernel(
   const std::uint32_t old_n = delta_count[seg];
   const std::uint32_t total = old_n + inc_n;
   const std::uint32_t off = cons_out_off[i];
-  const std::uint32_t *dk =
-      delta_keys + static_cast<std::size_t>(seg) * kDeltaCap;
-  const std::uint32_t *dv =
-      delta_values + static_cast<std::size_t>(seg) * kDeltaCap;
-  for (std::uint32_t r = threadIdx.x; r < total; r += blockDim.x) {
+  const std::size_t dbase = seg_delta_base(seg, delta_active);
+  const std::uint32_t *dk = delta_keys + dbase;
+  const std::uint32_t *dv = delta_values + dbase;
+  const std::uint32_t chunk = ceil_div_u32(total, blockDim.x);
+  const std::uint32_t r0 = threadIdx.x * chunk;
+  const std::uint32_t r1 = r0 + chunk < total ? r0 + chunk : total;
+  if (r0 >= total)
+    return;
+  // One merge-path partition per tile, then a serial merge.
+  std::uint32_t p = seg_merge_partition(batch_keys + b, inc_n, dk, old_n, r0);
+  std::uint32_t q = r0 - p;
+  for (std::uint32_t r = r0; r < r1; ++r) {
     std::uint32_t key, val;
-    ds_merge_pick(batch_keys + b, batch_values + b, inc_n, dk, dv, old_n, r,
-                  key, val);
+    if (p < inc_n && (q >= old_n || batch_keys[b + p] <= dk[q])) {
+      key = batch_keys[b + p];
+      val = batch_values[b + p];
+      ++p;
+    } else {
+      key = dk[q];
+      val = dv[q];
+      ++q;
+    }
     out_keys[off + r] = key;
     out_values[off + r] = val;
   }
@@ -1723,6 +1873,7 @@ __global__ void delta_inc_merge_kernel(
 
 __global__ void delta_reset_kernel(const std::uint32_t *seg_list,
                                    std::size_t count,
+                                   std::uint8_t *delta_active,
                                    std::uint32_t *delta_count,
                                    std::uint32_t *delta_prefix,
                                    std::uint8_t *delta_dead) {
@@ -1730,10 +1881,12 @@ __global__ void delta_reset_kernel(const std::uint32_t *seg_list,
   if (i >= count)
     return;
   const std::uint32_t seg = seg_list[i];
-  const std::size_t base = static_cast<std::size_t>(seg) * kDeltaCap;
-  for (std::uint32_t p = threadIdx.x; p < kDeltaCap; p += blockDim.x)
+  const std::size_t base = 2u * static_cast<std::size_t>(seg) * kDeltaCap;
+  for (std::uint32_t p = threadIdx.x; p < 2u * kDeltaCap;
+       p += blockDim.x)
     delta_dead[base + p] = 0u;
   if (threadIdx.x == 0) {
+    delta_active[seg] = 0u;
     delta_count[seg] = 0u;
     delta_prefix[static_cast<std::size_t>(seg) * (kDeltaCap + 1)] = 0u;
   }
@@ -1744,7 +1897,8 @@ __global__ void delta_mark_deleted_kernel(
     const std::uint32_t *keys, std::size_t n, const std::uint32_t *dest,
     std::uint32_t ord_divisor, const std::uint32_t *dir_seg_id,
     const std::uint32_t *delta_keys,
-    const std::uint32_t *delta_values, const std::uint32_t *delta_fence,
+    const std::uint32_t *delta_values, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence,
     const std::uint32_t *delta_count, std::uint8_t *delta_dead,
     std::uint32_t *ord_flag, std::uint32_t *touched_list,
     std::uint32_t *ord_live_delta, std::uint32_t *ord_value_delta,
@@ -1757,7 +1911,7 @@ __global__ void delta_mark_deleted_kernel(
   const std::uint32_t cnt = delta_count[seg];
   if (cnt == 0)
     return;
-  const std::size_t base = static_cast<std::size_t>(seg) * kDeltaCap;
+  const std::size_t base = seg_delta_base(seg, delta_active);
   const std::uint32_t key = keys[i];
   const std::uint32_t p = seg_delta_lower_bound(
       delta_keys + base, delta_fence + static_cast<std::size_t>(seg) * kDeltaFence,
@@ -1771,55 +1925,67 @@ __global__ void delta_mark_deleted_kernel(
   }
 }
 
-// Compact one touched delta and rebuild metadata.
+// Compact one touched delta into its inactive buffer.
 __global__ void delta_compact_kernel(
     const std::uint32_t *touched_list, const std::uint32_t *counters,
     const std::uint32_t *dir_seg_id, std::uint32_t *delta_keys,
-    std::uint32_t *delta_values, std::uint32_t *delta_count,
+    std::uint32_t *delta_values, std::uint8_t *delta_active,
+    std::uint32_t *delta_count,
     std::uint32_t *delta_fence, std::uint32_t *delta_prefix,
     std::uint8_t *delta_dead) {
   const std::uint32_t touched = counters[1];
   if (blockIdx.x >= touched)
     return;
   const std::uint32_t seg = dir_seg_id[touched_list[blockIdx.x]];
-  const std::size_t base = static_cast<std::size_t>(seg) * kDeltaCap;
+  const std::uint32_t act = delta_active[seg];
+  const std::size_t src_base =
+      (2u * static_cast<std::size_t>(seg) + act) * kDeltaCap;
+  const std::size_t dst_base =
+      (2u * static_cast<std::size_t>(seg) + (act ^ 1u)) * kDeltaCap;
   const std::uint32_t old_n = delta_count[seg];
-  __shared__ std::uint32_t s_k[kDeltaCap];
-  __shared__ std::uint32_t s_v[kDeltaCap];
-  __shared__ std::uint32_t s_pos[kDeltaCap];
   __shared__ std::uint32_t s_scan[256];
-  for (std::uint32_t p = threadIdx.x; p < old_n; p += blockDim.x) {
-    s_k[p] = delta_keys[base + p];
-    s_v[p] = delta_values[base + p];
-    s_pos[p] = delta_dead[base + p] ? 0u : 1u;
-    delta_dead[base + p] = 0u;
-  }
-  __syncthreads();
-  delta_block_prefix(s_pos, old_n, s_scan);
-  const std::uint32_t total = old_n ? s_pos[old_n - 1] : 0u;
-  for (std::uint32_t p = threadIdx.x; p < old_n; p += blockDim.x) {
-    const std::uint32_t keep =
-        p == 0 ? s_pos[0] : s_pos[p] - s_pos[p - 1];
-    if (keep) {
-      delta_keys[base + s_pos[p] - 1] = s_k[p];
-      delta_values[base + s_pos[p] - 1] = s_v[p];
+  __shared__ std::uint32_t s_total;
+  const std::uint32_t chunk = ceil_div_u32(old_n, blockDim.x);
+  const std::uint32_t r0 = threadIdx.x * chunk;
+  const std::uint32_t r1 = r0 + chunk < old_n ? r0 + chunk : old_n;
+  std::uint32_t keep = 0;
+  for (std::uint32_t r = r0; r < r1; ++r)
+    keep += delta_dead[src_base + r] ? 0u : 1u;
+  const std::uint32_t pos0 = block_scan_exclusive(keep, s_scan);
+  if (threadIdx.x == blockDim.x - 1)
+    s_total = pos0 + keep;
+  std::uint32_t vals[kDeltaLocal];
+  std::uint32_t w = 0;
+  std::uint32_t vsum = 0;
+  for (std::uint32_t r = r0; r < r1; ++r) {
+    if (!delta_dead[src_base + r]) {
+      const std::uint32_t v = delta_values[src_base + r];
+      delta_keys[dst_base + pos0 + w] = delta_keys[src_base + r];
+      delta_values[dst_base + pos0 + w] = v;
+      delta_dead[dst_base + pos0 + w] = 0u;
+      vals[w] = v;
+      vsum += v;
+      ++w;
     }
+    delta_dead[src_base + r] = 0u;
   }
-  __syncthreads();
+  const std::uint32_t vbase = block_scan_exclusive(vsum, s_scan);
   std::uint32_t *prefix =
       delta_prefix + static_cast<std::size_t>(seg) * (kDeltaCap + 1);
-  for (std::uint32_t p = threadIdx.x; p < total; p += blockDim.x)
-    s_v[p] = delta_values[base + p];
+  std::uint32_t run = vbase;
+  for (std::uint32_t j = 0; j < w; ++j) {
+    run += vals[j];
+    prefix[pos0 + j + 1] = run;
+  }
   __syncthreads();
-  delta_block_prefix(s_v, total, s_scan);
-  for (std::uint32_t p = threadIdx.x; p < total; p += blockDim.x)
-    prefix[p + 1] = s_v[p];
+  const std::uint32_t total = s_total;
   if (total > 0 && threadIdx.x < kDeltaFence)
     delta_fence[static_cast<std::size_t>(seg) * kDeltaFence + threadIdx.x] =
-        delta_keys[base + (threadIdx.x * total) / kDeltaFence];
+        delta_keys[dst_base + (threadIdx.x * total) / kDeltaFence];
   if (threadIdx.x == 0) {
     prefix[0] = 0u;
     delta_count[seg] = total;
+    delta_active[seg] = static_cast<std::uint8_t>(act ^ 1u);
   }
 }
 
@@ -1830,6 +1996,49 @@ __global__ void delta_gather_counts_kernel(const std::uint32_t *dir_seg_id,
   const std::size_t ord = blockIdx.x * blockDim.x + threadIdx.x;
   if (ord < dir_count)
     out[ord] = delta_count[dir_seg_id[ord]];
+}
+
+__global__ void delta_absorb_plan_kernel(
+    const std::uint32_t *ord, const std::uint32_t *batch_begin,
+    const std::uint32_t *batch_end, const std::uint32_t *delta_count,
+    std::size_t count, const std::uint32_t *dir_seg_id,
+    const std::uint32_t *dir_boundary, const std::uint32_t *dir_live,
+    std::uint32_t *seg_id, std::uint32_t *boundary,
+    std::uint32_t *total_live, std::uint32_t *old_live,
+    std::uint32_t *incoming_count) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const std::uint32_t o = ord[i];
+  const std::uint32_t seg = dir_seg_id[o];
+  const std::uint32_t batch_count = batch_end[i] - batch_begin[i];
+  const std::uint32_t dc = delta_count[seg];
+  seg_id[i] = seg;
+  boundary[i] = dir_boundary[o];
+  total_live[i] = dir_live[o] + batch_count;
+  old_live[i] = dir_live[o] - dc;
+  incoming_count[i] = dc + batch_count;
+}
+
+__global__ void delta_absorb_offsets_kernel(
+    const std::uint32_t *incoming_count,
+    const std::uint32_t *incoming_offset, std::size_t count,
+    std::uint32_t *incoming_end) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count)
+    incoming_end[i] = incoming_offset[i] + incoming_count[i];
+}
+
+__global__ void delta_absorb_commit_kernel(
+    const std::uint32_t *ord, const std::uint32_t *total_live,
+    const std::uint32_t *value_sum, std::size_t count,
+    std::uint32_t *dir_live, std::uint32_t *dir_value_sum) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const std::uint32_t o = ord[i];
+  dir_live[o] = total_live[i];
+  dir_value_sum[o] = value_sum[i];
 }
 
 __global__ void ds_absorb_write_kernel(
@@ -2187,25 +2396,11 @@ __global__ void seg_gather_group_ordered_kernel(
     const std::size_t src =
         slot_base + static_cast<std::size_t>(b) * kBucketSlots;
     const std::uint32_t dst = base + prefix[b];
-    // Sort buckets while gathering.
-    std::uint32_t k[kBucketSlots];
-    std::uint32_t v[kBucketSlots];
-    for (std::uint32_t j = 0; j < live; ++j) {
-      const std::uint32_t kk = pool_keys[src + j];
-      const std::uint32_t vv = pool_values[src + j];
-      std::uint32_t p = j;
-      while (p > 0 && k[p - 1] > kk) {
-        k[p] = k[p - 1];
-        v[p] = v[p - 1];
-        --p;
-      }
-      k[p] = kk;
-      v[p] = vv;
-    }
+    // Buckets are stored sorted; copy through.
     for (std::uint32_t j = 0; j < live; ++j) {
       cand_seg[dst + j] = g;
-      cand_key[dst + j] = k[j];
-      cand_value[dst + j] = v[j];
+      cand_key[dst + j] = pool_keys[src + j];
+      cand_value[dst + j] = pool_values[src + j];
     }
   }
 }
@@ -2268,28 +2463,21 @@ __global__ void unpack_sort_payload_kernel(
   ops[i] = static_cast<std::uint8_t>(payload[i]);
 }
 
-#ifndef GPULSMOPT_DIR_SMEM_MAX
-#define GPULSMOPT_DIR_SMEM_MAX 6144
-#endif
 __global__ void point_lookup_walk_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_value,
     std::uint8_t *out_found, const std::uint32_t *perm,
     const std::uint32_t *const *run_keys, const std::uint32_t *const *run_vals,
     const std::uint8_t *const *run_ops, const std::uint32_t *run_cnt,
     int num_runs, const std::uint32_t *dir_boundary,
-    const std::uint32_t *dir_seg_id, std::size_t dir_count,
+    const std::uint32_t *dir_radix_first, const std::uint32_t *dir_seg_id,
+    std::size_t dir_count,
     const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
     const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
-    const std::uint32_t *seg_bucket_live, const std::uint32_t *delta_keys,
-    const std::uint32_t *delta_values, const std::uint32_t *delta_fence,
+    const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *seg_bucket_live_prefix,
+    const std::uint32_t *delta_keys, const std::uint32_t *delta_values,
+    const std::uint8_t *delta_active, const std::uint32_t *delta_fence,
     const std::uint32_t *delta_count) {
-  __shared__ std::uint32_t s_dir[GPULSMOPT_DIR_SMEM_MAX];
-  const bool cache_dir = dir_count > 0 && dir_count <= GPULSMOPT_DIR_SMEM_MAX;
-  if (cache_dir) {
-    for (std::size_t t = threadIdx.x; t < dir_count; t += blockDim.x)
-      s_dir[t] = dir_boundary[t];
-    __syncthreads();
-  }
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
@@ -2319,14 +2507,14 @@ __global__ void point_lookup_walk_kernel(
   std::uint32_t value = 0;
   bool found = false;
   if (dir_count > 0) {
-    const std::uint32_t *dir = cache_dir ? s_dir : dir_boundary;
-    std::size_t ord = lower_bound_u32(dir, dir_count, key);
+    std::size_t ord =
+        dir_route(key, dir_radix_first, dir_boundary, dir_count);
     if (ord >= dir_count)
       ord = dir_count - 1;
     found = seg_point_lookup(dir_seg_id[ord], key, pool_keys, pool_values,
                              pool_valid, seg_bucket_max, seg_bucket_live,
-                             delta_keys, delta_values, delta_fence,
-                             delta_count, &value);
+                             seg_bucket_live_prefix, delta_keys, delta_values,
+                             delta_active, delta_fence, delta_count, &value);
   }
   out_found[o] = found ? 1u : 0u;
   out_value[o] = found ? value : 0u;
@@ -2339,8 +2527,8 @@ __global__ void seg_flip_lookup_kernel(
     const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
     const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
     const std::uint32_t *seg_bucket_live, const std::uint32_t *delta_keys,
-    const std::uint32_t *delta_values, const std::uint32_t *delta_fence,
-    const std::uint32_t *delta_count) {
+    const std::uint32_t *delta_values, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence, const std::uint32_t *delta_count) {
   const std::size_t m = blockIdx.x;
   if (m >= dirty_count)
     return;
@@ -2365,15 +2553,10 @@ __global__ void seg_flip_lookup_kernel(
         slot_base + static_cast<std::size_t>(b) * kBucketSlots;
     for (std::size_t qi = qb + qbb; qi < qb + qee; ++qi) {
       const std::uint32_t q = sorted_q[qi];
-      std::uint32_t found = 0u;
-      std::uint32_t value = 0u;
-      for (std::uint32_t ki = 0; ki < live; ++ki) {
-        if (pool_keys[base + ki] == q) {
-          found = 1u;
-          value = pool_values[base + ki];
-          break;
-        }
-      }
+      const std::size_t ki = lower_bound_u32(pool_keys + base, live, q);
+      const std::uint32_t found =
+          ki < live && pool_keys[base + ki] == q ? 1u : 0u;
+      const std::uint32_t value = found ? pool_values[base + ki] : 0u;
       out_found[qi] = found;
       out_value[qi] = value;
     }
@@ -2383,10 +2566,9 @@ __global__ void seg_flip_lookup_kernel(
   const std::uint32_t dc = delta_count[seg];
   if (dc == 0)
     return;
-  const std::uint32_t *dk =
-      delta_keys + static_cast<std::size_t>(seg) * kDeltaCap;
-  const std::uint32_t *dv =
-      delta_values + static_cast<std::size_t>(seg) * kDeltaCap;
+  const std::size_t dbase = seg_delta_base(seg, delta_active);
+  const std::uint32_t *dk = delta_keys + dbase;
+  const std::uint32_t *dv = delta_values + dbase;
   const std::uint32_t *fence =
       delta_fence + static_cast<std::size_t>(seg) * kDeltaFence;
   for (std::uint32_t qi = qb + threadIdx.x; qi < qb + qn; qi += blockDim.x) {
@@ -2434,14 +2616,15 @@ __global__ void overlay_walk_override_kernel(
 
 __global__ void successor_index_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_keys,
-    const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
-    const std::uint32_t *dir_prefix, std::size_t dir_count,
+    const std::uint32_t *dir_boundary, const std::uint32_t *dir_radix_first,
+    const std::uint32_t *dir_seg_id, const std::uint32_t *dir_prefix,
+    std::size_t dir_count,
     const std::uint32_t *pool_keys,
     const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
-    const std::uint32_t *delta_keys, const std::uint32_t *delta_fence,
-    const std::uint32_t *delta_count, const std::uint32_t *killed_keys,
-    std::size_t killed_count, const std::uint32_t *live_ins_keys,
-    std::size_t live_ins_count) {
+    const std::uint32_t *delta_keys, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence, const std::uint32_t *delta_count,
+    const std::uint32_t *killed_keys, std::size_t killed_count,
+    const std::uint32_t *live_ins_keys, std::size_t live_ins_count) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
@@ -2453,7 +2636,8 @@ __global__ void successor_index_kernel(
       best = live_ins_keys[p];
   }
   if (dir_count > 0 && q < best) {
-    std::size_t start_ord = lower_bound_u32(dir_boundary, dir_count, q);
+    std::size_t start_ord =
+        dir_route(q, dir_radix_first, dir_boundary, dir_count);
     if (start_ord >= dir_count)
       start_ord = dir_count - 1;
     std::size_t killed =
@@ -2467,7 +2651,7 @@ __global__ void successor_index_kernel(
       const std::uint32_t dc = delta_count[seg];
       if (dc > 0) {
         const std::uint32_t *dk =
-            delta_keys + static_cast<std::size_t>(seg) * kDeltaCap;
+            delta_keys + seg_delta_base(seg, delta_active);
         std::uint32_t p = seg_delta_lower_bound(
             dk, delta_fence + static_cast<std::size_t>(seg) * kDeltaFence, dc,
             q);
@@ -2500,18 +2684,11 @@ __global__ void successor_index_kernel(
         if (live == 0)
           continue;
         const std::size_t base = slots + bucket * kBucketSlots;
-        // Find the next live key in an unordered bucket.
-        std::uint32_t floor =
+        const std::uint32_t floor =
             ord == start_ord && bucket == start_bucket ? q : 0u;
-        for (;;) {
-          std::uint32_t candidate = kEmptyKey;
-          for (std::uint32_t p = 0; p < live; ++p) {
-            const std::uint32_t k = pool_keys[base + p];
-            if (k >= floor && k < candidate)
-              candidate = k;
-          }
-          if (candidate == kEmptyKey)
-            break;
+        std::size_t p = lower_bound_u32(pool_keys + base, live, floor);
+        for (; p < live; ++p) {
+          const std::uint32_t candidate = pool_keys[base + p];
           if (candidate >= limit) {
             capped = true;
             break;
@@ -2522,7 +2699,6 @@ __global__ void successor_index_kernel(
             bcand = candidate;
             break;
           }
-          floor = candidate + 1;
         }
       }
       const std::uint32_t cand = bcand < dcand ? bcand : dcand;
@@ -2562,11 +2738,14 @@ __device__ inline std::uint32_t overlay_count_range(const std::uint32_t *keys,
 
 __global__ void sheet_point_values_kernel(
     const std::uint32_t *keys, std::size_t n, const std::uint32_t *dir_boundary,
-    const std::uint32_t *dir_seg_id, std::size_t dir_count,
+    const std::uint32_t *dir_radix_first, const std::uint32_t *dir_seg_id,
+    std::size_t dir_count,
     const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
     const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
-    const std::uint32_t *seg_bucket_live, const std::uint32_t *delta_keys,
-    const std::uint32_t *delta_values, const std::uint32_t *delta_fence,
+    const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *seg_bucket_live_prefix,
+    const std::uint32_t *delta_keys, const std::uint32_t *delta_values,
+    const std::uint8_t *delta_active, const std::uint32_t *delta_fence,
     const std::uint32_t *delta_count, std::uint32_t *out_val,
     std::uint32_t *out_flag) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2575,13 +2754,14 @@ __global__ void sheet_point_values_kernel(
   std::uint32_t v = 0;
   bool f = false;
   if (dir_count > 0) {
-    std::size_t ord = lower_bound_u32(dir_boundary, dir_count, keys[i]);
+    std::size_t ord =
+        dir_route(keys[i], dir_radix_first, dir_boundary, dir_count);
     if (ord >= dir_count)
       ord = dir_count - 1;
     f = seg_point_lookup(dir_seg_id[ord], keys[i], pool_keys, pool_values,
                          pool_valid, seg_bucket_max, seg_bucket_live,
-                         delta_keys, delta_values, delta_fence, delta_count,
-                         &v);
+                         seg_bucket_live_prefix, delta_keys, delta_values,
+                         delta_active, delta_fence, delta_count, &v);
   }
   out_val[i] = f ? v : 0u;
   out_flag[i] = f ? 1u : 0u;
@@ -2590,14 +2770,17 @@ __global__ void sheet_point_values_kernel(
 __global__ void range_overlay_kernel(
     const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_sums,
     std::uint32_t *out_counts, std::size_t query_count,
-    const std::uint32_t *dir_boundary, const std::uint32_t *dir_seg_id,
+    const std::uint32_t *dir_boundary, const std::uint32_t *dir_radix_first,
+    const std::uint32_t *dir_seg_id,
     const std::uint32_t *dir_prefix, const std::uint32_t *dir_value_prefix,
     std::size_t dir_count, const std::uint32_t *pool_keys,
     const std::uint32_t *pool_values, const std::uint8_t *pool_valid,
     const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
-    const std::uint32_t *seg_bucket_value_sum,
-    const std::uint32_t *delta_keys, const std::uint32_t *delta_fence,
-    const std::uint32_t *delta_count, const std::uint32_t *delta_prefix,
+    const std::uint32_t *seg_bucket_live_prefix,
+    const std::uint32_t *seg_bucket_value_prefix,
+    const std::uint32_t *delta_keys, const std::uint8_t *delta_active,
+    const std::uint32_t *delta_fence, const std::uint32_t *delta_count,
+    const std::uint32_t *delta_prefix,
     const std::uint32_t *ins_keys,
     const std::uint32_t *ins_prefix, std::size_t ins_count,
     const std::uint32_t *tomb_keys, const std::uint32_t *tomb_val_prefix,
@@ -2613,17 +2796,18 @@ __global__ void range_overlay_kernel(
     return;
   }
   std::uint32_t sum = seg_sheet_range_sum(
-      l, h, dir_boundary, dir_seg_id, dir_value_prefix, dir_count, pool_keys,
-      pool_values, pool_valid, seg_bucket_max, seg_bucket_live,
-      seg_bucket_value_sum, delta_keys, delta_fence, delta_count,
-      delta_prefix);
+      l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_value_prefix,
+      dir_count, pool_keys, pool_values, pool_valid, seg_bucket_max,
+      seg_bucket_live, seg_bucket_value_prefix, delta_keys, delta_active,
+      delta_fence, delta_count, delta_prefix);
   sum += overlay_prefix_range(ins_prefix, ins_keys, ins_count, l, h);
   sum -= overlay_prefix_range(tomb_val_prefix, tomb_keys, tomb_count, l, h);
   out_sums[i] = sum;
   if (out_counts) {
     std::uint32_t c = seg_sheet_range_count(
-        l, h, dir_boundary, dir_seg_id, dir_prefix, dir_count, pool_keys,
-        pool_valid, seg_bucket_max, seg_bucket_live, delta_keys, delta_fence,
+        l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_prefix, dir_count,
+        pool_keys, pool_valid, seg_bucket_max, seg_bucket_live,
+        seg_bucket_live_prefix, delta_keys, delta_active, delta_fence,
         delta_count);
     c += overlay_count_range(ins_keys, ins_count, l, h);
     c -= overlay_prefix_range(tomb_cnt_prefix, tomb_keys, tomb_count, l, h);
@@ -2634,10 +2818,13 @@ __global__ void range_overlay_kernel(
 __global__ void count_overlay_kernel(
     const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_counts,
     std::size_t query_count, const std::uint32_t *dir_boundary,
-    const std::uint32_t *dir_seg_id, const std::uint32_t *dir_prefix,
+    const std::uint32_t *dir_radix_first, const std::uint32_t *dir_seg_id,
+    const std::uint32_t *dir_prefix,
     std::size_t dir_count, const std::uint32_t *pool_keys,
     const std::uint8_t *pool_valid, const std::uint32_t *seg_bucket_max,
-    const std::uint32_t *seg_bucket_live, const std::uint32_t *delta_keys,
+    const std::uint32_t *seg_bucket_live,
+    const std::uint32_t *seg_bucket_live_prefix,
+    const std::uint32_t *delta_keys, const std::uint8_t *delta_active,
     const std::uint32_t *delta_fence, const std::uint32_t *delta_count,
     const std::uint32_t *ins_keys,
     std::size_t ins_count, const std::uint32_t *tomb_keys,
@@ -2651,8 +2838,9 @@ __global__ void count_overlay_kernel(
     return;
   }
   std::uint32_t c = seg_sheet_range_count(
-      l, h, dir_boundary, dir_seg_id, dir_prefix, dir_count, pool_keys,
-      pool_valid, seg_bucket_max, seg_bucket_live, delta_keys, delta_fence,
+      l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_prefix, dir_count,
+      pool_keys, pool_valid, seg_bucket_max, seg_bucket_live,
+      seg_bucket_live_prefix, delta_keys, delta_active, delta_fence,
       delta_count);
   c += overlay_count_range(ins_keys, ins_count, l, h);
   c -= overlay_prefix_range(tomb_cnt_prefix, tomb_keys, tomb_count, l, h);
@@ -2795,11 +2983,13 @@ public:
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     gpulsmopt_detail::count_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.lo, batch.hi, batch.out_counts, batch.count,
-        raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
-        raw_or_null(d_dir_prefix_), h_dir_seg_id_.size(),
+        raw_or_null(d_dir_boundary_), raw_or_null(d_dir_radix_first_),
+        raw_or_null(d_dir_seg_id_), raw_or_null(d_dir_prefix_),
+        h_dir_seg_id_.size(),
         raw_or_null(pool_keys_), raw_or_null(pool_valid_),
         raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
-        raw_or_null(delta_keys_), raw_or_null(seg_delta_fence_),
+        raw_or_null(seg_bucket_live_prefix_), raw_or_null(delta_keys_),
+        raw_or_null(seg_delta_active_), raw_or_null(seg_delta_fence_),
         raw_or_null(seg_delta_count_),
         ins_keys, no_overlay ? 0 : ix->ins, tomb_keys, tomb_cnt,
         no_overlay ? 0 : ix->u - ix->ins);
@@ -2823,12 +3013,14 @@ public:
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     gpulsmopt_detail::successor_index_kernel<<<grid, block, 0, stream>>>(
         batch.queries, batch.count, batch.out_keys,
-        raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
-        raw_or_null(d_dir_prefix_), h_dir_seg_id_.size(),
+        raw_or_null(d_dir_boundary_), raw_or_null(d_dir_radix_first_),
+        raw_or_null(d_dir_seg_id_), raw_or_null(d_dir_prefix_),
+        h_dir_seg_id_.size(),
         raw_or_null(pool_keys_), raw_or_null(seg_bucket_max_),
         raw_or_null(seg_bucket_live_), raw_or_null(delta_keys_),
-        raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_count_), killed,
-        killed_count, live_ins, live_ins_count);
+        raw_or_null(seg_delta_active_), raw_or_null(seg_delta_fence_),
+        raw_or_null(seg_delta_count_), killed, killed_count, live_ins,
+        live_ins_count);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -2853,12 +3045,14 @@ public:
     gpulsmopt_detail::range_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.lo, batch.hi, batch.out_sums, batch.out_counts,
         batch.query_count, raw_or_null(d_dir_boundary_),
-        raw_or_null(d_dir_seg_id_), raw_or_null(d_dir_prefix_),
-        raw_or_null(d_dir_value_prefix_), h_dir_seg_id_.size(),
+        raw_or_null(d_dir_radix_first_), raw_or_null(d_dir_seg_id_),
+        raw_or_null(d_dir_prefix_), raw_or_null(d_dir_value_prefix_),
+        h_dir_seg_id_.size(),
         raw_or_null(pool_keys_), raw_or_null(pool_values_),
         raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
-        raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
-        raw_or_null(delta_keys_), raw_or_null(seg_delta_fence_),
+        raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_live_prefix_),
+        raw_or_null(seg_bucket_value_prefix_), raw_or_null(delta_keys_),
+        raw_or_null(seg_delta_active_), raw_or_null(seg_delta_fence_),
         raw_or_null(seg_delta_count_), raw_or_null(seg_delta_prefix_),
         ins_keys, ins_prefix, no_overlay ? 0 : ix->ins, tomb_keys, tomb_val,
         tomb_cnt, no_overlay ? 0 : ix->u - ix->ins);
@@ -2924,10 +3118,12 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::size_t total = device_bytes_all(
         pool_keys_, pool_values_, pool_valid_, seg_bucket_max_,
-        seg_bucket_live_, seg_bucket_value_sum_, delta_keys_, delta_values_,
-        seg_delta_count_, seg_delta_fence_, seg_delta_prefix_, delta_dead_,
-        d_dir_seg_id_, d_dir_boundary_, d_dir_prefix_, d_dir_value_sum_,
-        d_dir_value_prefix_,
+        seg_bucket_live_, seg_bucket_value_sum_, seg_bucket_live_prefix_,
+        seg_bucket_value_prefix_, delta_keys_, delta_values_,
+        seg_delta_active_, seg_delta_count_, seg_delta_fence_,
+        seg_delta_prefix_, delta_dead_, d_dir_seg_id_, d_dir_boundary_,
+        d_dir_live_, d_dir_prefix_, d_dir_value_sum_, d_dir_value_prefix_,
+        d_dir_radix_first_,
         scratch_incoming_keys_, scratch_incoming_values_, scratch_delete_keys_,
         seg_pull_counter_, seg_dirty_bucket_dirty_,
         seg_cand_seg_, seg_cand_key_, seg_cand_value_,
@@ -3007,6 +3203,10 @@ private:
                                      sizeof(std::uint32_t),
                                  stream));
     }
+    if (!seg_delta_active_.empty()) {
+      CUDA_CHECK(cudaMemsetAsync(raw_or_null(seg_delta_active_), 0,
+                                 seg_delta_active_.size(), stream));
+    }
     if (!seg_delta_prefix_.empty()) {
       CUDA_CHECK(cudaMemsetAsync(raw_or_null(seg_delta_prefix_), 0,
                                  seg_delta_prefix_.size() *
@@ -3065,6 +3265,8 @@ private:
                  0u);
     CUDA_CHECK(cudaMemsetAsync(raw_or_null(seg_delta_count_) + seg_id, 0,
                                sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(raw_or_null(seg_delta_active_) + seg_id, 0,
+                               sizeof(std::uint8_t), stream));
     CUDA_CHECK(cudaMemsetAsync(
         raw_or_null(seg_delta_prefix_) +
             static_cast<std::size_t>(seg_id) *
@@ -3072,8 +3274,20 @@ private:
         0, sizeof(std::uint32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(
         raw_or_null(delta_dead_) +
-            static_cast<std::size_t>(seg_id) * gpulsmopt_detail::kDeltaCap,
-        0, gpulsmopt_detail::kDeltaCap * sizeof(std::uint8_t), stream));
+            2u * static_cast<std::size_t>(seg_id) *
+                gpulsmopt_detail::kDeltaCap,
+        0, 2u * gpulsmopt_detail::kDeltaCap * sizeof(std::uint8_t), stream));
+    const std::size_t prefix_base =
+        static_cast<std::size_t>(seg_id) *
+        (gpulsmopt_detail::kSegmentBuckets + 1);
+    CUDA_CHECK(cudaMemsetAsync(
+        raw_or_null(seg_bucket_live_prefix_) + prefix_base, 0,
+        (gpulsmopt_detail::kSegmentBuckets + 1) * sizeof(std::uint32_t),
+        stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        raw_or_null(seg_bucket_value_prefix_) + prefix_base, 0,
+        (gpulsmopt_detail::kSegmentBuckets + 1) * sizeof(std::uint32_t),
+        stream));
   }
 
   void grow_pool(std::size_t new_capacity) {
@@ -3089,15 +3303,20 @@ private:
                             0u);
     seg_bucket_value_sum_.resize(
         new_capacity * gpulsmopt_detail::kSegmentBuckets, 0u);
-    delta_keys_.resize(new_capacity * gpulsmopt_detail::kDeltaCap,
+    seg_bucket_live_prefix_.resize(
+        new_capacity * (gpulsmopt_detail::kSegmentBuckets + 1), 0u);
+    seg_bucket_value_prefix_.resize(
+        new_capacity * (gpulsmopt_detail::kSegmentBuckets + 1), 0u);
+    delta_keys_.resize(2u * new_capacity * gpulsmopt_detail::kDeltaCap,
                        gpulsmopt_detail::kEmptyKey);
-    delta_values_.resize(new_capacity * gpulsmopt_detail::kDeltaCap, 0u);
+    delta_values_.resize(2u * new_capacity * gpulsmopt_detail::kDeltaCap, 0u);
+    seg_delta_active_.resize(new_capacity, 0u);
     seg_delta_count_.resize(new_capacity, 0u);
     seg_delta_fence_.resize(new_capacity * gpulsmopt_detail::kDeltaFence,
                             gpulsmopt_detail::kEmptyKey);
     seg_delta_prefix_.resize(
         new_capacity * (gpulsmopt_detail::kDeltaCap + 1), 0u);
-    delta_dead_.resize(new_capacity * gpulsmopt_detail::kDeltaCap, 0u);
+    delta_dead_.resize(2u * new_capacity * gpulsmopt_detail::kDeltaCap, 0u);
     for (std::size_t id = pool_capacity_; id < new_capacity; ++id) {
       free_ids_.push_back(static_cast<std::uint32_t>(id));
     }
@@ -3118,6 +3337,7 @@ private:
     const std::size_t d = h_dir_seg_id_.size();
     resize_reuse(d_dir_seg_id_, d);
     resize_reuse(d_dir_boundary_, d);
+    resize_reuse(d_dir_radix_first_, gpulsmopt_detail::kDirRadixSize + 1);
     auto copy = [&](thrust::device_vector<std::uint32_t> &dst,
                     const std::vector<std::uint32_t> &src) {
       if (src.empty())
@@ -3128,8 +3348,14 @@ private:
     };
     copy(d_dir_seg_id_, h_dir_seg_id_);
     copy(d_dir_boundary_, h_dir_boundary_);
+    const int block = 256;
+    const int grid = static_cast<int>((d + 1 + block - 1) / block);
+    gpulsmopt_detail::dir_build_radix_kernel<<<grid, block, 0, stream>>>(
+        raw_or_null(d_dir_boundary_), d, raw_or_null(d_dir_radix_first_));
+    CUDA_CHECK(cudaGetLastError());
     flat_route_dirty_ = true;
     upload_directory_metadata(stream);
+    rebuild_all_bucket_prefixes(stream);
   }
 
   // Rebuild flat bucket and radix delete routing.
@@ -3159,33 +3385,107 @@ private:
 
   void upload_directory_metadata(cudaStream_t stream) {
     const std::size_t d = h_dir_seg_id_.size();
+    resize_reuse(d_dir_live_, d);
     resize_reuse(d_dir_prefix_, d + 1);
     resize_reuse(d_dir_value_sum_, d);
     resize_reuse(d_dir_value_prefix_, d + 1);
-    dir_prefix_host_.resize(d + 1);
-    dir_value_prefix_host_.resize(d + 1);
-    std::uint32_t acc = 0;
-    std::uint32_t value_acc = 0;
-    dir_prefix_host_[0] = 0;
-    dir_value_prefix_host_[0] = 0;
-    for (std::size_t i = 0; i < d; ++i) {
-      acc += h_dir_live_[i];
-      value_acc += h_dir_value_sum_[i];
-      dir_prefix_host_[i + 1] = acc;
-      dir_value_prefix_host_[i + 1] = value_acc;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(
-        raw_or_null(d_dir_prefix_), dir_prefix_host_.data(),
-        (d + 1) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        raw_or_null(d_dir_value_prefix_), dir_value_prefix_host_.data(),
-        (d + 1) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream));
-    if (!h_dir_value_sum_.empty()) {
+    if (d > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(
+          raw_or_null(d_dir_live_), h_dir_live_.data(),
+          d * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream));
       CUDA_CHECK(cudaMemcpyAsync(
           raw_or_null(d_dir_value_sum_), h_dir_value_sum_.data(),
-          h_dir_value_sum_.size() * sizeof(std::uint32_t),
+          d * sizeof(std::uint32_t),
           cudaMemcpyHostToDevice, stream));
     }
+    host_metadata_dirty_ = false;
+    rebuild_directory_prefixes_device(stream);
+  }
+
+  void rebuild_directory_prefixes_device(cudaStream_t stream) {
+    const std::size_t d = h_dir_seg_id_.size();
+    if (d == 0) {
+      CUDA_CHECK(cudaMemsetAsync(raw_or_null(d_dir_prefix_), 0,
+                                 sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(raw_or_null(d_dir_value_prefix_), 0,
+                                 sizeof(std::uint32_t), stream));
+      return;
+    }
+    std::size_t live_bytes = 0;
+    std::size_t value_bytes = 0;
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, live_bytes, raw_or_null(d_dir_live_),
+        raw_or_null(d_dir_prefix_), static_cast<int>(d), stream));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, value_bytes, raw_or_null(d_dir_value_sum_),
+        raw_or_null(d_dir_value_prefix_), static_cast<int>(d), stream));
+    ensure_sort_temp(std::max(live_bytes, value_bytes));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        sort_temp_storage_.data(), live_bytes, raw_or_null(d_dir_live_),
+        raw_or_null(d_dir_prefix_), static_cast<int>(d), stream));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        sort_temp_storage_.data(), value_bytes, raw_or_null(d_dir_value_sum_),
+        raw_or_null(d_dir_value_prefix_), static_cast<int>(d), stream));
+    gpulsmopt_detail::directory_prefix_total_kernel<<<1, 1, 0, stream>>>(
+        raw_or_null(d_dir_live_), raw_or_null(d_dir_value_sum_), d,
+        raw_or_null(d_dir_prefix_), raw_or_null(d_dir_value_prefix_));
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  void ensure_host_directory_metadata(cudaStream_t stream) {
+    if (!host_metadata_dirty_)
+      return;
+    const std::size_t d = h_dir_seg_id_.size();
+    h_dir_live_.resize(d);
+    h_dir_value_sum_.resize(d);
+    if (d > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(
+          h_dir_live_.data(), raw_or_null(d_dir_live_),
+          d * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          h_dir_value_sum_.data(), raw_or_null(d_dir_value_sum_),
+          d * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    host_metadata_dirty_ = false;
+  }
+
+  void rebuild_all_bucket_prefixes(cudaStream_t stream) {
+    const std::size_t count = h_dir_seg_id_.size();
+    if (count == 0)
+      return;
+    gpulsmopt_detail::seg_bucket_prefix_kernel<<<count, 256, 0, stream>>>(
+        nullptr, raw_or_null(d_dir_seg_id_), count,
+        raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
+        raw_or_null(seg_bucket_live_prefix_),
+        raw_or_null(seg_bucket_value_prefix_));
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  void rebuild_direct_bucket_prefixes(const std::uint32_t *seg_ids,
+                                      std::size_t count,
+                                      cudaStream_t stream) {
+    if (count == 0)
+      return;
+    gpulsmopt_detail::seg_bucket_prefix_kernel<<<count, 256, 0, stream>>>(
+        seg_ids, nullptr, count, raw_or_null(seg_bucket_live_),
+        raw_or_null(seg_bucket_value_sum_),
+        raw_or_null(seg_bucket_live_prefix_),
+        raw_or_null(seg_bucket_value_prefix_));
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  void rebuild_ordinal_bucket_prefixes(const std::uint32_t *ordinals,
+                                       std::size_t count,
+                                       cudaStream_t stream) {
+    if (count == 0)
+      return;
+    gpulsmopt_detail::seg_bucket_prefix_kernel<<<count, 256, 0, stream>>>(
+        ordinals, raw_or_null(d_dir_seg_id_), count,
+        raw_or_null(seg_bucket_live_), raw_or_null(seg_bucket_value_sum_),
+        raw_or_null(seg_bucket_live_prefix_),
+        raw_or_null(seg_bucket_value_prefix_));
+    CUDA_CHECK(cudaGetLastError());
   }
 
   template <class T>
@@ -3420,6 +3720,8 @@ private:
                                  cudaStream_t stream) {
     if (incoming_count == 0)
       return;
+    consolidate_all_deltas(stream);
+    ensure_host_directory_metadata(stream);
     auto policy = thrust::cuda::par.on(stream);
 
     const std::size_t dir_count = h_dir_seg_id_.size();
@@ -3800,6 +4102,7 @@ private:
   void merge_underfull_segments(cudaStream_t stream) {
     // This gather reads bucket storage only.
     consolidate_all_deltas(stream);
+    ensure_host_directory_metadata(stream);
     const std::size_t n = h_dir_seg_id_.size();
     if (n < 2)
       return;
@@ -4124,14 +4427,28 @@ private:
       sort_temp_storage_.resize_discard(bytes);
   }
 
+  void exclusive_scan_u32(const std::uint32_t *input,
+                          std::uint32_t *output, std::size_t count,
+                          cudaStream_t stream) {
+    if (count == 0)
+      return;
+    std::size_t temp_bytes = 0;
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, temp_bytes, input, output, static_cast<int>(count), stream));
+    ensure_sort_temp(temp_bytes);
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        sort_temp_storage_.data(), temp_bytes, input, output,
+        static_cast<int>(count), stream));
+  }
+
   void prepare_sort_storage(std::size_t direct_count,
-                            std::size_t legacy_count,
+                            std::size_t log_count,
                             cudaStream_t stream) {
     direct_sort_keys_.resize_discard(direct_count);
     direct_sort_values_.resize_discard(direct_count);
-    sort_key_output_.resize_discard(legacy_count);
-    sort_payload_input_.resize_discard(legacy_count);
-    sort_payload_output_.resize_discard(legacy_count);
+    sort_key_output_.resize_discard(log_count);
+    sort_payload_input_.resize_discard(log_count);
+    sort_payload_output_.resize_discard(log_count);
     std::size_t direct_bytes = 0;
     if (direct_count > 0) {
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
@@ -4139,14 +4456,14 @@ private:
           direct_sort_keys_.data(), raw_or_null(scratch_incoming_values_),
           direct_sort_values_.data(), direct_count, 0, 32, stream));
     }
-    std::size_t legacy_bytes = 0;
-    if (legacy_count > 0) {
+    std::size_t log_bytes = 0;
+    if (log_count > 0) {
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, legacy_bytes, raw_or_null(scratch_incoming_keys_),
+          nullptr, log_bytes, raw_or_null(scratch_incoming_keys_),
           sort_key_output_.data(), sort_payload_input_.data(),
-          sort_payload_output_.data(), legacy_count, 0, 32, stream));
+          sort_payload_output_.data(), log_count, 0, 32, stream));
     }
-    ensure_sort_temp(std::max(direct_bytes, legacy_bytes));
+    ensure_sort_temp(std::max(direct_bytes, log_bytes));
   }
 
   // Reserve direct-path buffers before timed updates.
@@ -4294,6 +4611,7 @@ private:
                           cudaStream_t stream) {
     if (entries.empty())
       return;
+    ensure_host_directory_metadata(stream);
     const std::size_t dir_count = h_dir_seg_id_.size();
     const int block = 256;
     std::sort(entries.begin(), entries.end(),
@@ -4380,14 +4698,15 @@ private:
         raw_or_null(seg_slow_seg_id_), raw_or_null(seg_slow_old_live_),
         raw_or_null(seg_slow_inc_count_), raw_or_null(seg_slow_in_begin_),
         residue_count, batch_keys, batch_values, raw_or_null(delta_keys_),
-        raw_or_null(delta_values_), raw_or_null(seg_delta_count_),
-        delta_inc_keys_.data(), delta_inc_values_.data());
+        raw_or_null(delta_values_), raw_or_null(seg_delta_active_),
+        raw_or_null(seg_delta_count_), delta_inc_keys_.data(),
+        delta_inc_values_.data());
     CUDA_CHECK(cudaGetLastError());
     gpulsmopt_detail::delta_reset_kernel<<<
         static_cast<unsigned>(residue_count), block, 0, stream>>>(
         raw_or_null(seg_slow_seg_id_), residue_count,
-        raw_or_null(seg_delta_count_), raw_or_null(seg_delta_prefix_),
-        raw_or_null(delta_dead_));
+        raw_or_null(seg_delta_active_), raw_or_null(seg_delta_count_),
+        raw_or_null(seg_delta_prefix_), raw_or_null(delta_dead_));
     CUDA_CHECK(cudaGetLastError());
     gpulsmopt_detail::ds_gather_old_kernel<<<
         static_cast<unsigned>(residue_count *
@@ -4451,8 +4770,8 @@ private:
       gpulsmopt_detail::delta_reset_kernel<<<
           static_cast<unsigned>(outputs_total), block, 0, stream>>>(
           raw_or_null(seg_d_output_seg_id_), outputs_total,
-          raw_or_null(seg_delta_count_), raw_or_null(seg_delta_prefix_),
-          raw_or_null(delta_dead_));
+          raw_or_null(seg_delta_active_), raw_or_null(seg_delta_count_),
+          raw_or_null(seg_delta_prefix_), raw_or_null(delta_dead_));
       CUDA_CHECK(cudaGetLastError());
       upload_vec(seg_src_out_base_, o_old_live, stream);
       upload_vec(seg_src_seg_id_, o_old_bound, stream);
@@ -4528,10 +4847,107 @@ private:
       recompute_sheet_live_count();
       upload_directory(stream);
     } else {
+      rebuild_direct_bucket_prefixes(raw_or_null(seg_slow_seg_id_),
+                                     absorb_count, stream);
       recompute_sheet_live_count();
       upload_directory_metadata(stream);
     }
     // Repack invalidates bucket routing metadata.
+    flat_route_dirty_ = true;
+  }
+
+  void run_absorb_consolidations_device(
+      const std::uint32_t *ord, const std::uint32_t *batch_begin,
+      const std::uint32_t *batch_end, std::size_t absorb_count,
+      const std::uint32_t *batch_keys, const std::uint32_t *batch_values,
+      std::size_t batch_count, cudaStream_t stream) {
+    if (absorb_count == 0)
+      return;
+    resize_reuse(seg_slow_seg_id_, absorb_count);
+    resize_reuse(seg_slow_old_boundary_, absorb_count);
+    resize_reuse(seg_dirty_live_, absorb_count);
+    resize_reuse(seg_slow_old_live_, absorb_count);
+    resize_reuse(seg_slow_inc_count_, absorb_count);
+    resize_reuse(seg_d_old_offset_, absorb_count);
+    resize_reuse(seg_slow_in_begin_, absorb_count);
+    resize_reuse(seg_slow_in_end_, absorb_count);
+    resize_reuse(seg_d_out_value_sum_, absorb_count);
+    const int block = 256;
+    const int grid =
+        static_cast<int>((absorb_count + block - 1) / block);
+    gpulsmopt_detail::delta_absorb_plan_kernel<<<grid, block, 0, stream>>>(
+        ord, batch_begin, batch_end, raw_or_null(seg_delta_count_),
+        absorb_count, raw_or_null(d_dir_seg_id_),
+        raw_or_null(d_dir_boundary_), raw_or_null(d_dir_live_),
+        raw_or_null(seg_slow_seg_id_), raw_or_null(seg_slow_old_boundary_),
+        raw_or_null(seg_dirty_live_), raw_or_null(seg_slow_old_live_),
+        raw_or_null(seg_slow_inc_count_));
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(raw_or_null(seg_slow_old_live_),
+                       raw_or_null(seg_d_old_offset_), absorb_count, stream);
+    exclusive_scan_u32(raw_or_null(seg_slow_inc_count_),
+                       raw_or_null(seg_slow_in_begin_), absorb_count, stream);
+    gpulsmopt_detail::delta_absorb_offsets_kernel<<<grid, block, 0, stream>>>(
+        raw_or_null(seg_slow_inc_count_), raw_or_null(seg_slow_in_begin_),
+        absorb_count, raw_or_null(seg_slow_in_end_));
+    CUDA_CHECK(cudaGetLastError());
+
+    const std::size_t inc_capacity =
+        batch_count + absorb_count * gpulsmopt_detail::kDeltaCap;
+    const std::size_t old_capacity =
+        absorb_count * gpulsmopt_detail::kSegmentSlots;
+    delta_inc_keys_.resize_discard(std::max<std::size_t>(inc_capacity, 1));
+    delta_inc_values_.resize_discard(std::max<std::size_t>(inc_capacity, 1));
+    seg_old_key_.resize_discard(std::max<std::size_t>(old_capacity, 1));
+    seg_old_value_.resize_discard(std::max<std::size_t>(old_capacity, 1));
+
+    gpulsmopt_detail::delta_inc_merge_kernel<<<
+        static_cast<unsigned>(absorb_count), block, 0, stream>>>(
+        raw_or_null(seg_slow_seg_id_), batch_begin, batch_end,
+        raw_or_null(seg_slow_in_begin_), absorb_count, batch_keys,
+        batch_values, raw_or_null(delta_keys_), raw_or_null(delta_values_),
+        raw_or_null(seg_delta_active_), raw_or_null(seg_delta_count_),
+        delta_inc_keys_.data(), delta_inc_values_.data());
+    CUDA_CHECK(cudaGetLastError());
+    gpulsmopt_detail::delta_reset_kernel<<<
+        static_cast<unsigned>(absorb_count), block, 0, stream>>>(
+        raw_or_null(seg_slow_seg_id_), absorb_count,
+        raw_or_null(seg_delta_active_), raw_or_null(seg_delta_count_),
+        raw_or_null(seg_delta_prefix_), raw_or_null(delta_dead_));
+    CUDA_CHECK(cudaGetLastError());
+    gpulsmopt_detail::ds_gather_old_kernel<<<
+        static_cast<unsigned>(absorb_count *
+                              gpulsmopt_detail::kDsGatherChunks),
+        block, 0, stream>>>(
+        raw_or_null(seg_slow_seg_id_), raw_or_null(seg_d_old_offset_),
+        absorb_count, raw_or_null(pool_keys_), raw_or_null(pool_values_),
+        raw_or_null(seg_bucket_live_), seg_old_key_.data(),
+        seg_old_value_.data());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemsetAsync(raw_or_null(seg_d_out_value_sum_), 0,
+                               absorb_count * sizeof(std::uint32_t), stream));
+    gpulsmopt_detail::ds_absorb_write_kernel<<<
+        static_cast<unsigned>(absorb_count *
+                              gpulsmopt_detail::kDsAbsorbChunks),
+        block, 0, stream>>>(
+        raw_or_null(seg_slow_seg_id_), raw_or_null(seg_slow_old_boundary_),
+        raw_or_null(seg_dirty_live_), raw_or_null(seg_d_old_offset_),
+        raw_or_null(seg_slow_in_begin_), raw_or_null(seg_slow_in_end_),
+        absorb_count, delta_inc_keys_.data(), delta_inc_values_.data(),
+        seg_old_key_.data(), seg_old_value_.data(), raw_or_null(pool_keys_),
+        raw_or_null(pool_values_), raw_or_null(pool_valid_),
+        raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
+        raw_or_null(seg_bucket_value_sum_),
+        raw_or_null(seg_d_out_value_sum_));
+    CUDA_CHECK(cudaGetLastError());
+    rebuild_direct_bucket_prefixes(raw_or_null(seg_slow_seg_id_),
+                                   absorb_count, stream);
+    gpulsmopt_detail::delta_absorb_commit_kernel<<<grid, block, 0, stream>>>(
+        ord, raw_or_null(seg_dirty_live_),
+        raw_or_null(seg_d_out_value_sum_), absorb_count,
+        raw_or_null(d_dir_live_), raw_or_null(d_dir_value_sum_));
+    CUDA_CHECK(cudaGetLastError());
+    host_metadata_dirty_ = true;
     flat_route_dirty_ = true;
   }
 
@@ -4590,96 +5006,82 @@ private:
     const std::size_t dir_count = h_dir_seg_id_.size();
     if (dir_count == 0 || count == 0)
       return;
-    ds_meta_.resize_discard(3 * dir_count + 4);
+    ds_meta_.resize_discard(2);
     ds_slow_list_.resize_discard(dir_count);
     ds_residue_.resize_discard(dir_count);
     ds_base_.resize_discard(2 * dir_count);
-    ds_window_.resize_discard(4 * dir_count);
-    std::uint32_t *counters = ds_meta_.data() + 3 * dir_count;
-    std::uint32_t *append_begin = ds_base_.data();
-    std::uint32_t *append_end = append_begin + dir_count;
-    std::uint32_t *append_slice_sum = ds_window_.data();
-    std::uint32_t *cons_begin = append_slice_sum + dir_count;
-    std::uint32_t *cons_end = cons_begin + dir_count;
-    std::uint32_t *cons_dcount = cons_end + dir_count;
+    ds_window_.resize_discard(3 * dir_count);
+    std::uint32_t *counters = ds_meta_.data();
+    std::uint32_t *absorb_begin = ds_base_.data();
+    std::uint32_t *absorb_end = absorb_begin + dir_count;
+    std::uint32_t *split_begin = ds_window_.data();
+    std::uint32_t *split_end = split_begin + dir_count;
+    std::uint32_t *split_dcount = split_end + dir_count;
 
     const int block = 256;
     std::uint32_t counters_host[2] = {0u, 0u};
-    std::vector<std::uint32_t> h_append_ord(dir_count),
-        h_append_begin(dir_count), h_append_end(dir_count),
-        h_append_sum(dir_count);
-    std::vector<std::uint32_t> h_cons_ord(dir_count), h_cons_begin(dir_count),
-        h_cons_end(dir_count), h_cons_dcount(dir_count);
     {
       GPULSMOPT_PROF_PHASE(prof_delta_ingest_ms_);
       CUDA_CHECK(
-          cudaMemsetAsync(counters, 0, 4 * sizeof(std::uint32_t), stream));
-      const int dir_grid = static_cast<int>((dir_count + block - 1) / block);
-      gpulsmopt_detail::delta_slice_classify_kernel<<<dir_grid, block, 0,
-                                                      stream>>>(
-          sorted_keys, count, raw_or_null(d_dir_boundary_),
-          raw_or_null(d_dir_seg_id_), dir_count,
-          raw_or_null(seg_delta_count_), ds_slow_list_.data(), append_begin,
-          append_end, ds_residue_.data(), cons_begin, cons_end, cons_dcount,
-          counters);
-      CUDA_CHECK(cudaGetLastError());
-      gpulsmopt_detail::delta_merge_append_kernel<<<dir_count, block, 0,
-                                                    stream>>>(
-          ds_slow_list_.data(), append_begin, append_end, counters,
-          raw_or_null(d_dir_seg_id_), sorted_keys, sorted_values,
-          raw_or_null(delta_keys_), raw_or_null(delta_values_),
-          raw_or_null(seg_delta_count_), raw_or_null(seg_delta_fence_),
-          raw_or_null(seg_delta_prefix_), append_slice_sum);
+          cudaMemsetAsync(counters, 0, 2 * sizeof(std::uint32_t), stream));
+      gpulsmopt_detail::delta_ingest_kernel<<<
+          static_cast<unsigned>(dir_count), block, 0, stream>>>(
+          sorted_keys, sorted_values, count, raw_or_null(d_dir_boundary_),
+          raw_or_null(d_dir_seg_id_), dir_count, raw_or_null(delta_keys_),
+          raw_or_null(delta_values_), raw_or_null(delta_dead_),
+          raw_or_null(seg_delta_active_), raw_or_null(seg_delta_count_),
+          raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_prefix_),
+          raw_or_null(d_dir_live_), raw_or_null(d_dir_value_sum_),
+          ds_slow_list_.data(), absorb_begin, absorb_end, ds_residue_.data(),
+          split_begin, split_end, split_dcount, counters);
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaMemcpyAsync(counters_host, counters,
                                  2 * sizeof(std::uint32_t),
                                  cudaMemcpyDeviceToHost, stream));
-      const std::size_t bytes = dir_count * sizeof(std::uint32_t);
-      CUDA_CHECK(cudaMemcpyAsync(h_append_ord.data(), ds_slow_list_.data(),
-                                 bytes, cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_append_begin.data(), append_begin, bytes,
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_append_end.data(), append_end, bytes,
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_append_sum.data(), append_slice_sum, bytes,
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_cons_ord.data(), ds_residue_.data(), bytes,
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_cons_begin.data(), cons_begin, bytes,
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_cons_end.data(), cons_end, bytes,
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(h_cons_dcount.data(), cons_dcount, bytes,
-                                 cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    const std::uint32_t n_append = counters_host[0];
-    const std::uint32_t n_cons = counters_host[1];
-    for (std::uint32_t i = 0; i < n_append; ++i) {
-      const std::uint32_t ord = h_append_ord[i];
-      h_dir_live_[ord] += h_append_end[i] - h_append_begin[i];
-      h_dir_value_sum_[ord] += h_append_sum[i];
+    const std::uint32_t n_absorb = counters_host[0];
+    const std::uint32_t n_split = counters_host[1];
+    host_metadata_dirty_ = true;
+    if (n_absorb > 0) {
+      GPULSMOPT_PROF_PHASE(prof_delta_consolidate_ms_);
+      run_absorb_consolidations_device(
+          ds_slow_list_.data(), absorb_begin, absorb_end, n_absorb, sorted_keys,
+          sorted_values, count, stream);
     }
     overlay_dirty_ = true;
     read_view_dirty_ = true;
 #ifdef GPULSMOPT_PROFILE_INSERT
-    printf("[prof]     scatter: append_segs=%u consolidate_segs=%u "
-           "(incoming=%zu)\n",
-           n_append, n_cons, count);
+    printf("[prof]     scatter: absorb=%u split=%u (incoming=%zu)\n",
+           n_absorb, n_split, count);
 #endif
-    if (n_cons == 0) {
-      recompute_sheet_live_count();
-      upload_directory_metadata(stream);
+    if (n_split > 0) {
+      GPULSMOPT_PROF_PHASE(prof_delta_consolidate_ms_);
+      std::vector<std::uint32_t> h_split_ord(n_split);
+      std::vector<std::uint32_t> h_split_begin(n_split);
+      std::vector<std::uint32_t> h_split_end(n_split);
+      std::vector<std::uint32_t> h_split_dcount(n_split);
+      const std::size_t bytes = n_split * sizeof(std::uint32_t);
+      CUDA_CHECK(cudaMemcpyAsync(h_split_ord.data(), ds_residue_.data(), bytes,
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(h_split_begin.data(), split_begin, bytes,
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(h_split_end.data(), split_end, bytes,
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(h_split_dcount.data(), split_dcount, bytes,
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      std::vector<DeltaConsolidation> entries(n_split);
+      for (std::uint32_t i = 0; i < n_split; ++i) {
+        entries[i] = {h_split_ord[i], h_split_begin[i],
+                      h_split_end[i] - h_split_begin[i],
+                      h_split_dcount[i]};
+      }
+      run_consolidations(entries, sorted_keys, sorted_values, stream);
       return;
     }
-    {
-      GPULSMOPT_PROF_PHASE(prof_delta_consolidate_ms_);
-      std::vector<DeltaConsolidation> entries(n_cons);
-      for (std::uint32_t i = 0; i < n_cons; ++i)
-        entries[i] = {h_cons_ord[i], h_cons_begin[i],
-                      h_cons_end[i] - h_cons_begin[i], h_cons_dcount[i]};
-      run_consolidations(entries, sorted_keys, sorted_values, stream);
-    }
+    sheet_live_count_ += count;
+    rebuild_directory_prefixes_device(stream);
   }
 
   bool try_scatter_sheet_delete(const std::uint32_t *keys_in,
@@ -4693,6 +5095,7 @@ private:
     // Drain overlays before deleting from the Sheet.
     if (c0_log_count_ > 0 || !runs_.empty())
       merge_down(stream);
+    ensure_host_directory_metadata(stream);
     const std::size_t dir_count = h_dir_seg_id_.size();
     const std::size_t total_buckets =
         dir_count * static_cast<std::size_t>(gpulsmopt_detail::kSegmentBuckets);
@@ -4761,16 +5164,18 @@ private:
           static_cast<std::uint32_t>(gpulsmopt_detail::kSegmentBuckets),
           raw_or_null(d_dir_seg_id_),
           raw_or_null(delta_keys_), raw_or_null(delta_values_),
-          raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_count_),
-          raw_or_null(delta_dead_), ds_meta_.data(), ds_slow_list_.data(),
-          live_delta, value_delta, counters);
+          raw_or_null(seg_delta_active_), raw_or_null(seg_delta_fence_),
+          raw_or_null(seg_delta_count_), raw_or_null(delta_dead_),
+          ds_meta_.data(), ds_slow_list_.data(), live_delta, value_delta,
+          counters);
       CUDA_CHECK(cudaGetLastError());
       gpulsmopt_detail::delta_compact_kernel<<<
           static_cast<unsigned>(dir_count), block, 0, stream>>>(
           ds_slow_list_.data(), counters, raw_or_null(d_dir_seg_id_),
           raw_or_null(delta_keys_), raw_or_null(delta_values_),
-          raw_or_null(seg_delta_count_), raw_or_null(seg_delta_fence_),
-          raw_or_null(seg_delta_prefix_), raw_or_null(delta_dead_));
+          raw_or_null(seg_delta_active_), raw_or_null(seg_delta_count_),
+          raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_prefix_),
+          raw_or_null(delta_dead_));
       CUDA_CHECK(cudaGetLastError());
     }
     std::vector<std::uint32_t> meta_host(2 * dir_count + 1);
@@ -4793,6 +5198,7 @@ private:
         sheet_fragmented_ = true;
     }
     recompute_sheet_live_count();
+    rebuild_all_bucket_prefixes(stream);
     upload_directory_metadata(stream);
     overlay_dirty_ = true;
     read_view_dirty_ = true;
@@ -5019,13 +5425,15 @@ private:
       const int grid = static_cast<int>((tomb + block - 1) / block);
       gpulsmopt_detail::sheet_point_values_kernel<<<grid, block, 0, stream>>>(
           raw_or_null(ix.gk) + ins, tomb, raw_or_null(d_dir_boundary_),
-          raw_or_null(d_dir_seg_id_), h_dir_seg_id_.size(),
+          raw_or_null(d_dir_radix_first_), raw_or_null(d_dir_seg_id_),
+          h_dir_seg_id_.size(),
           raw_or_null(pool_keys_), raw_or_null(pool_values_),
           raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
-          raw_or_null(seg_bucket_live_), raw_or_null(delta_keys_),
-          raw_or_null(delta_values_), raw_or_null(seg_delta_fence_),
-          raw_or_null(seg_delta_count_), raw_or_null(tval),
-          raw_or_null(tflag));
+          raw_or_null(seg_bucket_live_),
+          raw_or_null(seg_bucket_live_prefix_), raw_or_null(delta_keys_),
+          raw_or_null(delta_values_), raw_or_null(seg_delta_active_),
+          raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_count_),
+          raw_or_null(tval), raw_or_null(tflag));
       CUDA_CHECK(cudaGetLastError());
       thrust::inclusive_scan(policy, tval.begin(), tval.end(),
                              ix.tomb_val_prefix.begin() + 1);
@@ -5069,6 +5477,7 @@ private:
   void apply_sheet_deletes(std::size_t tomb, cudaStream_t stream) {
     if (tomb == 0 || h_dir_seg_id_.empty())
       return;
+    ensure_host_directory_metadata(stream);
     auto policy = thrust::cuda::par.on(stream);
     resize_reuse(seg_inc_ordinal_, tomb);
     {
@@ -5159,16 +5568,17 @@ private:
           raw_or_null(scratch_delete_keys_), tomb,
           raw_or_null(seg_inc_ordinal_), 1u, raw_or_null(d_dir_seg_id_),
           raw_or_null(delta_keys_), raw_or_null(delta_values_),
-          raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_count_),
-          raw_or_null(delta_dead_), d_ord_flag, ds_slow_list_.data(),
-          d_live_delta, d_value_delta, d_counters);
+          raw_or_null(seg_delta_active_), raw_or_null(seg_delta_fence_),
+          raw_or_null(seg_delta_count_), raw_or_null(delta_dead_), d_ord_flag,
+          ds_slow_list_.data(), d_live_delta, d_value_delta, d_counters);
       CUDA_CHECK(cudaGetLastError());
       gpulsmopt_detail::delta_compact_kernel<<<
           static_cast<unsigned>(dir_count), block, 0, stream>>>(
           ds_slow_list_.data(), d_counters, raw_or_null(d_dir_seg_id_),
           raw_or_null(delta_keys_), raw_or_null(delta_values_),
-          raw_or_null(seg_delta_count_), raw_or_null(seg_delta_fence_),
-          raw_or_null(seg_delta_prefix_), raw_or_null(delta_dead_));
+          raw_or_null(seg_delta_active_), raw_or_null(seg_delta_count_),
+          raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_prefix_),
+          raw_or_null(delta_dead_));
       CUDA_CHECK(cudaGetLastError());
     }
     std::vector<std::uint32_t> delta_meta(2 * dir_count);
@@ -5204,6 +5614,7 @@ private:
     // Bucket deletes invalidate routing metadata.
     flat_route_dirty_ = true;
     recompute_sheet_live_count();
+    rebuild_ordinal_bucket_prefixes(raw_or_null(seg_dirty_ord_), m, stream);
     upload_directory_metadata(stream);
   }
 
@@ -5372,8 +5783,8 @@ private:
         raw_or_null(pool_keys_), raw_or_null(pool_values_),
         raw_or_null(pool_valid_), raw_or_null(seg_bucket_max_),
         raw_or_null(seg_bucket_live_), raw_or_null(delta_keys_),
-        raw_or_null(delta_values_), raw_or_null(seg_delta_fence_),
-        raw_or_null(seg_delta_count_));
+        raw_or_null(delta_values_), raw_or_null(seg_delta_active_),
+        raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_count_));
     CUDA_CHECK(cudaGetLastError());
     if (num_runs > 0) {
       const int block = 256;
@@ -5406,11 +5817,14 @@ private:
       const int grid = static_cast<int>((n + block - 1) / block);
       gpulsmopt_detail::point_lookup_walk_kernel<<<grid, block, 0, stream>>>(
           batch.queries, n, batch.out_values, batch.out_found, nullptr, rk, rv,
-          ro, rc, 0, raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
-          h_dir_seg_id_.size(), raw_or_null(pool_keys_),
+          ro, rc, 0, raw_or_null(d_dir_boundary_),
+          raw_or_null(d_dir_radix_first_), raw_or_null(d_dir_seg_id_),
+          h_dir_seg_id_.size(),
+          raw_or_null(pool_keys_),
           raw_or_null(pool_values_), raw_or_null(pool_valid_),
           raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
-          raw_or_null(delta_keys_), raw_or_null(delta_values_),
+          raw_or_null(seg_bucket_live_prefix_), raw_or_null(delta_keys_),
+          raw_or_null(delta_values_), raw_or_null(seg_delta_active_),
           raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_count_));
       CUDA_CHECK(cudaGetLastError());
       return;
@@ -5441,11 +5855,13 @@ private:
       gpulsmopt_detail::point_lookup_walk_kernel<<<grid, block, 0, stream>>>(
           raw_or_null(lookup_sorted_queries_), n, batch.out_values, batch.out_found,
           raw_or_null(lookup_permutation_), rk, rv, ro, rc, num_runs,
-          raw_or_null(d_dir_boundary_), raw_or_null(d_dir_seg_id_),
-          h_dir_seg_id_.size(), raw_or_null(pool_keys_),
+          raw_or_null(d_dir_boundary_), raw_or_null(d_dir_radix_first_),
+          raw_or_null(d_dir_seg_id_), h_dir_seg_id_.size(),
+          raw_or_null(pool_keys_),
           raw_or_null(pool_values_), raw_or_null(pool_valid_),
           raw_or_null(seg_bucket_max_), raw_or_null(seg_bucket_live_),
-          raw_or_null(delta_keys_), raw_or_null(delta_values_),
+          raw_or_null(seg_bucket_live_prefix_), raw_or_null(delta_keys_),
+          raw_or_null(delta_values_), raw_or_null(seg_delta_active_),
           raw_or_null(seg_delta_fence_), raw_or_null(seg_delta_count_));
       CUDA_CHECK(cudaGetLastError());
     }
@@ -5513,8 +5929,11 @@ private:
   thrust::device_vector<std::uint32_t> seg_bucket_max_;
   thrust::device_vector<std::uint32_t> seg_bucket_live_;
   thrust::device_vector<std::uint32_t> seg_bucket_value_sum_;
+  thrust::device_vector<std::uint32_t> seg_bucket_live_prefix_;
+  thrust::device_vector<std::uint32_t> seg_bucket_value_prefix_;
   thrust::device_vector<std::uint32_t> delta_keys_;
   thrust::device_vector<std::uint32_t> delta_values_;
+  thrust::device_vector<std::uint8_t> seg_delta_active_;
   thrust::device_vector<std::uint32_t> seg_delta_count_;
   thrust::device_vector<std::uint32_t> seg_delta_fence_;
   thrust::device_vector<std::uint32_t> seg_delta_prefix_;
@@ -5524,13 +5943,14 @@ private:
   std::vector<std::uint32_t> h_dir_boundary_;
   std::vector<std::uint32_t> h_dir_live_;
   std::vector<std::uint32_t> h_dir_value_sum_;
-  std::vector<std::uint32_t> dir_prefix_host_;
-  std::vector<std::uint32_t> dir_value_prefix_host_;
   thrust::device_vector<std::uint32_t> d_dir_seg_id_;
   thrust::device_vector<std::uint32_t> d_dir_boundary_;
+  thrust::device_vector<std::uint32_t> d_dir_live_;
   thrust::device_vector<std::uint32_t> d_dir_prefix_;
   thrust::device_vector<std::uint32_t> d_dir_value_sum_;
   thrust::device_vector<std::uint32_t> d_dir_value_prefix_;
+  thrust::device_vector<std::uint32_t> d_dir_radix_first_;
+  bool host_metadata_dirty_ = false;
 
   thrust::device_vector<std::uint32_t> scratch_incoming_keys_;
   thrust::device_vector<std::uint32_t> scratch_incoming_values_;
