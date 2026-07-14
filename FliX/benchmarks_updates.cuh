@@ -1546,40 +1546,6 @@ void benchmark_updates(
 
                 if constexpr (supports_updates)
                 {
-                    // Warm up the kernels with a dummy insert to ensure fair timing for the first real update batch
-                    if (step == 1 )  
-                    {
-                        std::cerr << "Performing Dummy Insert Round\n";
-                        size_t dummy_insert_size = 10; // 2000;
-                        if (dummy_insert_size > active_range_end - active_range_start)
-                        {
-                            dummy_insert_size = active_range_end - active_range_start; // Ensure we don't exceed available keys
-                        }
-                        std::vector<key_type> dummy_inserts(
-                            generated_keys.begin(),
-                            generated_keys.begin() + dummy_insert_size);
-
-                        std::vector<smallsize> dummy_offsets(dummy_insert_size);
-                        std::iota(dummy_offsets.begin(), dummy_offsets.end(), 0);
-
-                        // unsorted dummy insert batch (pre-sort disabled):
-                        // auto sort_perm_dum = sort_permutation(dummy_inserts, std::less<key_type>());
-                        // apply_permutation(dummy_inserts, sort_perm_dum);
-                        // apply_permutation(dummy_offsets, sort_perm_dum);
-
-                        insert_delete_keys_buffer.upload(dummy_inserts.data(), dummy_insert_size);
-                        insert_offsets_buffer.upload(dummy_offsets.data(), dummy_insert_size);
-
-                        std::cerr << "Dummy insert size: " << dummy_insert_size << std::endl;
-                        // NOTE Should be SORTING the DUMMY LISTS but it does not matter All keys already exist
-                        //  timer.start();
-                        index.insert(insert_delete_keys_buffer.ptr(), insert_offsets_buffer.ptr(), dummy_insert_size, 0);
-                        // index.insert(nullptr, nullptr, dummy_insert_size, 0);
-                        // timer.stop();
-                        cudaDeviceSynchronize();
-                        CUERR
-                    }
-
 #ifdef COMBINE_INSERT_DELETE
                     // insert the next batch
                     if (do_insert)

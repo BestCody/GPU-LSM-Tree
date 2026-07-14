@@ -53,27 +53,27 @@ namespace gpulsmopt_detail {
 #define GPULSMOPT_SEGMENT_BUCKETS 256
 #endif
 #ifndef GPULSMOPT_TARGET_FILL
-#define GPULSMOPT_TARGET_FILL 19
+#define GPULSMOPT_TARGET_FILL 17
 #endif
 #ifndef GPULSMOPT_INPLACE_MAX_INCOMING
 #define GPULSMOPT_INPLACE_MAX_INCOMING 1024
 #endif
 #ifndef GPULSMOPT_C0_FLUSH_BUDGET
-#define GPULSMOPT_C0_FLUSH_BUDGET (1 << 18)
+#define GPULSMOPT_C0_FLUSH_BUDGET (1 << 19)
 #endif
 #ifndef GPULSMOPT_LOOKUP_FLIX_MIN_BATCH
 #define GPULSMOPT_LOOKUP_FLIX_MIN_BATCH (1 << 22)
 #endif
 // Large batches bypass C0 and enter the Sheet.
 #ifndef GPULSMOPT_SCATTER_MIN_BATCH
-#define GPULSMOPT_SCATTER_MIN_BATCH (1 << 20)
+#define GPULSMOPT_SCATTER_MIN_BATCH (1 << 18)
 #endif
 // Maximum sorted delta entries per segment.
 #ifndef GPULSMOPT_DELTA_CAP
-#define GPULSMOPT_DELTA_CAP 2048
+#define GPULSMOPT_DELTA_CAP 4096
 #endif
 #ifndef GPULSMOPT_DELTA_CAP_JITTER
-#define GPULSMOPT_DELTA_CAP_JITTER 768
+#define GPULSMOPT_DELTA_CAP_JITTER 1024
 #endif
 #ifndef GPULSMOPT_SPLIT_FILL
 #define GPULSMOPT_SPLIT_FILL 32
@@ -3371,10 +3371,7 @@ public:
     merge_incoming_into_sheet(raw_or_null(scratch_incoming_keys_),
                               raw_or_null(scratch_incoming_values_), n,
                               stream);
-    const std::size_t direct_count =
-        std::min(max_elements_, 4 * c0_flush_budget());
-    prepare_sort_storage(direct_count, c0_flush_budget(), stream);
-    prepare_scatter_storage();
+    prepare_for_insert(stream);
     overlay_dirty_ = true;
     read_view_dirty_ = true;
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -4706,6 +4703,32 @@ private:
     run_buffer_pool_.push_back(std::move(run));
   }
 
+  void reserve_run_storage(std::size_t count) {
+    SortedRun run;
+    run.keys.resize(count);
+    run.values.resize(count);
+    run.ops.resize(count);
+    release_run_storage(std::move(run));
+  }
+
+  void prepare_run_storage() {
+    if (!runs_.empty() || !run_buffer_pool_.empty())
+      return;
+    const std::size_t budget = c0_flush_budget();
+    const std::size_t limit = std::min(max_elements_, 4 * budget);
+    run_buffer_pool_.reserve(5);
+    if (budget <= limit) {
+      reserve_run_storage(budget);
+      reserve_run_storage(budget);
+    }
+    if (2 * budget <= limit) {
+      reserve_run_storage(2 * budget);
+      reserve_run_storage(2 * budget);
+    }
+    if (4 * budget <= limit)
+      reserve_run_storage(4 * budget);
+  }
+
   void recycle_active_runs() {
     for (auto &run : runs_)
       release_run_storage(std::move(run));
@@ -4802,6 +4825,15 @@ private:
     resize_reuse(seg_src_out_base_, dir_count);
     resize_reuse(seg_src_seg_id_, dir_count);
     prepare_absorb_kernel();
+  }
+
+  void prepare_for_insert(cudaStream_t stream) {
+    const std::size_t direct_count = std::min(
+        max_elements_, std::max(4 * c0_flush_budget(), batch_size_));
+    ensure_c0_log(stream);
+    prepare_sort_storage(direct_count, c0_flush_budget(), stream);
+    prepare_scatter_storage();
+    prepare_run_storage();
   }
 
   static constexpr std::size_t absorb_shared_bytes() {

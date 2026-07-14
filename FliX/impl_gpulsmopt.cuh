@@ -40,6 +40,17 @@
 
 namespace gpulsmopt_adapter_detail {
 
+constexpr size_t batch_size_hint() {
+  size_t hint = static_cast<size_t>(GPULSMOPT_BATCH_SIZE);
+#ifdef UPDATE_INSERT_BATCH_LOG
+  hint = std::max(hint, size_t{1} << UPDATE_INSERT_BATCH_LOG);
+#endif
+#ifdef UPDATE_DELETE_BATCH_LOG
+  hint = std::max(hint, size_t{1} << UPDATE_DELETE_BATCH_LOG);
+#endif
+  return hint;
+}
+
 inline void check_cuda(cudaError_t err) {
   if (err != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(err));
@@ -153,7 +164,7 @@ public:
   static parameters_type parameters() {
     return {
         {"batch_size",
-         std::to_string(static_cast<size_t>(GPULSMOPT_BATCH_SIZE))},
+         std::to_string(gpulsmopt_adapter_detail::batch_size_hint())},
         {"segment_buckets",
          std::to_string(static_cast<size_t>(GPULSMOPT_SEGMENT_BUCKETS))},
         {"target_fill",
@@ -195,7 +206,7 @@ public:
     build_values_buffer_.resize(size);
 
     const size_t configured_batch_size =
-        static_cast<size_t>(GPULSMOPT_BATCH_SIZE);
+        gpulsmopt_adapter_detail::batch_size_hint();
     const size_t config_batch_size = std::max<size_t>(
         1, std::min(configured_max_size == 0 ? size : configured_max_size,
                     configured_batch_size));
