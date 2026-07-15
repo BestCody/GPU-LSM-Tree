@@ -1412,12 +1412,34 @@ public:
     bound_epoch_views_.resize(gpulsmopt_detail::kEpochMax);
     bound_epoch_view_valid_.resize(gpulsmopt_detail::kEpochMax);
     epoch_metadata_graphs_.resize(gpulsmopt_detail::kEpochMax);
+    try {
+      CUDA_CHECK(cudaMallocHost(
+          reinterpret_cast<void **>(&epoch_removed_host_),
+          (gpulsmopt_detail::kEpochMax + 1) * sizeof(std::uint32_t)));
+      CUDA_CHECK(cudaEventCreateWithFlags(
+          &epoch_delete_ready_, cudaEventDisableTiming));
+    } catch (...) {
+      if (epoch_delete_ready_)
+        cudaEventDestroy(epoch_delete_ready_);
+      if (epoch_removed_host_)
+        cudaFreeHost(epoch_removed_host_);
+      throw;
+    }
   }
 
-  ~GPULSMOpt() { destroy_epoch_metadata_graphs(); }
+  ~GPULSMOpt() {
+    if (epoch_delete_pending_ && epoch_delete_ready_)
+      cudaEventSynchronize(epoch_delete_ready_);
+    destroy_epoch_metadata_graphs();
+    if (epoch_delete_ready_)
+      cudaEventDestroy(epoch_delete_ready_);
+    if (epoch_removed_host_)
+      cudaFreeHost(epoch_removed_host_);
+  }
 
   void clear(cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+    reap_pending_deletes(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     clear_epoch_state();
     clear_spine_state();
@@ -1432,6 +1454,7 @@ public:
       return;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+      reap_pending_deletes(stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       reset_insert_prof_();
       const auto prof_t0 = std::chrono::high_resolution_clock::now();
@@ -1484,6 +1507,7 @@ public:
       return;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+      reap_pending_deletes(stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       reset_insert_prof_();
       const auto prof_t0 = std::chrono::high_resolution_clock::now();
@@ -1511,11 +1535,18 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
                                                    std::defer_lock);
+    if (epoch_delete_pending_) {
+      guard.unlock();
+      exclusive.lock();
+      reap_pending_deletes(stream);
+    }
     const bool has_overlay = c0_log_count_ != 0 || !runs_.empty();
     if (!spine_micro_ready_ || epoch_heavy_pending() ||
         (has_overlay && overlay_dirty_)) {
-      guard.unlock();
-      exclusive.lock();
+      if (!exclusive.owns_lock()) {
+        guard.unlock();
+        exclusive.lock();
+      }
       ensure_spine_microdirectory(stream);
       ensure_epoch_heavy_sorted(stream);
       if (has_overlay)
@@ -1530,6 +1561,11 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
                                                    std::defer_lock);
+    if (epoch_delete_pending_) {
+      guard.unlock();
+      exclusive.lock();
+      reap_pending_deletes(stream);
+    }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const bool overlay_pending =
         !no_overlay &&
@@ -1538,8 +1574,10 @@ public:
         epoch_count_prefix_pending() ||
         (spine_has_dead_ && !spine_dead_count_prefix_ready_) ||
         overlay_pending) {
-      guard.unlock();
-      exclusive.lock();
+      if (!exclusive.owns_lock()) {
+        guard.unlock();
+        exclusive.lock();
+      }
       ensure_spine_microdirectory(stream);
       ensure_epoch_heavy_sorted(stream);
       ensure_epoch_count_prefixes(stream);
@@ -1574,14 +1612,21 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
                                                    std::defer_lock);
+    if (epoch_delete_pending_) {
+      guard.unlock();
+      exclusive.lock();
+      reap_pending_deletes(stream);
+    }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const bool overlay_pending =
         !no_overlay &&
         (overlay_dirty_ || !cached_overlay_.successor_ready);
     if (!spine_micro_ready_ || epoch_heavy_pending() ||
         epoch_bitmap_pending() || overlay_pending) {
-      guard.unlock();
-      exclusive.lock();
+      if (!exclusive.owns_lock()) {
+        guard.unlock();
+        exclusive.lock();
+      }
       ensure_spine_microdirectory(stream);
       ensure_epoch_heavy_sorted(stream);
       ensure_epoch_bitmaps(stream);
@@ -1614,6 +1659,11 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
                                                    std::defer_lock);
+    if (epoch_delete_pending_) {
+      guard.unlock();
+      exclusive.lock();
+      reap_pending_deletes(stream);
+    }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const bool overlay_pending =
         !no_overlay &&
@@ -1626,8 +1676,10 @@ public:
          (!spine_dead_value_prefix_ready_ ||
           (batch.out_counts && !spine_dead_count_prefix_ready_))) ||
         overlay_pending) {
-      guard.unlock();
-      exclusive.lock();
+      if (!exclusive.owns_lock()) {
+        guard.unlock();
+        exclusive.lock();
+      }
       ensure_spine_microdirectory(stream);
       ensure_epoch_heavy_sorted(stream);
       ensure_epoch_value_prefixes(stream);
@@ -1670,6 +1722,7 @@ public:
 
   void consolidate(cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+    reap_pending_deletes(stream);
     merge_down(stream);
     consolidate_all_epochs(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1680,6 +1733,7 @@ public:
     if (n == 0)
       return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+    reap_pending_deletes(stream);
     sort_direct_batch(keys, values, n, stream);
     std::swap(spine_keys_, direct_sort_keys_);
     std::swap(spine_values_, direct_sort_values_);
@@ -1693,8 +1747,14 @@ public:
   }
 
   std::size_t live_count() const {
-    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    return live_count_;
+    auto *self = const_cast<GPULSMOpt *>(this);
+    std::unique_lock<std::shared_mutex> guard(self->snapshot_mutex_);
+    if (self->epoch_delete_pending_) {
+      const cudaStream_t stream = self->epoch_delete_stream_;
+      self->reap_pending_deletes(stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    return self->live_count_;
   }
 
   std::size_t gpu_resident_bytes() const {
@@ -2334,6 +2394,7 @@ private:
                            bool keys_sorted, cudaStream_t stream) {
     if (count == 0)
       return;
+    reap_pending_deletes(stream);
     if (!epochs_.empty()) {
       ensure_epoch_heavy_sorted(stream);
       ensure_epoch_bitmaps(stream);
@@ -2367,17 +2428,22 @@ private:
         spine_dead_count_sum_.data(), spine_dead_value_sum_.data(),
         raw_or_null(epoch_removed_) + ecount);
     CUDA_CHECK(cudaGetLastError());
-    epoch_removed_host_.resize(ecount + 1);
-    CUDA_CHECK(cudaMemcpyAsync(epoch_removed_host_.data(),
+    CUDA_CHECK(cudaMemcpyAsync(epoch_removed_host_,
                                raw_or_null(epoch_removed_),
                                (ecount + 1) * sizeof(std::uint32_t),
                                cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaEventRecord(epoch_delete_ready_, stream));
+    epoch_delete_epoch_count_ = ecount;
+    epoch_delete_stream_ = stream;
+    epoch_delete_pending_ = true;
   }
 
-  void finish_epoch_deletes(cudaStream_t stream) {
-    const std::uint32_t spine_removed = epoch_removed_host_.back();
+  void finish_epoch_deletes(cudaStream_t stream, std::size_t ecount) {
+    if (ecount != epochs_.size())
+      throw std::runtime_error("epoch state changed during delete");
+    const std::uint32_t spine_removed = epoch_removed_host_[ecount];
     bool epochs_changed = false;
-    for (std::size_t i = 0; i < epochs_.size(); ++i) {
+    for (std::size_t i = 0; i < ecount; ++i) {
       if (epoch_removed_host_[i] == 0)
         continue;
       epochs_changed = true;
@@ -2414,6 +2480,22 @@ private:
     }
     if (epochs_changed)
       refresh_active_epoch_views(stream);
+  }
+
+  void reap_pending_deletes(cudaStream_t stream) {
+    if (!epoch_delete_pending_)
+      return;
+    const cudaError_t status = cudaEventQuery(epoch_delete_ready_);
+    if (status == cudaErrorNotReady) {
+      CUDA_CHECK(cudaEventSynchronize(epoch_delete_ready_));
+    } else {
+      CUDA_CHECK(status);
+    }
+    finish_epoch_deletes(stream, epoch_delete_epoch_count_);
+    recompute_live_count();
+    epoch_delete_pending_ = false;
+    epoch_delete_epoch_count_ = 0;
+    epoch_delete_stream_ = nullptr;
   }
 
   void acquire_epoch_slot() {
@@ -2457,7 +2539,6 @@ private:
       epoch.heavy_count.resize_discard(1);
     }
     resize_reuse(epoch_removed_, gpulsmopt_detail::kEpochMax + 1);
-    epoch_removed_host_.resize(gpulsmopt_detail::kEpochMax + 1);
     epoch_quotient_counts_.resize_discard(
         gpulsmopt_detail::kEpochQuotients);
     epoch_quotient_offsets_.resize_discard(
@@ -2475,7 +2556,6 @@ private:
       epoch_pool_.push_back(std::move(epoch));
     epochs_.clear();
     epoch_removed_.clear();
-    epoch_removed_host_.clear();
   }
 
   void recompute_live_count() {
@@ -3148,9 +3228,6 @@ private:
     if (c0_log_count_ > 0 || !runs_.empty())
       merge_down(stream);
     begin_epoch_deletes(keys, count, sorted, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    finish_epoch_deletes(stream);
-    recompute_live_count();
     invalidate_overlay_derivatives();
     return true;
   }
@@ -3578,9 +3655,7 @@ private:
     if (count == 0)
       return;
     begin_epoch_deletes(keys, count, true, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    finish_epoch_deletes(stream);
-    recompute_live_count();
+    reap_pending_deletes(stream);
   }
 
   void merge_down(cudaStream_t stream) {
@@ -3712,7 +3787,11 @@ private:
   std::vector<std::uint8_t> bound_epoch_view_valid_;
   std::vector<EpochMetadataGraph> epoch_metadata_graphs_;
   thrust::device_vector<std::uint32_t> epoch_removed_;
-  std::vector<std::uint32_t> epoch_removed_host_;
+  std::uint32_t *epoch_removed_host_ = nullptr;
+  cudaEvent_t epoch_delete_ready_ = nullptr;
+  cudaStream_t epoch_delete_stream_ = nullptr;
+  std::size_t epoch_delete_epoch_count_ = 0;
+  bool epoch_delete_pending_ = false;
 
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_values_;
