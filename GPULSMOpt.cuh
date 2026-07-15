@@ -107,6 +107,7 @@ constexpr int kEpochQuotientBits = 16;
 constexpr int kEpochSubgroupBits = 4;
 constexpr int kEpochQuotients = 1 << kEpochQuotientBits;
 constexpr int kEpochSubgroups = 1 << kEpochSubgroupBits;
+constexpr int kEpochSubgroupPlanes = kEpochSubgroupBits;
 constexpr int kEpochHeavySortCap = 128;
 constexpr int kEpochQuotientBitmapWords = kEpochQuotients / 32;
 static_assert(GPULSMOPT_SEGMENT_BUCKETS == 256,
@@ -349,8 +350,14 @@ __device__ inline bool epoch_point_position(
     const std::uint32_t subgroup =
         (key >> (kEpochQuotientBits - kEpochSubgroupBits)) &
         (kEpochSubgroups - 1);
-    std::uint32_t mask =
-        ev.subgroup_masks[quotient * kEpochSubgroups + subgroup];
+    const std::uint32_t valid =
+        count == 32u ? 0xffffffffu : ((1u << count) - 1u);
+    const std::uint32_t *planes =
+        ev.subgroup_masks + quotient * kEpochSubgroupPlanes;
+    std::uint32_t mask = valid;
+#pragma unroll
+    for (int bit = 0; bit < kEpochSubgroupBits; ++bit)
+      mask &= ((subgroup >> bit) & 1u) ? planes[bit] : ~planes[bit];
     while (mask != 0u) {
       const std::uint32_t bit = __ffs(mask) - 1;
       const std::uint32_t p = begin + bit;
@@ -1975,7 +1982,10 @@ __global__ void epoch_quotient_meta_kernel(
   const std::uint32_t begin = offsets[quotient];
   const std::uint32_t end = offsets[quotient + 1];
   const std::uint32_t count = end - begin;
-  std::uint32_t masks[kEpochSubgroups] = {};
+  std::uint32_t plane0 = 0u;
+  std::uint32_t plane1 = 0u;
+  std::uint32_t plane2 = 0u;
+  std::uint32_t plane3 = 0u;
   std::uint32_t sum = 0u;
   for (std::uint32_t p = begin; p < end; ++p) {
     sum += values[p];
@@ -1983,13 +1993,19 @@ __global__ void epoch_quotient_meta_kernel(
       const std::uint32_t subgroup =
           (keys[p] >> (kEpochQuotientBits - kEpochSubgroupBits)) &
           (kEpochSubgroups - 1);
-      masks[subgroup] |= 1u << (p - begin);
+      const std::uint32_t position = 1u << (p - begin);
+      plane0 |= (0u - ((subgroup >> 0) & 1u)) & position;
+      plane1 |= (0u - ((subgroup >> 1) & 1u)) & position;
+      plane2 |= (0u - ((subgroup >> 2) & 1u)) & position;
+      plane3 |= (0u - ((subgroup >> 3) & 1u)) & position;
     }
   }
   if (count <= 32u) {
-#pragma unroll
-    for (int subgroup = 0; subgroup < kEpochSubgroups; ++subgroup)
-      subgroup_masks[quotient * kEpochSubgroups + subgroup] = masks[subgroup];
+    const std::uint32_t base = quotient * kEpochSubgroupPlanes;
+    subgroup_masks[base + 0] = plane0;
+    subgroup_masks[base + 1] = plane1;
+    subgroup_masks[base + 2] = plane2;
+    subgroup_masks[base + 3] = plane3;
   }
   if (count > 32u) {
     if (count <= kEpochHeavySortCap)
@@ -2918,8 +2934,14 @@ public:
     initialize_segmented_storage(0);
     epoch_views_.resize(gpulsmopt_detail::kEpochMax);
     epoch_dead_ptrs_.resize(gpulsmopt_detail::kEpochMax);
+    bound_epoch_views_.resize(gpulsmopt_detail::kEpochMax);
+    bound_epoch_dead_ptrs_.resize(gpulsmopt_detail::kEpochMax);
+    bound_epoch_view_valid_.resize(gpulsmopt_detail::kEpochMax);
+    epoch_metadata_graphs_.resize(gpulsmopt_detail::kEpochMax);
     CUDA_CHECK(cudaStreamSynchronize(0));
   }
+
+  ~GPULSMOpt() { destroy_epoch_metadata_graphs(); }
 
   void clear(cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
@@ -3255,8 +3277,19 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_bitmap;
     std::size_t count = 0;
     std::size_t live_count = 0;
+    std::size_t slot_id = std::numeric_limits<std::size_t>::max();
     bool has_dead = false;
     bool dead_initialized = false;
+  };
+
+  struct EpochMetadataGraph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    gpulsmopt_detail::EpochView view{};
+    const std::uint32_t *heavy_list = nullptr;
+    const std::uint32_t *heavy_count = nullptr;
+    const std::uint8_t *temp_storage = nullptr;
+    std::size_t count = 0;
   };
 
   const gpulsmopt_detail::EpochView *epoch_view_ptr() const {
@@ -3279,36 +3312,79 @@ private:
             epoch.has_dead ? 1u : 0u};
   }
 
+  static bool same_epoch_view(const gpulsmopt_detail::EpochView &a,
+                              const gpulsmopt_detail::EpochView &b) {
+    return a.keys == b.keys && a.values == b.values && a.dead == b.dead &&
+           a.quotient_off == b.quotient_off &&
+           a.subgroup_masks == b.subgroup_masks &&
+           a.quotient_live == b.quotient_live &&
+           a.quotient_value_sum == b.quotient_value_sum &&
+           a.quotient_count_prefix == b.quotient_count_prefix &&
+           a.quotient_value_prefix == b.quotient_value_prefix &&
+           a.quotient_bitmap == b.quotient_bitmap &&
+           a.has_dead == b.has_dead;
+  }
+
+  void upload_epoch_view(std::size_t index,
+                         const gpulsmopt_detail::EpochView &view,
+                         std::uint8_t *dead, cudaStream_t stream) {
+    bound_epoch_views_[index] = view;
+    bound_epoch_dead_ptrs_[index] = dead;
+    bound_epoch_view_valid_[index] = 1u;
+    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_views_) + index,
+                               bound_epoch_views_.data() + index,
+                               sizeof(view), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_dead_ptrs_) + index,
+                               bound_epoch_dead_ptrs_.data() + index,
+                               sizeof(dead), cudaMemcpyHostToDevice, stream));
+  }
+
   void append_epoch_view(EpochStorage &epoch, cudaStream_t stream) {
     const std::size_t index = epochs_.size() - 1;
     const gpulsmopt_detail::EpochView view = make_epoch_view(epoch);
     std::uint8_t *dead = epoch.dead.data();
-    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_views_) + index, &view,
-                               sizeof(view), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_dead_ptrs_) + index, &dead,
-                               sizeof(dead), cudaMemcpyHostToDevice, stream));
+    if (bound_epoch_view_valid_[index] &&
+        same_epoch_view(bound_epoch_views_[index], view) &&
+        bound_epoch_dead_ptrs_[index] == dead)
+      return;
+    upload_epoch_view(index, view, dead, stream);
+  }
+
+  void prebind_epoch_views(cudaStream_t stream) {
+    std::size_t index = 0;
+    for (auto &epoch : epochs_) {
+      bound_epoch_views_[index] = make_epoch_view(epoch);
+      bound_epoch_dead_ptrs_[index] = epoch.dead.data();
+      bound_epoch_view_valid_[index] = 1u;
+      ++index;
+    }
+    for (auto it = epoch_pool_.rbegin(); it != epoch_pool_.rend(); ++it) {
+      auto view = make_epoch_view(*it);
+      view.has_dead = 0u;
+      bound_epoch_views_[index] = view;
+      bound_epoch_dead_ptrs_[index] = it->dead.data();
+      bound_epoch_view_valid_[index] = 1u;
+      ++index;
+    }
+    std::fill(bound_epoch_view_valid_.begin() + index,
+              bound_epoch_view_valid_.end(), 0u);
+    if (index == 0)
+      return;
+    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_views_),
+                               bound_epoch_views_.data(),
+                               index * sizeof(bound_epoch_views_[0]),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_dead_ptrs_),
+                               bound_epoch_dead_ptrs_.data(),
+                               index * sizeof(bound_epoch_dead_ptrs_[0]),
+                               cudaMemcpyHostToDevice, stream));
   }
 
   void refresh_epoch_views(cudaStream_t stream) {
-    std::vector<gpulsmopt_detail::EpochView> views;
-    std::vector<std::uint8_t *> dead;
-    views.reserve(epochs_.size());
-    dead.reserve(epochs_.size());
-    for (auto &epoch : epochs_) {
-      views.push_back(make_epoch_view(epoch));
-      dead.push_back(epoch.dead.data());
-    }
-    if (!views.empty()) {
-      CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_views_), views.data(),
-                                 views.size() * sizeof(views[0]),
-                                 cudaMemcpyHostToDevice, stream));
-      CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_dead_ptrs_), dead.data(),
-                                 dead.size() * sizeof(dead[0]),
-                                 cudaMemcpyHostToDevice, stream));
-    }
+    prebind_epoch_views(stream);
   }
 
-  void commit_epoch_metadata(EpochStorage &epoch, cudaStream_t stream) {
+  void prepare_epoch_metadata_storage(EpochStorage &epoch) {
     epoch.has_dead = false;
     epoch.dead_initialized = false;
     epoch.dead.resize_discard(epoch.count);
@@ -3317,7 +3393,7 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1);
     epoch.subgroup_masks.resize_discard(
         gpulsmopt_detail::kEpochQuotients *
-        gpulsmopt_detail::kEpochSubgroups);
+        gpulsmopt_detail::kEpochSubgroupPlanes);
     epoch.quotient_live.resize_discard(
         gpulsmopt_detail::kEpochQuotients);
     epoch.quotient_value_sum.resize_discard(
@@ -3330,6 +3406,10 @@ private:
         gpulsmopt_detail::kEpochQuotientBitmapWords);
     epoch_heavy_list_.resize_discard(gpulsmopt_detail::kEpochQuotients);
     epoch_heavy_count_.resize_discard(1);
+  }
+
+  void launch_epoch_metadata_kernels(EpochStorage &epoch, std::size_t count,
+                                     cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(epoch_heavy_count_.data(), 0,
                                sizeof(std::uint32_t), stream));
     constexpr int block = 256;
@@ -3339,7 +3419,7 @@ private:
         (gpulsmopt_detail::kEpochQuotients + 1 + block - 1) / block;
     gpulsmopt_detail::epoch_quotient_offsets_kernel<<<offset_grid, block, 0,
                                                       stream>>>(
-        epoch.keys.data(), static_cast<std::uint32_t>(epoch.count),
+        epoch.keys.data(), static_cast<std::uint32_t>(count),
         epoch.quotient_off.data());
     gpulsmopt_detail::epoch_quotient_meta_kernel<<<quotient_grid, block, 0,
                                                    stream>>>(
@@ -3356,6 +3436,93 @@ private:
                        epoch.quotient_value_prefix.data(),
                        gpulsmopt_detail::kEpochQuotients, stream);
     CUDA_CHECK(cudaGetLastError());
+  }
+
+  bool metadata_graph_matches(const EpochMetadataGraph &state,
+                              EpochStorage &epoch,
+                              std::size_t count) {
+    auto view = make_epoch_view(epoch);
+    view.has_dead = 0u;
+    return state.executable != nullptr && state.count == count &&
+           same_epoch_view(state.view, view) &&
+           state.heavy_list == epoch_heavy_list_.data() &&
+           state.heavy_count == epoch_heavy_count_.data() &&
+           state.temp_storage == sort_temp_storage_.data();
+  }
+
+  void destroy_epoch_metadata_graph(EpochMetadataGraph &state) noexcept {
+    if (state.executable)
+      cudaGraphExecDestroy(state.executable);
+    if (state.graph)
+      cudaGraphDestroy(state.graph);
+    state = {};
+  }
+
+  void destroy_epoch_metadata_graphs() noexcept {
+    for (auto &state : epoch_metadata_graphs_)
+      destroy_epoch_metadata_graph(state);
+  }
+
+  void capture_epoch_metadata_graph(EpochStorage &epoch, std::size_t count,
+                                    cudaStream_t stream) {
+    if (epoch.slot_id >= epoch_metadata_graphs_.size())
+      return;
+    EpochMetadataGraph &state = epoch_metadata_graphs_[epoch.slot_id];
+    destroy_epoch_metadata_graph(state);
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    launch_epoch_metadata_kernels(epoch, count, stream);
+    cudaGraph_t graph = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    cudaGraphExec_t executable = nullptr;
+    const cudaError_t status =
+        cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0);
+    if (status != cudaSuccess) {
+      cudaGraphDestroy(graph);
+      CUDA_CHECK(status);
+    }
+    state.graph = graph;
+    state.executable = executable;
+    state.view = make_epoch_view(epoch);
+    state.view.has_dead = 0u;
+    state.heavy_list = epoch_heavy_list_.data();
+    state.heavy_count = epoch_heavy_count_.data();
+    state.temp_storage = sort_temp_storage_.data();
+    state.count = count;
+  }
+
+  void prepare_epoch_metadata_graphs(std::size_t count) {
+    if (count < static_cast<std::size_t>(GPULSMOPT_SCATTER_MIN_BATCH) ||
+        count > std::numeric_limits<std::uint32_t>::max())
+      return;
+    cudaStream_t capture_stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&capture_stream,
+                                          cudaStreamNonBlocking));
+    try {
+      for (auto &epoch : epochs_)
+        capture_epoch_metadata_graph(epoch, count, capture_stream);
+      for (auto &epoch : epoch_pool_)
+        capture_epoch_metadata_graph(epoch, count, capture_stream);
+    } catch (...) {
+      cudaStreamDestroy(capture_stream);
+      throw;
+    }
+    CUDA_CHECK(cudaStreamDestroy(capture_stream));
+  }
+
+  bool launch_epoch_metadata_graph(EpochStorage &epoch, cudaStream_t stream) {
+    if (epoch.slot_id >= epoch_metadata_graphs_.size())
+      return false;
+    EpochMetadataGraph &state = epoch_metadata_graphs_[epoch.slot_id];
+    if (!metadata_graph_matches(state, epoch, epoch.count))
+      return false;
+    CUDA_CHECK(cudaGraphLaunch(state.executable, stream));
+    return true;
+  }
+
+  void commit_epoch_metadata(EpochStorage &epoch, cudaStream_t stream) {
+    prepare_epoch_metadata_storage(epoch);
+    if (!launch_epoch_metadata_graph(epoch, stream))
+      launch_epoch_metadata_kernels(epoch, epoch.count, stream);
     append_epoch_view(epoch, stream);
     sheet_live_count_ += epoch.count;
     overlay_dirty_ = true;
@@ -3484,6 +3651,7 @@ private:
   void acquire_epoch_slot() {
     if (epoch_pool_.empty()) {
       epochs_.emplace_back();
+      epochs_.back().slot_id = next_epoch_slot_id_++;
       return;
     }
     epochs_.push_back(std::move(epoch_pool_.back()));
@@ -3492,8 +3660,10 @@ private:
 
   void reserve_epoch_storage(std::size_t count) {
     while (epochs_.size() + epoch_pool_.size() <
-           static_cast<std::size_t>(gpulsmopt_detail::kEpochMax))
+           static_cast<std::size_t>(gpulsmopt_detail::kEpochMax)) {
       epoch_pool_.emplace_back();
+      epoch_pool_.back().slot_id = next_epoch_slot_id_++;
+    }
     for (auto &epoch : epoch_pool_) {
       epoch.keys.resize_discard(count);
       epoch.values.resize_discard(count);
@@ -3503,7 +3673,7 @@ private:
           gpulsmopt_detail::kEpochQuotients + 1);
       epoch.subgroup_masks.resize_discard(
           gpulsmopt_detail::kEpochQuotients *
-          gpulsmopt_detail::kEpochSubgroups);
+          gpulsmopt_detail::kEpochSubgroupPlanes);
       epoch.quotient_live.resize_discard(
           gpulsmopt_detail::kEpochQuotients);
       epoch.quotient_value_sum.resize_discard(
@@ -4890,6 +5060,8 @@ private:
     ensure_c0_log(stream);
     prepare_sort_storage(direct_count, c0_flush_budget(), stream);
     reserve_epoch_storage(direct_count);
+    prepare_epoch_metadata_graphs(batch_size_);
+    prebind_epoch_views(stream);
     prepare_scatter_storage();
     prepare_run_storage();
   }
@@ -5897,8 +6069,13 @@ private:
 
   std::vector<EpochStorage> epochs_;
   std::vector<EpochStorage> epoch_pool_;
+  std::size_t next_epoch_slot_id_ = 0;
   thrust::device_vector<gpulsmopt_detail::EpochView> epoch_views_;
   thrust::device_vector<std::uint8_t *> epoch_dead_ptrs_;
+  std::vector<gpulsmopt_detail::EpochView> bound_epoch_views_;
+  std::vector<std::uint8_t *> bound_epoch_dead_ptrs_;
+  std::vector<std::uint8_t> bound_epoch_view_valid_;
+  std::vector<EpochMetadataGraph> epoch_metadata_graphs_;
   thrust::device_vector<std::uint32_t> epoch_dirty_;
   thrust::device_vector<std::uint32_t> epoch_removed_;
   std::vector<std::uint32_t> epoch_dirty_host_;
