@@ -2,8 +2,6 @@
 #include "gpu_dictionary_adapter.cuh"
 
 #include <cooperative_groups.h>
-#include <cub/block/block_load.cuh>
-#include <cub/block/block_radix_sort.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
@@ -74,10 +72,6 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_EPOCH_MAX
 #define GPULSMOPT_EPOCH_MAX 16
 #endif
-// One-global-pass hybrid radix sort for epoch creation.
-#ifndef GPULSMOPT_HYBRID_SORT
-#define GPULSMOPT_HYBRID_SORT 1
-#endif
 #ifndef GPULSMOPT_SM120_RADIX
 #define GPULSMOPT_SM120_RADIX 1
 #endif
@@ -86,9 +80,6 @@ namespace gpulsmopt_detail {
 #endif
 #ifndef GPULSMOPT_RADIX_ITEMS
 #define GPULSMOPT_RADIX_ITEMS 22
-#endif
-#ifndef GPULSMOPT_EPOCH_PENDING_CAP
-#define GPULSMOPT_EPOCH_PENDING_CAP 4096
 #endif
 #ifndef GPULSMOPT_SPLIT_FILL
 #define GPULSMOPT_SPLIT_FILL 32
@@ -112,18 +103,14 @@ static_assert(GPULSMOPT_SPLIT_FILL_JITTER >= 0 &&
                       GPULSMOPT_TARGET_FILL,
               "jittered split triggers must stay above the target fill");
 constexpr int kEpochMax = GPULSMOPT_EPOCH_MAX;
-constexpr std::uint32_t kEpochPendingCap =
-    GPULSMOPT_EPOCH_PENDING_CAP;
-constexpr std::size_t kEpochStMaxAverage = 4;
-constexpr int kEpochBucketsPerGroup = 8;
-constexpr int kEpochCoarseGroups =
-    kSegmentBuckets / kEpochBucketsPerGroup;
-constexpr int kEpochCoarseStride = kEpochCoarseGroups + 1;
-constexpr std::uint32_t kEpochHotSegment = 2048;
+constexpr int kEpochQuotientBits = 16;
+constexpr int kEpochSubgroupBits = 4;
+constexpr int kEpochQuotients = 1 << kEpochQuotientBits;
+constexpr int kEpochSubgroups = 1 << kEpochSubgroupBits;
+constexpr int kEpochHeavySortCap = 128;
+constexpr int kEpochQuotientBitmapWords = kEpochQuotients / 32;
 static_assert(GPULSMOPT_SEGMENT_BUCKETS == 256,
               "epoch bucket bitmaps assume 256 buckets per segment");
-static_assert(kSegmentBuckets % kEpochBucketsPerGroup == 0,
-              "epoch groups must divide each segment");
 static_assert(GPULSMOPT_RADIX_THREADS % 32 == 0,
               "radix block size must be warp aligned");
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
@@ -329,157 +316,214 @@ upper_bound_u32(const std::uint32_t *data, std::size_t n, std::uint32_t key) {
   return first;
 }
 
-// Immutable batch with logical bucket offsets.
 struct EpochView {
   const std::uint32_t *keys;
   const std::uint32_t *values;
-  const std::uint32_t *vprefix;
-  const std::uint32_t *cprefix;
   const std::uint8_t *dead;
-  const std::uint32_t *seg_cuts;
-  const std::uint32_t *coarse_off;
-  const std::uint32_t *coarse_value_prefix;
-  const std::uint32_t *bitmap;
+  const std::uint32_t *quotient_off;
+  const std::uint32_t *subgroup_masks;
+  std::uint32_t *quotient_live;
+  std::uint32_t *quotient_value_sum;
+  const std::uint32_t *quotient_count_prefix;
+  const std::uint32_t *quotient_value_prefix;
+  const std::uint32_t *quotient_bitmap;
+  const std::uint8_t *quotient_heavy;
   std::uint32_t count;
   std::uint32_t has_dead;
-  std::uint32_t bucket_meta_valid;
 };
 
-__device__ inline bool epoch_point_find(const EpochView &ev, std::uint32_t ord,
-                                        std::uint32_t bucket,
-                                        std::uint32_t key,
-                                        std::uint32_t *out_value) {
-  if (ev.bucket_meta_valid &&
-      !((ev.bitmap[ord * 8u + (bucket >> 5)] >> (bucket & 31u)) & 1u))
+__device__ inline bool epoch_key_killed(
+    std::uint32_t key, const std::uint32_t *killed_keys,
+    std::size_t killed_count) {
+  if (killed_count == 0)
     return false;
-  const std::uint32_t base = ev.seg_cuts[ord];
-  const std::uint32_t len = ev.seg_cuts[ord + 1] - base;
-  const std::uint32_t *off =
-      ev.coarse_off + static_cast<std::size_t>(ord) * kEpochCoarseStride;
-  std::uint32_t lo, hi;
-  if (!ev.bucket_meta_valid) {
-    lo = 0;
-    hi = len;
-  } else {
-    const std::uint32_t group = bucket / kEpochBucketsPerGroup;
-    lo = off[group];
-    hi = off[group + 1];
+  const std::size_t p = lower_bound_u32(killed_keys, killed_count, key);
+  return p < killed_count && killed_keys[p] == key;
+}
+
+__device__ inline bool epoch_point_position(
+    const EpochView &ev, std::uint32_t key, std::uint32_t *position) {
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
+  const std::uint32_t begin = ev.quotient_off[quotient];
+  const std::uint32_t end = ev.quotient_off[quotient + 1];
+  const std::uint8_t heavy = ev.quotient_heavy[quotient];
+  if (heavy == 0u) {
+    const std::uint32_t subgroup =
+        (key >> (kEpochQuotientBits - kEpochSubgroupBits)) &
+        (kEpochSubgroups - 1);
+    std::uint32_t mask =
+        ev.subgroup_masks[quotient * kEpochSubgroups + subgroup];
+    while (mask != 0u) {
+      const std::uint32_t bit = __ffs(mask) - 1;
+      const std::uint32_t p = begin + bit;
+      if (ev.keys[p] == key && (!ev.has_dead || !ev.dead[p])) {
+        *position = p;
+        return true;
+      }
+      mask &= mask - 1;
+    }
+    return false;
   }
-  std::uint32_t p =
-      lo + static_cast<std::uint32_t>(
-               lower_bound_u32(ev.keys + base + lo, hi - lo, key));
-  for (; p < hi && ev.keys[base + p] == key; ++p) {
-    if (ev.has_dead && ev.dead[base + p])
-      continue;
-    if (out_value)
-      *out_value = ev.values[base + p];
-    return true;
+  if (heavy == 1u) {
+    std::uint32_t p = begin + static_cast<std::uint32_t>(
+                                  lower_bound_u32(ev.keys + begin,
+                                                  end - begin, key));
+    for (; p < end && ev.keys[p] == key; ++p) {
+      if (!ev.has_dead || !ev.dead[p]) {
+        *position = p;
+        return true;
+      }
+    }
+    return false;
+  }
+  for (std::uint32_t p = begin; p < end; ++p) {
+    if (ev.keys[p] == key && (!ev.has_dead || !ev.dead[p])) {
+      *position = p;
+      return true;
+    }
   }
   return false;
 }
 
-__device__ inline void epoch_seg_bounds(const EpochView &ev, std::uint32_t ord,
-                                        std::uint32_t lo_key,
-                                        std::uint32_t hi_key,
-                                        std::uint32_t &lb, std::uint32_t &ub) {
-  const std::uint32_t base = ev.seg_cuts[ord];
-  const std::uint32_t len = ev.seg_cuts[ord + 1] - base;
-  lb = base + static_cast<std::uint32_t>(
-                  lower_bound_u32(ev.keys + base, len, lo_key));
-  ub = base + static_cast<std::uint32_t>(
-                  upper_bound_u32(ev.keys + base, len, hi_key));
+__device__ inline bool epoch_point_find(const EpochView &ev,
+                                        std::uint32_t key,
+                                        std::uint32_t *out_value) {
+  std::uint32_t position;
+  if (!epoch_point_position(ev, key, &position))
+    return false;
+  if (out_value)
+    *out_value = ev.values[position];
+  return true;
 }
 
-__device__ inline std::uint32_t
-epoch_range_count_one(const EpochView &ev, std::uint32_t ord, std::uint32_t l,
-                      std::uint32_t h) {
-  std::uint32_t lb, ub;
-  epoch_seg_bounds(ev, ord, l, h, lb, ub);
-  if (ub <= lb)
-    return 0;
-  return ev.has_dead ? ev.cprefix[ub] - ev.cprefix[lb] : ub - lb;
-}
-
-__device__ inline std::uint32_t
-epoch_range_sum_one(const EpochView &ev, std::uint32_t ord, std::uint32_t l,
-                    std::uint32_t h,
-                    const std::uint32_t *bucket_max) {
-  std::uint32_t lb, ub;
-  if (ev.has_dead) {
-    epoch_seg_bounds(ev, ord, l, h, lb, ub);
-    return ub > lb ? ev.vprefix[ub] - ev.vprefix[lb] : 0u;
-  }
-  const std::uint32_t base = ev.seg_cuts[ord];
-  const std::uint32_t len = ev.seg_cuts[ord + 1] - base;
-  if (len == 0)
-    return 0u;
-  if (!ev.bucket_meta_valid) {
-    epoch_seg_bounds(ev, ord, l, h, lb, ub);
-    std::uint32_t sum = 0u;
+__device__ inline std::uint32_t epoch_quotient_count(
+    const EpochView &ev, std::uint32_t quotient, std::uint32_t lo,
+    std::uint32_t hi) {
+  const std::uint32_t begin = ev.quotient_off[quotient];
+  const std::uint32_t end = ev.quotient_off[quotient + 1];
+  std::uint32_t count = 0u;
+  if (ev.quotient_heavy[quotient] == 1u) {
+    const std::uint32_t lb = begin + static_cast<std::uint32_t>(
+                                         lower_bound_u32(ev.keys + begin,
+                                                         end - begin, lo));
+    const std::uint32_t ub = begin + static_cast<std::uint32_t>(
+                                         upper_bound_u32(ev.keys + begin,
+                                                         end - begin, hi));
+    if (!ev.has_dead)
+      return ub - lb;
     for (std::uint32_t p = lb; p < ub; ++p)
+      count += ev.dead[p] == 0u;
+    return count;
+  }
+  for (std::uint32_t p = begin; p < end; ++p)
+    count += ev.keys[p] >= lo && ev.keys[p] <= hi &&
+             (!ev.has_dead || !ev.dead[p]);
+  return count;
+}
+
+__device__ inline std::uint32_t epoch_quotient_sum(
+    const EpochView &ev, std::uint32_t quotient, std::uint32_t lo,
+    std::uint32_t hi) {
+  const std::uint32_t begin = ev.quotient_off[quotient];
+  const std::uint32_t end = ev.quotient_off[quotient + 1];
+  std::uint32_t sum = 0u;
+  if (ev.quotient_heavy[quotient] == 1u) {
+    const std::uint32_t lb = begin + static_cast<std::uint32_t>(
+                                         lower_bound_u32(ev.keys + begin,
+                                                         end - begin, lo));
+    const std::uint32_t ub = begin + static_cast<std::uint32_t>(
+                                         upper_bound_u32(ev.keys + begin,
+                                                         end - begin, hi));
+    for (std::uint32_t p = lb; p < ub; ++p)
+      if (!ev.has_dead || !ev.dead[p])
+        sum += ev.values[p];
+    return sum;
+  }
+  for (std::uint32_t p = begin; p < end; ++p)
+    if (ev.keys[p] >= lo && ev.keys[p] <= hi &&
+        (!ev.has_dead || !ev.dead[p]))
       sum += ev.values[p];
-    return sum;
-  }
-  std::size_t first =
-      lower_bound_u32(bucket_max, kSegmentBuckets, l);
-  if (first >= kSegmentBuckets)
-    return 0u;
-  std::size_t last =
-      lower_bound_u32(bucket_max, kSegmentBuckets, h);
-  if (last >= kSegmentBuckets)
-    last = kSegmentBuckets - 1;
-  const std::uint32_t first_group =
-      static_cast<std::uint32_t>(first / kEpochBucketsPerGroup);
-  const std::uint32_t last_group =
-      static_cast<std::uint32_t>(last / kEpochBucketsPerGroup);
-  const std::uint32_t *off =
-      ev.coarse_off + static_cast<std::size_t>(ord) * kEpochCoarseStride;
-  const std::uint32_t *prefix = ev.coarse_value_prefix +
-                                static_cast<std::size_t>(ord) *
-                                    kEpochCoarseStride;
-  const std::uint32_t first_lo = off[first_group];
-  const std::uint32_t first_hi = off[first_group + 1];
-  lb = first_lo + static_cast<std::uint32_t>(lower_bound_u32(
-                      ev.keys + base + first_lo, first_hi - first_lo, l));
-  if (first_group == last_group) {
-    ub = first_lo + static_cast<std::uint32_t>(upper_bound_u32(
-                        ev.keys + base + first_lo, first_hi - first_lo, h));
-    std::uint32_t sum = 0u;
-    for (std::uint32_t p = lb; p < ub; ++p)
-      sum += ev.values[base + p];
-    return sum;
-  }
-  const std::uint32_t last_lo = off[last_group];
-  const std::uint32_t last_hi = off[last_group + 1];
-  ub = last_lo + static_cast<std::uint32_t>(upper_bound_u32(
-                       ev.keys + base + last_lo, last_hi - last_lo, h));
-  std::uint32_t sum = prefix[last_group] - prefix[first_group + 1];
-  for (std::uint32_t p = lb; p < first_hi; ++p)
-    sum += ev.values[base + p];
-  for (std::uint32_t p = last_lo; p < ub; ++p)
-    sum += ev.values[base + p];
   return sum;
 }
 
-// Finds the first live epoch key at or above q.
-__device__ inline std::uint32_t
-epoch_successor_candidate(const EpochView &ev, std::uint32_t ord,
-                          std::uint32_t q, const std::uint32_t *killed_keys,
-                          std::size_t killed_count) {
-  const std::uint32_t base = ev.seg_cuts[ord];
-  const std::uint32_t len = ev.seg_cuts[ord + 1] - base;
-  if (len == 0)
+__device__ inline std::uint32_t epoch_range_count_one(
+    const EpochView &ev, std::uint32_t lo, std::uint32_t hi) {
+  const std::uint32_t first = lo >> kEpochQuotientBits;
+  const std::uint32_t last = hi >> kEpochQuotientBits;
+  if (first == last)
+    return epoch_quotient_count(ev, first, lo, hi);
+  std::uint32_t count = epoch_quotient_count(ev, first, lo, 0xffffffffu);
+  count += epoch_quotient_count(ev, last, 0u, hi);
+  if (last > first + 1)
+    count += ev.quotient_count_prefix[last] -
+             ev.quotient_count_prefix[first + 1];
+  return count;
+}
+
+__device__ inline std::uint32_t epoch_range_sum_one(
+    const EpochView &ev, std::uint32_t lo, std::uint32_t hi) {
+  const std::uint32_t first = lo >> kEpochQuotientBits;
+  const std::uint32_t last = hi >> kEpochQuotientBits;
+  if (first == last)
+    return epoch_quotient_sum(ev, first, lo, hi);
+  std::uint32_t sum = epoch_quotient_sum(ev, first, lo, 0xffffffffu);
+  sum += epoch_quotient_sum(ev, last, 0u, hi);
+  if (last > first + 1)
+    sum += ev.quotient_value_prefix[last] -
+           ev.quotient_value_prefix[first + 1];
+  return sum;
+}
+
+__device__ inline std::uint32_t epoch_quotient_successor(
+    const EpochView &ev, std::uint32_t quotient, std::uint32_t floor,
+    const std::uint32_t *killed_keys, std::size_t killed_count) {
+  const std::uint32_t begin = ev.quotient_off[quotient];
+  const std::uint32_t end = ev.quotient_off[quotient + 1];
+  if (ev.quotient_heavy[quotient] == 1u) {
+    std::uint32_t p = begin + static_cast<std::uint32_t>(
+                                  lower_bound_u32(ev.keys + begin,
+                                                  end - begin, floor));
+    for (; p < end; ++p) {
+      const std::uint32_t key = ev.keys[p];
+      if ((!ev.has_dead || !ev.dead[p]) &&
+          !epoch_key_killed(key, killed_keys, killed_count))
+        return key;
+    }
     return kEmptyKey;
-  std::uint32_t p =
-      static_cast<std::uint32_t>(lower_bound_u32(ev.keys + base, len, q));
-  for (; p < len; ++p) {
-    if (ev.has_dead && ev.dead[base + p])
+  }
+  std::uint32_t best = kEmptyKey;
+  for (std::uint32_t p = begin; p < end; ++p) {
+    const std::uint32_t key = ev.keys[p];
+    if (key >= floor && key < best && (!ev.has_dead || !ev.dead[p]) &&
+        !epoch_key_killed(key, killed_keys, killed_count))
+      best = key;
+  }
+  return best;
+}
+
+__device__ inline std::uint32_t epoch_successor_candidate(
+    const EpochView &ev, std::uint32_t key,
+    const std::uint32_t *killed_keys, std::size_t killed_count) {
+  std::uint32_t quotient = key >> kEpochQuotientBits;
+  std::uint32_t candidate = epoch_quotient_successor(
+      ev, quotient, key, killed_keys, killed_count);
+  if (candidate != kEmptyKey)
+    return candidate;
+  ++quotient;
+  while (quotient < kEpochQuotients) {
+    const std::uint32_t word = quotient >> 5;
+    const std::uint32_t bit = quotient & 31u;
+    std::uint32_t mask = ev.quotient_bitmap[word] & (0xffffffffu << bit);
+    if (mask == 0u) {
+      quotient = (word + 1u) * 32u;
       continue;
-    const std::uint32_t cand = ev.keys[base + p];
-    const std::size_t kp =
-        killed_count ? lower_bound_u32(killed_keys, killed_count, cand) : 0;
-    if (kp == killed_count || killed_keys[kp] != cand)
-      return cand;
+    }
+    quotient = word * 32u + static_cast<std::uint32_t>(__ffs(mask) - 1);
+    candidate = epoch_quotient_successor(
+        ev, quotient, 0u, killed_keys, killed_count);
+    if (candidate != kEmptyKey)
+      return candidate;
+    ++quotient;
   }
   return kEmptyKey;
 }
@@ -1463,6 +1507,9 @@ __device__ inline bool seg_point_lookup(
     const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
     const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
     const EpochView *epochs, int epoch_count, std::uint32_t *out_value) {
+  for (int e = epoch_count - 1; e >= 0; --e)
+    if (epoch_point_find(epochs[e], key, out_value))
+      return true;
   const std::size_t meta_base =
       static_cast<std::size_t>(seg_id) * kSegmentBuckets;
   std::size_t bucket =
@@ -1470,10 +1517,6 @@ __device__ inline bool seg_point_lookup(
   const bool in_stored = bucket < kSegmentBuckets;
   if (!in_stored)
     bucket = kSegmentBuckets - 1;
-  for (int e = epoch_count - 1; e >= 0; --e)
-    if (epoch_point_find(epochs[e], ord, static_cast<std::uint32_t>(bucket),
-                         key, out_value))
-      return true;
   if (in_stored) {
     const std::size_t start =
         static_cast<std::size_t>(seg_id) * kSegmentSlots +
@@ -1495,9 +1538,9 @@ __device__ inline std::uint32_t seg_range_count_one(
     const std::uint32_t *seg_bucket_max, const std::uint32_t *seg_bucket_live,
     const std::uint32_t *seg_bucket_live_prefix, const EpochView *epochs,
     int epoch_count) {
-  std::uint32_t from_delta = 0;
-  for (int e = 0; e < epoch_count; ++e)
-    from_delta += epoch_range_count_one(epochs[e], ord, lo, hi);
+  (void)ord;
+  (void)epochs;
+  (void)epoch_count;
   const std::size_t meta_base =
       static_cast<std::size_t>(seg_id) * kSegmentBuckets;
   const std::size_t slot_base =
@@ -1505,7 +1548,7 @@ __device__ inline std::uint32_t seg_range_count_one(
   const std::size_t first =
       lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, lo);
   if (first >= kSegmentBuckets)
-    return from_delta;
+    return 0u;
   const std::size_t last =
       lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, hi);
   std::uint32_t count = 0;
@@ -1518,7 +1561,7 @@ __device__ inline std::uint32_t seg_range_count_one(
   };
   if (first == last) {
     scan_bucket(first);
-    return count + from_delta;
+    return count;
   }
   scan_bucket(first);
   const std::size_t full_end = last < kSegmentBuckets ? last : kSegmentBuckets;
@@ -1530,7 +1573,7 @@ __device__ inline std::uint32_t seg_range_count_one(
     count += seg_bucket_live_prefix[pbase + full_end] -
              seg_bucket_live_prefix[pbase + first + 1];
   }
-  return count + from_delta;
+  return count;
 }
 
 __device__ inline std::uint32_t seg_range_sum_one(
@@ -1540,18 +1583,17 @@ __device__ inline std::uint32_t seg_range_sum_one(
     const std::uint32_t *seg_bucket_live,
     const std::uint32_t *seg_bucket_value_prefix, const EpochView *epochs,
     int epoch_count) {
+  (void)ord;
+  (void)epochs;
+  (void)epoch_count;
   const std::size_t meta_base =
       static_cast<std::size_t>(seg_id) * kSegmentBuckets;
-  std::uint32_t from_delta = 0;
-  for (int e = 0; e < epoch_count; ++e)
-    from_delta += epoch_range_sum_one(
-        epochs[e], ord, lo, hi, seg_bucket_max + meta_base);
   const std::size_t slot_base =
       static_cast<std::size_t>(seg_id) * kSegmentSlots;
   const std::size_t first =
       lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, lo);
   if (first >= kSegmentBuckets)
-    return from_delta;
+    return 0u;
   const std::size_t last =
       lower_bound_u32(seg_bucket_max + meta_base, kSegmentBuckets, hi);
   std::uint32_t sum = 0;
@@ -1565,7 +1607,7 @@ __device__ inline std::uint32_t seg_range_sum_one(
   };
   if (first == last) {
     scan_bucket(first);
-    return sum + from_delta;
+    return sum;
   }
   scan_bucket(first);
   const std::size_t full_end = last < kSegmentBuckets ? last : kSegmentBuckets;
@@ -1577,7 +1619,7 @@ __device__ inline std::uint32_t seg_range_sum_one(
     sum += seg_bucket_value_prefix[pbase + full_end] -
            seg_bucket_value_prefix[pbase + first + 1];
   }
-  return sum + from_delta;
+  return sum;
 }
 
 __device__ inline std::uint32_t seg_sheet_range_sum(
@@ -1903,257 +1945,140 @@ block_scan_exclusive(std::uint32_t value, std::uint32_t *scratch) {
   return result;
 }
 
-__global__ void delta_slice_kernel(
-    const std::uint32_t *batch_keys, std::size_t n,
-    const std::uint32_t *dir_boundary, std::size_t dir_count,
-    std::uint32_t *cuts) {
-  const std::size_t ord = blockIdx.x * blockDim.x + threadIdx.x;
-  if (ord == 0)
-    cuts[0] = 0u;
-  if (ord >= dir_count)
+__global__ void epoch_quotient_offsets_kernel(
+    const std::uint32_t *keys, std::uint32_t count,
+    std::uint32_t *offsets) {
+  const std::uint32_t quotient = blockIdx.x * blockDim.x + threadIdx.x;
+  if (quotient > kEpochQuotients)
     return;
-  cuts[ord + 1] =
-      ord + 1 == dir_count
-          ? static_cast<std::uint32_t>(n)
-          : static_cast<std::uint32_t>(
-                upper_bound_u32(batch_keys, n, dir_boundary[ord]));
+  if (quotient == kEpochQuotients) {
+    offsets[quotient] = count;
+    return;
+  }
+  const std::uint32_t key = quotient << kEpochQuotientBits;
+  offsets[quotient] = static_cast<std::uint32_t>(
+      lower_bound_u32(keys, count, key));
 }
 
-__global__ void epoch_coarse_meta_st_kernel(
-    const std::uint32_t *epoch_keys, const std::uint32_t *epoch_values,
-    const std::uint32_t *cuts, std::size_t dir_count,
-    const std::uint32_t *dir_seg_id, const std::uint32_t *seg_bucket_max,
-    std::uint32_t *coarse_off, std::uint32_t *coarse_value_prefix,
-    std::uint32_t *bitmap,
-    std::uint32_t *dir_live, std::uint32_t *dir_value_sum,
-    std::uint32_t *pending_count, std::uint32_t *pending_value_sum,
-    std::uint32_t *overflow) {
-  const std::size_t ord = blockIdx.x * blockDim.x + threadIdx.x;
-  if (ord >= dir_count)
+__global__ void epoch_quotient_meta_kernel(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    const std::uint32_t *offsets, std::uint32_t *subgroup_masks,
+    std::uint32_t *quotient_live, std::uint32_t *quotient_value_sum,
+    std::uint32_t *quotient_bitmap, std::uint8_t *quotient_heavy,
+    std::uint32_t *heavy_list, std::uint32_t *heavy_count) {
+  const std::uint32_t quotient = blockIdx.x * blockDim.x + threadIdx.x;
+  if (quotient >= kEpochQuotients)
     return;
-  const std::uint32_t base = cuts[ord];
-  const std::uint32_t len = cuts[ord + 1] - base;
-  if (len == 0)
-    return;
-  std::uint32_t *off = coarse_off + ord * kEpochCoarseStride;
-  std::uint32_t *prefix =
-      coarse_value_prefix + ord * kEpochCoarseStride;
+  const std::uint32_t begin = offsets[quotient];
+  const std::uint32_t end = offsets[quotient + 1];
+  const std::uint32_t count = end - begin;
+  std::uint32_t masks[kEpochSubgroups] = {};
   std::uint32_t sum = 0u;
-  const std::uint32_t seg = dir_seg_id[ord];
-  const std::size_t meta =
-      static_cast<std::size_t>(seg) * kSegmentBuckets;
-  std::uint32_t p = 0u;
-  off[0] = 0u;
-  prefix[0] = 0u;
-  for (int word = 0; word < 8; ++word) {
-    std::uint32_t bits = 0u;
-    for (int lane = 0; lane < 32; ++lane) {
-      const int bucket = word * 32 + lane;
-      const std::uint32_t before = p;
-      const std::uint32_t boundary = seg_bucket_max[meta + bucket];
-      while (p < len &&
-             (bucket + 1 == kSegmentBuckets ||
-              epoch_keys[base + p] <= boundary)) {
-        sum += epoch_values[base + p];
-        ++p;
-      }
-      if (p != before)
-        bits |= 1u << lane;
-      if ((bucket + 1) % kEpochBucketsPerGroup == 0) {
-        const int group = (bucket + 1) / kEpochBucketsPerGroup;
-        off[group] = p;
-        prefix[group] = sum;
-      }
+  for (std::uint32_t p = begin; p < end; ++p) {
+    sum += values[p];
+    if (count <= 32u) {
+      const std::uint32_t subgroup =
+          (keys[p] >> (kEpochQuotientBits - kEpochSubgroupBits)) &
+          (kEpochSubgroups - 1);
+      masks[subgroup] |= 1u << (p - begin);
     }
-    bitmap[ord * 8u + word] = bits;
   }
-  dir_live[ord] += len;
-  dir_value_sum[ord] += sum;
-  const std::uint32_t pending = pending_count[ord] + len;
-  pending_count[ord] = pending;
-  pending_value_sum[ord] += sum;
-  if (pending >= kEpochPendingCap)
-    atomicExch(overflow, 1u);
+#pragma unroll
+  for (int subgroup = 0; subgroup < kEpochSubgroups; ++subgroup)
+    subgroup_masks[quotient * kEpochSubgroups + subgroup] = masks[subgroup];
+  std::uint8_t heavy = 0u;
+  if (count > 32u) {
+    heavy = count <= kEpochHeavySortCap ? 1u : 2u;
+    if (heavy == 1u)
+      heavy_list[atomicAdd(heavy_count, 1u)] = quotient;
+  }
+  quotient_heavy[quotient] = heavy;
+  quotient_live[quotient] = count;
+  quotient_value_sum[quotient] = sum;
+  const std::uint32_t occupied = __ballot_sync(0xffffffffu, count != 0u);
+  if ((threadIdx.x & 31) == 0)
+    quotient_bitmap[quotient >> 5] = occupied;
 }
 
-__global__ void epoch_coarse_meta_kernel(
-    const std::uint32_t *epoch_keys, const std::uint32_t *epoch_values,
-    const std::uint32_t *cuts, std::size_t dir_count,
-    const std::uint32_t *dir_seg_id, const std::uint32_t *seg_bucket_max,
-    std::uint32_t *coarse_off, std::uint32_t *coarse_value_prefix,
-    std::uint32_t *bitmap,
-    std::uint32_t *dir_live, std::uint32_t *dir_value_sum,
-    std::uint32_t *pending_count, std::uint32_t *pending_value_sum,
-    std::uint32_t *overflow) {
-  const std::size_t ord = blockIdx.x;
-  if (ord >= dir_count)
-    return;
-  const std::uint32_t base = cuts[ord];
-  const std::uint32_t len = cuts[ord + 1] - base;
-  if (len == 0)
-    return;
-  __shared__ std::uint32_t s_boundary[kSegmentBuckets];
-  __shared__ std::uint32_t s_count[kSegmentBuckets];
-  __shared__ std::uint32_t s_group_sum[kEpochCoarseGroups];
-  __shared__ std::uint8_t s_group_bits[kEpochCoarseGroups];
-  const int lane = threadIdx.x;
-  const std::uint32_t seg = dir_seg_id[ord];
-  const std::size_t meta =
-      static_cast<std::size_t>(seg) * kSegmentBuckets;
-  for (int b = lane; b < kSegmentBuckets; b += 32) {
-    s_boundary[b] = seg_bucket_max[meta + b];
-    s_count[b] = 0u;
-  }
-  s_group_sum[lane] = 0u;
-  __syncwarp();
-  std::uint32_t group_count = 0u;
-  std::uint32_t group_sum = 0u;
-  std::uint32_t bits = 0u;
-  if (len > kEpochHotSegment) {
-    for (std::uint32_t p = lane; p < len; p += 32) {
-      std::size_t bucket = lower_bound_u32(
-          s_boundary, kSegmentBuckets, epoch_keys[base + p]);
-      if (bucket >= kSegmentBuckets)
-        bucket = kSegmentBuckets - 1;
-      atomicAdd(s_count + bucket, 1u);
-      atomicAdd(s_group_sum + bucket / kEpochBucketsPerGroup,
-                epoch_values[base + p]);
-    }
-    __syncwarp();
-    const int bucket_base = lane * kEpochBucketsPerGroup;
-#pragma unroll
-    for (int b = 0; b < kEpochBucketsPerGroup; ++b) {
-      const std::uint32_t count = s_count[bucket_base + b];
-      group_count += count;
-      if (count != 0u)
-        bits |= 1u << b;
-    }
-    group_sum = s_group_sum[lane];
-  } else {
-    const int last_bucket =
-        (lane + 1) * kEpochBucketsPerGroup - 1;
-    const std::uint32_t end =
-        lane + 1 == kEpochCoarseGroups
-            ? len
-            : static_cast<std::uint32_t>(upper_bound_u32(
-                  epoch_keys + base, len, s_boundary[last_bucket]));
-    const std::uint32_t prior =
-        __shfl_up_sync(0xffffffffu, end, 1);
-    std::uint32_t p = lane == 0 ? 0u : prior;
-    const std::uint32_t start = p;
-#pragma unroll
-    for (int b = 0; b < kEpochBucketsPerGroup; ++b) {
-      const int bucket = lane * kEpochBucketsPerGroup + b;
-      const std::uint32_t before = p;
-      const std::uint32_t boundary = s_boundary[bucket];
-      while (p < end &&
-             (bucket + 1 == kSegmentBuckets ||
-              epoch_keys[base + p] <= boundary)) {
-        group_sum += epoch_values[base + p];
-        ++p;
+__global__ void epoch_sort_heavy_quotients_kernel(
+    std::uint32_t *keys, std::uint32_t *values,
+    const std::uint32_t *offsets, const std::uint32_t *heavy_list,
+    const std::uint32_t *heavy_count) {
+  __shared__ std::uint32_t shared_keys[kEpochHeavySortCap];
+  __shared__ std::uint32_t shared_values[kEpochHeavySortCap];
+  const int tid = threadIdx.x;
+  const std::uint32_t count = heavy_count[0];
+  for (std::uint32_t item = blockIdx.x; item < count;
+       item += gridDim.x) {
+    const std::uint32_t quotient = heavy_list[item];
+    const std::uint32_t begin = offsets[quotient];
+    const std::uint32_t length = offsets[quotient + 1] - begin;
+    shared_keys[tid] =
+        tid < length ? keys[begin + tid] : kEmptyKey;
+    shared_values[tid] = tid < length ? values[begin + tid] : 0u;
+    __syncthreads();
+    for (int size = 2; size <= kEpochHeavySortCap; size <<= 1) {
+      for (int stride = size >> 1; stride > 0; stride >>= 1) {
+        const int peer = tid ^ stride;
+        if (peer > tid) {
+          const bool ascending = (tid & size) == 0;
+          const std::uint32_t a = shared_keys[tid];
+          const std::uint32_t b = shared_keys[peer];
+          if ((ascending && a > b) || (!ascending && a < b)) {
+            shared_keys[tid] = b;
+            shared_keys[peer] = a;
+            const std::uint32_t av = shared_values[tid];
+            shared_values[tid] = shared_values[peer];
+            shared_values[peer] = av;
+          }
+        }
+        __syncthreads();
       }
-      if (p != before)
-        bits |= 1u << b;
     }
-    group_count = end - start;
-  }
-  std::uint32_t count_scan = group_count;
-  std::uint32_t value_scan = group_sum;
-#pragma unroll
-  for (int offset = 1; offset < 32; offset <<= 1) {
-    const std::uint32_t count_up =
-        __shfl_up_sync(0xffffffffu, count_scan, offset);
-    const std::uint32_t value_up =
-        __shfl_up_sync(0xffffffffu, value_scan, offset);
-    if (lane >= offset) {
-      count_scan += count_up;
-      value_scan += value_up;
+    if (tid < length) {
+      keys[begin + tid] = shared_keys[tid];
+      values[begin + tid] = shared_values[tid];
     }
+    __syncthreads();
   }
-  std::uint32_t *off = coarse_off + ord * kEpochCoarseStride;
-  std::uint32_t *prefix =
-      coarse_value_prefix + ord * kEpochCoarseStride;
-  off[lane] = count_scan - group_count;
-  prefix[lane] = value_scan - group_sum;
-  if (lane + 1 == kEpochCoarseGroups) {
-    off[kEpochCoarseGroups] = count_scan;
-    prefix[kEpochCoarseGroups] = value_scan;
-  }
-  s_group_bits[lane] = static_cast<std::uint8_t>(bits);
-  __syncwarp();
-  if (lane < 8) {
-    const int group = lane * 4;
-    bitmap[ord * 8u + lane] =
-        static_cast<std::uint32_t>(s_group_bits[group]) |
-        (static_cast<std::uint32_t>(s_group_bits[group + 1]) << 8) |
-        (static_cast<std::uint32_t>(s_group_bits[group + 2]) << 16) |
-        (static_cast<std::uint32_t>(s_group_bits[group + 3]) << 24);
-  }
-  const std::uint32_t total =
-      __shfl_sync(0xffffffffu, value_scan, 31);
-  if (lane == 0) {
-    dir_live[ord] += len;
-    dir_value_sum[ord] += total;
-    const std::uint32_t pending = pending_count[ord] + len;
-    pending_count[ord] = pending;
-    pending_value_sum[ord] += total;
-    if (pending >= kEpochPendingCap)
-      atomicExch(overflow, 1u);
-  }
+}
+
+__global__ void epoch_quotient_bitmap_kernel(
+    const std::uint32_t *quotient_live, std::uint32_t *quotient_bitmap) {
+  const std::uint32_t quotient = blockIdx.x * blockDim.x + threadIdx.x;
+  if (quotient >= kEpochQuotients)
+    return;
+  const std::uint32_t occupied =
+      __ballot_sync(0xffffffffu, quotient_live[quotient] != 0u);
+  if ((threadIdx.x & 31) == 0)
+    quotient_bitmap[quotient >> 5] = occupied;
 }
 
 // Marks an epoch record dead.
 __global__ void epoch_mark_deleted_kernel(
-    const std::uint32_t *keys, std::size_t n, const std::uint32_t *dest,
-    std::uint32_t ord_divisor, const EpochView *epochs, int epoch_count,
+    const std::uint32_t *keys, std::size_t n, const EpochView *epochs,
+    int epoch_count,
     std::uint8_t *const *epoch_dead, std::uint32_t *epoch_dirty,
-    std::uint32_t *epoch_removed, std::uint32_t *pending_count,
-    std::uint32_t *pending_value_sum, std::uint32_t *ord_live_delta,
-    std::uint32_t *ord_value_delta, std::uint8_t *found) {
+    std::uint32_t *epoch_removed, std::uint8_t *found) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
   found[i] = 0u;
-  const std::uint32_t ord = dest[i] / ord_divisor;
-  const std::uint32_t bucket = dest[i] % ord_divisor;
   const std::uint32_t key = keys[i];
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
   int found_epoch = -1;
   for (int e = epoch_count - 1; e >= 0; --e) {
     const EpochView &ev = epochs[e];
-    const std::uint32_t base = ev.seg_cuts[ord];
-    const std::uint32_t len = ev.seg_cuts[ord + 1] - base;
-    if (len == 0)
+    std::uint32_t position;
+    if (!epoch_point_position(ev, key, &position))
       continue;
-    std::uint32_t lo = 0u;
-    std::uint32_t hi = len;
-    const std::uint32_t *off =
-        ev.coarse_off + static_cast<std::size_t>(ord) *
-                            kEpochCoarseStride;
-    if (ord_divisor == static_cast<std::uint32_t>(kSegmentBuckets) &&
-        ev.bucket_meta_valid) {
-      if (!((ev.bitmap[ord * 8u + (bucket >> 5)] >> (bucket & 31u)) & 1u))
-        continue;
-      const std::uint32_t group = bucket / kEpochBucketsPerGroup;
-      lo = off[group];
-      hi = off[group + 1];
-    }
-    std::uint32_t p =
-        lo + static_cast<std::uint32_t>(
-                 lower_bound_u32(ev.keys + base + lo, hi - lo, key));
-    for (; p < hi && ev.keys[base + p] == key; ++p) {
-      if (epoch_dead[e][base + p])
-        continue;
-      epoch_dead[e][base + p] = 1u;
-      atomicAdd(ord_live_delta + ord, 0u - 1u);
-      atomicAdd(ord_value_delta + ord, 0u - ev.values[base + p]);
-      atomicAdd(pending_count + ord, 0u - 1u);
-      atomicAdd(pending_value_sum + ord, 0u - ev.values[base + p]);
-      found_epoch = e;
-      found[i] = 1u;
-      break;
-    }
-    if (found_epoch >= 0)
-      break;
+    epoch_dead[e][position] = 1u;
+    atomicAdd(ev.quotient_live + quotient, 0u - 1u);
+    atomicAdd(ev.quotient_value_sum + quotient,
+              0u - ev.values[position]);
+    found_epoch = e;
+    found[i] = 1u;
+    break;
   }
   const unsigned active = __activemask();
   const unsigned found_mask =
@@ -2169,14 +2094,12 @@ __global__ void epoch_mark_deleted_kernel(
 }
 
 __global__ void epoch_live_input_kernel(
-    const std::uint32_t *values, const std::uint8_t *dead, std::size_t n,
-    std::uint32_t *live_values, std::uint32_t *live_counts) {
+    const std::uint8_t *dead, std::size_t n,
+    std::uint32_t *live_counts) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
-  const bool live = dead[i] == 0u;
-  live_values[i] = live ? values[i] : 0u;
-  live_counts[i] = live ? 1u : 0u;
+  live_counts[i] = dead[i] == 0u ? 1u : 0u;
 }
 
 __global__ void prefix_total_kernel(const std::uint32_t *input,
@@ -2198,111 +2121,6 @@ __global__ void epoch_gather_live_kernel(
   const std::size_t out = output_base + count_prefix[i];
   out_keys[out] = keys[i];
   out_values[out] = values[i];
-}
-
-__global__ void epoch_partition_segments_kernel(
-    const EpochView *epochs, int epoch_count, std::size_t dir_count,
-    const std::uint8_t *selected, std::uint32_t *counters,
-    std::uint32_t *selected_keys, std::uint32_t *selected_values,
-    std::uint32_t *retained_keys, std::uint32_t *retained_values) {
-  const std::size_t ord = blockIdx.x;
-  const int e = static_cast<int>(blockIdx.y);
-  if (ord >= dir_count || e >= epoch_count)
-    return;
-  const EpochView &ev = epochs[e];
-  const std::uint32_t begin = ev.seg_cuts[ord];
-  const std::uint32_t end = ev.seg_cuts[ord + 1];
-  if (begin == end)
-    return;
-  const std::uint32_t live_begin =
-      ev.has_dead ? ev.cprefix[begin] : begin;
-  const std::uint32_t live_end = ev.has_dead ? ev.cprefix[end] : end;
-  const std::uint32_t live = live_end - live_begin;
-  if (live == 0)
-    return;
-  __shared__ std::uint32_t output_base;
-  const bool take = selected[ord] != 0u;
-  if (threadIdx.x == 0)
-    output_base = atomicAdd(counters + (take ? 0 : 1), live);
-  __syncthreads();
-  for (std::uint32_t p = begin + threadIdx.x; p < end;
-       p += blockDim.x) {
-    if (ev.has_dead && ev.dead[p])
-      continue;
-    const std::uint32_t live_pos =
-        (ev.has_dead ? ev.cprefix[p] : p) - live_begin;
-    const std::uint32_t out = output_base + live_pos;
-    if (take) {
-      selected_keys[out] = ev.keys[p];
-      selected_values[out] = ev.values[p];
-    } else {
-      retained_keys[out] = ev.keys[p];
-      retained_values[out] = ev.values[p];
-    }
-  }
-}
-
-constexpr int kHybridBlockThreads = 256;
-
-__global__ void hybrid_bin_cuts_kernel(const std::uint32_t *keys,
-                                       std::size_t n,
-                                       std::uint32_t *cuts,
-                                       std::uint32_t capacity,
-                                       std::uint32_t *heavy) {
-  const std::uint32_t bin = threadIdx.x;
-  if (blockIdx.x != 0 || bin >= 256u)
-    return;
-  const std::uint32_t lo_key = bin << 24;
-  const std::uint32_t lo = static_cast<std::uint32_t>(
-      lower_bound_u32(keys, n, lo_key));
-  const std::uint32_t hi =
-      bin == 255u
-          ? static_cast<std::uint32_t>(n)
-          : static_cast<std::uint32_t>(
-                lower_bound_u32(keys, n, (bin + 1u) << 24));
-  cuts[bin] = lo;
-  if (bin == 255u)
-    cuts[256] = static_cast<std::uint32_t>(n);
-  if (hi - lo > capacity)
-    atomicExch(heavy, 1u);
-}
-
-template <int ItemsPerThread>
-__global__ void hybrid_tail_sort_kernel(
-    const std::uint32_t *in_keys, const std::uint32_t *in_values,
-    const std::uint32_t *cuts, std::uint32_t *out_keys,
-    std::uint32_t *out_values) {
-  using BlockLoad =
-      cub::BlockLoad<std::uint32_t, kHybridBlockThreads,
-                     ItemsPerThread, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-  using BlockSort =
-      cub::BlockRadixSort<std::uint32_t, kHybridBlockThreads,
-                          ItemsPerThread, std::uint32_t>;
-  union TempStorage {
-    typename BlockLoad::TempStorage load;
-    typename BlockSort::TempStorage sort;
-  };
-  __shared__ TempStorage temp;
-  const std::uint32_t bin = blockIdx.x;
-  const std::uint32_t begin = cuts[bin];
-  const std::uint32_t len = cuts[bin + 1] - begin;
-  std::uint32_t keys[ItemsPerThread];
-  std::uint32_t values[ItemsPerThread];
-  BlockLoad(temp.load).Load(in_keys + begin, keys, len, kEmptyKey);
-  __syncthreads();
-  BlockLoad(temp.load).Load(in_values + begin, values, len, 0u);
-  __syncthreads();
-  BlockSort(temp.sort).SortBlockedToStriped(keys, values, 0, 24);
-  __syncthreads();
-#pragma unroll
-  for (int item = 0; item < ItemsPerThread; ++item) {
-    const std::uint32_t local =
-        static_cast<std::uint32_t>(item * kHybridBlockThreads + threadIdx.x);
-    if (local < len) {
-      out_keys[begin + local] = keys[item];
-      out_values[begin + local] = values[item];
-    }
-  }
 }
 
 __global__ void ds_absorb_write_kernel(
@@ -2793,7 +2611,7 @@ __global__ void seg_flip_lookup_kernel(
   const std::size_t m = blockIdx.x;
   if (m >= dirty_count)
     return;
-  const std::uint32_t ord = ord_arr[m];
+  (void)ord_arr;
   const std::uint32_t seg = seg_id_arr[m];
   const std::size_t meta = static_cast<std::size_t>(seg) * kSegmentBuckets;
   const std::size_t slot_base = static_cast<std::size_t>(seg) * kSegmentSlots;
@@ -2828,14 +2646,9 @@ __global__ void seg_flip_lookup_kernel(
     if (out_found[qi])
       continue;
     const std::uint32_t key = sorted_q[qi];
-    std::size_t bucket =
-        lower_bound_u32(seg_bucket_max + meta, kSegmentBuckets, key);
-    if (bucket >= kSegmentBuckets)
-      bucket = kSegmentBuckets - 1;
     for (int e = epoch_count - 1; e >= 0; --e) {
       std::uint32_t value;
-      if (epoch_point_find(epochs[e], ord,
-                           static_cast<std::uint32_t>(bucket), key, &value)) {
+      if (epoch_point_find(epochs[e], key, &value)) {
         out_found[qi] = 1u;
         out_value[qi] = value;
         break;
@@ -2896,6 +2709,12 @@ __global__ void successor_index_kernel(
     if (p < live_ins_count)
       best = live_ins_keys[p];
   }
+  for (int e = epoch_count - 1; e >= 0; --e) {
+    const std::uint32_t candidate = epoch_successor_candidate(
+        epochs[e], q, killed_keys, killed_count);
+    if (candidate < best)
+      best = candidate;
+  }
   if (dir_count > 0 && q < best) {
     std::size_t start_ord =
         dir_route(q, dir_radix_first, dir_boundary, dir_count);
@@ -2907,16 +2726,7 @@ __global__ void successor_index_kernel(
       if (dir_prefix[ord + 1] == dir_prefix[ord])
         continue;
       const std::uint32_t seg = dir_seg_id[ord];
-      const std::uint32_t floor = ord == start_ord ? q : 0u;
-      std::uint32_t ecand = kEmptyKey;
-      for (int e = epoch_count - 1; e >= 0; --e) {
-        const std::uint32_t cand = epoch_successor_candidate(
-            epochs[e], static_cast<std::uint32_t>(ord), floor, killed_keys,
-            killed_count);
-        if (cand < ecand)
-          ecand = cand;
-      }
-      const std::uint32_t limit = ecand < best ? ecand : best;
+      const std::uint32_t limit = best;
       const std::size_t meta =
           static_cast<std::size_t>(seg) * kSegmentBuckets;
       const std::size_t slots =
@@ -2951,14 +2761,12 @@ __global__ void successor_index_kernel(
           }
         }
       }
-      const std::uint32_t cand = bcand < ecand ? bcand : ecand;
-      if (cand != kEmptyKey) {
-        out_keys[i] = cand < best ? cand : (best == kEmptyKey ? 0u : best);
+      if (bcand != kEmptyKey) {
+        out_keys[i] = bcand;
         return;
       }
       if (capped) {
-        const std::uint32_t limit_best = ecand < best ? ecand : best;
-        out_keys[i] = limit_best == kEmptyKey ? 0u : limit_best;
+        out_keys[i] = best == kEmptyKey ? 0u : best;
         return;
       }
     }
@@ -3043,6 +2851,8 @@ __global__ void range_overlay_kernel(
       l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_value_prefix,
       dir_count, pool_keys, pool_values, seg_bucket_max, seg_bucket_live,
       seg_bucket_value_prefix, epochs, epoch_count);
+  for (int e = 0; e < epoch_count; ++e)
+    sum += epoch_range_sum_one(epochs[e], l, h);
   sum += overlay_prefix_range(ins_prefix, ins_keys, ins_count, l, h);
   sum -= overlay_prefix_range(tomb_val_prefix, tomb_keys, tomb_count, l, h);
   out_sums[i] = sum;
@@ -3051,6 +2861,8 @@ __global__ void range_overlay_kernel(
         l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_prefix, dir_count,
         pool_keys, seg_bucket_max, seg_bucket_live, seg_bucket_live_prefix,
         epochs, epoch_count);
+    for (int e = 0; e < epoch_count; ++e)
+      c += epoch_range_count_one(epochs[e], l, h);
     c += overlay_count_range(ins_keys, ins_count, l, h);
     c -= overlay_prefix_range(tomb_cnt_prefix, tomb_keys, tomb_count, l, h);
     out_counts[i] = c;
@@ -3082,6 +2894,8 @@ __global__ void count_overlay_kernel(
       l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_prefix, dir_count,
       pool_keys, seg_bucket_max, seg_bucket_live, seg_bucket_live_prefix,
       epochs, epoch_count);
+  for (int e = 0; e < epoch_count; ++e)
+    c += epoch_range_count_one(epochs[e], l, h);
   c += overlay_count_range(ins_keys, ins_count, l, h);
   c -= overlay_prefix_range(tomb_cnt_prefix, tomb_keys, tomb_count, l, h);
   out_counts[i] = c;
@@ -3359,19 +3173,16 @@ public:
         seg_bucket_value_prefix_, d_dir_seg_id_, d_dir_boundary_,
         d_dir_live_, d_dir_prefix_, d_dir_value_sum_, d_dir_value_prefix_,
         d_dir_radix_first_, epoch_views_, epoch_dead_ptrs_,
-        epoch_pending_count_, epoch_pending_value_sum_, epoch_overflow_,
-        epoch_dirty_, epoch_removed_, epoch_selected_segments_,
+        epoch_dirty_, epoch_removed_,
         scratch_incoming_keys_, scratch_incoming_values_, scratch_delete_keys_,
         seg_pull_counter_, seg_dirty_bucket_dirty_,
         seg_cand_seg_, seg_cand_key_, seg_cand_value_,
         c0_log_keys_, c0_log_values_, c0_log_ops_, seg_new_value_sum_,
         seg_d_out_value_sum_, direct_sort_keys_, direct_sort_values_,
         sort_key_output_, sort_payload_input_, sort_payload_output_,
-        sort_temp_storage_, hybrid_stage_keys_, hybrid_stage_values_,
-        hybrid_bin_cuts_, hybrid_heavy_, epoch_live_values_,
-        epoch_live_counts_, epoch_merge_keys_, epoch_merge_values_,
-        epoch_retain_keys_, epoch_retain_values_,
-        epoch_partition_counters_, epoch_delete_found_, radix_first_,
+        sort_temp_storage_, epoch_live_counts_,
+        epoch_merge_keys_, epoch_merge_values_, epoch_delete_found_,
+        epoch_heavy_list_, epoch_heavy_count_, radix_first_,
         flat_bucket_max_, ds_dest_,
         ds_cnt_cursor_, ds_base_,
         ds_dirty_, ds_staged_keys_, ds_staged_values_, ds_meta_,
@@ -3382,14 +3193,18 @@ public:
       total += device_bytes_all(g.keys, g.values, g.ops);
     for (const auto &epoch : epochs_)
       total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.value_prefix, epoch.count_prefix,
-          epoch.dead, epoch.seg_cuts, epoch.coarse_off,
-          epoch.coarse_value_prefix, epoch.bitmap);
+          epoch.keys, epoch.values, epoch.count_prefix, epoch.dead,
+          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
+          epoch.quotient_value_sum, epoch.quotient_count_prefix,
+          epoch.quotient_value_prefix, epoch.quotient_bitmap,
+          epoch.quotient_heavy);
     for (const auto &epoch : epoch_pool_)
       total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.value_prefix, epoch.count_prefix,
-          epoch.dead, epoch.seg_cuts, epoch.coarse_off,
-          epoch.coarse_value_prefix, epoch.bitmap);
+          epoch.keys, epoch.values, epoch.count_prefix, epoch.dead,
+          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
+          epoch.quotient_value_sum, epoch.quotient_count_prefix,
+          epoch.quotient_value_prefix, epoch.quotient_bitmap,
+          epoch.quotient_heavy);
     return total;
   }
 
@@ -3435,18 +3250,19 @@ private:
   struct EpochStorage {
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> value_prefix;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> count_prefix;
     gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> dead;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> seg_cuts;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> coarse_off;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> coarse_value_prefix;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> bitmap;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> subgroup_masks;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_live;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_value_sum;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_count_prefix;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_value_prefix;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_bitmap;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> quotient_heavy;
     std::size_t count = 0;
     std::size_t live_count = 0;
-    std::size_t dir_count = 0;
     bool has_dead = false;
-    bool bucket_meta_valid = true;
   };
 
   const gpulsmopt_detail::EpochView *epoch_view_ptr() const {
@@ -3455,26 +3271,6 @@ private:
 
   int epoch_count() const { return static_cast<int>(epochs_.size()); }
 
-  void ensure_epoch_directory_state(cudaStream_t stream) {
-    const std::size_t d = h_dir_seg_id_.size();
-    if (epoch_pending_count_.size() == d)
-      return;
-    if (!epochs_.empty())
-      throw std::runtime_error("epoch directory changed before consolidation");
-    resize_reuse(epoch_pending_count_, d);
-    resize_reuse(epoch_pending_value_sum_, d);
-    if (d > 0) {
-      CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_pending_count_), 0,
-                                 d * sizeof(std::uint32_t), stream));
-      CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_pending_value_sum_), 0,
-                                 d * sizeof(std::uint32_t), stream));
-    }
-    resize_reuse(epoch_overflow_, 1);
-    CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_overflow_), 0,
-                               sizeof(std::uint32_t), stream));
-    epoch_overflow_host_ = 0u;
-  }
-
   void refresh_epoch_views(cudaStream_t stream) {
     std::vector<gpulsmopt_detail::EpochView> views;
     std::vector<std::uint8_t *> dead;
@@ -3482,13 +3278,16 @@ private:
     dead.reserve(epochs_.size());
     for (auto &epoch : epochs_) {
       views.push_back({epoch.keys.data(), epoch.values.data(),
-                       epoch.value_prefix.data(), epoch.count_prefix.data(),
-                       epoch.dead.data(), epoch.seg_cuts.data(),
-                       epoch.coarse_off.data(),
-                       epoch.coarse_value_prefix.data(), epoch.bitmap.data(),
+                       epoch.dead.data(), epoch.quotient_off.data(),
+                       epoch.subgroup_masks.data(),
+                       epoch.quotient_live.data(),
+                       epoch.quotient_value_sum.data(),
+                       epoch.quotient_count_prefix.data(),
+                       epoch.quotient_value_prefix.data(),
+                       epoch.quotient_bitmap.data(),
+                       epoch.quotient_heavy.data(),
                        static_cast<std::uint32_t>(epoch.count),
-                       epoch.has_dead ? 1u : 0u,
-                       epoch.bucket_meta_valid ? 1u : 0u});
+                       epoch.has_dead ? 1u : 0u});
       dead.push_back(epoch.dead.data());
     }
     resize_reuse(epoch_views_, views.size());
@@ -3504,65 +3303,71 @@ private:
   }
 
   void commit_epoch_metadata(EpochStorage &epoch, cudaStream_t stream) {
-    const std::size_t d = h_dir_seg_id_.size();
-    epoch.dir_count = d;
     epoch.has_dead = false;
-    epoch.bucket_meta_valid = true;
-    epoch.seg_cuts.resize_discard(d + 1);
-    epoch.coarse_off.resize_discard(
-        d * gpulsmopt_detail::kEpochCoarseStride);
-    epoch.coarse_value_prefix.resize_discard(
-        d * gpulsmopt_detail::kEpochCoarseStride);
-    epoch.bitmap.resize_discard(d * 8u);
     epoch.dead.resize_discard(epoch.count);
-    epoch.value_prefix.resize_discard(epoch.count + 1);
     epoch.count_prefix.resize_discard(epoch.count + 1);
+    epoch.quotient_off.resize_discard(
+        gpulsmopt_detail::kEpochQuotients + 1);
+    epoch.subgroup_masks.resize_discard(
+        gpulsmopt_detail::kEpochQuotients *
+        gpulsmopt_detail::kEpochSubgroups);
+    epoch.quotient_live.resize_discard(
+        gpulsmopt_detail::kEpochQuotients);
+    epoch.quotient_value_sum.resize_discard(
+        gpulsmopt_detail::kEpochQuotients);
+    epoch.quotient_count_prefix.resize_discard(
+        gpulsmopt_detail::kEpochQuotients + 1);
+    epoch.quotient_value_prefix.resize_discard(
+        gpulsmopt_detail::kEpochQuotients + 1);
+    epoch.quotient_bitmap.resize_discard(
+        gpulsmopt_detail::kEpochQuotientBitmapWords);
+    epoch.quotient_heavy.resize_discard(
+        gpulsmopt_detail::kEpochQuotients);
+    epoch_heavy_list_.resize_discard(gpulsmopt_detail::kEpochQuotients);
+    epoch_heavy_count_.resize_discard(1);
     if (epoch.count > 0)
       CUDA_CHECK(cudaMemsetAsync(epoch.dead.data(), 0, epoch.count, stream));
-    if (d > 0) {
-      CUDA_CHECK(cudaMemsetAsync(epoch.bitmap.data(), 0,
-                                 d * 8u * sizeof(std::uint32_t), stream));
-      const int block = 256;
-      const int grid = static_cast<int>((d + block - 1) / block);
-      gpulsmopt_detail::delta_slice_kernel<<<grid, block, 0, stream>>>(
-          epoch.keys.data(), epoch.count, raw_or_null(d_dir_boundary_), d,
-          epoch.seg_cuts.data());
-      CUDA_CHECK(cudaGetLastError());
-      if (epoch.count <= d * gpulsmopt_detail::kEpochStMaxAverage) {
-        gpulsmopt_detail::epoch_coarse_meta_st_kernel<<<grid, block, 0,
-                                                        stream>>>(
-            epoch.keys.data(), epoch.values.data(), epoch.seg_cuts.data(), d,
-            raw_or_null(d_dir_seg_id_), raw_or_null(seg_bucket_max_),
-            epoch.coarse_off.data(), epoch.coarse_value_prefix.data(),
-            epoch.bitmap.data(),
-            raw_or_null(d_dir_live_), raw_or_null(d_dir_value_sum_),
-            raw_or_null(epoch_pending_count_),
-            raw_or_null(epoch_pending_value_sum_),
-            raw_or_null(epoch_overflow_));
-      } else {
-        gpulsmopt_detail::epoch_coarse_meta_kernel<<<
-            static_cast<unsigned>(d), 32, 0, stream>>>(
-            epoch.keys.data(), epoch.values.data(), epoch.seg_cuts.data(), d,
-            raw_or_null(d_dir_seg_id_), raw_or_null(seg_bucket_max_),
-            epoch.coarse_off.data(), epoch.coarse_value_prefix.data(),
-            epoch.bitmap.data(),
-            raw_or_null(d_dir_live_), raw_or_null(d_dir_value_sum_),
-            raw_or_null(epoch_pending_count_),
-            raw_or_null(epoch_pending_value_sum_),
-            raw_or_null(epoch_overflow_));
-      }
-      CUDA_CHECK(cudaGetLastError());
-    }
+    CUDA_CHECK(cudaMemsetAsync(epoch_heavy_count_.data(), 0,
+                               sizeof(std::uint32_t), stream));
+    constexpr int block = 256;
+    constexpr int quotient_grid =
+        gpulsmopt_detail::kEpochQuotients / block;
+    constexpr int offset_grid =
+        (gpulsmopt_detail::kEpochQuotients + 1 + block - 1) / block;
+    gpulsmopt_detail::epoch_quotient_offsets_kernel<<<offset_grid, block, 0,
+                                                      stream>>>(
+        epoch.keys.data(), static_cast<std::uint32_t>(epoch.count),
+        epoch.quotient_off.data());
+    gpulsmopt_detail::epoch_quotient_meta_kernel<<<quotient_grid, block, 0,
+                                                   stream>>>(
+        epoch.keys.data(), epoch.values.data(), epoch.quotient_off.data(),
+        epoch.subgroup_masks.data(), epoch.quotient_live.data(),
+        epoch.quotient_value_sum.data(), epoch.quotient_bitmap.data(),
+        epoch.quotient_heavy.data(), epoch_heavy_list_.data(),
+        epoch_heavy_count_.data());
+    gpulsmopt_detail::epoch_sort_heavy_quotients_kernel<<<188, 128, 0,
+                                                          stream>>>(
+        epoch.keys.data(), epoch.values.data(), epoch.quotient_off.data(),
+        epoch_heavy_list_.data(), epoch_heavy_count_.data());
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(epoch.quotient_live.data(),
+                       epoch.quotient_count_prefix.data(),
+                       gpulsmopt_detail::kEpochQuotients, stream);
+    exclusive_scan_u32(epoch.quotient_value_sum.data(),
+                       epoch.quotient_value_prefix.data(),
+                       gpulsmopt_detail::kEpochQuotients, stream);
+    gpulsmopt_detail::prefix_total_kernel<<<1, 1, 0, stream>>>(
+        epoch.quotient_live.data(), gpulsmopt_detail::kEpochQuotients,
+        epoch.quotient_count_prefix.data());
+    gpulsmopt_detail::prefix_total_kernel<<<1, 1, 0, stream>>>(
+        epoch.quotient_value_sum.data(),
+        gpulsmopt_detail::kEpochQuotients,
+        epoch.quotient_value_prefix.data());
+    CUDA_CHECK(cudaGetLastError());
     refresh_epoch_views(stream);
-    rebuild_directory_prefixes_device(stream);
-    host_metadata_dirty_ = true;
     sheet_live_count_ += epoch.count;
     overlay_dirty_ = true;
     read_view_dirty_ = true;
-    CUDA_CHECK(cudaMemcpyAsync(&epoch_overflow_host_,
-                               raw_or_null(epoch_overflow_),
-                               sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
   }
 
   void create_sorted_epoch(const std::uint32_t *keys,
@@ -3570,9 +3375,6 @@ private:
                            cudaStream_t stream) {
     if (epochs_.size() >= static_cast<std::size_t>(gpulsmopt_detail::kEpochMax))
       consolidate_all_epochs(stream);
-    else if (epoch_overflow_host_)
-      consolidate_overflow_epochs(stream);
-    ensure_epoch_directory_state(stream);
     acquire_epoch_slot();
     EpochStorage &epoch = epochs_.back();
     epoch.count = count;
@@ -3593,9 +3395,6 @@ private:
                              cudaStream_t stream) {
     if (epochs_.size() >= static_cast<std::size_t>(gpulsmopt_detail::kEpochMax))
       consolidate_all_epochs(stream);
-    else if (epoch_overflow_host_)
-      consolidate_overflow_epochs(stream);
-    ensure_epoch_directory_state(stream);
     acquire_epoch_slot();
     EpochStorage &epoch = epochs_.back();
     epoch.count = count;
@@ -3614,10 +3413,6 @@ private:
   }
 
   void begin_epoch_deletes(const std::uint32_t *keys, std::size_t count,
-                           const std::uint32_t *dest,
-                           std::uint32_t ord_divisor,
-                           std::uint32_t *ord_live_delta,
-                           std::uint32_t *ord_value_delta,
                            cudaStream_t stream) {
     if (epochs_.empty())
       return;
@@ -3632,11 +3427,9 @@ private:
     const int block = 256;
     const int grid = static_cast<int>((count + block - 1) / block);
     gpulsmopt_detail::epoch_mark_deleted_kernel<<<grid, block, 0, stream>>>(
-        keys, count, dest, ord_divisor, epoch_view_ptr(), epoch_count(),
+        keys, count, epoch_view_ptr(), epoch_count(),
         raw_or_null(epoch_dead_ptrs_), raw_or_null(epoch_dirty_),
-        raw_or_null(epoch_removed_), raw_or_null(epoch_pending_count_),
-        raw_or_null(epoch_pending_value_sum_), ord_live_delta,
-        ord_value_delta, epoch_delete_found_.data());
+        raw_or_null(epoch_removed_), epoch_delete_found_.data());
     CUDA_CHECK(cudaGetLastError());
     epoch_dirty_host_.resize(ecount);
     epoch_removed_host_.resize(ecount);
@@ -3664,23 +3457,21 @@ private:
         epoch_dirty_host_[i] = 2u;
         continue;
       }
-      const std::size_t n = epoch.count;
-      epoch_live_values_.resize_discard(n);
-      epoch_live_counts_.resize_discard(n);
-      const int block = 256;
-      const int grid = static_cast<int>((n + block - 1) / block);
-      gpulsmopt_detail::epoch_live_input_kernel<<<grid, block, 0, stream>>>(
-          epoch.values.data(), epoch.dead.data(), n,
-          epoch_live_values_.data(), epoch_live_counts_.data());
-      CUDA_CHECK(cudaGetLastError());
-      exclusive_scan_u32(epoch_live_values_.data(),
-                         epoch.value_prefix.data(), n, stream);
-      exclusive_scan_u32(epoch_live_counts_.data(),
-                         epoch.count_prefix.data(), n, stream);
+      exclusive_scan_u32(epoch.quotient_value_sum.data(),
+                         epoch.quotient_value_prefix.data(),
+                         gpulsmopt_detail::kEpochQuotients, stream);
+      exclusive_scan_u32(epoch.quotient_live.data(),
+                         epoch.quotient_count_prefix.data(),
+                         gpulsmopt_detail::kEpochQuotients, stream);
       gpulsmopt_detail::prefix_total_kernel<<<1, 1, 0, stream>>>(
-          epoch_live_values_.data(), n, epoch.value_prefix.data());
+          epoch.quotient_value_sum.data(),
+          gpulsmopt_detail::kEpochQuotients,
+          epoch.quotient_value_prefix.data());
       gpulsmopt_detail::prefix_total_kernel<<<1, 1, 0, stream>>>(
-          epoch_live_counts_.data(), n, epoch.count_prefix.data());
+          epoch.quotient_live.data(), gpulsmopt_detail::kEpochQuotients,
+          epoch.quotient_count_prefix.data());
+      gpulsmopt_detail::epoch_quotient_bitmap_kernel<<<256, 256, 0, stream>>>(
+          epoch.quotient_live.data(), epoch.quotient_bitmap.data());
       CUDA_CHECK(cudaGetLastError());
       epoch.has_dead = true;
     }
@@ -3698,18 +3489,6 @@ private:
     refresh_epoch_views(stream);
   }
 
-  void invalidate_epoch_bucket_metadata(cudaStream_t stream) {
-    bool changed = false;
-    for (auto &epoch : epochs_) {
-      if (epoch.bucket_meta_valid) {
-        epoch.bucket_meta_valid = false;
-        changed = true;
-      }
-    }
-    if (changed)
-      refresh_epoch_views(stream);
-  }
-
   void acquire_epoch_slot() {
     if (epoch_pool_.empty()) {
       epochs_.emplace_back();
@@ -3719,43 +3498,44 @@ private:
     epoch_pool_.pop_back();
   }
 
-  void reserve_epoch_storage(std::size_t count, cudaStream_t stream) {
-    const std::size_t d = h_dir_seg_id_.size();
+  void reserve_epoch_storage(std::size_t count) {
     while (epochs_.size() + epoch_pool_.size() <
            static_cast<std::size_t>(gpulsmopt_detail::kEpochMax))
       epoch_pool_.emplace_back();
     for (auto &epoch : epoch_pool_) {
       epoch.keys.resize_discard(count);
       epoch.values.resize_discard(count);
-      epoch.value_prefix.resize_discard(count + 1);
       epoch.count_prefix.resize_discard(count + 1);
       epoch.dead.resize_discard(count);
-      epoch.seg_cuts.resize_discard(d + 1);
-      epoch.coarse_off.resize_discard(
-          d * gpulsmopt_detail::kEpochCoarseStride);
-      epoch.coarse_value_prefix.resize_discard(
-          d * gpulsmopt_detail::kEpochCoarseStride);
-      epoch.bitmap.resize_discard(d * 8u);
+      epoch.quotient_off.resize_discard(
+          gpulsmopt_detail::kEpochQuotients + 1);
+      epoch.subgroup_masks.resize_discard(
+          gpulsmopt_detail::kEpochQuotients *
+          gpulsmopt_detail::kEpochSubgroups);
+      epoch.quotient_live.resize_discard(
+          gpulsmopt_detail::kEpochQuotients);
+      epoch.quotient_value_sum.resize_discard(
+          gpulsmopt_detail::kEpochQuotients);
+      epoch.quotient_count_prefix.resize_discard(
+          gpulsmopt_detail::kEpochQuotients + 1);
+      epoch.quotient_value_prefix.resize_discard(
+          gpulsmopt_detail::kEpochQuotients + 1);
+      epoch.quotient_bitmap.resize_discard(
+          gpulsmopt_detail::kEpochQuotientBitmapWords);
+      epoch.quotient_heavy.resize_discard(
+          gpulsmopt_detail::kEpochQuotients);
     }
-    ensure_epoch_directory_state(stream);
     resize_reuse(epoch_dirty_, gpulsmopt_detail::kEpochMax);
     resize_reuse(epoch_removed_, gpulsmopt_detail::kEpochMax);
     epoch_dirty_host_.resize(gpulsmopt_detail::kEpochMax);
     epoch_removed_host_.resize(gpulsmopt_detail::kEpochMax);
-    epoch_live_values_.resize_discard(count);
     epoch_live_counts_.resize_discard(count);
     const std::size_t pending_capacity =
         count * static_cast<std::size_t>(gpulsmopt_detail::kEpochMax);
     epoch_merge_keys_.resize_discard(pending_capacity);
     epoch_merge_values_.resize_discard(pending_capacity);
-    epoch_retain_keys_.resize_discard(pending_capacity);
-    epoch_retain_values_.resize_discard(pending_capacity);
-    epoch_partition_counters_.resize_discard(2);
-    resize_reuse(epoch_selected_segments_, d);
-    hybrid_stage_keys_.resize_discard(count);
-    hybrid_stage_values_.resize_discard(count);
-    hybrid_bin_cuts_.resize_discard(257);
-    hybrid_heavy_.resize_discard(1);
+    epoch_heavy_list_.resize_discard(gpulsmopt_detail::kEpochQuotients);
+    epoch_heavy_count_.resize_discard(1);
   }
 
   void clear_epoch_state() {
@@ -3764,14 +3544,10 @@ private:
     epochs_.clear();
     epoch_views_.clear();
     epoch_dead_ptrs_.clear();
-    epoch_pending_count_.clear();
-    epoch_pending_value_sum_.clear();
-    epoch_overflow_.clear();
     epoch_dirty_.clear();
     epoch_removed_.clear();
     epoch_dirty_host_.clear();
     epoch_removed_host_.clear();
-    epoch_overflow_host_ = 0u;
   }
 
   void initialize_segmented_storage(cudaStream_t stream) {
@@ -4795,6 +4571,8 @@ private:
     std::size_t total = 0;
     for (std::uint32_t v : h_dir_live_)
       total += v;
+    for (const auto &epoch : epochs_)
+      total += epoch.live_count;
     sheet_live_count_ = total;
   }
 
@@ -5098,7 +4876,7 @@ private:
         max_elements_, std::max(4 * c0_flush_budget(), batch_size_));
     ensure_c0_log(stream);
     prepare_sort_storage(direct_count, c0_flush_budget(), stream);
-    reserve_epoch_storage(direct_count, stream);
+    reserve_epoch_storage(direct_count);
     prepare_scatter_storage();
     prepare_run_storage();
   }
@@ -5126,55 +4904,14 @@ private:
                         const std::uint32_t *values, std::size_t n,
                         std::uint32_t *out_keys, std::uint32_t *out_values,
                         cudaStream_t stream) {
-#if GPULSMOPT_HYBRID_SORT
-    if (n <= (std::size_t{1} << 18)) {
-      constexpr std::uint32_t capacity =
-          6u * gpulsmopt_detail::kHybridBlockThreads;
-      hybrid_stage_keys_.resize_discard(n);
-      hybrid_stage_values_.resize_discard(n);
-      hybrid_bin_cuts_.resize_discard(257);
-      hybrid_heavy_.resize_discard(1);
-      std::size_t partial_bytes = 0;
-      std::size_t full_bytes = 0;
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, partial_bytes, keys, hybrid_stage_keys_.data(), values,
-          hybrid_stage_values_.data(), static_cast<int>(n), 24, 32, stream));
-      CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
-          nullptr, full_bytes, keys, out_keys, values, out_values,
-          static_cast<std::uint32_t>(n), 0, 32, stream));
-      ensure_sort_temp(std::max(partial_bytes, full_bytes));
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          sort_temp_storage_.data(), partial_bytes, keys,
-          hybrid_stage_keys_.data(), values, hybrid_stage_values_.data(),
-          static_cast<int>(n), 24, 32, stream));
-      CUDA_CHECK(cudaMemsetAsync(hybrid_heavy_.data(), 0,
-                                 sizeof(std::uint32_t), stream));
-      gpulsmopt_detail::hybrid_bin_cuts_kernel<<<1, 256, 0, stream>>>(
-          hybrid_stage_keys_.data(), n, hybrid_bin_cuts_.data(), capacity,
-          hybrid_heavy_.data());
-      CUDA_CHECK(cudaGetLastError());
-      std::uint32_t heavy = 0;
-      CUDA_CHECK(cudaMemcpyAsync(&heavy, hybrid_heavy_.data(),
-                                 sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                                 stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      if (heavy == 0u) {
-        gpulsmopt_detail::hybrid_tail_sort_kernel<6><<<256, 256, 0, stream>>>(
-            hybrid_stage_keys_.data(), hybrid_stage_values_.data(),
-            hybrid_bin_cuts_.data(), out_keys, out_values);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-      }
-    }
-#endif
     std::size_t temp_bytes = 0;
     CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
         nullptr, temp_bytes, keys, out_keys, values, out_values,
-        static_cast<std::uint32_t>(n), 0, 32, stream));
+        static_cast<std::uint32_t>(n), 16, 32, stream));
     ensure_sort_temp(temp_bytes);
     CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
         sort_temp_storage_.data(), temp_bytes, keys, out_keys, values,
-        out_values, static_cast<std::uint32_t>(n), 0, 32, stream));
+        out_values, static_cast<std::uint32_t>(n), 16, 32, stream));
   }
 
   void sort_log(thrust::device_vector<std::uint32_t> &k,
@@ -5247,148 +4984,9 @@ private:
     overlay_dirty_ = true;
     read_view_dirty_ = true;
   }
-
-
-  void consolidate_overflow_epochs(cudaStream_t stream) {
-    if (epochs_.empty())
-      return;
-    ensure_host_directory_metadata(stream);
-    const std::size_t d = h_dir_seg_id_.size();
-    std::vector<std::uint32_t> pending_count(d), pending_value(d);
-    CUDA_CHECK(cudaMemcpyAsync(pending_count.data(),
-                               raw_or_null(epoch_pending_count_),
-                               d * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(pending_value.data(),
-                               raw_or_null(epoch_pending_value_sum_),
-                               d * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<std::uint8_t> selected(d, 0u);
-    std::size_t selected_total = 0;
-    for (std::size_t ord = 0; ord < d; ++ord) {
-      if (pending_count[ord] < gpulsmopt_detail::kEpochPendingCap)
-        continue;
-      selected[ord] = 1u;
-      selected_total += pending_count[ord];
-    }
-    if (selected_total == 0) {
-      epoch_overflow_host_ = 0u;
-      CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_overflow_), 0,
-                                 sizeof(std::uint32_t), stream));
-      return;
-    }
-    for (std::size_t ord = 0; ord < d; ++ord) {
-      if (pending_count[ord] > h_dir_live_[ord])
-        throw std::runtime_error("epoch live metadata underflow");
-      h_dir_live_[ord] -= pending_count[ord];
-      h_dir_value_sum_[ord] -= pending_value[ord];
-    }
-    recompute_sheet_live_count();
-    upload_directory_metadata(stream);
-
-    std::size_t live_total = 0;
-    for (const auto &epoch : epochs_)
-      live_total += epoch.live_count;
-    epoch_merge_keys_.resize_discard(live_total);
-    epoch_merge_values_.resize_discard(live_total);
-    epoch_retain_keys_.resize_discard(live_total);
-    epoch_retain_values_.resize_discard(live_total);
-    resize_reuse(epoch_selected_segments_, d);
-    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_selected_segments_),
-                               selected.data(), d * sizeof(std::uint8_t),
-                               cudaMemcpyHostToDevice, stream));
-    epoch_partition_counters_.resize_discard(2);
-    CUDA_CHECK(cudaMemsetAsync(epoch_partition_counters_.data(), 0,
-                               2 * sizeof(std::uint32_t), stream));
-    dim3 grid(static_cast<unsigned>(d),
-              static_cast<unsigned>(epochs_.size()));
-    gpulsmopt_detail::epoch_partition_segments_kernel<<<grid, 256, 0,
-                                                        stream>>>(
-        epoch_view_ptr(), epoch_count(), d,
-        raw_or_null(epoch_selected_segments_),
-        epoch_partition_counters_.data(), epoch_merge_keys_.data(),
-        epoch_merge_values_.data(), epoch_retain_keys_.data(),
-        epoch_retain_values_.data());
-    CUDA_CHECK(cudaGetLastError());
-    std::uint32_t counts[2] = {0u, 0u};
-    CUDA_CHECK(cudaMemcpyAsync(counts, epoch_partition_counters_.data(),
-                               2 * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (counts[0] != selected_total ||
-        static_cast<std::size_t>(counts[0]) + counts[1] != live_total)
-      throw std::runtime_error("epoch partition count mismatch");
-
-    clear_epoch_state();
-    EpochStorage retained;
-    if (!epoch_pool_.empty()) {
-      retained = std::move(epoch_pool_.back());
-      epoch_pool_.pop_back();
-    }
-    if (counts[1] > 0) {
-      retained.count = counts[1];
-      retained.live_count = counts[1];
-      retained.has_dead = false;
-      retained.bucket_meta_valid = true;
-      retained.keys.resize_discard(counts[1]);
-      retained.values.resize_discard(counts[1]);
-      sort_epoch_batch(epoch_retain_keys_.data(),
-                       epoch_retain_values_.data(), counts[1],
-                       retained.keys.data(), retained.values.data(), stream);
-    }
-    if (counts[0] > 0)
-      sort_direct_batch(epoch_merge_keys_.data(), epoch_merge_values_.data(),
-                        counts[0], stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    if (counts[0] > 0) {
-      consolidating_epochs_ = true;
-      try {
-        merge_incoming_into_sheet(direct_sort_keys_.data(),
-                                  direct_sort_values_.data(), counts[0],
-                                  stream);
-        consolidating_epochs_ = false;
-      } catch (...) {
-        consolidating_epochs_ = false;
-        throw;
-      }
-    }
-    if (counts[1] > 0) {
-      ensure_epoch_directory_state(stream);
-      epochs_.push_back(std::move(retained));
-      commit_epoch_metadata(epochs_.back(), stream);
-    } else {
-      epoch_pool_.push_back(std::move(retained));
-    }
-  }
-
   void consolidate_all_epochs(cudaStream_t stream) {
     if (epochs_.empty())
       return;
-    ensure_host_directory_metadata(stream);
-    const std::size_t d = h_dir_seg_id_.size();
-    std::vector<std::uint32_t> pending_count(d), pending_value(d);
-    if (d > 0) {
-      CUDA_CHECK(cudaMemcpyAsync(pending_count.data(),
-                                 raw_or_null(epoch_pending_count_),
-                                 d * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(pending_value.data(),
-                                 raw_or_null(epoch_pending_value_sum_),
-                                 d * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      for (std::size_t ord = 0; ord < d; ++ord) {
-        if (pending_count[ord] > h_dir_live_[ord])
-          throw std::runtime_error("epoch live metadata underflow");
-        h_dir_live_[ord] -= pending_count[ord];
-        h_dir_value_sum_[ord] -= pending_value[ord];
-      }
-    }
-    recompute_sheet_live_count();
-    upload_directory_metadata(stream);
-
     std::size_t live_total = 0;
     for (const auto &epoch : epochs_)
       live_total += epoch.live_count;
@@ -5396,7 +4994,7 @@ private:
     epoch_merge_values_.resize_discard(live_total);
     std::size_t output_base = 0;
     const int block = 256;
-    for (const auto &epoch : epochs_) {
+    for (auto &epoch : epochs_) {
       if (epoch.live_count == 0)
         continue;
       if (!epoch.has_dead) {
@@ -5411,6 +5009,11 @@ private:
       } else {
         const int grid =
             static_cast<int>((epoch.count + block - 1) / block);
+        epoch_live_counts_.resize_discard(epoch.count);
+        gpulsmopt_detail::epoch_live_input_kernel<<<grid, block, 0, stream>>>(
+            epoch.dead.data(), epoch.count, epoch_live_counts_.data());
+        exclusive_scan_u32(epoch_live_counts_.data(),
+                           epoch.count_prefix.data(), epoch.count, stream);
         gpulsmopt_detail::epoch_gather_live_kernel<<<grid, block, 0, stream>>>(
             epoch.keys.data(), epoch.values.data(), epoch.dead.data(),
             epoch.count_prefix.data(), epoch.count,
@@ -5489,14 +5092,11 @@ private:
     ds_staged_keys_.resize_discard(count);
     ds_staged_values_.resize_discard(count);
     ds_meta_.resize_discard(3 * dir_count + 4);
-    ds_window_.resize_discard(2 * dir_count);
     std::uint32_t *cnt = ds_cnt_cursor_.data();
     std::uint32_t *cursor = cnt + total_buckets;
     std::uint32_t *live_delta = ds_meta_.data() + dir_count;
     std::uint32_t *value_delta = live_delta + dir_count;
     std::uint32_t *counters = value_delta + dir_count;
-    std::uint32_t *epoch_live_delta = ds_window_.data();
-    std::uint32_t *epoch_value_delta = epoch_live_delta + dir_count;
 
     const int block = 256;
     const int key_grid = static_cast<int>((count + block - 1) / block);
@@ -5508,19 +5108,13 @@ private:
       CUDA_CHECK(cudaMemsetAsync(
           ds_meta_.data(), 0, (3 * dir_count + 4) * sizeof(std::uint32_t),
           stream));
-      CUDA_CHECK(cudaMemsetAsync(epoch_live_delta, 0,
-                                 2 * dir_count * sizeof(std::uint32_t),
-                                 stream));
       rebuild_flat_route(stream);
       if (had_epochs) {
         gpulsmopt_detail::ds_route_only_kernel<<<key_grid, block, 0, stream>>>(
             keys_in, count, radix_first_.data(), flat_bucket_max_.data(),
             total_buckets, ds_dest_.data());
         CUDA_CHECK(cudaGetLastError());
-        begin_epoch_deletes(
-            keys_in, count, ds_dest_.data(),
-            static_cast<std::uint32_t>(gpulsmopt_detail::kSegmentBuckets),
-            epoch_live_delta, epoch_value_delta, stream);
+        begin_epoch_deletes(keys_in, count, stream);
         gpulsmopt_detail::ds_count_epoch_misses_kernel<<<
             key_grid, block, 0, stream>>>(
             ds_dest_.data(), epoch_delete_found_.data(), count, cnt,
@@ -5571,32 +5165,24 @@ private:
       CUDA_CHECK(cudaGetLastError());
     }
     std::vector<std::uint32_t> meta_host(2 * dir_count + 1);
-    std::vector<std::uint32_t> epoch_meta_host(2 * dir_count);
     CUDA_CHECK(cudaMemcpyAsync(meta_host.data(), live_delta,
                                (2 * dir_count + 1) * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(epoch_meta_host.data(), epoch_live_delta,
-                               2 * dir_count * sizeof(std::uint32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     finish_epoch_deletes(stream);
     bool physical_deleted = false;
     for (std::size_t ord = 0; ord < dir_count; ++ord)
       physical_deleted |= meta_host[ord] != 0u;
-    if (physical_deleted)
-      invalidate_epoch_bucket_metadata(stream);
     const std::uint32_t num_dirty = meta_host[2 * dir_count];
     (void)num_dirty;
     flat_route_dirty_ |= physical_deleted;
     const std::uint32_t watermark = target_segment_live_ / 2;
     for (std::size_t ord = 0; ord < dir_count; ++ord) {
-      const std::uint32_t live_delta_v =
-          meta_host[ord] + epoch_meta_host[ord];
+      const std::uint32_t live_delta_v = meta_host[ord];
       if (live_delta_v == 0)
         continue;
       h_dir_live_[ord] += live_delta_v;
-      h_dir_value_sum_[ord] += meta_host[dir_count + ord] +
-                               epoch_meta_host[dir_count + ord];
+      h_dir_value_sum_[ord] += meta_host[dir_count + ord];
       if (!had_epochs && h_dir_live_[ord] < watermark)
         sheet_fragmented_ = true;
     }
@@ -5951,22 +5537,7 @@ private:
           raw_or_null(seg_new_live_), raw_or_null(seg_new_value_sum_));
       CUDA_CHECK(cudaGetLastError());
     }
-    const std::size_t dir_count = h_dir_seg_id_.size();
-    ds_meta_.resize_discard(3 * dir_count + 4);
-    std::uint32_t *d_live_delta = ds_meta_.data() + dir_count;
-    std::uint32_t *d_value_delta = d_live_delta + dir_count;
-    CUDA_CHECK(cudaMemsetAsync(ds_meta_.data(), 0,
-                               (3 * dir_count + 4) * sizeof(std::uint32_t),
-                               stream));
-    begin_epoch_deletes(raw_or_null(scratch_delete_keys_), tomb,
-                        raw_or_null(seg_inc_bucket_),
-                        static_cast<std::uint32_t>(
-                            gpulsmopt_detail::kSegmentBuckets),
-                        d_live_delta, d_value_delta, stream);
-    std::vector<std::uint32_t> epoch_meta(2 * dir_count);
-    CUDA_CHECK(cudaMemcpyAsync(epoch_meta.data(), d_live_delta,
-                               2 * dir_count * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
+    begin_epoch_deletes(raw_or_null(scratch_delete_keys_), tomb, stream);
     std::vector<std::uint32_t> dirty_ord(m), new_live(m), new_value_sum(m);
     CUDA_CHECK(cudaMemcpyAsync(dirty_ord.data(), raw_or_null(seg_dirty_ord_),
                                m * sizeof(std::uint32_t),
@@ -5989,14 +5560,6 @@ private:
       h_dir_live_[ord] = new_live[i];
       h_dir_value_sum_[ord] = new_value_sum[i];
     }
-    for (std::size_t ord = 0; ord < dir_count; ++ord) {
-      if (epoch_meta[ord] == 0)
-        continue;
-      h_dir_live_[ord] += epoch_meta[ord];
-      h_dir_value_sum_[ord] += epoch_meta[dir_count + ord];
-    }
-    if (physical_deleted)
-      invalidate_epoch_bucket_metadata(stream);
     flat_route_dirty_ |= physical_deleted;
     recompute_sheet_live_count();
     if (physical_deleted)
@@ -6315,15 +5878,10 @@ private:
   std::vector<EpochStorage> epoch_pool_;
   thrust::device_vector<gpulsmopt_detail::EpochView> epoch_views_;
   thrust::device_vector<std::uint8_t *> epoch_dead_ptrs_;
-  thrust::device_vector<std::uint32_t> epoch_pending_count_;
-  thrust::device_vector<std::uint32_t> epoch_pending_value_sum_;
-  thrust::device_vector<std::uint32_t> epoch_overflow_;
   thrust::device_vector<std::uint32_t> epoch_dirty_;
   thrust::device_vector<std::uint32_t> epoch_removed_;
-  thrust::device_vector<std::uint8_t> epoch_selected_segments_;
   std::vector<std::uint32_t> epoch_dirty_host_;
   std::vector<std::uint32_t> epoch_removed_host_;
-  std::uint32_t epoch_overflow_host_ = 0u;
   bool consolidating_epochs_ = false;
 
   std::vector<std::uint32_t> h_dir_seg_id_;
@@ -6348,18 +5906,12 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> sort_payload_input_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> sort_payload_output_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> sort_temp_storage_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hybrid_stage_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hybrid_stage_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hybrid_bin_cuts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hybrid_heavy_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_live_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_live_counts_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_merge_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_merge_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_retain_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_retain_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_partition_counters_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> epoch_delete_found_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_heavy_list_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_heavy_count_;
   std::size_t direct_sort_count_ = 0;
   std::size_t direct_sort_temp_bytes_ = 0;
   std::size_t dir_scan_count_ = 0;
