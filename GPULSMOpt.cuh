@@ -65,11 +65,9 @@ namespace gpulsmopt_detail {
 constexpr int kEpochMax = GPULSMOPT_EPOCH_MAX;
 constexpr int kEpochQuotientBits = 16;
 constexpr int kEpochSubgroupBits = 4;
-constexpr int kEpochGateBits = 6;
 constexpr int kEpochQuotients = 1 << kEpochQuotientBits;
 constexpr int kEpochSubgroups = 1 << kEpochSubgroupBits;
 constexpr int kEpochSubgroupPlanes = kEpochSubgroupBits;
-constexpr int kEpochGateWords = 1 << (kEpochGateBits - 5);
 constexpr int kEpochSubgroupPrefixStride = kEpochSubgroups + 1;
 constexpr int kEpochHeavySortCap = 128;
 constexpr int kEpochQuotientBitmapWords = kEpochQuotients / 32;
@@ -280,7 +278,6 @@ struct EpochView {
   const std::uint8_t *dead;
   const std::uint32_t *quotient_off;
   const std::uint32_t *subgroup_masks;
-  const std::uint32_t *quotient_gate;
   std::uint32_t *quotient_live;
   std::uint32_t *quotient_value_sum;
   const std::uint32_t *quotient_count_prefix;
@@ -312,17 +309,6 @@ __device__ inline bool epoch_key_killed(
   return p < killed_count && killed_keys[p] == key;
 }
 
-__device__ inline bool epoch_gate_contains(const EpochView &ev,
-                                           std::uint32_t key) {
-  const std::uint32_t quotient = key >> kEpochQuotientBits;
-  const std::uint32_t gate =
-      (key >> (kEpochQuotientBits - kEpochGateBits)) &
-      ((1u << kEpochGateBits) - 1u);
-  const std::uint32_t word = gate >> 5;
-  const std::uint32_t bit = gate & 31u;
-  return (ev.quotient_gate[quotient * kEpochGateWords + word] >> bit) & 1u;
-}
-
 __device__ inline std::uint32_t epoch_subgroup_mask(
     const EpochView &ev, std::uint32_t quotient, std::uint32_t subgroup,
     std::uint32_t count) {
@@ -339,8 +325,6 @@ __device__ inline std::uint32_t epoch_subgroup_mask(
 
 __device__ inline bool epoch_point_position(
     const EpochView &ev, std::uint32_t key, std::uint32_t *position) {
-  if (!epoch_gate_contains(ev, key))
-    return false;
   const std::uint32_t quotient = key >> kEpochQuotientBits;
   const std::uint32_t begin = ev.quotient_off[quotient];
   const std::uint32_t end = ev.quotient_off[quotient + 1];
@@ -854,7 +838,7 @@ __global__ void spine_gather_live_kernel(
 __global__ void epoch_quotient_metadata_kernel(
     const std::uint32_t *keys, std::uint32_t record_count,
     std::uint32_t *offsets, std::uint32_t *subgroup_masks,
-    std::uint32_t *quotient_gate, std::uint32_t *quotient_live) {
+    std::uint32_t *quotient_live) {
   const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t stride = gridDim.x * blockDim.x;
   for (std::uint32_t i = tid; i < record_count; i += stride) {
@@ -866,17 +850,12 @@ __global__ void epoch_quotient_metadata_kernel(
     if (i != 0u && quotient == previous)
       continue;
     std::uint32_t planes[kEpochSubgroupPlanes] = {};
-    std::uint32_t gate[kEpochGateWords] = {};
     std::uint32_t end = i;
     while (end < record_count) {
       const std::uint32_t current_key = end == i ? keys[i] : keys[end];
       if ((current_key >> kEpochQuotientBits) != quotient)
         break;
       const std::uint32_t local = end - i;
-      const std::uint32_t gate_index =
-          (current_key >> (kEpochQuotientBits - kEpochGateBits)) &
-          ((1u << kEpochGateBits) - 1u);
-      gate[gate_index >> 5] |= 1u << (gate_index & 31u);
       if (local < 32u) {
         const std::uint32_t subgroup =
             (current_key >>
@@ -892,28 +871,19 @@ __global__ void epoch_quotient_metadata_kernel(
     if (i == 0u) {
       for (std::uint32_t q = 0; q <= quotient; ++q)
         offsets[q] = 0u;
-      for (std::uint32_t q = 0; q < quotient; ++q) {
+      for (std::uint32_t q = 0; q < quotient; ++q)
         quotient_live[q] = 0u;
-        quotient_gate[q * kEpochGateWords] = 0u;
-        quotient_gate[q * kEpochGateWords + 1u] = 0u;
-      }
     } else {
       for (std::uint32_t q = previous + 1u; q <= quotient; ++q)
         offsets[q] = i;
-      for (std::uint32_t q = previous + 1u; q < quotient; ++q) {
+      for (std::uint32_t q = previous + 1u; q < quotient; ++q)
         quotient_live[q] = 0u;
-        quotient_gate[q * kEpochGateWords] = 0u;
-        quotient_gate[q * kEpochGateWords + 1u] = 0u;
-      }
     }
     if (end == record_count) {
       for (std::uint32_t q = quotient + 1u; q <= kEpochQuotients; ++q)
         offsets[q] = record_count;
-      for (std::uint32_t q = quotient + 1u; q < kEpochQuotients; ++q) {
+      for (std::uint32_t q = quotient + 1u; q < kEpochQuotients; ++q)
         quotient_live[q] = 0u;
-        quotient_gate[q * kEpochGateWords] = 0u;
-        quotient_gate[q * kEpochGateWords + 1u] = 0u;
-      }
     }
     const std::uint32_t count = end - i;
     if (count <= 32u) {
@@ -922,10 +892,6 @@ __global__ void epoch_quotient_metadata_kernel(
       for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
         subgroup_masks[base + bit] = planes[bit];
     }
-    const std::uint32_t gate_base = quotient * kEpochGateWords;
-#pragma unroll
-    for (int word = 0; word < kEpochGateWords; ++word)
-      quotient_gate[gate_base + word] = gate[word];
     quotient_live[quotient] = count;
   }
 }
@@ -1593,25 +1559,12 @@ public:
     const int block = 128;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     const auto spine = make_spine_view();
-    if (!no_overlay) {
-      gpulsmopt_detail::count_query_kernel<true, true>
-          <<<grid, block, 0, stream>>>(
-              batch.lo, batch.hi, batch.out_counts, batch.count, spine,
-              spine_dead_count_prefix_.data(), epoch_view_ptr(), epoch_count(),
-              ins_keys, ix->ins, tomb_keys, tomb_cnt, ix->u - ix->ins);
-    } else if (epoch_count() > 0) {
-      gpulsmopt_detail::count_query_kernel<false, true>
-          <<<grid, block, 0, stream>>>(
-              batch.lo, batch.hi, batch.out_counts, batch.count, spine,
-              spine_dead_count_prefix_.data(), epoch_view_ptr(), epoch_count(),
-              nullptr, 0, nullptr, nullptr, 0);
-    } else {
-      gpulsmopt_detail::count_query_kernel<false, false>
-          <<<grid, block, 0, stream>>>(
-              batch.lo, batch.hi, batch.out_counts, batch.count, spine,
-              spine_dead_count_prefix_.data(), nullptr, 0,
-              nullptr, 0, nullptr, nullptr, 0);
-    }
+    gpulsmopt_detail::count_query_kernel<true, true>
+        <<<grid, block, 0, stream>>>(
+            batch.lo, batch.hi, batch.out_counts, batch.count, spine,
+            spine_dead_count_prefix_.data(), epoch_view_ptr(), epoch_count(),
+            ins_keys, no_overlay ? 0 : ix->ins, tomb_keys, tomb_cnt,
+            no_overlay ? 0 : ix->u - ix->ins);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -1647,23 +1600,11 @@ public:
     const std::size_t live_ins_count = no_overlay ? 0 : ix->live_ins_count;
     const int block = 128;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
-    if (!no_overlay) {
-      gpulsmopt_detail::successor_index_kernel<true, true>
-          <<<grid, block, 0, stream>>>(
-              batch.queries, batch.count, batch.out_keys, make_spine_view(),
-              epoch_view_ptr(), epoch_count(), killed, killed_count, live_ins,
-              live_ins_count);
-    } else if (epoch_count() > 0) {
-      gpulsmopt_detail::successor_index_kernel<false, true>
-          <<<grid, block, 0, stream>>>(
-              batch.queries, batch.count, batch.out_keys, make_spine_view(),
-              epoch_view_ptr(), epoch_count(), nullptr, 0, nullptr, 0);
-    } else {
-      gpulsmopt_detail::successor_index_kernel<false, false>
-          <<<grid, block, 0, stream>>>(
-              batch.queries, batch.count, batch.out_keys, make_spine_view(),
-              nullptr, 0, nullptr, 0, nullptr, 0);
-    }
+    gpulsmopt_detail::successor_index_kernel<true, true>
+        <<<grid, block, 0, stream>>>(
+            batch.queries, batch.count, batch.out_keys, make_spine_view(),
+            epoch_view_ptr(), epoch_count(), killed, killed_count, live_ins,
+            live_ins_count);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -1716,32 +1657,14 @@ public:
     const int block = 128;
     const int grid = static_cast<int>((batch.query_count + block - 1) / block);
     const auto spine = make_spine_view();
-    if (!no_overlay) {
-      gpulsmopt_detail::range_query_kernel<true, true>
-          <<<grid, block, 0, stream>>>(
-              batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-              batch.query_count, spine, spine_value_prefix_.data(),
-              spine_dead_count_prefix_.data(),
-              spine_dead_value_prefix_.data(), epoch_view_ptr(), epoch_count(),
-              ins_keys, ins_prefix, ix->ins, tomb_keys, tomb_val, tomb_cnt,
-              ix->u - ix->ins);
-    } else if (epoch_count() > 0) {
-      gpulsmopt_detail::range_query_kernel<false, true>
-          <<<grid, block, 0, stream>>>(
-              batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-              batch.query_count, spine, spine_value_prefix_.data(),
-              spine_dead_count_prefix_.data(),
-              spine_dead_value_prefix_.data(), epoch_view_ptr(), epoch_count(),
-              nullptr, nullptr, 0, nullptr, nullptr, nullptr, 0);
-    } else {
-      gpulsmopt_detail::range_query_kernel<false, false>
-          <<<grid, block, 0, stream>>>(
-              batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-              batch.query_count, spine, spine_value_prefix_.data(),
-              spine_dead_count_prefix_.data(),
-              spine_dead_value_prefix_.data(), nullptr, 0,
-              nullptr, nullptr, 0, nullptr, nullptr, nullptr, 0);
-    }
+    gpulsmopt_detail::range_query_kernel<true, true>
+        <<<grid, block, 0, stream>>>(
+            batch.lo, batch.hi, batch.out_sums, batch.out_counts,
+            batch.query_count, spine, spine_value_prefix_.data(),
+            spine_dead_count_prefix_.data(),
+            spine_dead_value_prefix_.data(), epoch_view_ptr(), epoch_count(),
+            ins_keys, ins_prefix, no_overlay ? 0 : ix->ins, tomb_keys,
+            tomb_val, tomb_cnt, no_overlay ? 0 : ix->u - ix->ins);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -1804,8 +1727,7 @@ public:
     for (const auto &epoch : epochs_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.dead,
-          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_gate,
-          epoch.quotient_live,
+          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
           epoch.quotient_value_prefix, epoch.subgroup_value_prefix,
           epoch.quotient_bitmap,
@@ -1813,8 +1735,7 @@ public:
     for (const auto &epoch : epoch_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.dead,
-          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_gate,
-          epoch.quotient_live,
+          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
           epoch.quotient_value_prefix, epoch.subgroup_value_prefix,
           epoch.quotient_bitmap,
@@ -2006,7 +1927,6 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> dead;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> subgroup_masks;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_gate;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_live;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_value_sum;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_count_prefix;
@@ -2047,7 +1967,6 @@ private:
             epoch.dead.data(),
             epoch.quotient_off.data(),
             epoch.subgroup_masks.data(),
-            epoch.quotient_gate.data(),
             epoch.quotient_live.data(),
             epoch.quotient_value_sum.data(),
             epoch.quotient_count_prefix.data(),
@@ -2066,7 +1985,6 @@ private:
     return a.keys == b.keys && a.values == b.values && a.dead == b.dead &&
            a.quotient_off == b.quotient_off &&
            a.subgroup_masks == b.subgroup_masks &&
-           a.quotient_gate == b.quotient_gate &&
            a.quotient_live == b.quotient_live &&
            a.quotient_value_sum == b.quotient_value_sum &&
            a.quotient_count_prefix == b.quotient_count_prefix &&
@@ -2146,9 +2064,6 @@ private:
     epoch.subgroup_masks.resize_discard(
         gpulsmopt_detail::kEpochQuotients *
         gpulsmopt_detail::kEpochSubgroupPlanes);
-    epoch.quotient_gate.resize_discard(
-        gpulsmopt_detail::kEpochQuotients *
-        gpulsmopt_detail::kEpochGateWords);
     epoch.quotient_live.resize_discard(
         gpulsmopt_detail::kEpochQuotients);
     epoch.quotient_value_sum.resize_discard(
@@ -2171,13 +2086,11 @@ private:
     std::uint32_t record_count = static_cast<std::uint32_t>(count);
     std::uint32_t *offsets = epoch.quotient_off.data();
     std::uint32_t *subgroup_masks = epoch.subgroup_masks.data();
-    std::uint32_t *quotient_gate = epoch.quotient_gate.data();
     std::uint32_t *quotient_live = epoch.quotient_live.data();
     const int grid = static_cast<int>((record_count + block - 1) / block);
     gpulsmopt_detail::epoch_quotient_metadata_kernel<<<grid, block, 0,
                                                        stream>>>(
-        keys, record_count, offsets, subgroup_masks, quotient_gate,
-        quotient_live);
+        keys, record_count, offsets, subgroup_masks, quotient_live);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -2528,9 +2441,6 @@ private:
       epoch.subgroup_masks.resize_discard(
           gpulsmopt_detail::kEpochQuotients *
           gpulsmopt_detail::kEpochSubgroupPlanes);
-      epoch.quotient_gate.resize_discard(
-          gpulsmopt_detail::kEpochQuotients *
-          gpulsmopt_detail::kEpochGateWords);
       epoch.quotient_live.resize_discard(
           gpulsmopt_detail::kEpochQuotients);
       epoch.quotient_value_sum.resize_discard(
@@ -3745,25 +3655,15 @@ private:
     const int block = 256;
     const int grid = static_cast<int>((n + block - 1) / block);
     const auto spine = make_spine_view();
-    if (!no_overlay) {
-      gpulsmopt_detail::point_lookup_kernel<true, true>
-          <<<grid, block, 0, stream>>>(
-              batch.queries, n, batch.out_values, batch.out_found,
-              raw_or_null(ix->gk), raw_or_null(ix->gv), ix->ins,
-              raw_or_null(ix->gk) + ix->ins, ix->u - ix->ins, spine,
-              epoch_view_ptr(), epoch_count());
-    } else if (epoch_count() > 0) {
-      gpulsmopt_detail::point_lookup_kernel<false, true>
-          <<<grid, block, 0, stream>>>(
-              batch.queries, n, batch.out_values, batch.out_found,
-              nullptr, nullptr, 0, nullptr, 0, spine,
-              epoch_view_ptr(), epoch_count());
-    } else {
-      gpulsmopt_detail::point_lookup_kernel<false, false>
-          <<<grid, block, 0, stream>>>(
-              batch.queries, n, batch.out_values, batch.out_found,
-              nullptr, nullptr, 0, nullptr, 0, spine, nullptr, 0);
-    }
+    gpulsmopt_detail::point_lookup_kernel<true, true>
+        <<<grid, block, 0, stream>>>(
+            batch.queries, n, batch.out_values, batch.out_found,
+            no_overlay ? nullptr : raw_or_null(ix->gk),
+            no_overlay ? nullptr : raw_or_null(ix->gv),
+            no_overlay ? 0 : ix->ins,
+            no_overlay ? nullptr : raw_or_null(ix->gk) + ix->ins,
+            no_overlay ? 0 : ix->u - ix->ins, spine,
+            epoch_view_ptr(), epoch_count());
     CUDA_CHECK(cudaGetLastError());
   }
 
