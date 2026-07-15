@@ -146,18 +146,14 @@ public:
     return {
         {"batch_size",
          std::to_string(gpulsmopt_adapter_detail::batch_size_hint())},
-        {"segment_buckets",
-         std::to_string(static_cast<size_t>(GPULSMOPT_SEGMENT_BUCKETS))},
-        {"target_fill",
-         std::to_string(static_cast<size_t>(GPULSMOPT_TARGET_FILL))},
-        {"inplace_max_incoming",
-         std::to_string(static_cast<size_t>(GPULSMOPT_INPLACE_MAX_INCOMING))},
         {"c0_log", "1"},
         {"sorted_runs", "1"},
         {"c0_flush_budget",
          std::to_string(static_cast<size_t>(GPULSMOPT_C0_FLUSH_BUDGET))},
-        {"lookup_flix_min_batch",
-         std::to_string(static_cast<size_t>(GPULSMOPT_LOOKUP_FLIX_MIN_BATCH))},
+        {"epoch_min_batch",
+         std::to_string(static_cast<size_t>(GPULSMOPT_SCATTER_MIN_BATCH))},
+        {"epoch_max",
+         std::to_string(static_cast<size_t>(GPULSMOPT_EPOCH_MAX))},
     };
   }
 
@@ -170,7 +166,6 @@ public:
   size_t gpu_resident_bytes() {
     size_t total = dictionary_ ? dictionary_->gpu_resident_bytes() : 0;
     total += build_values_buffer_.num_elements * sizeof(smallsize);
-    total += lookup_found_buffer_.num_elements * sizeof(std::uint8_t);
     return total;
   }
 
@@ -219,7 +214,6 @@ public:
   void destroy() {
     dictionary_.reset();
     build_values_buffer_.free();
-    lookup_found_buffer_.free();
   }
 
   void lookup(const key_type *keys, value_type *result, size_t size,
@@ -227,15 +221,11 @@ public:
     ensure_built();
     if (size == 0)
       return;
-    if (lookup_found_buffer_.num_elements < size) {
-      lookup_found_buffer_.resize(size);
-    }
-
     DeviceLookupBatch batch;
     batch.queries = reinterpret_cast<const std::uint32_t *>(keys);
     batch.count = size;
     batch.out_values = reinterpret_cast<std::uint32_t *>(result);
-    batch.out_found = lookup_found_buffer_.ptr();
+    batch.out_found = nullptr;
     dictionary_->lookup(batch, stream);
   }
 
@@ -273,6 +263,7 @@ public:
     GPULSMOpt::DeviceKeyBatch batch;
     batch.keys = reinterpret_cast<const std::uint32_t *>(update_list);
     batch.count = size;
+    batch.sorted = true;
     dictionary_->erase(batch, stream);
   }
 
@@ -297,7 +288,6 @@ private:
 
   std::unique_ptr<GPULSMOpt> dictionary_;
   cuda_buffer<smallsize> build_values_buffer_;
-  cuda_buffer<std::uint8_t> lookup_found_buffer_;
 };
 
 #endif
