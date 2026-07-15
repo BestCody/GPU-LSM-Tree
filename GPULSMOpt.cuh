@@ -328,6 +328,8 @@ struct EpochView {
   const std::uint32_t *quotient_count_prefix;
   const std::uint32_t *quotient_value_prefix;
   const std::uint32_t *quotient_bitmap;
+  std::uint32_t *heavy_list;
+  std::uint32_t *heavy_count;
   std::uint32_t has_dead;
 };
 
@@ -1955,82 +1957,124 @@ block_scan_exclusive(std::uint32_t value, std::uint32_t *scratch) {
   return result;
 }
 
-__global__ void epoch_quotient_offsets_kernel(
-    const std::uint32_t *keys, std::uint32_t count,
-    std::uint32_t *offsets) {
-  const std::uint32_t quotient = blockIdx.x * blockDim.x + threadIdx.x;
-  if (quotient > kEpochQuotients)
-    return;
-  if (quotient == kEpochQuotients) {
-    offsets[quotient] = count;
-    return;
+__global__ void epoch_quotient_metadata_kernel(
+    const std::uint32_t *keys, std::uint32_t record_count,
+    std::uint32_t *offsets, std::uint32_t *subgroup_masks,
+    std::uint32_t *quotient_live) {
+  const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t stride = gridDim.x * blockDim.x;
+  for (std::uint32_t i = tid; i < record_count; i += stride) {
+    const std::uint32_t quotient = keys[i] >> kEpochQuotientBits;
+    const unsigned active = __activemask();
+    std::uint32_t previous = __shfl_up_sync(active, quotient, 1);
+    if ((threadIdx.x & 31) == 0 && i != 0u)
+      previous = keys[i - 1] >> kEpochQuotientBits;
+    if (i != 0u && quotient == previous)
+      continue;
+    std::uint32_t end = i + 1u;
+    while (end < record_count &&
+           (keys[end] >> kEpochQuotientBits) == quotient)
+      ++end;
+    if (i == 0u) {
+      for (std::uint32_t q = 0; q <= quotient; ++q)
+        offsets[q] = 0u;
+      for (std::uint32_t q = 0; q < quotient; ++q) {
+        quotient_live[q] = 0u;
+      }
+    } else {
+      for (std::uint32_t q = previous + 1u; q <= quotient; ++q)
+        offsets[q] = i;
+      for (std::uint32_t q = previous + 1u; q < quotient; ++q) {
+        quotient_live[q] = 0u;
+      }
+    }
+    if (end == record_count) {
+      for (std::uint32_t q = quotient + 1u; q <= kEpochQuotients; ++q)
+        offsets[q] = record_count;
+      for (std::uint32_t q = quotient + 1u; q < kEpochQuotients; ++q) {
+        quotient_live[q] = 0u;
+      }
+    }
+    const std::uint32_t count = end - i;
+    std::uint32_t planes[kEpochSubgroupPlanes] = {};
+    if (count <= 32u) {
+      for (std::uint32_t p = i; p < end; ++p) {
+        const std::uint32_t subgroup =
+            (keys[p] >> (kEpochQuotientBits - kEpochSubgroupBits)) &
+            (kEpochSubgroups - 1);
+        const std::uint32_t position = 1u << (p - i);
+#pragma unroll
+        for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
+          planes[bit] |= (0u - ((subgroup >> bit) & 1u)) & position;
+      }
+    }
+    if (count <= 32u) {
+      const std::uint32_t base = quotient * kEpochSubgroupPlanes;
+#pragma unroll
+      for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
+        subgroup_masks[base + bit] = planes[bit];
+    }
+    quotient_live[quotient] = count;
   }
-  const std::uint32_t key = quotient << kEpochQuotientBits;
-  offsets[quotient] = static_cast<std::uint32_t>(
-      lower_bound_u32(keys, count, key));
 }
 
-__global__ void epoch_quotient_meta_kernel(
-    const std::uint32_t *keys, const std::uint32_t *values,
-    const std::uint32_t *offsets, std::uint32_t *subgroup_masks,
-    std::uint32_t *quotient_live, std::uint32_t *quotient_value_sum,
-    std::uint32_t *quotient_bitmap, std::uint32_t *heavy_list,
-    std::uint32_t *heavy_count) {
-  const std::uint32_t quotient = blockIdx.x * blockDim.x + threadIdx.x;
-  if (quotient >= kEpochQuotients)
+__global__ void epoch_quotient_value_sum_kernel(
+    const EpochView *epochs, int epoch_count, std::uint32_t pending_mask) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t total =
+      static_cast<std::uint32_t>(epoch_count) * kEpochQuotients;
+  if (index >= total)
     return;
-  const std::uint32_t begin = offsets[quotient];
-  const std::uint32_t end = offsets[quotient + 1];
-  const std::uint32_t count = end - begin;
-  std::uint32_t plane0 = 0u;
-  std::uint32_t plane1 = 0u;
-  std::uint32_t plane2 = 0u;
-  std::uint32_t plane3 = 0u;
+  const int epoch_index = index >> kEpochQuotientBits;
+  if ((pending_mask & (1u << epoch_index)) == 0u)
+    return;
+  const std::uint32_t quotient = index & (kEpochQuotients - 1);
+  const EpochView ev = epochs[epoch_index];
+  const std::uint32_t begin = ev.quotient_off[quotient];
+  const std::uint32_t end = ev.quotient_off[quotient + 1];
   std::uint32_t sum = 0u;
-  for (std::uint32_t p = begin; p < end; ++p) {
-    sum += values[p];
-    if (count <= 32u) {
-      const std::uint32_t subgroup =
-          (keys[p] >> (kEpochQuotientBits - kEpochSubgroupBits)) &
-          (kEpochSubgroups - 1);
-      const std::uint32_t position = 1u << (p - begin);
-      plane0 |= (0u - ((subgroup >> 0) & 1u)) & position;
-      plane1 |= (0u - ((subgroup >> 1) & 1u)) & position;
-      plane2 |= (0u - ((subgroup >> 2) & 1u)) & position;
-      plane3 |= (0u - ((subgroup >> 3) & 1u)) & position;
-    }
-  }
-  if (count <= 32u) {
-    const std::uint32_t base = quotient * kEpochSubgroupPlanes;
-    subgroup_masks[base + 0] = plane0;
-    subgroup_masks[base + 1] = plane1;
-    subgroup_masks[base + 2] = plane2;
-    subgroup_masks[base + 3] = plane3;
-  }
-  if (count > 32u) {
-    if (count <= kEpochHeavySortCap)
-      heavy_list[atomicAdd(heavy_count, 1u)] = quotient;
-  }
-  quotient_live[quotient] = count;
-  quotient_value_sum[quotient] = sum;
-  const std::uint32_t occupied = __ballot_sync(0xffffffffu, count != 0u);
-  if ((threadIdx.x & 31) == 0)
-    quotient_bitmap[quotient >> 5] = occupied;
+  for (std::uint32_t p = begin; p < end; ++p)
+    sum += ev.values[p];
+  ev.quotient_value_sum[quotient] = sum;
+}
+
+__global__ void epoch_classify_heavy_quotients_kernel(
+    const EpochView *epochs, int epoch_count, std::uint32_t pending_mask) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t total =
+      static_cast<std::uint32_t>(epoch_count) * kEpochQuotients;
+  if (index >= total)
+    return;
+  const int epoch_index = index >> kEpochQuotientBits;
+  if ((pending_mask & (1u << epoch_index)) == 0u)
+    return;
+  const std::uint32_t quotient = index & (kEpochQuotients - 1);
+  const EpochView ev = epochs[epoch_index];
+  const std::uint32_t count =
+      ev.quotient_off[quotient + 1] - ev.quotient_off[quotient];
+  if (count > 32u && count <= kEpochHeavySortCap)
+    ev.heavy_list[atomicAdd(ev.heavy_count, 1u)] = quotient;
 }
 
 __global__ void epoch_sort_heavy_quotients_kernel(
-    std::uint32_t *keys, std::uint32_t *values,
-    const std::uint32_t *offsets, const std::uint32_t *heavy_list,
-    const std::uint32_t *heavy_count) {
+    const EpochView *epochs, int epoch_count, std::uint32_t pending_mask) {
   __shared__ std::uint32_t shared_keys[kEpochHeavySortCap];
   __shared__ std::uint32_t shared_values[kEpochHeavySortCap];
+  constexpr int shards = 64;
+  const int epoch_index = blockIdx.x / shards;
+  if (epoch_index >= epoch_count ||
+      (pending_mask & (1u << epoch_index)) == 0u)
+    return;
+  const int shard = blockIdx.x - epoch_index * shards;
+  const EpochView ev = epochs[epoch_index];
+  std::uint32_t *keys = const_cast<std::uint32_t *>(ev.keys);
+  std::uint32_t *values = const_cast<std::uint32_t *>(ev.values);
   const int tid = threadIdx.x;
-  const std::uint32_t count = heavy_count[0];
-  for (std::uint32_t item = blockIdx.x; item < count;
-       item += gridDim.x) {
-    const std::uint32_t quotient = heavy_list[item];
-    const std::uint32_t begin = offsets[quotient];
-    const std::uint32_t length = offsets[quotient + 1] - begin;
+  const std::uint32_t count = ev.heavy_count[0];
+  for (std::uint32_t item = shard; item < count; item += shards) {
+    const std::uint32_t quotient = ev.heavy_list[item];
+    const std::uint32_t begin = ev.quotient_off[quotient];
+    const std::uint32_t length = ev.quotient_off[quotient + 1] - begin;
     shared_keys[tid] =
         tid < length ? keys[begin + tid] : kEmptyKey;
     shared_values[tid] = tid < length ? values[begin + tid] : 0u;
@@ -3040,6 +3084,13 @@ public:
     if (batch.count == 0)
       return;
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
+                                                   std::defer_lock);
+    if (epoch_heavy_pending()) {
+      guard.unlock();
+      exclusive.lock();
+      ensure_epoch_heavy_sorted(stream);
+    }
     lookup_layered(batch, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -3048,6 +3099,13 @@ public:
     if (batch.count == 0)
       return;
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
+                                                   std::defer_lock);
+    if (epoch_heavy_pending()) {
+      guard.unlock();
+      exclusive.lock();
+      ensure_epoch_heavy_sorted(stream);
+    }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
     const std::uint32_t *ins_keys = no_overlay ? nullptr : raw_or_null(ix->gk);
@@ -3075,6 +3133,14 @@ public:
     if (batch.count == 0)
       return;
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
+                                                   std::defer_lock);
+    if (epoch_heavy_pending() || epoch_bitmap_pending()) {
+      guard.unlock();
+      exclusive.lock();
+      ensure_epoch_heavy_sorted(stream);
+      ensure_epoch_bitmaps(stream);
+    }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
     const std::uint32_t *killed =
@@ -3102,6 +3168,14 @@ public:
     if (batch.query_count == 0)
       return;
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
+    std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
+                                                   std::defer_lock);
+    if (epoch_heavy_pending() || epoch_value_prefix_pending()) {
+      guard.unlock();
+      exclusive.lock();
+      ensure_epoch_heavy_sorted(stream);
+      ensure_epoch_value_prefixes(stream);
+    }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
     const std::uint32_t *ins_keys = no_overlay ? nullptr : raw_or_null(ix->gk);
@@ -3200,8 +3274,7 @@ public:
         sort_key_output_, sort_payload_input_, sort_payload_output_,
         sort_temp_storage_, epoch_live_counts_,
         epoch_merge_keys_, epoch_merge_values_, epoch_delete_found_,
-        epoch_heavy_list_, epoch_heavy_count_, radix_first_,
-        flat_bucket_max_, ds_dest_,
+        radix_first_, flat_bucket_max_, ds_dest_,
         ds_cnt_cursor_, ds_base_,
         ds_dirty_, ds_staged_keys_, ds_staged_values_, ds_meta_,
         ds_slow_list_, ds_residue_, ds_window_);
@@ -3214,13 +3287,15 @@ public:
           epoch.keys, epoch.values, epoch.count_prefix, epoch.dead,
           epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
-          epoch.quotient_value_prefix, epoch.quotient_bitmap);
+          epoch.quotient_value_prefix, epoch.quotient_bitmap,
+          epoch.heavy_list, epoch.heavy_count);
     for (const auto &epoch : epoch_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_prefix, epoch.dead,
           epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
-          epoch.quotient_value_prefix, epoch.quotient_bitmap);
+          epoch.quotient_value_prefix, epoch.quotient_bitmap,
+          epoch.heavy_list, epoch.heavy_count);
     return total;
   }
 
@@ -3275,20 +3350,23 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_count_prefix;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_value_prefix;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_bitmap;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> heavy_list;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> heavy_count;
     std::size_t count = 0;
     std::size_t live_count = 0;
     std::size_t slot_id = std::numeric_limits<std::size_t>::max();
     bool has_dead = false;
     bool dead_initialized = false;
+    bool heavy_sorted = true;
+    bool value_sums_ready = true;
+    bool value_prefix_ready = true;
+    bool bitmap_ready = true;
   };
 
   struct EpochMetadataGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
     gpulsmopt_detail::EpochView view{};
-    const std::uint32_t *heavy_list = nullptr;
-    const std::uint32_t *heavy_count = nullptr;
-    const std::uint8_t *temp_storage = nullptr;
     std::size_t count = 0;
   };
 
@@ -3309,6 +3387,8 @@ private:
             epoch.quotient_count_prefix.data(),
             epoch.quotient_value_prefix.data(),
             epoch.quotient_bitmap.data(),
+            epoch.heavy_list.data(),
+            epoch.heavy_count.data(),
             epoch.has_dead ? 1u : 0u};
   }
 
@@ -3322,6 +3402,8 @@ private:
            a.quotient_count_prefix == b.quotient_count_prefix &&
            a.quotient_value_prefix == b.quotient_value_prefix &&
            a.quotient_bitmap == b.quotient_bitmap &&
+           a.heavy_list == b.heavy_list &&
+           a.heavy_count == b.heavy_count &&
            a.has_dead == b.has_dead;
   }
 
@@ -3387,6 +3469,10 @@ private:
   void prepare_epoch_metadata_storage(EpochStorage &epoch) {
     epoch.has_dead = false;
     epoch.dead_initialized = false;
+    epoch.heavy_sorted = false;
+    epoch.value_sums_ready = false;
+    epoch.value_prefix_ready = false;
+    epoch.bitmap_ready = false;
     epoch.dead.resize_discard(epoch.count);
     epoch.count_prefix.resize_discard(epoch.count + 1);
     epoch.quotient_off.resize_discard(
@@ -3404,37 +3490,22 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1);
     epoch.quotient_bitmap.resize_discard(
         gpulsmopt_detail::kEpochQuotientBitmapWords);
-    epoch_heavy_list_.resize_discard(gpulsmopt_detail::kEpochQuotients);
-    epoch_heavy_count_.resize_discard(1);
+    epoch.heavy_list.resize_discard(gpulsmopt_detail::kEpochQuotients);
+    epoch.heavy_count.resize_discard(1);
   }
 
   void launch_epoch_metadata_kernels(EpochStorage &epoch, std::size_t count,
                                      cudaStream_t stream) {
-    CUDA_CHECK(cudaMemsetAsync(epoch_heavy_count_.data(), 0,
-                               sizeof(std::uint32_t), stream));
     constexpr int block = 256;
-    constexpr int quotient_grid =
-        gpulsmopt_detail::kEpochQuotients / block;
-    constexpr int offset_grid =
-        (gpulsmopt_detail::kEpochQuotients + 1 + block - 1) / block;
-    gpulsmopt_detail::epoch_quotient_offsets_kernel<<<offset_grid, block, 0,
-                                                      stream>>>(
-        epoch.keys.data(), static_cast<std::uint32_t>(count),
-        epoch.quotient_off.data());
-    gpulsmopt_detail::epoch_quotient_meta_kernel<<<quotient_grid, block, 0,
-                                                   stream>>>(
-        epoch.keys.data(), epoch.values.data(), epoch.quotient_off.data(),
-        epoch.subgroup_masks.data(), epoch.quotient_live.data(),
-        epoch.quotient_value_sum.data(), epoch.quotient_bitmap.data(),
-        epoch_heavy_list_.data(), epoch_heavy_count_.data());
-    gpulsmopt_detail::epoch_sort_heavy_quotients_kernel<<<188, 128, 0,
-                                                          stream>>>(
-        epoch.keys.data(), epoch.values.data(), epoch.quotient_off.data(),
-        epoch_heavy_list_.data(), epoch_heavy_count_.data());
-    CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(epoch.quotient_value_sum.data(),
-                       epoch.quotient_value_prefix.data(),
-                       gpulsmopt_detail::kEpochQuotients, stream);
+    const std::uint32_t *keys = epoch.keys.data();
+    std::uint32_t record_count = static_cast<std::uint32_t>(count);
+    std::uint32_t *offsets = epoch.quotient_off.data();
+    std::uint32_t *subgroup_masks = epoch.subgroup_masks.data();
+    std::uint32_t *quotient_live = epoch.quotient_live.data();
+    const int grid = static_cast<int>((record_count + block - 1) / block);
+    gpulsmopt_detail::epoch_quotient_metadata_kernel<<<grid, block, 0,
+                                                       stream>>>(
+        keys, record_count, offsets, subgroup_masks, quotient_live);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -3444,10 +3515,7 @@ private:
     auto view = make_epoch_view(epoch);
     view.has_dead = 0u;
     return state.executable != nullptr && state.count == count &&
-           same_epoch_view(state.view, view) &&
-           state.heavy_list == epoch_heavy_list_.data() &&
-           state.heavy_count == epoch_heavy_count_.data() &&
-           state.temp_storage == sort_temp_storage_.data();
+           same_epoch_view(state.view, view);
   }
 
   void destroy_epoch_metadata_graph(EpochMetadataGraph &state) noexcept {
@@ -3482,11 +3550,10 @@ private:
     }
     state.graph = graph;
     state.executable = executable;
+    CUDA_CHECK(cudaGraphUpload(executable, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     state.view = make_epoch_view(epoch);
     state.view.has_dead = 0u;
-    state.heavy_list = epoch_heavy_list_.data();
-    state.heavy_count = epoch_heavy_count_.data();
-    state.temp_storage = sort_temp_storage_.data();
     state.count = count;
   }
 
@@ -3527,6 +3594,100 @@ private:
     sheet_live_count_ += epoch.count;
     overlay_dirty_ = true;
     read_view_dirty_ = true;
+  }
+
+  bool epoch_heavy_pending() const {
+    for (const auto &epoch : epochs_)
+      if (!epoch.heavy_sorted)
+        return true;
+    return false;
+  }
+
+  bool epoch_value_prefix_pending() const {
+    for (const auto &epoch : epochs_)
+      if (!epoch.value_prefix_ready)
+        return true;
+    return false;
+  }
+
+  bool epoch_bitmap_pending() const {
+    for (const auto &epoch : epochs_)
+      if (!epoch.bitmap_ready)
+        return true;
+    return false;
+  }
+
+  void ensure_epoch_heavy_sorted(cudaStream_t stream) {
+    std::uint32_t pending_mask = 0u;
+    for (std::size_t i = 0; i < epochs_.size(); ++i)
+      if (!epochs_[i].heavy_sorted) {
+        pending_mask |= 1u << i;
+        CUDA_CHECK(cudaMemsetAsync(epochs_[i].heavy_count.data(), 0,
+                                   sizeof(std::uint32_t), stream));
+      }
+    if (pending_mask == 0u)
+      return;
+    constexpr int block = 256;
+    const std::size_t quotient_count =
+        epochs_.size() * gpulsmopt_detail::kEpochQuotients;
+    const int classify_grid =
+        static_cast<int>((quotient_count + block - 1) / block);
+    gpulsmopt_detail::epoch_classify_heavy_quotients_kernel<<<
+        classify_grid, block, 0, stream>>>(epoch_view_ptr(), epoch_count(),
+                                           pending_mask);
+    CUDA_CHECK(cudaGetLastError());
+    constexpr int shards = 64;
+    const int grid = epoch_count() * shards;
+    gpulsmopt_detail::epoch_sort_heavy_quotients_kernel<<<grid, 128, 0,
+                                                          stream>>>(
+        epoch_view_ptr(), epoch_count(), pending_mask);
+    CUDA_CHECK(cudaGetLastError());
+    for (auto &epoch : epochs_)
+      epoch.heavy_sorted = true;
+  }
+
+  void ensure_epoch_value_prefixes(cudaStream_t stream) {
+    ensure_epoch_value_sums(stream);
+    for (auto &epoch : epochs_) {
+      if (epoch.value_prefix_ready)
+        continue;
+      exclusive_scan_u32(epoch.quotient_value_sum.data(),
+                         epoch.quotient_value_prefix.data(),
+                         gpulsmopt_detail::kEpochQuotients, stream);
+      epoch.value_prefix_ready = true;
+    }
+  }
+
+  void ensure_epoch_value_sums(cudaStream_t stream) {
+    std::uint32_t pending_mask = 0u;
+    for (std::size_t i = 0; i < epochs_.size(); ++i)
+      if (!epochs_[i].value_sums_ready)
+        pending_mask |= 1u << i;
+    if (pending_mask == 0u)
+      return;
+    constexpr int block = 256;
+    const std::size_t quotient_count =
+        epochs_.size() * gpulsmopt_detail::kEpochQuotients;
+    const int grid =
+        static_cast<int>((quotient_count + block - 1) / block);
+    gpulsmopt_detail::epoch_quotient_value_sum_kernel<<<grid, block, 0,
+                                                        stream>>>(
+        epoch_view_ptr(), epoch_count(), pending_mask);
+    CUDA_CHECK(cudaGetLastError());
+    for (auto &epoch : epochs_)
+      epoch.value_sums_ready = true;
+  }
+
+  void ensure_epoch_bitmaps(cudaStream_t stream) {
+    for (auto &epoch : epochs_) {
+      if (epoch.bitmap_ready)
+        continue;
+      gpulsmopt_detail::epoch_quotient_bitmap_kernel<<<256, 256, 0,
+                                                       stream>>>(
+          epoch.quotient_live.data(), epoch.quotient_bitmap.data());
+      CUDA_CHECK(cudaGetLastError());
+      epoch.bitmap_ready = true;
+    }
   }
 
   void create_sorted_epoch(const std::uint32_t *keys,
@@ -3575,6 +3736,8 @@ private:
                            cudaStream_t stream) {
     if (epochs_.empty())
       return;
+    ensure_epoch_heavy_sorted(stream);
+    ensure_epoch_value_sums(stream);
     const std::size_t ecount = epochs_.size();
     for (auto &epoch : epochs_) {
       if (epoch.dead_initialized)
@@ -3626,12 +3789,15 @@ private:
       exclusive_scan_u32(epoch.quotient_value_sum.data(),
                          epoch.quotient_value_prefix.data(),
                          gpulsmopt_detail::kEpochQuotients, stream);
+      epoch.value_sums_ready = true;
+      epoch.value_prefix_ready = true;
       exclusive_scan_u32(epoch.quotient_live.data(),
                          epoch.quotient_count_prefix.data(),
                          gpulsmopt_detail::kEpochQuotients, stream);
       gpulsmopt_detail::epoch_quotient_bitmap_kernel<<<256, 256, 0, stream>>>(
           epoch.quotient_live.data(), epoch.quotient_bitmap.data());
       CUDA_CHECK(cudaGetLastError());
+      epoch.bitmap_ready = true;
       epoch.has_dead = true;
     }
     std::size_t output = 0;
@@ -3684,6 +3850,9 @@ private:
           gpulsmopt_detail::kEpochQuotients + 1);
       epoch.quotient_bitmap.resize_discard(
           gpulsmopt_detail::kEpochQuotientBitmapWords);
+      epoch.heavy_list.resize_discard(
+          gpulsmopt_detail::kEpochQuotients);
+      epoch.heavy_count.resize_discard(1);
     }
     resize_reuse(epoch_dirty_, gpulsmopt_detail::kEpochMax);
     resize_reuse(epoch_removed_, gpulsmopt_detail::kEpochMax);
@@ -3694,8 +3863,6 @@ private:
         count * static_cast<std::size_t>(gpulsmopt_detail::kEpochMax);
     epoch_merge_keys_.resize_discard(pending_capacity);
     epoch_merge_values_.resize_discard(pending_capacity);
-    epoch_heavy_list_.resize_discard(gpulsmopt_detail::kEpochQuotients);
-    epoch_heavy_count_.resize_discard(1);
   }
 
   void clear_epoch_state() {
@@ -5059,6 +5226,16 @@ private:
         max_elements_, std::max(4 * c0_flush_budget(), batch_size_));
     ensure_c0_log(stream);
     prepare_sort_storage(direct_count, c0_flush_budget(), stream);
+    const std::size_t warm_count =
+        std::min({batch_size_, direct_count, scratch_incoming_keys_.size(),
+                  scratch_incoming_values_.size()});
+    if (warm_count >= static_cast<std::size_t>(
+                          GPULSMOPT_SCATTER_MIN_BATCH)) {
+      sort_epoch_batch(raw_or_null(scratch_incoming_keys_),
+                       raw_or_null(scratch_incoming_values_), warm_count,
+                       direct_sort_keys_.data(), direct_sort_values_.data(),
+                       stream);
+    }
     reserve_epoch_storage(direct_count);
     prepare_epoch_metadata_graphs(batch_size_);
     prebind_epoch_views(stream);
@@ -6108,8 +6285,6 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_merge_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_merge_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> epoch_delete_found_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_heavy_list_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_heavy_count_;
   std::size_t direct_sort_count_ = 0;
   std::size_t direct_sort_temp_bytes_ = 0;
   std::size_t epoch_sort_count_ = 0;
