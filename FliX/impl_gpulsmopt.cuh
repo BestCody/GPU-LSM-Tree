@@ -103,13 +103,6 @@ __global__ void fill_sequence_kernel(std::uint32_t *values, size_t size) {
     values[tid] = static_cast<std::uint32_t>(tid);
 }
 
-__global__ void finalize_lookup_kernel(const std::uint8_t *found,
-                                       smallsize *values, size_t size) {
-  const size_t tid = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-  if (tid < size && found[tid] == 0)
-    values[tid] = not_found;
-}
-
 inline void fill_sequence(std::uint32_t *values, size_t size,
                           cudaStream_t stream) {
   if (size == 0)
@@ -118,18 +111,6 @@ inline void fill_sequence(std::uint32_t *values, size_t size,
   const int blocks =
       static_cast<int>((size + threads_per_block - 1) / threads_per_block);
   fill_sequence_kernel<<<blocks, threads_per_block, 0, stream>>>(values, size);
-  check_cuda(cudaGetLastError());
-}
-
-inline void finalize_lookup(const std::uint8_t *found, smallsize *values,
-                            size_t size, cudaStream_t stream) {
-  if (size == 0)
-    return;
-  constexpr int threads_per_block = 256;
-  const int blocks =
-      static_cast<int>((size + threads_per_block - 1) / threads_per_block);
-  finalize_lookup_kernel<<<blocks, threads_per_block, 0, stream>>>(
-      found, values, size);
   check_cuda(cudaGetLastError());
 }
 
@@ -256,8 +237,6 @@ public:
     batch.out_values = reinterpret_cast<std::uint32_t *>(result);
     batch.out_found = lookup_found_buffer_.ptr();
     dictionary_->lookup(batch, stream);
-    gpulsmopt_adapter_detail::finalize_lookup(lookup_found_buffer_.ptr(),
-                                              result, size, stream);
   }
 
   void multi_lookup_sum(const key_type *keys, value_type *result, size_t size,

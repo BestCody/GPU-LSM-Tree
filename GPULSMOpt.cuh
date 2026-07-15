@@ -110,6 +110,12 @@ constexpr int kEpochSubgroups = 1 << kEpochSubgroupBits;
 constexpr int kEpochSubgroupPlanes = kEpochSubgroupBits;
 constexpr int kEpochHeavySortCap = 128;
 constexpr int kEpochQuotientBitmapWords = kEpochQuotients / 32;
+constexpr int kSpineRadixBits = 20;
+constexpr int kSpineRadixShift = 32 - kSpineRadixBits;
+constexpr int kSpineDeadBlockShift = 3;
+constexpr int kSpineDeadBlockSize = 1 << kSpineDeadBlockShift;
+constexpr std::size_t kSpineRadixSize =
+    std::size_t{1} << kSpineRadixBits;
 static_assert(GPULSMOPT_SEGMENT_BUCKETS == 256,
               "epoch bucket bitmaps assume 256 buckets per segment");
 static_assert(GPULSMOPT_RADIX_THREADS % 32 == 0,
@@ -327,7 +333,7 @@ struct EpochView {
   std::uint32_t *quotient_value_sum;
   const std::uint32_t *quotient_count_prefix;
   const std::uint32_t *quotient_value_prefix;
-  const std::uint32_t *quotient_bitmap;
+  std::uint32_t *quotient_bitmap;
   std::uint32_t *heavy_list;
   std::uint32_t *heavy_count;
   std::uint32_t has_dead;
@@ -538,6 +544,174 @@ __device__ inline std::uint32_t epoch_successor_candidate(
     ++quotient;
   }
   return kEmptyKey;
+}
+
+__device__ inline bool spine_dead(const std::uint32_t *dead,
+                                  std::size_t position) {
+  return dead && ((dead[position >> 5] >> (position & 31u)) & 1u);
+}
+
+__device__ inline std::size_t spine_lower_rank(
+    const std::uint32_t *keys, const std::uint32_t *radix,
+    std::uint32_t key) {
+  const std::uint32_t bin = key >> kSpineRadixShift;
+  const std::size_t begin = radix[bin];
+  const std::size_t end = radix[bin + 1];
+  return begin + lower_bound_u32(keys + begin, end - begin, key);
+}
+
+__device__ inline std::size_t spine_upper_rank(
+    const std::uint32_t *keys, const std::uint32_t *radix,
+    std::uint32_t key) {
+  const std::uint32_t bin = key >> kSpineRadixShift;
+  const std::size_t begin = radix[bin];
+  const std::size_t end = radix[bin + 1];
+  return begin + upper_bound_u32(keys + begin, end - begin, key);
+}
+
+__device__ inline bool spine_point_find(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    const std::uint32_t *radix, const std::uint32_t *dead,
+    std::size_t count, std::uint32_t key, std::uint32_t *out_value) {
+  if (count == 0)
+    return false;
+  const std::size_t position = spine_lower_rank(keys, radix, key);
+  if (position >= count || keys[position] != key ||
+      spine_dead(dead, position))
+    return false;
+  if (out_value)
+    *out_value = values[position];
+  return true;
+}
+
+__device__ inline std::uint32_t spine_dead_count_range(
+    const std::uint32_t *dead, const std::uint32_t *dead_prefix,
+    std::size_t begin, std::size_t end) {
+  if (!dead || begin >= end)
+    return 0u;
+  const std::size_t first = begin >> kSpineDeadBlockShift;
+  const std::size_t last = (end - 1) >> kSpineDeadBlockShift;
+  std::uint32_t total = 0u;
+  if (first == last) {
+    for (std::size_t p = begin; p < end; ++p)
+      total += spine_dead(dead, p);
+    return total;
+  }
+  const std::size_t first_end = (first + 1) << kSpineDeadBlockShift;
+  for (std::size_t p = begin; p < first_end; ++p)
+    total += spine_dead(dead, p);
+  const std::size_t last_begin = last << kSpineDeadBlockShift;
+  for (std::size_t p = last_begin; p < end; ++p)
+    total += spine_dead(dead, p);
+  if (last > first + 1)
+    total += dead_prefix[last] - dead_prefix[first + 1];
+  return total;
+}
+
+__device__ inline std::uint32_t spine_dead_sum_range(
+    const std::uint32_t *values, const std::uint32_t *dead,
+    const std::uint32_t *dead_prefix, std::size_t begin,
+    std::size_t end) {
+  if (!dead || begin >= end)
+    return 0u;
+  const std::size_t first = begin >> kSpineDeadBlockShift;
+  const std::size_t last = (end - 1) >> kSpineDeadBlockShift;
+  std::uint32_t total = 0u;
+  if (first == last) {
+    for (std::size_t p = begin; p < end; ++p)
+      if (spine_dead(dead, p))
+        total += values[p];
+    return total;
+  }
+  const std::size_t first_end = (first + 1) << kSpineDeadBlockShift;
+  for (std::size_t p = begin; p < first_end; ++p)
+    if (spine_dead(dead, p))
+      total += values[p];
+  const std::size_t last_begin = last << kSpineDeadBlockShift;
+  for (std::size_t p = last_begin; p < end; ++p)
+    if (spine_dead(dead, p))
+      total += values[p];
+  if (last > first + 1)
+    total += dead_prefix[last] - dead_prefix[first + 1];
+  return total;
+}
+
+__device__ inline std::uint32_t spine_range_count(
+    const std::uint32_t *keys, const std::uint32_t *radix,
+    const std::uint32_t *dead, const std::uint32_t *dead_prefix,
+    std::size_t count, std::uint32_t lo, std::uint32_t hi) {
+  if (count == 0)
+    return 0u;
+  const std::size_t begin = spine_lower_rank(keys, radix, lo);
+  const std::size_t end = spine_upper_rank(keys, radix, hi);
+  return static_cast<std::uint32_t>(end - begin) -
+         spine_dead_count_range(dead, dead_prefix, begin, end);
+}
+
+__device__ inline std::uint32_t spine_range_sum(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    const std::uint32_t *radix, const std::uint32_t *value_prefix,
+    const std::uint32_t *dead, const std::uint32_t *dead_value_prefix,
+    std::size_t count, std::uint32_t lo, std::uint32_t hi) {
+  if (count == 0)
+    return 0u;
+  const std::size_t begin = spine_lower_rank(keys, radix, lo);
+  const std::size_t end = spine_upper_rank(keys, radix, hi);
+  return value_prefix[end] - value_prefix[begin] -
+         spine_dead_sum_range(values, dead, dead_value_prefix, begin, end);
+}
+
+__device__ inline std::uint32_t spine_successor_candidate(
+    const std::uint32_t *keys, const std::uint32_t *radix,
+    const std::uint32_t *dead, std::size_t count, std::uint32_t key,
+    const std::uint32_t *killed_keys, std::size_t killed_count) {
+  if (count == 0)
+    return kEmptyKey;
+  std::size_t position = spine_lower_rank(keys, radix, key);
+  for (; position < count; ++position) {
+    const std::uint32_t candidate = keys[position];
+    if (!spine_dead(dead, position) &&
+        !epoch_key_killed(candidate, killed_keys, killed_count))
+      return candidate;
+  }
+  return kEmptyKey;
+}
+
+__global__ void spine_build_radix_kernel(
+    const std::uint32_t *keys, std::size_t count,
+    std::uint32_t *radix) {
+  const std::size_t bin = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bin > kSpineRadixSize)
+    return;
+  if (bin == kSpineRadixSize) {
+    radix[bin] = static_cast<std::uint32_t>(count);
+    return;
+  }
+  const std::uint32_t key =
+      static_cast<std::uint32_t>(bin << kSpineRadixShift);
+  radix[bin] = static_cast<std::uint32_t>(
+      lower_bound_u32(keys, count, key));
+}
+
+__global__ void spine_live_input_kernel(
+    const std::uint32_t *dead, std::size_t count,
+    std::uint32_t *live) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count)
+    live[i] = spine_dead(dead, i) ? 0u : 1u;
+}
+
+__global__ void spine_gather_live_kernel(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    const std::uint32_t *dead, const std::uint32_t *prefix,
+    std::size_t count, std::uint32_t *out_keys,
+    std::uint32_t *out_values) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count || spine_dead(dead, i))
+    return;
+  const std::size_t output = prefix[i];
+  out_keys[output] = keys[i];
+  out_values[output] = values[i];
 }
 
 // Segment directory radix.
@@ -2034,7 +2208,8 @@ __global__ void epoch_quotient_value_sum_kernel(
   const std::uint32_t end = ev.quotient_off[quotient + 1];
   std::uint32_t sum = 0u;
   for (std::uint32_t p = begin; p < end; ++p)
-    sum += ev.values[p];
+    if (!ev.has_dead || !ev.dead[p])
+      sum += ev.values[p];
   ev.quotient_value_sum[quotient] = sum;
 }
 
@@ -2116,16 +2291,17 @@ __global__ void epoch_quotient_bitmap_kernel(
     quotient_bitmap[quotient >> 5] = occupied;
 }
 
-// Marks an epoch record dead.
-__global__ void epoch_mark_deleted_kernel(
+__global__ void epoch_spine_delete_kernel(
     const std::uint32_t *keys, std::size_t n, const EpochView *epochs,
-    int epoch_count,
-    std::uint8_t *const *epoch_dead, std::uint32_t *epoch_dirty,
-    std::uint32_t *epoch_removed, std::uint8_t *found) {
+    int epoch_count, std::uint32_t *epoch_dirty,
+    std::uint32_t *epoch_removed, const std::uint32_t *spine_keys,
+    const std::uint32_t *spine_values, const std::uint32_t *spine_radix,
+    std::size_t spine_count, std::uint32_t *spine_dead_words,
+    std::uint32_t *spine_dead_count, std::uint32_t *spine_dead_value,
+    std::uint32_t *spine_removed) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
-  found[i] = 0u;
   const std::uint32_t key = keys[i];
   const std::uint32_t quotient = key >> kEpochQuotientBits;
   int found_epoch = -1;
@@ -2134,12 +2310,13 @@ __global__ void epoch_mark_deleted_kernel(
     std::uint32_t position;
     if (!epoch_point_position(ev, key, &position))
       continue;
-    epoch_dead[e][position] = 1u;
-    atomicAdd(ev.quotient_live + quotient, 0u - 1u);
-    atomicAdd(ev.quotient_value_sum + quotient,
-              0u - ev.values[position]);
+    const_cast<std::uint8_t *>(ev.dead)[position] = 1u;
+    const std::uint32_t old =
+        atomicSub(ev.quotient_live + quotient, 1u);
+    if (old == 1u)
+      atomicAnd(ev.quotient_bitmap + (quotient >> 5),
+                ~(1u << (quotient & 31u)));
     found_epoch = e;
-    found[i] = 1u;
     break;
   }
   const unsigned active = __activemask();
@@ -2152,7 +2329,21 @@ __global__ void epoch_mark_deleted_kernel(
       atomicAdd(epoch_removed + found_epoch,
                 static_cast<std::uint32_t>(__popc(peers)));
     }
+    return;
   }
+  if (spine_count == 0)
+    return;
+  const std::size_t position = spine_lower_rank(spine_keys, spine_radix, key);
+  if (position >= spine_count || spine_keys[position] != key)
+    return;
+  const std::size_t word = position >> 5;
+  const std::uint32_t bit = 1u << (position & 31u);
+  if (atomicOr(spine_dead_words + word, bit) & bit)
+    return;
+  const std::size_t dead_block = position >> kSpineDeadBlockShift;
+  atomicAdd(spine_dead_count + dead_block, 1u);
+  atomicAdd(spine_dead_value + dead_block, spine_values[position]);
+  atomicAdd(spine_removed, 1u);
 }
 
 __global__ void epoch_live_input_kernel(
@@ -2605,7 +2796,10 @@ __global__ void point_lookup_walk_kernel(
     std::uint8_t *out_found, const std::uint32_t *perm,
     const std::uint32_t *const *run_keys, const std::uint32_t *const *run_vals,
     const std::uint8_t *const *run_ops, const std::uint32_t *run_cnt,
-    int num_runs, const std::uint32_t *dir_boundary,
+    int num_runs, const std::uint32_t *spine_keys,
+    const std::uint32_t *spine_values, const std::uint32_t *spine_radix,
+    const std::uint32_t *spine_dead, std::size_t spine_count,
+    const std::uint32_t *dir_boundary,
     const std::uint32_t *dir_radix_first, const std::uint32_t *dir_seg_id,
     std::size_t dir_count,
     const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
@@ -2634,23 +2828,26 @@ __global__ void point_lookup_walk_kernel(
       }
       const bool live = has_ins && !tomb;
       out_found[o] = live ? 1u : 0u;
-      out_value[o] = live ? val : 0u;
+      out_value[o] = live ? val : kEmptyKey;
       return;
     }
   }
   std::uint32_t value = 0;
-  bool found = false;
-  if (dir_count > 0) {
+  bool found = spine_point_find(spine_keys, spine_values, spine_radix,
+                                spine_dead, spine_count, key, &value);
+  for (int e = epoch_count - 1; !found && e >= 0; --e)
+    found = epoch_point_find(epochs[e], key, &value);
+  if (!found && spine_count == 0 && dir_count > 0) {
     std::size_t ord =
         dir_route(key, dir_radix_first, dir_boundary, dir_count);
     if (ord >= dir_count)
       ord = dir_count - 1;
     found = seg_point_lookup(static_cast<std::uint32_t>(ord), dir_seg_id[ord],
                              key, pool_keys, pool_values, seg_bucket_max,
-                             seg_bucket_live, epochs, epoch_count, &value);
+                             seg_bucket_live, nullptr, 0, &value);
   }
   out_found[o] = found ? 1u : 0u;
-  out_value[o] = found ? value : 0u;
+  out_value[o] = found ? value : kEmptyKey;
 }
 
 __global__ void seg_flip_lookup_kernel(
@@ -2690,7 +2887,8 @@ __global__ void seg_flip_lookup_kernel(
       const std::size_t ki = lower_bound_u32(pool_keys + base, live, q);
       const std::uint32_t found =
           ki < live && pool_keys[base + ki] == q ? 1u : 0u;
-      const std::uint32_t value = found ? pool_values[base + ki] : 0u;
+      const std::uint32_t value =
+          found ? pool_values[base + ki] : kEmptyKey;
       out_found[qi] = found;
       out_value[qi] = value;
     }
@@ -2737,7 +2935,7 @@ __global__ void overlay_walk_override_kernel(
       }
       const bool live = has_ins && !tomb;
       out_found[i] = live ? 1u : 0u;
-      out_value[i] = live ? val : 0u;
+      out_value[i] = live ? val : kEmptyKey;
       return;
     }
   }
@@ -2745,6 +2943,8 @@ __global__ void overlay_walk_override_kernel(
 
 __global__ void successor_index_kernel(
     const std::uint32_t *queries, std::size_t n, std::uint32_t *out_keys,
+    const std::uint32_t *spine_keys, const std::uint32_t *spine_radix,
+    const std::uint32_t *spine_dead, std::size_t spine_count,
     const std::uint32_t *dir_boundary, const std::uint32_t *dir_radix_first,
     const std::uint32_t *dir_seg_id, const std::uint32_t *dir_prefix,
     std::size_t dir_count,
@@ -2763,13 +2963,18 @@ __global__ void successor_index_kernel(
     if (p < live_ins_count)
       best = live_ins_keys[p];
   }
+  const std::uint32_t spine_candidate = spine_successor_candidate(
+      spine_keys, spine_radix, spine_dead, spine_count, q, killed_keys,
+      killed_count);
+  if (spine_candidate < best)
+    best = spine_candidate;
   for (int e = epoch_count - 1; e >= 0; --e) {
     const std::uint32_t candidate = epoch_successor_candidate(
         epochs[e], q, killed_keys, killed_count);
     if (candidate < best)
       best = candidate;
   }
-  if (dir_count > 0 && q < best) {
+  if (spine_count == 0 && dir_count > 0 && q < best) {
     std::size_t start_ord =
         dir_route(q, dir_radix_first, dir_boundary, dir_count);
     if (start_ord >= dir_count)
@@ -2849,7 +3054,10 @@ __device__ inline std::uint32_t overlay_count_range(const std::uint32_t *keys,
 }
 
 __global__ void sheet_point_values_kernel(
-    const std::uint32_t *keys, std::size_t n, const std::uint32_t *dir_boundary,
+    const std::uint32_t *keys, std::size_t n,
+    const std::uint32_t *spine_keys, const std::uint32_t *spine_values,
+    const std::uint32_t *spine_radix, const std::uint32_t *spine_dead,
+    std::size_t spine_count, const std::uint32_t *dir_boundary,
     const std::uint32_t *dir_radix_first, const std::uint32_t *dir_seg_id,
     std::size_t dir_count,
     const std::uint32_t *pool_keys, const std::uint32_t *pool_values,
@@ -2861,15 +3069,18 @@ __global__ void sheet_point_values_kernel(
   if (i >= n)
     return;
   std::uint32_t v = 0;
-  bool f = false;
-  if (dir_count > 0) {
+  bool f = spine_point_find(spine_keys, spine_values, spine_radix, spine_dead,
+                            spine_count, keys[i], &v);
+  for (int e = epoch_count - 1; !f && e >= 0; --e)
+    f = epoch_point_find(epochs[e], keys[i], &v);
+  if (!f && spine_count == 0 && dir_count > 0) {
     std::size_t ord =
         dir_route(keys[i], dir_radix_first, dir_boundary, dir_count);
     if (ord >= dir_count)
       ord = dir_count - 1;
     f = seg_point_lookup(static_cast<std::uint32_t>(ord), dir_seg_id[ord],
                          keys[i], pool_keys, pool_values, seg_bucket_max,
-                         seg_bucket_live, epochs, epoch_count, &v);
+                         seg_bucket_live, nullptr, 0, &v);
   }
   out_val[i] = f ? v : 0u;
   out_flag[i] = f ? 1u : 0u;
@@ -2878,6 +3089,13 @@ __global__ void sheet_point_values_kernel(
 __global__ void range_overlay_kernel(
     const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_sums,
     std::uint32_t *out_counts, std::size_t query_count,
+    const std::uint32_t *spine_keys, const std::uint32_t *spine_values,
+    const std::uint32_t *spine_radix,
+    const std::uint32_t *spine_value_prefix,
+    const std::uint32_t *spine_dead,
+    const std::uint32_t *spine_dead_count_prefix,
+    const std::uint32_t *spine_dead_value_prefix,
+    std::size_t spine_count,
     const std::uint32_t *dir_boundary, const std::uint32_t *dir_radix_first,
     const std::uint32_t *dir_seg_id,
     const std::uint32_t *dir_prefix, const std::uint32_t *dir_value_prefix,
@@ -2901,20 +3119,31 @@ __global__ void range_overlay_kernel(
       out_counts[i] = 0;
     return;
   }
-  std::uint32_t sum = seg_sheet_range_sum(
-      l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_value_prefix,
-      dir_count, pool_keys, pool_values, seg_bucket_max, seg_bucket_live,
-      seg_bucket_value_prefix, epochs, epoch_count);
+  std::uint32_t sum = spine_count > 0
+                          ? spine_range_sum(
+                                spine_keys, spine_values, spine_radix,
+                                spine_value_prefix, spine_dead,
+                                spine_dead_value_prefix, spine_count, l, h)
+                          : seg_sheet_range_sum(
+                                l, h, dir_radix_first, dir_boundary, dir_seg_id,
+                                dir_value_prefix, dir_count, pool_keys,
+                                pool_values, seg_bucket_max, seg_bucket_live,
+                                seg_bucket_value_prefix, epochs, epoch_count);
   for (int e = 0; e < epoch_count; ++e)
     sum += epoch_range_sum_one(epochs[e], l, h);
   sum += overlay_prefix_range(ins_prefix, ins_keys, ins_count, l, h);
   sum -= overlay_prefix_range(tomb_val_prefix, tomb_keys, tomb_count, l, h);
   out_sums[i] = sum;
   if (out_counts) {
-    std::uint32_t c = seg_sheet_range_count(
-        l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_prefix, dir_count,
-        pool_keys, seg_bucket_max, seg_bucket_live, seg_bucket_live_prefix,
-        epochs, epoch_count);
+    std::uint32_t c = spine_count > 0
+                          ? spine_range_count(
+                                spine_keys, spine_radix, spine_dead,
+                                spine_dead_count_prefix, spine_count, l, h)
+                          : seg_sheet_range_count(
+                                l, h, dir_radix_first, dir_boundary, dir_seg_id,
+                                dir_prefix, dir_count, pool_keys,
+                                seg_bucket_max, seg_bucket_live,
+                                seg_bucket_live_prefix, epochs, epoch_count);
     for (int e = 0; e < epoch_count; ++e)
       c += epoch_range_count_one(epochs[e], l, h);
     c += overlay_count_range(ins_keys, ins_count, l, h);
@@ -2925,7 +3154,10 @@ __global__ void range_overlay_kernel(
 
 __global__ void count_overlay_kernel(
     const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_counts,
-    std::size_t query_count, const std::uint32_t *dir_boundary,
+    std::size_t query_count, const std::uint32_t *spine_keys,
+    const std::uint32_t *spine_radix, const std::uint32_t *spine_dead,
+    const std::uint32_t *spine_dead_count_prefix, std::size_t spine_count,
+    const std::uint32_t *dir_boundary,
     const std::uint32_t *dir_radix_first, const std::uint32_t *dir_seg_id,
     const std::uint32_t *dir_prefix,
     std::size_t dir_count, const std::uint32_t *pool_keys,
@@ -2944,10 +3176,15 @@ __global__ void count_overlay_kernel(
     out_counts[i] = 0;
     return;
   }
-  std::uint32_t c = seg_sheet_range_count(
-      l, h, dir_radix_first, dir_boundary, dir_seg_id, dir_prefix, dir_count,
-      pool_keys, seg_bucket_max, seg_bucket_live, seg_bucket_live_prefix,
-      epochs, epoch_count);
+  std::uint32_t c = spine_count > 0
+                        ? spine_range_count(
+                              spine_keys, spine_radix, spine_dead,
+                              spine_dead_count_prefix, spine_count, l, h)
+                        : seg_sheet_range_count(
+                              l, h, dir_radix_first, dir_boundary, dir_seg_id,
+                              dir_prefix, dir_count, pool_keys, seg_bucket_max,
+                              seg_bucket_live, seg_bucket_live_prefix, epochs,
+                              epoch_count);
   for (int e = 0; e < epoch_count; ++e)
     c += epoch_range_count_one(epochs[e], l, h);
   c += overlay_count_range(ins_keys, ins_count, l, h);
@@ -2974,12 +3211,9 @@ public:
     epochs_.reserve(gpulsmopt_detail::kEpochMax);
     epoch_pool_.reserve(gpulsmopt_detail::kEpochMax);
     epoch_views_.reserve(gpulsmopt_detail::kEpochMax);
-    epoch_dead_ptrs_.reserve(gpulsmopt_detail::kEpochMax);
     initialize_segmented_storage(0);
     epoch_views_.resize(gpulsmopt_detail::kEpochMax);
-    epoch_dead_ptrs_.resize(gpulsmopt_detail::kEpochMax);
     bound_epoch_views_.resize(gpulsmopt_detail::kEpochMax);
-    bound_epoch_dead_ptrs_.resize(gpulsmopt_detail::kEpochMax);
     bound_epoch_view_valid_.resize(gpulsmopt_detail::kEpochMax);
     epoch_metadata_graphs_.resize(gpulsmopt_detail::kEpochMax);
     CUDA_CHECK(cudaStreamSynchronize(0));
@@ -3101,10 +3335,13 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
                                                    std::defer_lock);
-    if (epoch_heavy_pending()) {
+    if (epoch_heavy_pending() || epoch_count_prefix_pending() ||
+        (spine_has_dead_ && !spine_dead_prefix_ready_)) {
       guard.unlock();
       exclusive.lock();
       ensure_epoch_heavy_sorted(stream);
+      ensure_epoch_count_prefixes(stream);
+      ensure_spine_dead_prefixes(stream);
     }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
@@ -3117,6 +3354,9 @@ public:
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     gpulsmopt_detail::count_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.lo, batch.hi, batch.out_counts, batch.count,
+        spine_keys_.data(), spine_radix_.data(),
+        spine_has_dead_ ? spine_dead_words_.data() : nullptr,
+        spine_dead_count_prefix_.data(), spine_count_,
         raw_or_null(d_dir_boundary_), raw_or_null(d_dir_radix_first_),
         raw_or_null(d_dir_seg_id_), raw_or_null(d_dir_prefix_),
         h_dir_seg_id_.size(),
@@ -3153,6 +3393,8 @@ public:
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     gpulsmopt_detail::successor_index_kernel<<<grid, block, 0, stream>>>(
         batch.queries, batch.count, batch.out_keys,
+        spine_keys_.data(), spine_radix_.data(),
+        spine_has_dead_ ? spine_dead_words_.data() : nullptr, spine_count_,
         raw_or_null(d_dir_boundary_), raw_or_null(d_dir_radix_first_),
         raw_or_null(d_dir_seg_id_), raw_or_null(d_dir_prefix_),
         h_dir_seg_id_.size(),
@@ -3170,11 +3412,16 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
                                                    std::defer_lock);
-    if (epoch_heavy_pending() || epoch_value_prefix_pending()) {
+    if (epoch_heavy_pending() || epoch_value_prefix_pending() ||
+        (batch.out_counts && epoch_count_prefix_pending()) ||
+        (spine_has_dead_ && !spine_dead_prefix_ready_)) {
       guard.unlock();
       exclusive.lock();
       ensure_epoch_heavy_sorted(stream);
       ensure_epoch_value_prefixes(stream);
+      if (batch.out_counts)
+        ensure_epoch_count_prefixes(stream);
+      ensure_spine_dead_prefixes(stream);
     }
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
     const OverlayReadIndex *ix = no_overlay ? nullptr : &overlay_index(stream);
@@ -3191,7 +3438,11 @@ public:
     const int grid = static_cast<int>((batch.query_count + block - 1) / block);
     gpulsmopt_detail::range_overlay_kernel<<<grid, block, 0, stream>>>(
         batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-        batch.query_count, raw_or_null(d_dir_boundary_),
+        batch.query_count, spine_keys_.data(), spine_values_.data(),
+        spine_radix_.data(), spine_value_prefix_.data(),
+        spine_has_dead_ ? spine_dead_words_.data() : nullptr,
+        spine_dead_count_prefix_.data(), spine_dead_value_prefix_.data(),
+        spine_count_, raw_or_null(d_dir_boundary_),
         raw_or_null(d_dir_radix_first_), raw_or_null(d_dir_seg_id_),
         raw_or_null(d_dir_prefix_), raw_or_null(d_dir_value_prefix_),
         h_dir_seg_id_.size(),
@@ -3229,6 +3480,8 @@ public:
     thrust::sort_by_key(policy, scratch_incoming_keys_.begin(),
                         scratch_incoming_keys_.end(),
                         scratch_incoming_values_.begin());
+    install_spine(raw_or_null(scratch_incoming_keys_),
+                  raw_or_null(scratch_incoming_values_), n, stream);
     merge_incoming_into_sheet(raw_or_null(scratch_incoming_keys_),
                               raw_or_null(scratch_incoming_values_), n,
                               stream);
@@ -3264,7 +3517,7 @@ public:
         seg_bucket_live_, seg_bucket_value_sum_, seg_bucket_live_prefix_,
         seg_bucket_value_prefix_, d_dir_seg_id_, d_dir_boundary_,
         d_dir_live_, d_dir_prefix_, d_dir_value_sum_, d_dir_value_prefix_,
-        d_dir_radix_first_, epoch_views_, epoch_dead_ptrs_,
+        d_dir_radix_first_, epoch_views_,
         epoch_dirty_, epoch_removed_,
         scratch_incoming_keys_, scratch_incoming_values_, scratch_delete_keys_,
         seg_pull_counter_, seg_dirty_bucket_dirty_,
@@ -3274,6 +3527,12 @@ public:
         sort_key_output_, sort_payload_input_, sort_payload_output_,
         sort_temp_storage_, epoch_live_counts_,
         epoch_merge_keys_, epoch_merge_values_, epoch_delete_found_,
+        spine_keys_, spine_values_, spine_value_prefix_, spine_radix_,
+        spine_dead_words_, spine_dead_count_sum_, spine_dead_value_sum_,
+        spine_dead_count_prefix_, spine_dead_value_prefix_, spine_removed_,
+        spine_live_counts_, spine_live_prefix_, spine_gather_keys_,
+        spine_gather_values_, spine_merge_keys_, spine_merge_values_,
+        delete_sort_keys_,
         radix_first_, flat_bucket_max_, ds_dest_,
         ds_cnt_cursor_, ds_base_,
         ds_dirty_, ds_staged_keys_, ds_staged_values_, ds_meta_,
@@ -3338,6 +3597,92 @@ private:
     v.resize(n);
   }
 
+  void clear_spine_state() {
+    spine_count_ = 0;
+    spine_live_count_ = 0;
+    spine_has_dead_ = false;
+    spine_dead_prefix_ready_ = true;
+    spine_keys_.resize_discard(0);
+    spine_values_.resize_discard(0);
+    spine_value_prefix_.resize_discard(0);
+    spine_radix_.resize_discard(0);
+    spine_dead_words_.resize_discard(0);
+    spine_dead_count_sum_.resize_discard(0);
+    spine_dead_value_sum_.resize_discard(0);
+    spine_dead_count_prefix_.resize_discard(0);
+    spine_dead_value_prefix_.resize_discard(0);
+  }
+
+  void build_spine_metadata(cudaStream_t stream) {
+    const std::size_t count = spine_count_;
+    spine_radix_.resize_discard(gpulsmopt_detail::kSpineRadixSize + 1);
+    constexpr int block = 256;
+    const int radix_grid = static_cast<int>(
+        (gpulsmopt_detail::kSpineRadixSize + 1 + block - 1) / block);
+    gpulsmopt_detail::spine_build_radix_kernel<<<radix_grid, block, 0,
+                                                 stream>>>(
+        spine_keys_.data(), count, spine_radix_.data());
+    CUDA_CHECK(cudaGetLastError());
+    spine_value_prefix_.resize_discard(count + 1);
+    CUDA_CHECK(cudaMemsetAsync(spine_value_prefix_.data(), 0,
+                               sizeof(std::uint32_t), stream));
+    if (count > 0) {
+      auto policy = thrust::cuda::par.on(stream);
+      thrust::inclusive_scan(policy, spine_values_.data(),
+                             spine_values_.data() + count,
+                             spine_value_prefix_.data() + 1);
+    }
+    const std::size_t words = (count + 31) / 32;
+    spine_dead_words_.resize_discard(words);
+    if (words > 0)
+      CUDA_CHECK(cudaMemsetAsync(spine_dead_words_.data(), 0,
+                                 words * sizeof(std::uint32_t), stream));
+    const std::size_t dead_blocks =
+        (count + gpulsmopt_detail::kSpineDeadBlockSize - 1) /
+        gpulsmopt_detail::kSpineDeadBlockSize;
+    spine_dead_count_sum_.resize_discard(dead_blocks + 1);
+    spine_dead_value_sum_.resize_discard(dead_blocks + 1);
+    spine_dead_count_prefix_.resize_discard(dead_blocks + 1);
+    spine_dead_value_prefix_.resize_discard(dead_blocks + 1);
+    CUDA_CHECK(cudaMemsetAsync(
+        spine_dead_count_sum_.data(), 0,
+        (dead_blocks + 1) * sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        spine_dead_value_sum_.data(), 0,
+        (dead_blocks + 1) * sizeof(std::uint32_t), stream));
+    spine_live_count_ = count;
+    spine_has_dead_ = false;
+    spine_dead_prefix_ready_ = true;
+  }
+
+  void install_spine(const std::uint32_t *keys,
+                     const std::uint32_t *values, std::size_t count,
+                     cudaStream_t stream) {
+    spine_keys_.resize_discard(count);
+    spine_values_.resize_discard(count);
+    if (count > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(spine_keys_.data(), keys,
+                                 count * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(spine_values_.data(), values,
+                                 count * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToDevice, stream));
+    }
+    spine_count_ = count;
+    build_spine_metadata(stream);
+  }
+
+  void ensure_spine_dead_prefixes(cudaStream_t stream) {
+    if (!spine_has_dead_ || spine_dead_prefix_ready_)
+      return;
+    const std::size_t blocks = spine_dead_count_sum_.size();
+    exclusive_scan_u32(spine_dead_count_sum_.data(),
+                       spine_dead_count_prefix_.data(), blocks, stream);
+    exclusive_scan_u32(spine_dead_value_sum_.data(),
+                       spine_dead_value_prefix_.data(), blocks, stream);
+    spine_dead_prefix_ready_ = true;
+  }
+
   struct EpochStorage {
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
@@ -3360,6 +3705,7 @@ private:
     bool heavy_sorted = true;
     bool value_sums_ready = true;
     bool value_prefix_ready = true;
+    bool count_prefix_ready = true;
     bool bitmap_ready = true;
   };
 
@@ -3409,34 +3755,27 @@ private:
 
   void upload_epoch_view(std::size_t index,
                          const gpulsmopt_detail::EpochView &view,
-                         std::uint8_t *dead, cudaStream_t stream) {
+                         cudaStream_t stream) {
     bound_epoch_views_[index] = view;
-    bound_epoch_dead_ptrs_[index] = dead;
     bound_epoch_view_valid_[index] = 1u;
     CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_views_) + index,
                                bound_epoch_views_.data() + index,
                                sizeof(view), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_dead_ptrs_) + index,
-                               bound_epoch_dead_ptrs_.data() + index,
-                               sizeof(dead), cudaMemcpyHostToDevice, stream));
   }
 
   void append_epoch_view(EpochStorage &epoch, cudaStream_t stream) {
     const std::size_t index = epochs_.size() - 1;
     const gpulsmopt_detail::EpochView view = make_epoch_view(epoch);
-    std::uint8_t *dead = epoch.dead.data();
     if (bound_epoch_view_valid_[index] &&
-        same_epoch_view(bound_epoch_views_[index], view) &&
-        bound_epoch_dead_ptrs_[index] == dead)
+        same_epoch_view(bound_epoch_views_[index], view))
       return;
-    upload_epoch_view(index, view, dead, stream);
+    upload_epoch_view(index, view, stream);
   }
 
   void prebind_epoch_views(cudaStream_t stream) {
     std::size_t index = 0;
     for (auto &epoch : epochs_) {
       bound_epoch_views_[index] = make_epoch_view(epoch);
-      bound_epoch_dead_ptrs_[index] = epoch.dead.data();
       bound_epoch_view_valid_[index] = 1u;
       ++index;
     }
@@ -3444,7 +3783,6 @@ private:
       auto view = make_epoch_view(*it);
       view.has_dead = 0u;
       bound_epoch_views_[index] = view;
-      bound_epoch_dead_ptrs_[index] = it->dead.data();
       bound_epoch_view_valid_[index] = 1u;
       ++index;
     }
@@ -3455,10 +3793,6 @@ private:
     CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_views_),
                                bound_epoch_views_.data(),
                                index * sizeof(bound_epoch_views_[0]),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(epoch_dead_ptrs_),
-                               bound_epoch_dead_ptrs_.data(),
-                               index * sizeof(bound_epoch_dead_ptrs_[0]),
                                cudaMemcpyHostToDevice, stream));
   }
 
@@ -3472,6 +3806,7 @@ private:
     epoch.heavy_sorted = false;
     epoch.value_sums_ready = false;
     epoch.value_prefix_ready = false;
+    epoch.count_prefix_ready = true;
     epoch.bitmap_ready = false;
     epoch.dead.resize_discard(epoch.count);
     epoch.count_prefix.resize_discard(epoch.count + 1);
@@ -3617,6 +3952,13 @@ private:
     return false;
   }
 
+  bool epoch_count_prefix_pending() const {
+    for (const auto &epoch : epochs_)
+      if (epoch.has_dead && !epoch.count_prefix_ready)
+        return true;
+    return false;
+  }
+
   void ensure_epoch_heavy_sorted(cudaStream_t stream) {
     std::uint32_t pending_mask = 0u;
     for (std::size_t i = 0; i < epochs_.size(); ++i)
@@ -3678,6 +4020,17 @@ private:
       epoch.value_sums_ready = true;
   }
 
+  void ensure_epoch_count_prefixes(cudaStream_t stream) {
+    for (auto &epoch : epochs_) {
+      if (!epoch.has_dead || epoch.count_prefix_ready)
+        continue;
+      exclusive_scan_u32(epoch.quotient_live.data(),
+                         epoch.quotient_count_prefix.data(),
+                         gpulsmopt_detail::kEpochQuotients, stream);
+      epoch.count_prefix_ready = true;
+    }
+  }
+
   void ensure_epoch_bitmaps(cudaStream_t stream) {
     for (auto &epoch : epochs_) {
       if (epoch.bitmap_ready)
@@ -3734,10 +4087,12 @@ private:
 
   void begin_epoch_deletes(const std::uint32_t *keys, std::size_t count,
                            cudaStream_t stream) {
-    if (epochs_.empty())
+    if (count == 0)
       return;
-    ensure_epoch_heavy_sorted(stream);
-    ensure_epoch_value_sums(stream);
+    if (!epochs_.empty()) {
+      ensure_epoch_heavy_sorted(stream);
+      ensure_epoch_bitmaps(stream);
+    }
     const std::size_t ecount = epochs_.size();
     for (auto &epoch : epochs_) {
       if (epoch.dead_initialized)
@@ -3748,33 +4103,44 @@ private:
     }
     resize_reuse(epoch_dirty_, ecount);
     resize_reuse(epoch_removed_, ecount);
-    epoch_delete_found_.resize_discard(count);
-    CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_dirty_), 0,
-                               ecount * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_removed_), 0,
-                               ecount * sizeof(std::uint32_t), stream));
+    if (ecount > 0) {
+      CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_dirty_), 0,
+                                 ecount * sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(raw_or_null(epoch_removed_), 0,
+                                 ecount * sizeof(std::uint32_t), stream));
+    }
+    spine_removed_.resize_discard(1);
+    CUDA_CHECK(cudaMemsetAsync(spine_removed_.data(), 0,
+                               sizeof(std::uint32_t), stream));
+    sort_delete_batch(keys, count, stream);
     const int block = 256;
     const int grid = static_cast<int>((count + block - 1) / block);
-    gpulsmopt_detail::epoch_mark_deleted_kernel<<<grid, block, 0, stream>>>(
-        keys, count, epoch_view_ptr(), epoch_count(),
-        raw_or_null(epoch_dead_ptrs_), raw_or_null(epoch_dirty_),
-        raw_or_null(epoch_removed_), epoch_delete_found_.data());
+    gpulsmopt_detail::epoch_spine_delete_kernel<<<grid, block, 0, stream>>>(
+        delete_sort_keys_.data(), count, epoch_view_ptr(), epoch_count(),
+        raw_or_null(epoch_dirty_), raw_or_null(epoch_removed_),
+        spine_keys_.data(), spine_values_.data(), spine_radix_.data(),
+        spine_count_, spine_dead_words_.data(),
+        spine_dead_count_sum_.data(), spine_dead_value_sum_.data(),
+        spine_removed_.data());
     CUDA_CHECK(cudaGetLastError());
     epoch_dirty_host_.resize(ecount);
     epoch_removed_host_.resize(ecount);
-    CUDA_CHECK(cudaMemcpyAsync(epoch_dirty_host_.data(),
-                               raw_or_null(epoch_dirty_),
-                               ecount * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(epoch_removed_host_.data(),
-                               raw_or_null(epoch_removed_),
-                               ecount * sizeof(std::uint32_t),
+    if (ecount > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(epoch_dirty_host_.data(),
+                                 raw_or_null(epoch_dirty_),
+                                 ecount * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(epoch_removed_host_.data(),
+                                 raw_or_null(epoch_removed_),
+                                 ecount * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(&spine_removed_host_, spine_removed_.data(),
+                               sizeof(std::uint32_t),
                                cudaMemcpyDeviceToHost, stream));
   }
 
   void finish_epoch_deletes(cudaStream_t stream) {
-    if (epochs_.empty())
-      return;
     for (std::size_t i = 0; i < epochs_.size(); ++i) {
       if (!epoch_dirty_host_[i])
         continue;
@@ -3786,17 +4152,9 @@ private:
         epoch_dirty_host_[i] = 2u;
         continue;
       }
-      exclusive_scan_u32(epoch.quotient_value_sum.data(),
-                         epoch.quotient_value_prefix.data(),
-                         gpulsmopt_detail::kEpochQuotients, stream);
-      epoch.value_sums_ready = true;
-      epoch.value_prefix_ready = true;
-      exclusive_scan_u32(epoch.quotient_live.data(),
-                         epoch.quotient_count_prefix.data(),
-                         gpulsmopt_detail::kEpochQuotients, stream);
-      gpulsmopt_detail::epoch_quotient_bitmap_kernel<<<256, 256, 0, stream>>>(
-          epoch.quotient_live.data(), epoch.quotient_bitmap.data());
-      CUDA_CHECK(cudaGetLastError());
+      epoch.value_sums_ready = false;
+      epoch.value_prefix_ready = false;
+      epoch.count_prefix_ready = false;
       epoch.bitmap_ready = true;
       epoch.has_dead = true;
     }
@@ -3811,7 +4169,15 @@ private:
       ++output;
     }
     epochs_.resize(output);
-    refresh_epoch_views(stream);
+    if (spine_removed_host_ > spine_live_count_)
+      throw std::runtime_error("spine delete count overflow");
+    if (spine_removed_host_ > 0) {
+      spine_live_count_ -= spine_removed_host_;
+      spine_has_dead_ = true;
+      spine_dead_prefix_ready_ = false;
+    }
+    if (!epochs_.empty() || output == 0)
+      refresh_epoch_views(stream);
   }
 
   void acquire_epoch_slot() {
@@ -3893,6 +4259,7 @@ private:
 
   void reset_directory_to_root(cudaStream_t stream) {
     clear_epoch_state();
+    clear_spine_state();
     free_ids_.clear();
     for (std::size_t id = 0; id < pool_capacity_; ++id) {
       free_ids_.push_back(static_cast<std::uint32_t>(id));
@@ -4376,7 +4743,7 @@ private:
                                  cudaStream_t stream) {
     if (incoming_count == 0)
       return;
-    if (!consolidating_epochs_ && !epochs_.empty())
+    if (!epochs_.empty())
       consolidate_all_epochs(stream);
     ensure_host_directory_metadata(stream);
     auto policy = thrust::cuda::par.on(stream);
@@ -4758,7 +5125,7 @@ private:
 
   void merge_underfull_segments(cudaStream_t stream) {
     // This gather reads bucket storage only.
-    if (!consolidating_epochs_ && !epochs_.empty())
+    if (!epochs_.empty())
       consolidate_all_epochs(stream);
     ensure_host_directory_metadata(stream);
     const std::size_t n = h_dir_seg_id_.size();
@@ -4893,9 +5260,10 @@ private:
   }
 
   void recompute_sheet_live_count() {
-    std::size_t total = 0;
-    for (std::uint32_t v : h_dir_live_)
-      total += v;
+    std::size_t total = spine_count_ > 0 ? spine_live_count_ : 0;
+    if (spine_count_ == 0)
+      for (std::uint32_t v : h_dir_live_)
+        total += v;
     for (const auto &epoch : epochs_)
       total += epoch.live_count;
     sheet_live_count_ = total;
@@ -5159,6 +5527,7 @@ private:
       log_sort_temp_bytes_ = log_bytes;
     }
     std::size_t epoch_bytes = 0;
+    std::size_t delete_bytes = 0;
     if (direct_count > 0) {
       CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
           nullptr, epoch_bytes, raw_or_null(scratch_incoming_keys_),
@@ -5167,6 +5536,12 @@ private:
           16, 32, stream));
       epoch_sort_count_ = direct_count;
       epoch_sort_temp_bytes_ = epoch_bytes;
+      delete_sort_keys_.resize_discard(direct_count);
+      CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+          nullptr, delete_bytes, raw_or_null(scratch_incoming_keys_),
+          delete_sort_keys_.data(), direct_count, 16, 32, stream));
+      delete_sort_count_ = direct_count;
+      delete_sort_temp_bytes_ = delete_bytes;
     }
     std::size_t scan_bytes = 0;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
@@ -5176,7 +5551,8 @@ private:
     scan_u32_count_ = gpulsmopt_detail::kEpochQuotients;
     scan_u32_temp_bytes_ = scan_bytes;
     ensure_sort_temp(
-        std::max({direct_bytes, log_bytes, epoch_bytes, scan_bytes}));
+        std::max({direct_bytes, log_bytes, epoch_bytes, delete_bytes,
+                  scan_bytes}));
   }
 
   // Reserve direct-path buffers before timed updates.
@@ -5278,6 +5654,23 @@ private:
     CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
         sort_temp_storage_.data(), temp_bytes, keys, out_keys, values,
         out_values, static_cast<std::uint32_t>(n), 16, 32, stream));
+  }
+
+  void sort_delete_batch(const std::uint32_t *keys, std::size_t n,
+                         cudaStream_t stream) {
+    delete_sort_keys_.resize_discard(n);
+    if (n > delete_sort_count_) {
+      delete_sort_temp_bytes_ = 0;
+      CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+          nullptr, delete_sort_temp_bytes_, keys, delete_sort_keys_.data(), n,
+          16, 32, stream));
+      delete_sort_count_ = n;
+    }
+    std::size_t temp_bytes = delete_sort_temp_bytes_;
+    ensure_sort_temp(temp_bytes);
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+        sort_temp_storage_.data(), temp_bytes, keys, delete_sort_keys_.data(),
+        n, 16, 32, stream));
   }
 
   void sort_log(thrust::device_vector<std::uint32_t> &k,
@@ -5396,20 +5789,66 @@ private:
     if (live_total > 0)
       sort_direct_batch(epoch_merge_keys_.data(), epoch_merge_values_.data(),
                         live_total, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    clear_epoch_state();
-
-    if (live_total == 0)
-      return;
-    consolidating_epochs_ = true;
-    try {
-      merge_incoming_into_sheet(direct_sort_keys_.data(),
-                                direct_sort_values_.data(), live_total, stream);
-      consolidating_epochs_ = false;
-    } catch (...) {
-      consolidating_epochs_ = false;
-      throw;
+    const std::uint32_t *base_keys = spine_keys_.data();
+    const std::uint32_t *base_values = spine_values_.data();
+    if (spine_has_dead_ && spine_count_ > 0) {
+      spine_live_counts_.resize_discard(spine_count_);
+      spine_live_prefix_.resize_discard(spine_count_);
+      spine_gather_keys_.resize_discard(spine_live_count_);
+      spine_gather_values_.resize_discard(spine_live_count_);
+      const int grid =
+          static_cast<int>((spine_count_ + block - 1) / block);
+      gpulsmopt_detail::spine_live_input_kernel<<<grid, block, 0, stream>>>(
+          spine_dead_words_.data(), spine_count_, spine_live_counts_.data());
+      exclusive_scan_u32(spine_live_counts_.data(),
+                         spine_live_prefix_.data(), spine_count_, stream);
+      gpulsmopt_detail::spine_gather_live_kernel<<<grid, block, 0, stream>>>(
+          spine_keys_.data(), spine_values_.data(), spine_dead_words_.data(),
+          spine_live_prefix_.data(), spine_count_, spine_gather_keys_.data(),
+          spine_gather_values_.data());
+      CUDA_CHECK(cudaGetLastError());
+      base_keys = spine_gather_keys_.data();
+      base_values = spine_gather_values_.data();
     }
+    const std::size_t merged_count = spine_live_count_ + live_total;
+    spine_merge_keys_.resize_discard(merged_count);
+    spine_merge_values_.resize_discard(merged_count);
+    if (spine_live_count_ == 0 && live_total > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(
+          spine_merge_keys_.data(), direct_sort_keys_.data(),
+          live_total * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          spine_merge_values_.data(), direct_sort_values_.data(),
+          live_total * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice, stream));
+    } else if (live_total == 0 && spine_live_count_ > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(
+          spine_merge_keys_.data(), base_keys,
+          spine_live_count_ * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice,
+          stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          spine_merge_values_.data(), base_values,
+          spine_live_count_ * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice,
+          stream));
+    } else if (merged_count > 0) {
+      auto policy = thrust::cuda::par.on(stream);
+      thrust::merge_by_key(
+          policy, base_keys, base_keys + spine_live_count_,
+          direct_sort_keys_.data(), direct_sort_keys_.data() + live_total,
+          base_values, direct_sort_values_.data(), spine_merge_keys_.data(),
+          spine_merge_values_.data());
+    }
+    clear_epoch_state();
+    if (merged_count == 0) {
+      clear_spine_state();
+    } else {
+      std::swap(spine_keys_, spine_merge_keys_);
+      std::swap(spine_values_, spine_merge_values_);
+      spine_count_ = merged_count;
+      build_spine_metadata(stream);
+    }
+    recompute_sheet_live_count();
+    overlay_dirty_ = true;
+    read_view_dirty_ = true;
   }
 
   bool try_scatter_sheet_insert(const std::uint32_t *keys_in,
@@ -5446,6 +5885,17 @@ private:
       return false;
     if (h_dir_seg_id_.empty())
       return false;
+    if (spine_count_ > 0 || !epochs_.empty()) {
+      if (c0_log_count_ > 0 || !runs_.empty())
+        merge_down(stream);
+      begin_epoch_deletes(keys_in, count, stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      finish_epoch_deletes(stream);
+      recompute_sheet_live_count();
+      overlay_dirty_ = true;
+      read_view_dirty_ = true;
+      return true;
+    }
     // Drain overlays before deleting from the Sheet.
     if (c0_log_count_ > 0 || !runs_.empty())
       merge_down(stream);
@@ -5784,7 +6234,10 @@ private:
       const int block = 256;
       const int grid = static_cast<int>((tomb + block - 1) / block);
       gpulsmopt_detail::sheet_point_values_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(ix.gk) + ins, tomb, raw_or_null(d_dir_boundary_),
+          raw_or_null(ix.gk) + ins, tomb, spine_keys_.data(),
+          spine_values_.data(), spine_radix_.data(),
+          spine_has_dead_ ? spine_dead_words_.data() : nullptr, spine_count_,
+          raw_or_null(d_dir_boundary_),
           raw_or_null(d_dir_radix_first_), raw_or_null(d_dir_seg_id_),
           h_dir_seg_id_.size(),
           raw_or_null(pool_keys_), raw_or_null(pool_values_),
@@ -5834,6 +6287,13 @@ private:
   void apply_sheet_deletes(std::size_t tomb, cudaStream_t stream) {
     if (tomb == 0 || h_dir_seg_id_.empty())
       return;
+    if (spine_count_ > 0 || !epochs_.empty()) {
+      begin_epoch_deletes(raw_or_null(scratch_delete_keys_), tomb, stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      finish_epoch_deletes(stream);
+      recompute_sheet_live_count();
+      return;
+    }
     ensure_host_directory_metadata(stream);
     auto policy = thrust::cuda::par.on(stream);
     resize_reuse(seg_inc_ordinal_, tomb);
@@ -6127,7 +6587,7 @@ private:
         h_dir_seg_id_.size() *
         static_cast<std::size_t>(gpulsmopt_detail::kSegmentBuckets);
     const bool use_flip =
-        !h_dir_seg_id_.empty() && n >= nbuckets &&
+        spine_count_ == 0 && !h_dir_seg_id_.empty() && n >= nbuckets &&
         n >= static_cast<std::size_t>(GPULSMOPT_LOOKUP_FLIX_MIN_BATCH);
 
     if (!use_flip && num_runs == 0) {
@@ -6135,7 +6595,10 @@ private:
       const int grid = static_cast<int>((n + block - 1) / block);
       gpulsmopt_detail::point_lookup_walk_kernel<<<grid, block, 0, stream>>>(
           batch.queries, n, batch.out_values, batch.out_found, nullptr, rk, rv,
-          ro, rc, 0, raw_or_null(d_dir_boundary_),
+          ro, rc, 0, spine_keys_.data(), spine_values_.data(),
+          spine_radix_.data(),
+          spine_has_dead_ ? spine_dead_words_.data() : nullptr, spine_count_,
+          raw_or_null(d_dir_boundary_),
           raw_or_null(d_dir_radix_first_), raw_or_null(d_dir_seg_id_),
           h_dir_seg_id_.size(),
           raw_or_null(pool_keys_),
@@ -6170,6 +6633,8 @@ private:
       gpulsmopt_detail::point_lookup_walk_kernel<<<grid, block, 0, stream>>>(
           raw_or_null(lookup_sorted_queries_), n, batch.out_values, batch.out_found,
           raw_or_null(lookup_permutation_), rk, rv, ro, rc, num_runs,
+          spine_keys_.data(), spine_values_.data(), spine_radix_.data(),
+          spine_has_dead_ ? spine_dead_words_.data() : nullptr, spine_count_,
           raw_or_null(d_dir_boundary_), raw_or_null(d_dir_radix_first_),
           raw_or_null(d_dir_seg_id_), h_dir_seg_id_.size(),
           raw_or_null(pool_keys_),
@@ -6184,6 +6649,11 @@ private:
   std::uint32_t target_fill_ = GPULSMOPT_TARGET_FILL;
   std::uint32_t target_segment_live_ = 0;
   std::size_t sheet_live_count_ = 0;
+  std::size_t spine_count_ = 0;
+  std::size_t spine_live_count_ = 0;
+  bool spine_has_dead_ = false;
+  bool spine_dead_prefix_ready_ = true;
+  std::uint32_t spine_removed_host_ = 0;
   bool sheet_fragmented_ = false;
   mutable std::shared_mutex snapshot_mutex_;
 
@@ -6248,16 +6718,13 @@ private:
   std::vector<EpochStorage> epoch_pool_;
   std::size_t next_epoch_slot_id_ = 0;
   thrust::device_vector<gpulsmopt_detail::EpochView> epoch_views_;
-  thrust::device_vector<std::uint8_t *> epoch_dead_ptrs_;
   std::vector<gpulsmopt_detail::EpochView> bound_epoch_views_;
-  std::vector<std::uint8_t *> bound_epoch_dead_ptrs_;
   std::vector<std::uint8_t> bound_epoch_view_valid_;
   std::vector<EpochMetadataGraph> epoch_metadata_graphs_;
   thrust::device_vector<std::uint32_t> epoch_dirty_;
   thrust::device_vector<std::uint32_t> epoch_removed_;
   std::vector<std::uint32_t> epoch_dirty_host_;
   std::vector<std::uint32_t> epoch_removed_host_;
-  bool consolidating_epochs_ = false;
 
   std::vector<std::uint32_t> h_dir_seg_id_;
   std::vector<std::uint32_t> h_dir_boundary_;
@@ -6285,10 +6752,29 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_merge_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_merge_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> epoch_delete_found_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_values_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_value_prefix_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_radix_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_words_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_count_sum_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_value_sum_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_count_prefix_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_value_prefix_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_removed_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_live_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_live_prefix_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_gather_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_gather_values_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_merge_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_merge_values_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> delete_sort_keys_;
   std::size_t direct_sort_count_ = 0;
   std::size_t direct_sort_temp_bytes_ = 0;
   std::size_t epoch_sort_count_ = 0;
   std::size_t epoch_sort_temp_bytes_ = 0;
+  std::size_t delete_sort_count_ = 0;
+  std::size_t delete_sort_temp_bytes_ = 0;
   std::size_t log_sort_count_ = 0;
   std::size_t log_sort_temp_bytes_ = 0;
   std::size_t scan_u32_count_ = 0;
