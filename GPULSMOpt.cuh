@@ -53,6 +53,12 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_EPOCH_MAX
 #define GPULSMOPT_EPOCH_MAX 16
 #endif
+#ifndef GPULSMOPT_DELETE_OWNER_SAMPLES
+#define GPULSMOPT_DELETE_OWNER_SAMPLES 2048
+#endif
+#ifndef GPULSMOPT_DELETE_ADAPTIVE_MIN_BATCH
+#define GPULSMOPT_DELETE_ADAPTIVE_MIN_BATCH (1 << 22)
+#endif
 #ifndef GPULSMOPT_SM120_RADIX
 #define GPULSMOPT_SM120_RADIX 1
 #endif
@@ -71,6 +77,7 @@ constexpr int kEpochSubgroupPlanes = kEpochSubgroupBits;
 constexpr int kEpochSubgroupPrefixStride = kEpochSubgroups + 1;
 constexpr int kEpochHeavySortCap = 128;
 constexpr int kEpochQuotientBitmapWords = kEpochQuotients / 32;
+constexpr int kDeleteLayerMax = kEpochMax + 1;
 constexpr int kSpineRadixBits = 20;
 constexpr int kSpineRadixShift = 32 - kSpineRadixBits;
 constexpr int kSpineMicroTarget = 4;
@@ -79,6 +86,8 @@ constexpr int kSpineDeadBlockSize = 1 << kSpineDeadBlockShift;
 constexpr std::size_t kSpineRadixSize =
     std::size_t{1} << kSpineRadixBits;
 static_assert(kEpochMax <= 32, "epoch delete mask requires <= 32 epochs");
+static_assert(GPULSMOPT_DELETE_OWNER_SAMPLES > 0,
+              "delete sample count must be positive");
 static_assert(GPULSMOPT_RADIX_THREADS % 32 == 0,
               "radix block size must be warp aligned");
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
@@ -323,11 +332,9 @@ __device__ inline std::uint32_t epoch_subgroup_mask(
   return mask;
 }
 
-__device__ inline bool epoch_point_position(
-    const EpochView &ev, std::uint32_t key, std::uint32_t *position) {
-  const std::uint32_t quotient = key >> kEpochQuotientBits;
-  const std::uint32_t begin = ev.quotient_off[quotient];
-  const std::uint32_t end = ev.quotient_off[quotient + 1];
+__device__ inline bool epoch_point_position_bounds(
+    const EpochView &ev, std::uint32_t key, std::uint32_t quotient,
+    std::uint32_t begin, std::uint32_t end, std::uint32_t *position) {
   const std::uint32_t count = end - begin;
   if (count <= 32u) {
     const std::uint32_t subgroup =
@@ -365,6 +372,15 @@ __device__ inline bool epoch_point_position(
     }
   }
   return false;
+}
+
+__device__ inline bool epoch_point_position(
+    const EpochView &ev, std::uint32_t key, std::uint32_t *position) {
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
+  const std::uint32_t begin = ev.quotient_off[quotient];
+  const std::uint32_t end = ev.quotient_off[quotient + 1];
+  return epoch_point_position_bounds(ev, key, quotient, begin, end,
+                                     position);
 }
 
 __device__ inline bool epoch_point_find(const EpochView &ev,
@@ -989,9 +1005,111 @@ __global__ void epoch_quotient_bitmap_kernel(
     quotient_bitmap[quotient >> 5] = occupied;
 }
 
+__device__ inline std::uint32_t
+epoch_delete_probe_work(std::uint32_t count) {
+  if (count <= 32u)
+    return 6u + (count + 15u) / 16u;
+  if (count <= kEpochHeavySortCap)
+    return 4u + 32u - __clz(count - 1u);
+  return 2u + (count < 4096u ? count : 4096u);
+}
+
+__device__ inline bool delete_layer_precedes(
+    int lhs, int rhs, const std::uint32_t *hits,
+    const std::uint32_t *work) {
+  if (hits[lhs] == 0u)
+    return false;
+  if (hits[rhs] == 0u)
+    return true;
+  const unsigned long long left =
+      static_cast<unsigned long long>(hits[lhs]) * work[rhs];
+  const unsigned long long right =
+      static_cast<unsigned long long>(hits[rhs]) * work[lhs];
+  return left > right;
+}
+
+__global__ void delete_layer_order_kernel(
+    const std::uint32_t *keys, std::size_t n, const EpochView *epochs,
+    int epoch_count, SpineView spine, std::uint32_t *global_hits,
+    std::uint32_t *global_work, std::uint32_t *block_counter,
+    std::uint8_t *layer_order) {
+  __shared__ std::uint32_t owner_hits[kDeleteLayerMax];
+  __shared__ std::uint32_t probe_work[kDeleteLayerMax];
+  const int layer_count = epoch_count + 1;
+  for (int layer = threadIdx.x; layer < layer_count;
+       layer += blockDim.x) {
+    owner_hits[layer] = 0u;
+    probe_work[layer] = 0u;
+  }
+  __syncthreads();
+
+  const std::uint32_t sample_count =
+      n < static_cast<std::size_t>(GPULSMOPT_DELETE_OWNER_SAMPLES)
+          ? static_cast<std::uint32_t>(n)
+          : static_cast<std::uint32_t>(GPULSMOPT_DELETE_OWNER_SAMPLES);
+  for (std::uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+       sample < sample_count; sample += gridDim.x * blockDim.x) {
+    const unsigned long long scaled =
+        (2ull * sample + 1ull) * static_cast<unsigned long long>(n);
+    const std::size_t index = scaled / (2ull * sample_count);
+    const std::uint32_t key = keys[index];
+    const std::uint32_t quotient = key >> kEpochQuotientBits;
+    int owner = -1;
+    for (int rank = 0; rank < epoch_count; ++rank) {
+      const int epoch = epoch_count - rank - 1;
+      const EpochView &ev = epochs[epoch];
+      const std::uint32_t begin = ev.quotient_off[quotient];
+      const std::uint32_t end = ev.quotient_off[quotient + 1];
+      atomicAdd(probe_work + epoch,
+                epoch_delete_probe_work(end - begin));
+      if (owner >= 0)
+        continue;
+      std::uint32_t position;
+      if (epoch_point_position_bounds(ev, key, quotient, begin, end,
+                                      &position))
+        owner = epoch;
+    }
+    atomicAdd(probe_work + epoch_count,
+              spine.count == 0 ? 1u : (spine.micro_bits ? 8u : 12u));
+    if (owner < 0 && spine_point_find(spine, key, nullptr))
+      owner = epoch_count;
+    if (owner >= 0)
+      atomicAdd(owner_hits + owner, 1u);
+  }
+  __syncthreads();
+
+  for (int layer = threadIdx.x; layer < layer_count;
+       layer += blockDim.x) {
+    atomicAdd(global_hits + layer, owner_hits[layer]);
+    atomicAdd(global_work + layer, probe_work[layer]);
+  }
+  __syncthreads();
+  if (threadIdx.x != 0)
+    return;
+  __threadfence();
+  const std::uint32_t ticket = atomicAdd(block_counter, 1u);
+  if (ticket + 1u != gridDim.x)
+    return;
+  for (int rank = 0; rank < epoch_count; ++rank)
+    layer_order[rank] = static_cast<std::uint8_t>(epoch_count - rank - 1);
+  layer_order[epoch_count] = static_cast<std::uint8_t>(epoch_count);
+  for (int rank = 1; rank < layer_count; ++rank) {
+    const std::uint8_t layer = layer_order[rank];
+    int position = rank;
+    while (position > 0 &&
+           delete_layer_precedes(layer, layer_order[position - 1],
+                                 global_hits, global_work)) {
+      layer_order[position] = layer_order[position - 1];
+      --position;
+    }
+    layer_order[position] = layer;
+  }
+}
+
 __global__ void epoch_spine_delete_kernel(
     const std::uint32_t *keys, std::size_t n, const EpochView *epochs,
-    int epoch_count, std::uint32_t *epoch_removed,
+    int epoch_count, const std::uint8_t *layer_order,
+    std::uint32_t *epoch_removed,
     std::uint32_t value_sums_ready_mask, SpineView spine,
     std::uint32_t *spine_dead_count, std::uint32_t *spine_dead_value,
     std::uint32_t *spine_removed) {
@@ -1001,15 +1119,32 @@ __global__ void epoch_spine_delete_kernel(
   const std::uint32_t key = keys[i];
   const std::uint32_t quotient = key >> kEpochQuotientBits;
   int found_epoch = -1;
+  bool found_spine = false;
+  std::size_t found_position = 0;
   std::uint32_t found_value = 0u;
-  for (int e = epoch_count - 1; e >= 0; --e) {
-    const EpochView &ev = epochs[e];
-    std::uint32_t position;
+  for (int rank = 0; rank <= epoch_count; ++rank) {
+    const int layer = layer_order
+                          ? static_cast<int>(layer_order[rank])
+                          : (rank < epoch_count ? epoch_count - rank - 1
+                                                : epoch_count);
+    if (layer == epoch_count) {
+      if (spine.count == 0)
+        continue;
+      const std::size_t position = spine_lower_rank(spine, key);
+      if (position >= spine.count || spine.keys[position] != key ||
+          spine_dead(spine.dead, position))
+        continue;
+      found_spine = true;
+      found_position = position;
+      break;
+    }
+    const EpochView &ev = epochs[layer];
+    std::uint32_t position = 0u;
     if (!epoch_point_position(ev, key, &position))
       continue;
     const_cast<std::uint8_t *>(ev.dead)[position] = 1u;
     found_value = ev.values[position];
-    found_epoch = e;
+    found_epoch = layer;
     break;
   }
   const unsigned active = __activemask();
@@ -1044,15 +1179,11 @@ __global__ void epoch_spine_delete_kernel(
     }
     return;
   }
-  if (spine.count == 0)
-    return;
   const unsigned spine_active = active & ~found_mask;
-  const std::size_t position = spine_lower_rank(spine, key);
-  const bool spine_hit =
-      position < spine.count && spine.keys[position] == key;
-  const unsigned spine_mask = __ballot_sync(spine_active, spine_hit);
-  if (!spine_hit)
+  const unsigned spine_mask = __ballot_sync(spine_active, found_spine);
+  if (!found_spine)
     return;
+  const std::size_t position = found_position;
   const std::size_t word = position >> 5;
   const std::uint32_t bit = 1u << (position & 31u);
   const unsigned word_peers =
@@ -1400,7 +1531,9 @@ public:
   using DeviceKeyBatch = gpulsmopt_detail::DeviceKeyBatch;
 
   explicit GPULSMOpt(const DictionaryConfig &config)
-      : max_elements_(config.max_elements), batch_size_(config.batch_size) {
+      : max_elements_(config.max_elements),
+        batch_capacity_(config.batch_capacity),
+        delete_order_policy_(config.delete_order) {
     if (max_elements_ > 0x7fffffffu) {
       throw std::invalid_argument(
           "GPULSMOpt currently supports at most 2^31-1 records");
@@ -1411,11 +1544,13 @@ public:
     epoch_views_.resize(gpulsmopt_detail::kEpochMax);
     bound_epoch_views_.resize(gpulsmopt_detail::kEpochMax);
     bound_epoch_view_valid_.resize(gpulsmopt_detail::kEpochMax);
-    epoch_metadata_graphs_.resize(gpulsmopt_detail::kEpochMax);
     try {
       CUDA_CHECK(cudaMallocHost(
           reinterpret_cast<void **>(&epoch_removed_host_),
           (gpulsmopt_detail::kEpochMax + 1) * sizeof(std::uint32_t)));
+      CUDA_CHECK(cudaMallocHost(
+          reinterpret_cast<void **>(&delete_layer_order_host_),
+          gpulsmopt_detail::kDeleteLayerMax * sizeof(std::uint8_t)));
       CUDA_CHECK(cudaEventCreateWithFlags(
           &epoch_delete_ready_, cudaEventDisableTiming));
     } catch (...) {
@@ -1423,6 +1558,8 @@ public:
         cudaEventDestroy(epoch_delete_ready_);
       if (epoch_removed_host_)
         cudaFreeHost(epoch_removed_host_);
+      if (delete_layer_order_host_)
+        cudaFreeHost(delete_layer_order_host_);
       throw;
     }
   }
@@ -1430,11 +1567,12 @@ public:
   ~GPULSMOpt() {
     if (epoch_delete_pending_ && epoch_delete_ready_)
       cudaEventSynchronize(epoch_delete_ready_);
-    destroy_epoch_metadata_graphs();
     if (epoch_delete_ready_)
       cudaEventDestroy(epoch_delete_ready_);
     if (epoch_removed_host_)
       cudaFreeHost(epoch_removed_host_);
+    if (delete_layer_order_host_)
+      cudaFreeHost(delete_layer_order_host_);
   }
 
   void clear(cudaStream_t stream) {
@@ -1443,6 +1581,7 @@ public:
     CUDA_CHECK(cudaStreamSynchronize(stream));
     clear_epoch_state();
     clear_spine_state();
+    invalidate_delete_layer_order();
     live_count_ = 0;
     recycle_active_runs();
     clear_c0_log(stream);
@@ -1455,6 +1594,7 @@ public:
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
       reap_pending_deletes(stream);
+      invalidate_delete_layer_order();
 #ifdef GPULSMOPT_PROFILE_INSERT
       reset_insert_prof_();
       const auto prof_t0 = std::chrono::high_resolution_clock::now();
@@ -1527,6 +1667,11 @@ public:
              prof_delete_ms_, prof_epoch_ingest_ms_);
 #endif
     }
+  }
+
+  void finish_pending_delete(cudaStream_t stream) {
+    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+    reap_pending_deletes(stream);
   }
 
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
@@ -1723,6 +1868,7 @@ public:
   void consolidate(cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     reap_pending_deletes(stream);
+    invalidate_delete_layer_order();
     merge_down(stream);
     consolidate_all_epochs(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1734,6 +1880,7 @@ public:
       return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     reap_pending_deletes(stream);
+    invalidate_delete_layer_order();
     sort_direct_batch(keys, values, n, stream);
     std::swap(spine_keys_, direct_sort_keys_);
     std::swap(spine_values_, direct_sort_values_);
@@ -1773,7 +1920,8 @@ public:
         spine_dead_count_prefix_, spine_dead_value_prefix_,
         spine_live_counts_, spine_live_prefix_, spine_gather_keys_,
         spine_gather_values_, spine_merge_keys_, spine_merge_values_,
-        delete_sort_keys_, ov_c0k_, ov_c0v_, ov_c0op_, ov_mk_, ov_mv_,
+        delete_sort_keys_, delete_layer_stats_, delete_layer_order_, ov_c0k_,
+        ov_c0v_, ov_c0op_, ov_mk_, ov_mv_,
         ov_mop_, overlay_tomb_values_, overlay_tomb_flags_,
         overlay_live_flags_, cached_overlay_.gk, cached_overlay_.gv,
         cached_overlay_.gop, cached_overlay_.ins_prefix,
@@ -1997,7 +2145,6 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> heavy_count;
     std::size_t count = 0;
     std::size_t live_count = 0;
-    std::size_t slot_id = std::numeric_limits<std::size_t>::max();
     bool has_dead = false;
     bool dead_initialized = false;
     bool heavy_sorted = true;
@@ -2006,13 +2153,6 @@ private:
     bool subgroup_value_prefix_ready = true;
     bool count_prefix_ready = true;
     bool bitmap_ready = true;
-  };
-
-  struct EpochMetadataGraph {
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t executable = nullptr;
-    gpulsmopt_detail::EpochView view{};
-    std::size_t count = 0;
   };
 
   const gpulsmopt_detail::EpochView *epoch_view_ptr() const {
@@ -2154,87 +2294,9 @@ private:
     CUDA_CHECK(cudaGetLastError());
   }
 
-  bool metadata_graph_matches(const EpochMetadataGraph &state,
-                              EpochStorage &epoch,
-                              std::size_t count) {
-    auto view = make_epoch_view(epoch);
-    view.has_dead = 0u;
-    return state.executable != nullptr && state.count == count &&
-           same_epoch_view(state.view, view);
-  }
-
-  void destroy_epoch_metadata_graph(EpochMetadataGraph &state) noexcept {
-    if (state.executable)
-      cudaGraphExecDestroy(state.executable);
-    if (state.graph)
-      cudaGraphDestroy(state.graph);
-    state = {};
-  }
-
-  void destroy_epoch_metadata_graphs() noexcept {
-    for (auto &state : epoch_metadata_graphs_)
-      destroy_epoch_metadata_graph(state);
-  }
-
-  void capture_epoch_metadata_graph(EpochStorage &epoch, std::size_t count,
-                                    cudaStream_t stream) {
-    if (epoch.slot_id >= epoch_metadata_graphs_.size())
-      return;
-    EpochMetadataGraph &state = epoch_metadata_graphs_[epoch.slot_id];
-    destroy_epoch_metadata_graph(state);
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    launch_epoch_metadata_kernels(epoch, count, stream);
-    cudaGraph_t graph = nullptr;
-    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-    cudaGraphExec_t executable = nullptr;
-    const cudaError_t status =
-        cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0);
-    if (status != cudaSuccess) {
-      cudaGraphDestroy(graph);
-      CUDA_CHECK(status);
-    }
-    state.graph = graph;
-    state.executable = executable;
-    CUDA_CHECK(cudaGraphUpload(executable, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    state.view = make_epoch_view(epoch);
-    state.view.has_dead = 0u;
-    state.count = count;
-  }
-
-  void prepare_epoch_metadata_graphs(std::size_t count) {
-    if (count < static_cast<std::size_t>(GPULSMOPT_SCATTER_MIN_BATCH) ||
-        count > std::numeric_limits<std::uint32_t>::max())
-      return;
-    cudaStream_t capture_stream = nullptr;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&capture_stream,
-                                          cudaStreamNonBlocking));
-    try {
-      for (auto &epoch : epochs_)
-        capture_epoch_metadata_graph(epoch, count, capture_stream);
-      for (auto &epoch : epoch_pool_)
-        capture_epoch_metadata_graph(epoch, count, capture_stream);
-    } catch (...) {
-      cudaStreamDestroy(capture_stream);
-      throw;
-    }
-    CUDA_CHECK(cudaStreamDestroy(capture_stream));
-  }
-
-  bool launch_epoch_metadata_graph(EpochStorage &epoch, cudaStream_t stream) {
-    if (epoch.slot_id >= epoch_metadata_graphs_.size())
-      return false;
-    EpochMetadataGraph &state = epoch_metadata_graphs_[epoch.slot_id];
-    if (!metadata_graph_matches(state, epoch, epoch.count))
-      return false;
-    CUDA_CHECK(cudaGraphLaunch(state.executable, stream));
-    return true;
-  }
-
   void commit_epoch_metadata(EpochStorage &epoch, cudaStream_t stream) {
     prepare_epoch_metadata_storage(epoch);
-    if (!launch_epoch_metadata_graph(epoch, stream))
-      launch_epoch_metadata_kernels(epoch, epoch.count, stream);
+    launch_epoch_metadata_kernels(epoch, epoch.count, stream);
     append_epoch_view(epoch, stream);
     live_count_ += epoch.count;
     invalidate_overlay_derivatives();
@@ -2390,6 +2452,133 @@ private:
     }
   }
 
+  static std::uint32_t host_delete_probe_work(std::size_t count) {
+    const std::uint32_t bounded = static_cast<std::uint32_t>(count);
+    if (bounded <= 32u)
+      return 6u + (bounded + 15u) / 16u;
+    if (bounded <= gpulsmopt_detail::kEpochHeavySortCap) {
+      std::uint32_t value = bounded - 1u;
+      std::uint32_t bits = 0u;
+      while (value != 0u) {
+        value >>= 1;
+        ++bits;
+      }
+      return 4u + bits;
+    }
+    return 2u + (bounded < 4096u ? bounded : 4096u);
+  }
+
+  void invalidate_delete_layer_order() {
+    delete_layer_order_host_count_ = 0;
+    delete_layer_order_host_valid_ = false;
+    delete_layer_order_device_count_ = 0;
+    delete_layer_order_device_matches_host_ = false;
+  }
+
+  void make_delete_layer_order(const std::uint32_t *weights,
+                               std::size_t layer_count,
+                               std::uint8_t *order) const {
+    const std::size_t ecount = layer_count - 1;
+    std::uint32_t work[gpulsmopt_detail::kDeleteLayerMax]{};
+    for (std::size_t epoch = 0; epoch < ecount; ++epoch) {
+      const std::size_t average =
+          (epochs_[epoch].count + gpulsmopt_detail::kEpochQuotients - 1) /
+          gpulsmopt_detail::kEpochQuotients;
+      work[epoch] = host_delete_probe_work(average);
+      order[epoch] = static_cast<std::uint8_t>(ecount - epoch - 1);
+    }
+    work[ecount] = spine_count_ == 0 ? 1u :
+                   (spine_micro_ready_ ? 8u : 12u);
+    order[ecount] = static_cast<std::uint8_t>(ecount);
+    for (std::size_t rank = 1; rank < layer_count; ++rank) {
+      const std::uint8_t layer = order[rank];
+      std::size_t position = rank;
+      while (position > 0) {
+        const std::uint8_t previous = order[position - 1];
+        const unsigned long long left =
+            static_cast<unsigned long long>(weights[layer]) * work[previous];
+        const unsigned long long right =
+            static_cast<unsigned long long>(weights[previous]) * work[layer];
+        if (weights[layer] == 0u || left <= right)
+          break;
+        order[position] = previous;
+        --position;
+      }
+      order[position] = layer;
+    }
+  }
+
+  bool store_delete_layer_order(const std::uint8_t *order,
+                                std::size_t layer_count) {
+    if (!delete_layer_order_host_ || layer_count < 2 ||
+        layer_count > gpulsmopt_detail::kDeleteLayerMax) {
+      invalidate_delete_layer_order();
+      return false;
+    }
+    bool same = delete_layer_order_host_count_ == layer_count;
+    for (std::size_t rank = 0; same && rank < layer_count; ++rank)
+      same = delete_layer_order_host_[rank] == order[rank];
+    if (!same) {
+      for (std::size_t rank = 0; rank < layer_count; ++rank)
+        delete_layer_order_host_[rank] = order[rank];
+      delete_layer_order_device_matches_host_ = false;
+    }
+    delete_layer_order_host_count_ = layer_count;
+    const std::size_t ecount = layer_count - 1;
+    bool differs = false;
+    for (std::size_t rank = 0; rank < layer_count; ++rank) {
+      const std::uint8_t fallback = static_cast<std::uint8_t>(
+          rank < ecount ? ecount - rank - 1 : ecount);
+      differs |= order[rank] != fallback;
+    }
+    delete_layer_order_host_valid_ = differs;
+    return differs;
+  }
+
+  const std::uint8_t *upload_delete_layer_order(cudaStream_t stream) {
+    if (!delete_layer_order_host_valid_)
+      return nullptr;
+    delete_layer_order_.resize_discard(gpulsmopt_detail::kDeleteLayerMax);
+    if (!delete_layer_order_device_matches_host_ ||
+        delete_layer_order_device_count_ != delete_layer_order_host_count_) {
+      CUDA_CHECK(cudaMemcpyAsync(
+          delete_layer_order_.data(), delete_layer_order_host_,
+          delete_layer_order_host_count_, cudaMemcpyHostToDevice, stream));
+      delete_layer_order_device_count_ = delete_layer_order_host_count_;
+      delete_layer_order_device_matches_host_ = true;
+    }
+    return delete_layer_order_.data();
+  }
+
+  const std::uint8_t *prepare_uniform_live_delete_order(
+      cudaStream_t stream) {
+    const std::size_t ecount = epochs_.size();
+    const std::size_t layer_count = ecount + 1;
+    std::uint32_t live[gpulsmopt_detail::kDeleteLayerMax]{};
+    std::uint8_t order[gpulsmopt_detail::kDeleteLayerMax]{};
+    for (std::size_t epoch = 0; epoch < ecount; ++epoch)
+      live[epoch] = static_cast<std::uint32_t>(epochs_[epoch].live_count);
+    live[ecount] = static_cast<std::uint32_t>(spine_live_count_);
+    make_delete_layer_order(live, layer_count, order);
+    if (!store_delete_layer_order(order, layer_count))
+      return nullptr;
+    return upload_delete_layer_order(stream);
+  }
+
+  void cache_delete_layer_order(
+      const std::vector<std::uint32_t> &owner_hits) {
+    const std::size_t ecount = epochs_.size();
+    const std::size_t layer_count = ecount + 1;
+    if (!delete_layer_order_host_ || owner_hits.size() != layer_count ||
+        layer_count > gpulsmopt_detail::kDeleteLayerMax) {
+      invalidate_delete_layer_order();
+      return;
+    }
+    std::uint8_t order[gpulsmopt_detail::kDeleteLayerMax]{};
+    make_delete_layer_order(owner_hits.data(), layer_count, order);
+    store_delete_layer_order(order, layer_count);
+  }
+
   void begin_epoch_deletes(const std::uint32_t *keys, std::size_t count,
                            bool keys_sorted, cudaStream_t stream) {
     if (count == 0)
@@ -2419,10 +2608,42 @@ private:
       sort_delete_batch(keys, count, stream);
       delete_keys = delete_sort_keys_.data();
     }
+    const std::uint8_t *layer_order = nullptr;
+    const std::size_t live_layers =
+        ecount + static_cast<std::size_t>(spine_live_count_ != 0);
+    if (delete_order_policy_ == DeleteOrderPolicy::uniform_live &&
+        live_layers > 1) {
+      layer_order = prepare_uniform_live_delete_order(stream);
+    } else if (count >= GPULSMOPT_DELETE_ADAPTIVE_MIN_BATCH &&
+               live_layers > 1) {
+      constexpr std::size_t stat_count =
+          2 * gpulsmopt_detail::kDeleteLayerMax + 1;
+      delete_layer_stats_.resize_discard(stat_count);
+      delete_layer_order_.resize_discard(gpulsmopt_detail::kDeleteLayerMax);
+      CUDA_CHECK(cudaMemsetAsync(delete_layer_stats_.data(), 0,
+                                 stat_count * sizeof(std::uint32_t), stream));
+      const std::size_t samples = std::min<std::size_t>(
+          count, GPULSMOPT_DELETE_OWNER_SAMPLES);
+      const int sample_grid = static_cast<int>((samples + 255) / 256);
+      gpulsmopt_detail::delete_layer_order_kernel<<<sample_grid, 256, 0,
+                                                    stream>>>(
+          delete_keys, count, epoch_view_ptr(), epoch_count(),
+          make_spine_delete_view(), delete_layer_stats_.data(),
+          delete_layer_stats_.data() + gpulsmopt_detail::kDeleteLayerMax,
+          delete_layer_stats_.data() +
+              2 * gpulsmopt_detail::kDeleteLayerMax,
+          delete_layer_order_.data());
+      CUDA_CHECK(cudaGetLastError());
+      delete_layer_order_device_matches_host_ = false;
+      layer_order = delete_layer_order_.data();
+    } else if (live_layers > 1 && delete_layer_order_host_valid_ &&
+               delete_layer_order_host_count_ == ecount + 1) {
+      layer_order = upload_delete_layer_order(stream);
+    }
     const int block = 256;
     const int grid = static_cast<int>((count + block - 1) / block);
     gpulsmopt_detail::epoch_spine_delete_kernel<<<grid, block, 0, stream>>>(
-        delete_keys, count, epoch_view_ptr(), epoch_count(),
+        delete_keys, count, epoch_view_ptr(), epoch_count(), layer_order,
         raw_or_null(epoch_removed_), value_sums_ready_mask,
         make_spine_delete_view(),
         spine_dead_count_sum_.data(), spine_dead_value_sum_.data(),
@@ -2459,12 +2680,19 @@ private:
       epoch.bitmap_ready = true;
       epoch.has_dead = true;
     }
+    const bool cache_observed_order =
+        delete_order_policy_ == DeleteOrderPolicy::adaptive;
+    std::vector<std::uint32_t> surviving_hits;
+    if (cache_observed_order)
+      surviving_hits.reserve(ecount + 1);
     std::size_t output = 0;
     for (std::size_t i = 0; i < epochs_.size(); ++i) {
       if (epochs_[i].live_count == 0) {
         epoch_pool_.push_back(std::move(epochs_[i]));
         continue;
       }
+      if (cache_observed_order)
+        surviving_hits.push_back(epoch_removed_host_[i]);
       if (output != i)
         epochs_[output] = std::move(epochs_[i]);
       ++output;
@@ -2480,6 +2708,10 @@ private:
     }
     if (epochs_changed)
       refresh_active_epoch_views(stream);
+    if (cache_observed_order) {
+      surviving_hits.push_back(spine_removed);
+      cache_delete_layer_order(surviving_hits);
+    }
   }
 
   void reap_pending_deletes(cudaStream_t stream) {
@@ -2501,7 +2733,6 @@ private:
   void acquire_epoch_slot() {
     if (epoch_pool_.empty()) {
       epochs_.emplace_back();
-      epochs_.back().slot_id = next_epoch_slot_id_++;
       return;
     }
     epochs_.push_back(std::move(epoch_pool_.back()));
@@ -2512,7 +2743,6 @@ private:
     while (epochs_.size() + epoch_pool_.size() <
            static_cast<std::size_t>(gpulsmopt_detail::kEpochMax)) {
       epoch_pool_.emplace_back();
-      epoch_pool_.back().slot_id = next_epoch_slot_id_++;
     }
     for (auto &epoch : epoch_pool_) {
       epoch.keys.resize_discard(count);
@@ -2545,6 +2775,9 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1);
     epoch_quotient_cursor_.resize_discard(
         gpulsmopt_detail::kEpochQuotients);
+    delete_layer_stats_.resize_discard(
+        2 * gpulsmopt_detail::kDeleteLayerMax + 1);
+    delete_layer_order_.resize_discard(gpulsmopt_detail::kDeleteLayerMax);
     const std::size_t pending_capacity =
         count * static_cast<std::size_t>(gpulsmopt_detail::kEpochMax);
     epoch_merge_keys_.resize_discard(pending_capacity);
@@ -2888,11 +3121,10 @@ private:
   // Reserve direct-path buffers before timed updates.
   void prepare_for_insert(cudaStream_t stream) {
     const std::size_t direct_count = std::min(
-        max_elements_, std::max(4 * c0_flush_budget(), batch_size_));
+        max_elements_, std::max(4 * c0_flush_budget(), batch_capacity_));
     ensure_c0_log(stream);
     prepare_sort_storage(direct_count, c0_flush_budget(), stream);
     reserve_epoch_storage(direct_count);
-    prepare_epoch_metadata_graphs(batch_size_);
     prebind_epoch_views(stream);
     prepare_run_storage();
     prepare_overlay_storage(direct_count);
@@ -3743,7 +3975,9 @@ private:
   }
 
   std::size_t max_elements_ = 0;
-  std::size_t batch_size_ = 0;
+  std::size_t batch_capacity_ = 0;
+  DeleteOrderPolicy delete_order_policy_ =
+      DeleteOrderPolicy::adaptive;
   std::size_t live_count_ = 0;
   std::size_t spine_count_ = 0;
   std::size_t spine_live_count_ = 0;
@@ -3781,13 +4015,16 @@ private:
 
   std::vector<EpochStorage> epochs_;
   std::vector<EpochStorage> epoch_pool_;
-  std::size_t next_epoch_slot_id_ = 0;
   thrust::device_vector<gpulsmopt_detail::EpochView> epoch_views_;
   std::vector<gpulsmopt_detail::EpochView> bound_epoch_views_;
   std::vector<std::uint8_t> bound_epoch_view_valid_;
-  std::vector<EpochMetadataGraph> epoch_metadata_graphs_;
   thrust::device_vector<std::uint32_t> epoch_removed_;
   std::uint32_t *epoch_removed_host_ = nullptr;
+  std::uint8_t *delete_layer_order_host_ = nullptr;
+  std::size_t delete_layer_order_host_count_ = 0;
+  bool delete_layer_order_host_valid_ = false;
+  std::size_t delete_layer_order_device_count_ = 0;
+  bool delete_layer_order_device_matches_host_ = false;
   cudaEvent_t epoch_delete_ready_ = nullptr;
   cudaStream_t epoch_delete_stream_ = nullptr;
   std::size_t epoch_delete_epoch_count_ = 0;
@@ -3823,6 +4060,8 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_merge_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_merge_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> delete_sort_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> delete_layer_stats_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> delete_layer_order_;
   std::size_t direct_sort_count_ = 0;
   std::size_t direct_sort_temp_bytes_ = 0;
   std::size_t epoch_sort_count_ = 0;

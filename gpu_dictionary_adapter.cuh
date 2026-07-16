@@ -3,9 +3,15 @@
 #include <cstddef>
 #include <cstdint>
 
+enum class DeleteOrderPolicy : std::uint8_t {
+  adaptive,
+  uniform_live,
+};
+
 struct DictionaryConfig {
   std::size_t max_elements = 0;
-  std::size_t batch_size = 0;
+  std::size_t batch_capacity = 0;
+  DeleteOrderPolicy delete_order = DeleteOrderPolicy::adaptive;
 };
 
 struct DeviceKeyValueBatch {

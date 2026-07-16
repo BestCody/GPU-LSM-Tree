@@ -34,21 +34,18 @@
 #undef GPULSMOPT_RESTORE_FLIX_CUDA_CHECK
 #endif
 
-#ifndef GPULSMOPT_BATCH_SIZE
-#define GPULSMOPT_BATCH_SIZE 65536
+#ifndef GPULSMOPT_BATCH_CAPACITY
+#ifdef GPULSMOPT_BATCH_SIZE
+#define GPULSMOPT_BATCH_CAPACITY GPULSMOPT_BATCH_SIZE
+#else
+#define GPULSMOPT_BATCH_CAPACITY (1 << 16)
+#endif
 #endif
 
 namespace gpulsmopt_adapter_detail {
 
-constexpr size_t batch_size_hint() {
-  size_t hint = static_cast<size_t>(GPULSMOPT_BATCH_SIZE);
-#ifdef UPDATE_INSERT_BATCH_LOG
-  hint = std::max(hint, size_t{1} << UPDATE_INSERT_BATCH_LOG);
-#endif
-#ifdef UPDATE_DELETE_BATCH_LOG
-  hint = std::max(hint, size_t{1} << UPDATE_DELETE_BATCH_LOG);
-#endif
-  return hint;
+constexpr size_t batch_capacity() {
+  return static_cast<size_t>(GPULSMOPT_BATCH_CAPACITY);
 }
 
 inline void check_cuda(cudaError_t err) {
@@ -144,8 +141,9 @@ public:
 
   static parameters_type parameters() {
     return {
-        {"batch_size",
-         std::to_string(gpulsmopt_adapter_detail::batch_size_hint())},
+        {"batch_capacity",
+         std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
+        {"delete_order", "uniform_live"},
         {"c0_log", "1"},
         {"sorted_runs", "1"},
         {"c0_flush_budget",
@@ -181,14 +179,15 @@ public:
 
     build_values_buffer_.resize(size);
 
-    const size_t configured_batch_size =
-        gpulsmopt_adapter_detail::batch_size_hint();
-    const size_t config_batch_size = std::max<size_t>(
+    const size_t configured_batch_capacity =
+        gpulsmopt_adapter_detail::batch_capacity();
+    const size_t config_batch_capacity = std::max<size_t>(
         1, std::min(configured_max_size == 0 ? size : configured_max_size,
-                    configured_batch_size));
+                    configured_batch_capacity));
     DictionaryConfig config;
     config.max_elements = configured_max_size;
-    config.batch_size = config_batch_size;
+    config.batch_capacity = config_batch_capacity;
+    config.delete_order = DeleteOrderPolicy::uniform_live;
 
     gpulsmopt_adapter_detail::scoped_cuda_event_timer timer(0, build_time_ms);
     dictionary_ = std::make_unique<GPULSMOpt>(config);
@@ -265,6 +264,7 @@ public:
     batch.count = size;
     batch.sorted = true;
     dictionary_->erase(batch, stream);
+    dictionary_->finish_pending_delete(stream);
   }
 
   void lookups_successor(const key_type *keys, key_type *result, size_t size,
