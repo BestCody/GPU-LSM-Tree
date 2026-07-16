@@ -152,6 +152,12 @@ public:
          std::to_string(static_cast<size_t>(GPULSMOPT_SCATTER_MIN_BATCH))},
         {"epoch_max",
          std::to_string(static_cast<size_t>(GPULSMOPT_EPOCH_MAX))},
+        {"delete_range_min",
+         std::to_string(
+             static_cast<size_t>(GPULSMOPT_DELETE_RANGE_MIN_BATCH))},
+        {"delete_range_target",
+         std::to_string(
+             static_cast<size_t>(GPULSMOPT_DELETE_RANGE_TARGET))},
     };
   }
 

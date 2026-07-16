@@ -59,6 +59,12 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_DELETE_ADAPTIVE_MIN_BATCH
 #define GPULSMOPT_DELETE_ADAPTIVE_MIN_BATCH (1 << 22)
 #endif
+#ifndef GPULSMOPT_DELETE_RANGE_MIN_BATCH
+#define GPULSMOPT_DELETE_RANGE_MIN_BATCH (1 << 18)
+#endif
+#ifndef GPULSMOPT_DELETE_RANGE_TARGET
+#define GPULSMOPT_DELETE_RANGE_TARGET 128
+#endif
 #ifndef GPULSMOPT_SM120_RADIX
 #define GPULSMOPT_SM120_RADIX 1
 #endif
@@ -78,6 +84,7 @@ constexpr int kEpochSubgroupPrefixStride = kEpochSubgroups + 1;
 constexpr int kEpochHeavySortCap = 128;
 constexpr int kEpochQuotientBitmapWords = kEpochQuotients / 32;
 constexpr int kDeleteLayerMax = kEpochMax + 1;
+constexpr int kDeleteOwnerMinBits = 10;
 constexpr int kSpineRadixBits = 20;
 constexpr int kSpineRadixShift = 32 - kSpineRadixBits;
 constexpr int kSpineMicroTarget = 4;
@@ -88,6 +95,10 @@ constexpr std::size_t kSpineRadixSize =
 static_assert(kEpochMax <= 32, "epoch delete mask requires <= 32 epochs");
 static_assert(GPULSMOPT_DELETE_OWNER_SAMPLES > 0,
               "delete sample count must be positive");
+static_assert(GPULSMOPT_DELETE_RANGE_MIN_BATCH > 0,
+              "delete owner minimum must be positive");
+static_assert(GPULSMOPT_DELETE_RANGE_TARGET > 0,
+              "delete owner target must be positive");
 static_assert(GPULSMOPT_RADIX_THREADS % 32 == 0,
               "radix block size must be warp aligned");
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
@@ -1216,6 +1227,196 @@ __global__ void epoch_spine_delete_kernel(
   }
   if (lane == __ffs(new_mask) - 1)
     atomicAdd(spine_removed, static_cast<std::uint32_t>(__popc(new_mask)));
+}
+
+__device__ inline bool delete_rank_group_owned(
+    std::size_t group, int shift, std::size_t owner_begin,
+    std::size_t owner_end, std::size_t total) {
+  const std::size_t begin = group << shift;
+  const std::size_t end = min(begin + (std::size_t{1} << shift), total);
+  return begin >= owner_begin && end <= owner_end;
+}
+
+__global__ void epoch_spine_owner_delete_kernel(
+    const std::uint32_t *keys, std::uint32_t n, const EpochView *epochs,
+    int epoch_count, const std::uint8_t *layer_order,
+    std::uint32_t *epoch_removed,
+    std::uint32_t value_sums_ready_mask, SpineView spine,
+    std::uint32_t *spine_dead_count, std::uint32_t *spine_dead_value,
+    int owner_bits, std::uint32_t owner_count) {
+  constexpr int kWarps = 8;
+  __shared__ std::uint32_t owner_bounds[kWarps + 1];
+  __shared__ std::uint32_t block_removed[kDeleteLayerMax];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const std::uint32_t owner_base = blockIdx.x * kWarps;
+  const int owner_shift = 32 - owner_bits;
+  if (threadIdx.x < kWarps + 1) {
+    const std::uint32_t boundary = owner_base + threadIdx.x;
+    if (boundary == 0u) {
+      owner_bounds[threadIdx.x] = 0u;
+    } else if (boundary >= owner_count) {
+      owner_bounds[threadIdx.x] = n;
+    } else {
+      const std::uint32_t key = boundary << owner_shift;
+      owner_bounds[threadIdx.x] = static_cast<std::uint32_t>(
+          lower_bound_u32(keys, n, key));
+    }
+  }
+  if (threadIdx.x < kDeleteLayerMax)
+    block_removed[threadIdx.x] = 0u;
+  __syncthreads();
+
+  const std::uint32_t owner = owner_base + warp;
+  if (owner < owner_count) {
+    const std::uint32_t input_begin = owner_bounds[warp];
+    const std::uint32_t input_end = owner_bounds[warp + 1];
+    std::size_t spine_begin = 0;
+    std::size_t spine_end = 0;
+    if (spine.count != 0) {
+      const int radix_shift = kSpineRadixBits - owner_bits;
+      const std::uint32_t radix_begin = owner << radix_shift;
+      const std::uint32_t radix_end = (owner + 1u) << radix_shift;
+      spine_begin = spine.radix[radix_begin];
+      spine_end = spine.radix[radix_end];
+    }
+    constexpr unsigned full = 0xffffffffu;
+    for (std::uint32_t base = input_begin; base < input_end; base += 32u) {
+      const std::uint32_t input = base + lane;
+      const bool valid = input < input_end;
+      std::uint32_t key = 0u;
+      std::uint32_t quotient = 0u;
+      int found_epoch = -1;
+      bool found_spine = false;
+      std::size_t found_position = 0;
+      std::uint32_t found_value = 0u;
+      if (valid) {
+        key = keys[input];
+        quotient = key >> kEpochQuotientBits;
+        for (int rank = 0; rank <= epoch_count; ++rank) {
+          const int layer = layer_order
+                                ? static_cast<int>(layer_order[rank])
+                                : (rank < epoch_count
+                                       ? epoch_count - rank - 1
+                                       : epoch_count);
+          if (layer == epoch_count) {
+            if (spine.count == 0)
+              continue;
+            const std::size_t position = spine_lower_rank(spine, key);
+            if (position >= spine.count || spine.keys[position] != key ||
+                spine_dead(spine.dead, position))
+              continue;
+            found_spine = true;
+            found_position = position;
+            break;
+          }
+          const EpochView &ev = epochs[layer];
+          std::uint32_t position = 0u;
+          if (!epoch_point_position(ev, key, &position))
+            continue;
+          const_cast<std::uint8_t *>(ev.dead)[position] = 1u;
+          found_value = ev.values[position];
+          found_epoch = layer;
+          found_position = position;
+          break;
+        }
+      }
+
+      const unsigned epoch_mask =
+          __ballot_sync(full, valid && found_epoch >= 0);
+      if (found_epoch >= 0) {
+        const std::uint32_t group_key =
+            (static_cast<std::uint32_t>(found_epoch) << 16) | quotient;
+        const unsigned quotient_peers =
+            __match_any_sync(epoch_mask, group_key);
+        const int quotient_leader = __ffs(quotient_peers) - 1;
+        const std::uint32_t removed =
+            static_cast<std::uint32_t>(__popc(quotient_peers));
+        const std::uint32_t removed_sum =
+            __reduce_add_sync(quotient_peers, found_value);
+        if (lane == quotient_leader) {
+          EpochView ev = epochs[found_epoch];
+          const std::uint32_t old = ev.quotient_live[quotient];
+          ev.quotient_live[quotient] = old - removed;
+          if ((value_sums_ready_mask >> found_epoch) & 1u)
+            ev.quotient_value_sum[quotient] -= removed_sum;
+          if (old == removed)
+            atomicAnd(ev.quotient_bitmap + (quotient >> 5),
+                      ~(1u << (quotient & 31u)));
+        }
+        const unsigned layer_peers =
+            __match_any_sync(epoch_mask, found_epoch);
+        if (lane == __ffs(layer_peers) - 1) {
+          atomicAdd(block_removed + found_epoch,
+                    static_cast<std::uint32_t>(__popc(layer_peers)));
+        }
+      }
+
+      const unsigned spine_mask =
+          __ballot_sync(full, valid && found_spine);
+      bool newly_spine_dead = false;
+      if (found_spine) {
+        const std::size_t word = found_position >> 5;
+        const std::uint32_t bit = 1u << (found_position & 31u);
+        const unsigned word_peers = __match_any_sync(
+            spine_mask, static_cast<std::uint32_t>(word));
+        const int word_leader = __ffs(word_peers) - 1;
+        const std::uint32_t word_bits =
+            __reduce_or_sync(word_peers, bit);
+        std::uint32_t old_word = 0u;
+        if (lane == word_leader) {
+          auto *dead = const_cast<std::uint32_t *>(spine.dead) + word;
+          if (delete_rank_group_owned(word, 5, spine_begin,
+                                      spine_end, spine.count)) {
+            old_word = *dead;
+            *dead = old_word | word_bits;
+          } else {
+            old_word = atomicOr(dead, word_bits);
+          }
+        }
+        old_word = __shfl_sync(word_peers, old_word, word_leader);
+        const unsigned bit_peers = __match_any_sync(word_peers, bit);
+        newly_spine_dead =
+            lane == __ffs(bit_peers) - 1 && (old_word & bit) == 0u;
+      }
+      const unsigned new_mask =
+          __ballot_sync(full, newly_spine_dead);
+      if (newly_spine_dead) {
+        const std::size_t dead_block =
+            found_position >> kSpineDeadBlockShift;
+        const unsigned block_peers = __match_any_sync(
+            new_mask, static_cast<std::uint32_t>(dead_block));
+        const int block_leader = __ffs(block_peers) - 1;
+        const std::uint32_t removed =
+            static_cast<std::uint32_t>(__popc(block_peers));
+        const std::uint32_t removed_sum =
+            __reduce_add_sync(block_peers,
+                              spine.values[found_position]);
+        if (lane == block_leader) {
+          if (delete_rank_group_owned(
+                  dead_block, kSpineDeadBlockShift,
+                  spine_begin, spine_end, spine.count)) {
+            spine_dead_count[dead_block] += removed;
+            spine_dead_value[dead_block] += removed_sum;
+          } else {
+            atomicAdd(spine_dead_count + dead_block, removed);
+            atomicAdd(spine_dead_value + dead_block, removed_sum);
+          }
+        }
+      }
+      if (new_mask != 0u && lane == __ffs(new_mask) - 1) {
+        atomicAdd(block_removed + epoch_count,
+                  static_cast<std::uint32_t>(__popc(new_mask)));
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x <= epoch_count) {
+    const std::uint32_t removed = block_removed[threadIdx.x];
+    if (removed != 0u)
+      atomicAdd(epoch_removed + threadIdx.x, removed);
+  }
 }
 
 __global__ void epoch_combined_quotient_counts_kernel(
@@ -2565,6 +2766,17 @@ private:
     return upload_delete_layer_order(stream);
   }
 
+  static int delete_owner_bits(std::size_t count) {
+    const std::size_t target = GPULSMOPT_DELETE_RANGE_TARGET;
+    const std::size_t desired = (count + target - 1) / target;
+    int bits = gpulsmopt_detail::kDeleteOwnerMinBits;
+    while (bits < gpulsmopt_detail::kEpochQuotientBits &&
+           (std::size_t{1} << bits) < desired) {
+      ++bits;
+    }
+    return bits;
+  }
+
   void cache_delete_layer_order(
       const std::vector<std::uint32_t> &owner_hits) {
     const std::size_t ecount = epochs_.size();
@@ -2640,14 +2852,28 @@ private:
                delete_layer_order_host_count_ == ecount + 1) {
       layer_order = upload_delete_layer_order(stream);
     }
-    const int block = 256;
-    const int grid = static_cast<int>((count + block - 1) / block);
-    gpulsmopt_detail::epoch_spine_delete_kernel<<<grid, block, 0, stream>>>(
-        delete_keys, count, epoch_view_ptr(), epoch_count(), layer_order,
-        raw_or_null(epoch_removed_), value_sums_ready_mask,
-        make_spine_delete_view(),
-        spine_dead_count_sum_.data(), spine_dead_value_sum_.data(),
-        raw_or_null(epoch_removed_) + ecount);
+    constexpr int block = 256;
+    if (delete_order_policy_ == DeleteOrderPolicy::uniform_live &&
+        count >= GPULSMOPT_DELETE_RANGE_MIN_BATCH) {
+      const int owner_bits = delete_owner_bits(count);
+      const std::uint32_t owner_count = 1u << owner_bits;
+      constexpr int warps = block / 32;
+      const int grid = static_cast<int>((owner_count + warps - 1) / warps);
+      gpulsmopt_detail::epoch_spine_owner_delete_kernel<<<
+          grid, block, 0, stream>>>(
+          delete_keys, static_cast<std::uint32_t>(count),
+          epoch_view_ptr(), epoch_count(), layer_order,
+          raw_or_null(epoch_removed_), value_sums_ready_mask,
+          make_spine_delete_view(), spine_dead_count_sum_.data(),
+          spine_dead_value_sum_.data(), owner_bits, owner_count);
+    } else {
+      const int grid = static_cast<int>((count + block - 1) / block);
+      gpulsmopt_detail::epoch_spine_delete_kernel<<<grid, block, 0, stream>>>(
+          delete_keys, count, epoch_view_ptr(), epoch_count(), layer_order,
+          raw_or_null(epoch_removed_), value_sums_ready_mask,
+          make_spine_delete_view(), spine_dead_count_sum_.data(),
+          spine_dead_value_sum_.data(), raw_or_null(epoch_removed_) + ecount);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(epoch_removed_host_,
                                raw_or_null(epoch_removed_),
