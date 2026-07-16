@@ -8,10 +8,17 @@ enum class DeleteOrderPolicy : std::uint8_t {
   uniform_live,
 };
 
+enum class BaseDeleteValuePolicy : std::uint8_t {
+  eager,
+  mark_only,
+};
+
 struct DictionaryConfig {
   std::size_t max_elements = 0;
   std::size_t batch_capacity = 0;
   DeleteOrderPolicy delete_order = DeleteOrderPolicy::adaptive;
+  BaseDeleteValuePolicy base_delete_values =
+      BaseDeleteValuePolicy::eager;
 };
 
 struct DeviceKeyValueBatch {

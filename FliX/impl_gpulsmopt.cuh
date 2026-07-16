@@ -13,6 +13,10 @@
 #include "cuda_buffer.cuh"
 #include "definitions.cuh"
 
+#ifndef GPULSMOPT_BASE_DELETE_MARK_ONLY
+#define GPULSMOPT_BASE_DELETE_MARK_ONLY 1
+#endif
+
 #ifdef CUDA_CHECK
 #define GPULSMOPT_RESTORE_FLIX_CUDA_CHECK
 #undef CUDA_CHECK
@@ -144,6 +148,8 @@ public:
         {"batch_capacity",
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
         {"delete_order", "uniform_live"},
+        {"base_delete_values",
+         GPULSMOPT_BASE_DELETE_MARK_ONLY ? "mark_only" : "eager"},
         {"c0_log", "1"},
         {"sorted_runs", "1"},
         {"c0_flush_budget",
@@ -194,6 +200,9 @@ public:
     config.max_elements = configured_max_size;
     config.batch_capacity = config_batch_capacity;
     config.delete_order = DeleteOrderPolicy::uniform_live;
+    config.base_delete_values = GPULSMOPT_BASE_DELETE_MARK_ONLY
+                                    ? BaseDeleteValuePolicy::mark_only
+                                    : BaseDeleteValuePolicy::eager;
 
     gpulsmopt_adapter_detail::scoped_cuda_event_timer timer(0, build_time_ms);
     dictionary_ = std::make_unique<GPULSMOpt>(config);

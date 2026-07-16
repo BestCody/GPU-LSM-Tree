@@ -89,8 +89,8 @@ constexpr int kDeleteOwnerMinBits = 10;
 constexpr int kSpineRadixBits = 20;
 constexpr int kSpineRadixShift = 32 - kSpineRadixBits;
 constexpr int kSpineMicroTarget = 4;
-constexpr int kSpineDeadBlockShift = 3;
-constexpr int kSpineDeadBlockSize = 1 << kSpineDeadBlockShift;
+constexpr int kSpineDeathWordShift = 5;
+constexpr int kSpineDeathWordSize = 1 << kSpineDeathWordShift;
 constexpr int kSpineLocatorBits = 10;
 constexpr int kSpineLocatorSlots = 1 << kSpineLocatorBits;
 constexpr int kSpineLocatorMaxCount = 768;
@@ -323,7 +323,7 @@ struct SpineView {
   const std::uint32_t *micro_base;
   const std::uint16_t *micro_offsets;
   const std::uint8_t *micro_bits;
-  const std::uint32_t *dead;
+  const std::uint64_t *death;
   std::size_t count;
 };
 
@@ -607,9 +607,26 @@ __device__ inline std::uint32_t epoch_successor_candidate(
   return kEmptyKey;
 }
 
-__device__ inline bool spine_dead(const std::uint32_t *dead,
-                                  std::size_t position) {
-  return dead && ((dead[position >> 5] >> (position & 31u)) & 1u);
+__device__ inline std::uint32_t spine_death_mask(
+    const std::uint64_t *death, std::size_t word) {
+  return death ? static_cast<std::uint32_t>(death[word]) : 0u;
+}
+
+__device__ inline std::uint32_t spine_death_value(
+    std::uint64_t state) {
+  return static_cast<std::uint32_t>(state >> 32);
+}
+
+__device__ inline std::uint64_t spine_death_state(
+    std::uint32_t mask, std::uint32_t value) {
+  return static_cast<std::uint64_t>(mask) |
+         (static_cast<std::uint64_t>(value) << 32);
+}
+
+__device__ inline bool spine_dead(const std::uint64_t *death,
+                                   std::size_t position) {
+  return (spine_death_mask(death, position >> 5) >>
+          (position & 31u)) & 1u;
 }
 
 __device__ inline void spine_refined_bounds(
@@ -690,7 +707,7 @@ __device__ inline bool spine_point_find(
     return false;
   const std::size_t position = spine_lower_rank(spine, key);
   if (position >= spine.count || spine.keys[position] != key ||
-      spine_dead(spine.dead, position))
+        spine_dead(spine.death, position))
     return false;
   if (out_value)
     *out_value = spine.values[position];
@@ -698,52 +715,68 @@ __device__ inline bool spine_point_find(
 }
 
 __device__ inline std::uint32_t spine_dead_count_range(
-    const std::uint32_t *dead, const std::uint32_t *dead_prefix,
+    const std::uint64_t *death, const std::uint32_t *dead_prefix,
     std::size_t begin, std::size_t end) {
-  if (!dead || begin >= end)
+  if (!death || begin >= end)
     return 0u;
-  const std::size_t first = begin >> kSpineDeadBlockShift;
-  const std::size_t last = (end - 1) >> kSpineDeadBlockShift;
-  std::uint32_t total = 0u;
+  const std::size_t first = begin >> kSpineDeathWordShift;
+  const std::size_t last = (end - 1) >> kSpineDeathWordShift;
+  const std::uint32_t first_mask =
+      0xffffffffu << (begin & 31u);
+  const std::uint32_t last_bits =
+      static_cast<std::uint32_t>(((end - 1) & 31u) + 1u);
+  const std::uint32_t last_mask =
+      last_bits == 32u ? 0xffffffffu : (1u << last_bits) - 1u;
   if (first == last) {
-    for (std::size_t p = begin; p < end; ++p)
-      total += spine_dead(dead, p);
-    return total;
+    return __popc(spine_death_mask(death, first) &
+                  first_mask & last_mask);
   }
-  const std::size_t first_end = (first + 1) << kSpineDeadBlockShift;
-  for (std::size_t p = begin; p < first_end; ++p)
-    total += spine_dead(dead, p);
-  const std::size_t last_begin = last << kSpineDeadBlockShift;
-  for (std::size_t p = last_begin; p < end; ++p)
-    total += spine_dead(dead, p);
+  std::uint32_t total =
+      __popc(spine_death_mask(death, first) & first_mask) +
+      __popc(spine_death_mask(death, last) & last_mask);
   if (last > first + 1)
     total += dead_prefix[last] - dead_prefix[first + 1];
   return total;
 }
 
+__device__ inline std::uint32_t spine_masked_value_sum(
+    const std::uint32_t *values, std::size_t base,
+    std::uint32_t mask) {
+  std::uint32_t total = 0u;
+  while (mask != 0u) {
+    const int bit = __ffs(mask) - 1;
+    total += values[base + static_cast<std::size_t>(bit)];
+    mask &= mask - 1u;
+  }
+  return total;
+}
+
 __device__ inline std::uint32_t spine_dead_sum_range(
-    const std::uint32_t *values, const std::uint32_t *dead,
+    const std::uint32_t *values, const std::uint64_t *death,
     const std::uint32_t *dead_prefix, std::size_t begin,
     std::size_t end) {
-  if (!dead || begin >= end)
+  if (!death || begin >= end)
     return 0u;
-  const std::size_t first = begin >> kSpineDeadBlockShift;
-  const std::size_t last = (end - 1) >> kSpineDeadBlockShift;
-  std::uint32_t total = 0u;
+  const std::size_t first = begin >> kSpineDeathWordShift;
+  const std::size_t last = (end - 1) >> kSpineDeathWordShift;
+  const std::uint32_t first_mask =
+      0xffffffffu << (begin & 31u);
+  const std::uint32_t last_bits =
+      static_cast<std::uint32_t>(((end - 1) & 31u) + 1u);
+  const std::uint32_t last_mask =
+      last_bits == 32u ? 0xffffffffu : (1u << last_bits) - 1u;
   if (first == last) {
-    for (std::size_t p = begin; p < end; ++p)
-      if (spine_dead(dead, p))
-        total += values[p];
-    return total;
+    const std::uint32_t mask =
+        spine_death_mask(death, first) & first_mask & last_mask;
+    return spine_masked_value_sum(
+        values, first << kSpineDeathWordShift, mask);
   }
-  const std::size_t first_end = (first + 1) << kSpineDeadBlockShift;
-  for (std::size_t p = begin; p < first_end; ++p)
-    if (spine_dead(dead, p))
-      total += values[p];
-  const std::size_t last_begin = last << kSpineDeadBlockShift;
-  for (std::size_t p = last_begin; p < end; ++p)
-    if (spine_dead(dead, p))
-      total += values[p];
+  std::uint32_t total = spine_masked_value_sum(
+      values, first << kSpineDeathWordShift,
+      spine_death_mask(death, first) & first_mask);
+  total += spine_masked_value_sum(
+      values, last << kSpineDeathWordShift,
+      spine_death_mask(death, last) & last_mask);
   if (last > first + 1)
     total += dead_prefix[last] - dead_prefix[first + 1];
   return total;
@@ -757,7 +790,7 @@ __device__ inline std::uint32_t spine_range_count(
   std::size_t begin = 0, end = 0;
   spine_range_ranks(spine, lo, hi, &begin, &end);
   return static_cast<std::uint32_t>(end - begin) -
-         spine_dead_count_range(spine.dead, dead_prefix, begin, end);
+         spine_dead_count_range(spine.death, dead_prefix, begin, end);
 }
 
 __device__ inline std::uint32_t spine_range_sum(
@@ -769,7 +802,7 @@ __device__ inline std::uint32_t spine_range_sum(
   std::size_t begin = 0, end = 0;
   spine_range_ranks(spine, lo, hi, &begin, &end);
   return value_prefix[end] - value_prefix[begin] -
-         spine_dead_sum_range(spine.values, spine.dead,
+           spine_dead_sum_range(spine.values, spine.death,
                               dead_value_prefix, begin, end);
 }
 
@@ -781,7 +814,7 @@ __device__ inline std::uint32_t spine_successor_candidate(
   std::size_t position = spine_lower_rank(spine, key);
   for (; position < spine.count; ++position) {
     const std::uint32_t candidate = spine.keys[position];
-    if (!spine_dead(spine.dead, position) &&
+    if (!spine_dead(spine.death, position) &&
         !epoch_key_killed(candidate, killed_keys, killed_count))
       return candidate;
   }
@@ -866,14 +899,13 @@ __device__ inline bool spine_locator_find(
     SpineLocatorView locator, SpineView spine, std::uint32_t key,
     std::size_t *position) {
   const std::uint32_t quotient = key >> kEpochQuotientBits;
-  if (!locator.slots || !locator.enabled ||
-      !locator.enabled[quotient]) {
-    const std::size_t rank = spine_lower_rank(spine, key);
-    if (rank >= spine.count || spine.keys[rank] != key ||
-        spine_dead(spine.dead, rank))
-      return false;
-    *position = rank;
-    return true;
+    if (!locator.slots || !locator.enabled ||
+        !locator.enabled[quotient]) {
+      const std::size_t rank = spine_lower_rank(spine, key);
+      if (rank >= spine.count || spine.keys[rank] != key)
+        return false;
+      *position = rank;
+      return true;
   }
   const std::uint32_t low = key & 0xffffu;
   std::uint32_t slot = spine_locator_slot(low);
@@ -887,11 +919,10 @@ __device__ inline bool spine_locator_find(
       const std::size_t begin =
           spine.radix[quotient <<
                        (kSpineRadixBits - kEpochQuotientBits)];
-      const std::size_t rank = begin + (packed >> 16);
-      if (rank < spine.count && spine.keys[rank] == key &&
-          !spine_dead(spine.dead, rank)) {
-        *position = rank;
-        return true;
+        const std::size_t rank = begin + (packed >> 16);
+        if (rank < spine.count) {
+          *position = rank;
+          return true;
       }
       return false;
     }
@@ -940,37 +971,53 @@ __global__ void spine_locator_build_kernel(
   }
 }
 
-__global__ void spine_dead_count_blocks_kernel(
-    const std::uint32_t *dead, std::size_t count,
-    std::uint32_t *block_counts) {
-  const std::size_t block = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t begin = block << kSpineDeadBlockShift;
-  if (begin >= count)
+__global__ void spine_death_count_kernel(
+    const std::uint64_t *death, std::size_t words,
+    std::uint32_t *counts) {
+  const std::size_t word = blockIdx.x * blockDim.x + threadIdx.x;
+  if (word >= words)
     return;
-  const std::size_t word = begin >> 5;
-  const std::uint32_t shift = begin & 31u;
-  const std::size_t remaining = count - begin;
-  const std::uint32_t valid = static_cast<std::uint32_t>(
-      remaining < kSpineDeadBlockSize ? remaining : kSpineDeadBlockSize);
-  const std::uint32_t mask = (1u << valid) - 1u;
-  block_counts[block] = __popc((dead[word] >> shift) & mask);
+  counts[word] = __popc(spine_death_mask(death, word));
+}
+
+__global__ void spine_death_value_kernel(
+    const std::uint64_t *death, std::size_t words,
+    std::uint32_t *sums) {
+  const std::size_t word = blockIdx.x * blockDim.x + threadIdx.x;
+  if (word < words)
+    sums[word] = spine_death_value(death[word]);
+}
+
+__global__ void spine_death_rebuild_value_kernel(
+    const std::uint32_t *values, const std::uint64_t *death,
+    std::size_t count, std::uint32_t *sums) {
+  const std::size_t word = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t base = word << kSpineDeathWordShift;
+  if (base >= count)
+    return;
+  std::uint32_t mask = spine_death_mask(death, word);
+  if (count - base < kSpineDeathWordSize) {
+    const std::uint32_t valid = static_cast<std::uint32_t>(count - base);
+    mask &= valid == 32u ? 0xffffffffu : (1u << valid) - 1u;
+  }
+  sums[word] = spine_masked_value_sum(values, base, mask);
 }
 
 __global__ void spine_live_input_kernel(
-    const std::uint32_t *dead, std::size_t count,
+    const std::uint64_t *death, std::size_t count,
     std::uint32_t *live) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < count)
-    live[i] = spine_dead(dead, i) ? 0u : 1u;
+    live[i] = spine_dead(death, i) ? 0u : 1u;
 }
 
 __global__ void spine_gather_live_kernel(
     const std::uint32_t *keys, const std::uint32_t *values,
-    const std::uint32_t *dead, const std::uint32_t *prefix,
+    const std::uint64_t *death, const std::uint32_t *prefix,
     std::size_t count, std::uint32_t *out_keys,
     std::uint32_t *out_values) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count || spine_dead(dead, i))
+  if (i >= count || spine_dead(death, i))
     return;
   const std::size_t output = prefix[i];
   out_keys[output] = keys[i];
@@ -1245,12 +1292,11 @@ __global__ void delete_layer_order_kernel(
   }
 }
 
+template <bool MarkOnly>
 __global__ void epoch_spine_delete_kernel(
     const std::uint32_t *keys, std::size_t n, const EpochView *epochs,
     int epoch_count, const std::uint8_t *layer_order,
-    std::uint32_t *epoch_removed,
-    std::uint32_t value_sums_ready_mask, SpineView spine,
-    std::uint32_t *spine_dead_count, std::uint32_t *spine_dead_value,
+    std::uint32_t *epoch_removed, SpineView spine,
     std::uint32_t *spine_removed) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
@@ -1260,7 +1306,6 @@ __global__ void epoch_spine_delete_kernel(
   int found_epoch = -1;
   bool found_spine = false;
   std::size_t found_position = 0;
-  std::uint32_t found_value = 0u;
   for (int rank = 0; rank <= epoch_count; ++rank) {
     const int layer = layer_order
                           ? static_cast<int>(layer_order[rank])
@@ -1270,8 +1315,7 @@ __global__ void epoch_spine_delete_kernel(
       if (spine.count == 0)
         continue;
       const std::size_t position = spine_lower_rank(spine, key);
-      if (position >= spine.count || spine.keys[position] != key ||
-          spine_dead(spine.dead, position))
+      if (position >= spine.count || spine.keys[position] != key)
         continue;
       found_spine = true;
       found_position = position;
@@ -1282,7 +1326,6 @@ __global__ void epoch_spine_delete_kernel(
     if (!epoch_point_position(ev, key, &position))
       continue;
     const_cast<std::uint8_t *>(ev.dead)[position] = 1u;
-    found_value = ev.values[position];
     found_epoch = layer;
     break;
   }
@@ -1298,14 +1341,10 @@ __global__ void epoch_spine_delete_kernel(
     const int quotient_leader = __ffs(quotient_peers) - 1;
     const std::uint32_t removed =
         static_cast<std::uint32_t>(__popc(quotient_peers));
-    const std::uint32_t removed_sum =
-        __reduce_add_sync(quotient_peers, found_value);
     if (lane == quotient_leader) {
       EpochView ev = epochs[found_epoch];
       const std::uint32_t old =
           atomicSub(ev.quotient_live + quotient, removed);
-      if ((value_sums_ready_mask >> found_epoch) & 1u)
-        atomicSub(ev.quotient_value_sum + quotient, removed_sum);
       if (old == removed)
         atomicAnd(ev.quotient_bitmap + (quotient >> 5),
                   ~(1u << (quotient & 31u)));
@@ -1332,8 +1371,10 @@ __global__ void epoch_spine_delete_kernel(
   const std::uint32_t word_bits = __reduce_or_sync(word_peers, bit);
   std::uint32_t old_word = 0u;
   if (lane == word_leader) {
-    old_word = atomicOr(const_cast<std::uint32_t *>(spine.dead) + word,
-                        word_bits);
+    old_word = atomicOr(
+        reinterpret_cast<std::uint32_t *>(
+            const_cast<std::uint64_t *>(spine.death)) + 2 * word,
+        word_bits);
   }
   old_word = __shfl_sync(word_peers, old_word, word_leader);
   const unsigned bit_peers = __match_any_sync(word_peers, bit);
@@ -1342,16 +1383,17 @@ __global__ void epoch_spine_delete_kernel(
   const unsigned new_mask = __ballot_sync(spine_mask, newly_dead);
   if (!newly_dead)
     return;
-  const std::size_t dead_block = position >> kSpineDeadBlockShift;
-  const unsigned block_peers = __match_any_sync(
-      new_mask, static_cast<std::uint32_t>(dead_block));
-  const int block_leader = __ffs(block_peers) - 1;
-  const std::uint32_t value_sum =
-      __reduce_add_sync(block_peers, spine.values[position]);
-  if (lane == block_leader) {
-    atomicAdd(spine_dead_count + dead_block,
-              static_cast<std::uint32_t>(__popc(block_peers)));
-    atomicAdd(spine_dead_value + dead_block, value_sum);
+  if constexpr (!MarkOnly) {
+    const unsigned value_peers = __match_any_sync(
+        new_mask, static_cast<std::uint32_t>(word));
+    const int value_leader = __ffs(value_peers) - 1;
+    const std::uint32_t value_sum =
+        __reduce_add_sync(value_peers, spine.values[position]);
+    if (lane == value_leader) {
+      auto *state = reinterpret_cast<std::uint32_t *>(
+          const_cast<std::uint64_t *>(spine.death));
+      atomicAdd(state + 2 * word + 1, value_sum);
+    }
   }
   if (lane == __ffs(new_mask) - 1)
     atomicAdd(spine_removed, static_cast<std::uint32_t>(__popc(new_mask)));
@@ -1365,12 +1407,12 @@ __device__ inline bool delete_rank_group_owned(
   return begin >= owner_begin && end <= owner_end;
 }
 
+template <bool MarkOnly>
 __global__ void epoch_spine_owner_delete_kernel(
     const std::uint32_t *keys, std::uint32_t n, const EpochView *epochs,
     int epoch_count, const std::uint8_t *layer_order,
-    std::uint32_t *epoch_removed,
-    std::uint32_t value_sums_ready_mask, SpineView spine,
-    SpineLocatorView locator, std::uint32_t *spine_dead_value,
+    std::uint32_t *epoch_removed, SpineView spine,
+    SpineLocatorView locator,
     int owner_bits, std::uint32_t owner_count) {
   constexpr int kWarps = 8;
   constexpr int kTile = 128;
@@ -1438,40 +1480,51 @@ __global__ void epoch_spine_owner_delete_kernel(
           const int leader = __ffs(word_peers) - 1;
           const std::uint32_t bits = __reduce_or_sync(word_peers, bit);
           std::uint32_t old_word = 0u;
+          std::uint64_t old_state = 0u;
+          const bool owned = delete_rank_group_owned(
+              word, kSpineDeathWordShift,
+              spine_begin, spine_end, spine.count);
           if (lane == leader) {
-            auto *dead = const_cast<std::uint32_t *>(spine.dead) + word;
-            if (delete_rank_group_owned(word, 5, spine_begin,
-                                        spine_end, spine.count)) {
-              old_word = *dead;
-              *dead = old_word | bits;
+            auto *death = const_cast<std::uint64_t *>(spine.death);
+            if (owned) {
+              old_state = death[word];
+              old_word = static_cast<std::uint32_t>(old_state);
             } else {
-              old_word = atomicOr(dead, bits);
+              auto *mask = reinterpret_cast<std::uint32_t *>(death) +
+                           2 * word;
+              old_word = atomicOr(mask, bits);
             }
           }
           old_word = __shfl_sync(word_peers, old_word, leader);
           const unsigned bit_peers = __match_any_sync(word_peers, bit);
           newly_dead = lane == __ffs(bit_peers) - 1 &&
                        (old_word & bit) == 0u;
-        }
-        const unsigned new_mask = __ballot_sync(full, newly_dead);
-        if (newly_dead) {
-          const std::size_t dead_block =
-              position >> kSpineDeadBlockShift;
-          const unsigned block_peers = __match_any_sync(
-              new_mask, static_cast<std::uint32_t>(dead_block));
-          const int leader = __ffs(block_peers) - 1;
-          const std::uint32_t removed_sum =
-              __reduce_add_sync(block_peers, spine.values[position]);
-          if (lane == leader) {
-            if (delete_rank_group_owned(
-                    dead_block, kSpineDeadBlockShift,
-                    spine_begin, spine_end, spine.count)) {
-              spine_dead_value[dead_block] += removed_sum;
-            } else {
-              atomicAdd(spine_dead_value + dead_block, removed_sum);
+          if constexpr (MarkOnly) {
+            if (lane == leader && owned) {
+              auto *death = const_cast<std::uint64_t *>(spine.death);
+              death[word] = spine_death_state(
+                  old_word | bits, spine_death_value(old_state));
+            }
+          } else {
+            const std::uint32_t value =
+                newly_dead ? spine.values[position] : 0u;
+            const std::uint32_t removed_sum =
+                __reduce_add_sync(word_peers, value);
+            if (lane == leader) {
+              auto *death = const_cast<std::uint64_t *>(spine.death);
+              if (owned) {
+                death[word] = spine_death_state(
+                    old_word | bits,
+                    spine_death_value(old_state) + removed_sum);
+              } else if (removed_sum != 0u) {
+                auto *sum = reinterpret_cast<std::uint32_t *>(death) +
+                            2 * word + 1;
+                atomicAdd(sum, removed_sum);
+              }
             }
           }
         }
+        const unsigned new_mask = __ballot_sync(full, newly_dead);
         if (new_mask != 0u && lane == __ffs(new_mask) - 1) {
           atomicAdd(block_removed + epoch_count,
                     static_cast<std::uint32_t>(__popc(new_mask)));
@@ -1501,28 +1554,13 @@ __global__ void epoch_spine_owner_delete_kernel(
           const int input = base + lane;
           const bool valid = input < queue_count;
           const std::uint32_t key = valid ? input_queue[input] : 0u;
-          const std::uint32_t quotient = key >> kEpochQuotientBits;
           std::uint32_t position = 0u;
           const EpochView ev = epochs[layer];
           const bool found =
               valid && epoch_point_position(ev, key, &position);
-          std::uint32_t value = 0u;
-          if (found) {
+          if (found)
             const_cast<std::uint8_t *>(ev.dead)[position] = 1u;
-            value = ev.values[position];
-          }
           const unsigned found_mask = __ballot_sync(full, found);
-          if (found) {
-            const unsigned peers =
-                __match_any_sync(found_mask, quotient);
-            const int leader = __ffs(peers) - 1;
-            const std::uint32_t removed_sum =
-                __reduce_add_sync(peers, value);
-            if (lane == leader &&
-                ((value_sums_ready_mask >> layer) & 1u)) {
-              ev.quotient_value_sum[quotient] -= removed_sum;
-            }
-          }
           if (found_mask != 0u && lane == __ffs(found_mask) - 1) {
             atomicAdd(block_removed + layer,
                       static_cast<std::uint32_t>(__popc(found_mask)));
@@ -1865,7 +1903,8 @@ public:
   explicit GPULSMOpt(const DictionaryConfig &config)
       : max_elements_(config.max_elements),
         batch_capacity_(config.batch_capacity),
-        delete_order_policy_(config.delete_order) {
+        delete_order_policy_(config.delete_order),
+        base_delete_value_policy_(config.base_delete_values) {
     if (max_elements_ > 0x7fffffffu) {
       throw std::invalid_argument(
           "GPULSMOpt currently supports at most 2^31-1 records");
@@ -2270,8 +2309,8 @@ public:
         spine_keys_, spine_values_, spine_value_prefix_, spine_radix_,
         spine_micro_base_, spine_micro_offsets_, spine_micro_bits_,
         spine_locator_slots_, spine_locator_enabled_,
-        spine_dead_words_, spine_dead_count_sum_, spine_dead_value_sum_,
-        spine_dead_count_prefix_, spine_dead_value_prefix_,
+          spine_death_words_, spine_dead_scan_input_,
+          spine_dead_count_prefix_, spine_dead_value_prefix_,
         spine_live_counts_, spine_live_prefix_, spine_gather_keys_,
         spine_gather_values_, spine_merge_keys_, spine_merge_values_,
         delete_sort_keys_, delete_layer_stats_, delete_layer_order_, ov_c0k_,
@@ -2361,13 +2400,13 @@ private:
             spine_micro_ready_ ? spine_micro_base_.data() : nullptr,
             spine_micro_ready_ ? spine_micro_offsets_.data() : nullptr,
             spine_micro_ready_ ? spine_micro_bits_.data() : nullptr,
-            spine_has_dead_ ? spine_dead_words_.data() : nullptr,
+              spine_has_dead_ ? spine_death_words_.data() : nullptr,
             spine_count_};
   }
 
   gpulsmopt_detail::SpineView make_spine_delete_view() const {
     auto view = make_spine_view();
-    view.dead = spine_dead_words_.data();
+    view.death = spine_death_words_.data();
     return view;
   }
 
@@ -2380,7 +2419,6 @@ private:
     spine_count_ = 0;
     spine_live_count_ = 0;
     spine_has_dead_ = false;
-    spine_dead_count_sum_ready_ = true;
     spine_dead_count_prefix_ready_ = true;
     spine_dead_value_prefix_ready_ = true;
     spine_keys_.resize_discard(0);
@@ -2394,9 +2432,8 @@ private:
     spine_locator_slots_.resize_discard(0);
     spine_locator_enabled_.resize_discard(0);
     spine_locator_ready_ = false;
-    spine_dead_words_.resize_discard(0);
-    spine_dead_count_sum_.resize_discard(0);
-    spine_dead_value_sum_.resize_discard(0);
+    spine_death_words_.resize_discard(0);
+    spine_dead_scan_input_.resize_discard(0);
     spine_dead_count_prefix_.resize_discard(0);
     spine_dead_value_prefix_.resize_discard(0);
   }
@@ -2422,26 +2459,15 @@ private:
                              spine_value_prefix_.data() + 1);
     }
     const std::size_t words = (count + 31) / 32;
-    spine_dead_words_.resize_discard(words);
+    spine_death_words_.resize_discard(words);
     if (words > 0)
-      CUDA_CHECK(cudaMemsetAsync(spine_dead_words_.data(), 0,
-                                 words * sizeof(std::uint32_t), stream));
-    const std::size_t dead_blocks =
-        (count + gpulsmopt_detail::kSpineDeadBlockSize - 1) /
-        gpulsmopt_detail::kSpineDeadBlockSize;
-    spine_dead_count_sum_.resize_discard(dead_blocks + 1);
-    spine_dead_value_sum_.resize_discard(dead_blocks + 1);
-    spine_dead_count_prefix_.resize_discard(dead_blocks + 1);
-    spine_dead_value_prefix_.resize_discard(dead_blocks + 1);
-    CUDA_CHECK(cudaMemsetAsync(
-        spine_dead_count_sum_.data(), 0,
-        (dead_blocks + 1) * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        spine_dead_value_sum_.data(), 0,
-        (dead_blocks + 1) * sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(spine_death_words_.data(), 0,
+                                 words * sizeof(std::uint64_t), stream));
+    spine_dead_scan_input_.resize_discard(words + 1);
+    spine_dead_count_prefix_.resize_discard(words + 1);
+    spine_dead_value_prefix_.resize_discard(words + 1);
     spine_live_count_ = count;
     spine_has_dead_ = false;
-    spine_dead_count_sum_ready_ = true;
     spine_dead_count_prefix_ready_ = true;
     spine_dead_value_prefix_ready_ = true;
   }
@@ -2502,33 +2528,39 @@ private:
   void ensure_spine_dead_count_prefix(cudaStream_t stream) {
     if (!spine_has_dead_ || spine_dead_count_prefix_ready_)
       return;
-    if (!spine_dead_count_sum_ready_) {
-      const std::size_t blocks =
-          (spine_count_ + gpulsmopt_detail::kSpineDeadBlockSize - 1) /
-          gpulsmopt_detail::kSpineDeadBlockSize;
-      constexpr int block = 256;
-      const int grid = static_cast<int>((blocks + block - 1) / block);
-      gpulsmopt_detail::spine_dead_count_blocks_kernel<<<grid, block, 0,
-                                                         stream>>>(
-          spine_dead_words_.data(), spine_count_,
-          spine_dead_count_sum_.data());
-      CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemsetAsync(spine_dead_count_sum_.data() + blocks, 0,
-                                 sizeof(std::uint32_t), stream));
-      spine_dead_count_sum_ready_ = true;
-    }
-    const std::size_t blocks = spine_dead_count_sum_.size();
-    exclusive_scan_u32(spine_dead_count_sum_.data(),
-                       spine_dead_count_prefix_.data(), blocks, stream);
+    const std::size_t words = spine_death_words_.size();
+    constexpr int block = 256;
+    const int grid = static_cast<int>((words + block - 1) / block);
+    gpulsmopt_detail::spine_death_count_kernel<<<grid, block, 0, stream>>>(
+        spine_death_words_.data(), words, spine_dead_scan_input_.data());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemsetAsync(spine_dead_scan_input_.data() + words, 0,
+                               sizeof(std::uint32_t), stream));
+    exclusive_scan_u32(spine_dead_scan_input_.data(),
+                       spine_dead_count_prefix_.data(), words + 1, stream);
     spine_dead_count_prefix_ready_ = true;
   }
 
   void ensure_spine_dead_value_prefix(cudaStream_t stream) {
     if (!spine_has_dead_ || spine_dead_value_prefix_ready_)
       return;
-    const std::size_t blocks = spine_dead_value_sum_.size();
-    exclusive_scan_u32(spine_dead_value_sum_.data(),
-                       spine_dead_value_prefix_.data(), blocks, stream);
+    const std::size_t words = spine_death_words_.size();
+    constexpr int block = 256;
+    const int grid = static_cast<int>((words + block - 1) / block);
+    if (base_delete_value_policy_ == BaseDeleteValuePolicy::mark_only) {
+      gpulsmopt_detail::spine_death_rebuild_value_kernel<<<
+          grid, block, 0, stream>>>(
+          spine_values_.data(), spine_death_words_.data(), spine_count_,
+          spine_dead_scan_input_.data());
+    } else {
+      gpulsmopt_detail::spine_death_value_kernel<<<grid, block, 0, stream>>>(
+          spine_death_words_.data(), words, spine_dead_scan_input_.data());
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemsetAsync(spine_dead_scan_input_.data() + words, 0,
+                               sizeof(std::uint32_t), stream));
+    exclusive_scan_u32(spine_dead_scan_input_.data(),
+                       spine_dead_value_prefix_.data(), words + 1, stream);
     spine_dead_value_prefix_ready_ = true;
   }
 
@@ -3066,10 +3098,6 @@ private:
                                  (ecount + 1) * sizeof(std::uint32_t),
                                  stream));
     }
-    std::uint32_t value_sums_ready_mask = 0u;
-    for (std::size_t e = 0; e < ecount; ++e)
-      if (epochs_[e].value_sums_ready)
-        value_sums_ready_mask |= 1u << e;
     const std::uint32_t *delete_keys = keys;
     if (!keys_sorted) {
       sort_delete_batch(keys, count, stream);
@@ -3113,32 +3141,48 @@ private:
         epoch.has_dead = true;
         epoch.live_counts_ready = false;
         epoch.count_prefix_ready = false;
+        epoch.value_sums_ready = false;
         epoch.value_prefix_ready = false;
         epoch.subgroup_value_prefix_ready = false;
       }
       refresh_active_epoch_views(stream);
       spine_has_dead_ = spine_count_ != 0;
-      spine_dead_count_sum_ready_ = false;
       spine_dead_count_prefix_ready_ = false;
       spine_dead_value_prefix_ready_ = false;
       const int owner_bits = delete_owner_bits(count);
       const std::uint32_t owner_count = 1u << owner_bits;
       constexpr int warps = block / 32;
       const int grid = static_cast<int>((owner_count + warps - 1) / warps);
-      gpulsmopt_detail::epoch_spine_owner_delete_kernel<<<
-          grid, block, 0, stream>>>(
-          delete_keys, static_cast<std::uint32_t>(count),
-          epoch_view_ptr(), epoch_count(), layer_order,
-          raw_or_null(epoch_removed_), value_sums_ready_mask,
-          make_spine_delete_view(), make_spine_locator_view(),
-          spine_dead_value_sum_.data(), owner_bits, owner_count);
+      if (base_delete_value_policy_ == BaseDeleteValuePolicy::mark_only) {
+        gpulsmopt_detail::epoch_spine_owner_delete_kernel<true><<<
+            grid, block, 0, stream>>>(
+            delete_keys, static_cast<std::uint32_t>(count),
+            epoch_view_ptr(), epoch_count(), layer_order,
+            raw_or_null(epoch_removed_), make_spine_delete_view(),
+            make_spine_locator_view(), owner_bits, owner_count);
+      } else {
+        gpulsmopt_detail::epoch_spine_owner_delete_kernel<false><<<
+            grid, block, 0, stream>>>(
+            delete_keys, static_cast<std::uint32_t>(count),
+            epoch_view_ptr(), epoch_count(), layer_order,
+            raw_or_null(epoch_removed_), make_spine_delete_view(),
+            make_spine_locator_view(), owner_bits, owner_count);
+      }
     } else {
       const int grid = static_cast<int>((count + block - 1) / block);
-      gpulsmopt_detail::epoch_spine_delete_kernel<<<grid, block, 0, stream>>>(
-          delete_keys, count, epoch_view_ptr(), epoch_count(), layer_order,
-          raw_or_null(epoch_removed_), value_sums_ready_mask,
-          make_spine_delete_view(), spine_dead_count_sum_.data(),
-          spine_dead_value_sum_.data(), raw_or_null(epoch_removed_) + ecount);
+      if (base_delete_value_policy_ == BaseDeleteValuePolicy::mark_only) {
+        gpulsmopt_detail::epoch_spine_delete_kernel<true><<<
+            grid, block, 0, stream>>>(
+            delete_keys, count, epoch_view_ptr(), epoch_count(), layer_order,
+            raw_or_null(epoch_removed_), make_spine_delete_view(),
+            raw_or_null(epoch_removed_) + ecount);
+      } else {
+        gpulsmopt_detail::epoch_spine_delete_kernel<false><<<
+            grid, block, 0, stream>>>(
+            delete_keys, count, epoch_view_ptr(), epoch_count(), layer_order,
+            raw_or_null(epoch_removed_), make_spine_delete_view(),
+            raw_or_null(epoch_removed_) + ecount);
+      }
     }
     CUDA_CHECK(cudaGetLastError());
     if (defer_results) {
@@ -3171,6 +3215,7 @@ private:
       epoch.live_count -= epoch_removed_host_[i];
       if (epoch.live_count == 0)
         continue;
+      epoch.value_sums_ready = false;
       epoch.value_prefix_ready = false;
       epoch.subgroup_value_prefix_ready = false;
       epoch.count_prefix_ready = false;
@@ -4451,11 +4496,12 @@ private:
   std::size_t batch_capacity_ = 0;
   DeleteOrderPolicy delete_order_policy_ =
       DeleteOrderPolicy::adaptive;
+  BaseDeleteValuePolicy base_delete_value_policy_ =
+      BaseDeleteValuePolicy::eager;
   std::size_t live_count_ = 0;
   std::size_t spine_count_ = 0;
   std::size_t spine_live_count_ = 0;
   bool spine_has_dead_ = false;
-  bool spine_dead_count_sum_ready_ = true;
   bool spine_dead_count_prefix_ready_ = true;
   bool spine_dead_value_prefix_ready_ = true;
   mutable std::shared_mutex snapshot_mutex_;
@@ -4525,9 +4571,8 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> spine_micro_bits_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_locator_slots_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> spine_locator_enabled_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_words_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_count_sum_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_value_sum_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> spine_death_words_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_scan_input_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_count_prefix_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_value_prefix_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_live_counts_;
