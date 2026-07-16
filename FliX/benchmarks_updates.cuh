@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <cmath>
+#include <cstdint>
 #include <random>
 #include <fstream>
 
@@ -83,6 +84,12 @@ constexpr size_t fixed_insert_batch_size =
 constexpr size_t fixed_delete_batch_size = size_t{1} << UPDATE_DELETE_BATCH_LOG;
 #endif
 
+#ifndef UPDATE_DELETE_SEED
+#define UPDATE_DELETE_SEED 42
+#endif
+
+constexpr uint64_t uniform_delete_seed = UPDATE_DELETE_SEED;
+
 // probe_key_sort_timed.cuh
 
 #ifndef GLOBALQUALIFIER
@@ -115,11 +122,10 @@ inline void cuda_check_impl(cudaError_t e, const char* expr, const char* file, i
 template <typename key_type>
 void assert_ceiling_results(const std::vector<key_type> &a_keys,
                             const std::vector<key_type> &b_results,
-                            const std::vector<key_type> &generated_keys,
-                            size_t d_end_point,
+                            const std::vector<key_type> &live_keys,
                             const char *a_name = "a",
                             const char *b_name = "b",
-                            const char *gen_name = "generated_keys")
+                            const char *live_name = "live_keys")
 {
     if (a_keys.size() != b_results.size())
     {
@@ -127,23 +133,12 @@ void assert_ceiling_results(const std::vector<key_type> &a_keys,
                   << ", " << b_name << "=" << b_results.size() << ")\n";
         std::abort();
     }
-    if (d_end_point > generated_keys.size())
-    {
-        std::cerr << "ASSERT FAIL: d_end_point out of range (d_end_point=" << d_end_point
-                  << ", " << gen_name << ".size()=" << generated_keys.size() << ")\n";
-        std::abort();
-    }
+    std::vector<key_type> sorted_live_keys(live_keys);
+    std::sort(sorted_live_keys.begin(), sorted_live_keys.end());
 
-    std::vector<key_type> sorted_generated_set(generated_keys.begin(),
-                                               generated_keys.begin() + d_end_point);
-    std::sort(sorted_generated_set.begin(), sorted_generated_set.end());
-    sorted_generated_set.erase(std::unique(sorted_generated_set.begin(),
-                                           sorted_generated_set.end()),
-                               sorted_generated_set.end());
-
-    if (sorted_generated_set.empty())
+    if (sorted_live_keys.empty())
     {
-        std::cerr << "ASSERT FAIL: " << gen_name << "[0:" << d_end_point << ") is empty\n";
+        std::cerr << "ASSERT FAIL: " << live_name << " is empty\n";
         std::abort();
     }
 
@@ -152,22 +147,13 @@ void assert_ceiling_results(const std::vector<key_type> &a_keys,
         const key_type query = a_keys[i];
 
         // >= query (ceiling)
-        auto it = std::lower_bound(sorted_generated_set.begin(),
-                                   sorted_generated_set.end(),
+        auto it = std::lower_bound(sorted_live_keys.begin(),
+                                   sorted_live_keys.end(),
                                    query);
 
-        if (it == sorted_generated_set.end())
+        if (it == sorted_live_keys.end())
         {
-
             continue;
-
-            /*
-            std::cerr << "ASSERT FAIL: no >= key exists for " << a_name << "[" << i << "]="
-                      << query << " within " << gen_name << "[0:" << d_end_point << ") "
-                      << "(max=" << sorted_generated_set.back() << "). "
-                      << b_name << "[" << i << "]=" << b_results[i] << "\n";
-            std::abort();
-            */
         }
 
         const key_type expected = *it;
@@ -182,9 +168,8 @@ void assert_ceiling_results(const std::vector<key_type> &a_keys,
                       << " " << a_name << "=" << query
                       << " expected=" << expected
                       << " " << b_name << "=" << got
-                      << " d_end_point=" << d_end_point
-                      << " set_min=" << sorted_generated_set.front()
-                      << " set_max=" << sorted_generated_set.back()
+                      << " set_min=" << sorted_live_keys.front()
+                      << " set_max=" << sorted_live_keys.back()
                       << "\n";
             std::abort();
         }
@@ -930,6 +915,59 @@ void generate_keys(
 }
 
 template <typename key_type>
+std::vector<key_type> draw_uniform_live_deletes(
+    size_t size,
+    std::vector<key_type> &live_keys,
+    std::mt19937_64 &gen)
+{
+    if (size > live_keys.size())
+        throw std::out_of_range("delete batch exceeds live set");
+
+    std::vector<key_type> delete_keys;
+    delete_keys.reserve(size);
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        std::uniform_int_distribution<size_t> index_dist(
+            0, live_keys.size() - 1);
+        const size_t index = index_dist(gen);
+        delete_keys.push_back(live_keys[index]);
+        live_keys[index] = live_keys.back();
+        live_keys.pop_back();
+    }
+
+    return delete_keys;
+}
+
+template <typename key_type>
+void draw_live_probes(
+    size_t size,
+    const std::vector<key_type> &live_keys,
+    const std::unordered_map<key_type, smallsize> &live_map,
+    std::vector<key_type> &probe_keys,
+    std::vector<smallsize> &expected_result)
+{
+    if (live_keys.empty())
+        throw std::out_of_range("cannot probe an empty live set");
+
+    std::mt19937_64 gen(42);
+    std::uniform_int_distribution<size_t> index_dist(
+        0, live_keys.size() - 1);
+    probe_keys.resize(size);
+    expected_result.resize(size);
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        const key_type key = live_keys[index_dist(gen)];
+        const auto it = live_map.find(key);
+        if (it == live_map.end())
+            throw std::logic_error("live-key oracle is inconsistent");
+        probe_keys[i] = key;
+        expected_result[i] = it->second;
+    }
+}
+
+template <typename key_type>
 void draw_probes(
     size_t size,
     const std::vector<key_type> &build_keys,
@@ -1283,6 +1321,8 @@ void benchmark_updates(
 
         std::cerr << "  insert_batch_size: " << insert_batch_size << std::endl;
         std::cerr << "  delete_batch_size: " << delete_batch_size << std::endl;
+        std::cerr << "  delete_selection: uniform_live" << std::endl;
+        std::cerr << "  delete_seed: " << uniform_delete_seed << std::endl;
         std::cerr << "  parameters: " << std::endl;
         for (auto &[key, value] : index_type::parameters())
         {
@@ -1415,12 +1455,10 @@ void benchmark_updates(
 
             std::cerr << " -> run " << run << std::endl;
 
-            size_t active_range_start = 0;
-            size_t begin_probe_range = 0;
-            size_t active_range_end = build_size;
+            size_t inserted_range_end = build_size;
 
             // upload initial build keys
-            insert_delete_keys_buffer.upload(generated_keys.data(), active_range_end - active_range_start);
+            insert_delete_keys_buffer.upload(generated_keys.data(), build_size);
 
             // initial build (untimed)
             index_type index;
@@ -1437,11 +1475,11 @@ void benchmark_updates(
                 // for Baselines
 #ifdef BASELINES
 #pragma message "BASELINE BUILD"
-                index.build(insert_delete_keys_buffer.ptr(), active_range_end - active_range_start, key_generation_size, available_bytes_for_index, nullptr, nullptr);
-                // index.build_static_tree(insert_delete_keys_buffer.ptr(), active_range_end - active_range_start, key_generation_size, available_bytes_for_index, nullptr, nullptr);
+                index.build(insert_delete_keys_buffer.ptr(), build_size, key_generation_size, available_bytes_for_index, nullptr, nullptr);
+                // index.build_static_tree(insert_delete_keys_buffer.ptr(), build_size, key_generation_size, available_bytes_for_index, nullptr, nullptr);
 #else
 #pragma message "REGULAR CGRXU BUILD-  BUCKET LAYER ONLY"
-                index.build_bucket_layer_only(insert_delete_keys_buffer.ptr(), active_range_end - active_range_start, key_generation_size, available_bytes_for_index, nullptr, nullptr);
+                index.build_bucket_layer_only(insert_delete_keys_buffer.ptr(), build_size, key_generation_size, available_bytes_for_index, nullptr, nullptr);
 #endif
             }
             catch (const std::exception &e)
@@ -1450,21 +1488,22 @@ void benchmark_updates(
                 break;
             }
 
-            // to support deletions following insertions
-            // Track the exact (begin,end) ranges of each insert batch in generated_keys
-            std::vector<std::pair<size_t, size_t>> insert_batches;
-            insert_batches.reserve(tc.batch_count);
-
             // host oracle of the index state (key -> newest value) so checks expect newest-wins under duplicates
             std::unordered_map<key_type, smallsize> live_map;
-            for (size_t p = active_range_start; p < active_range_end; ++p)
-                live_map[generated_keys[p]] = static_cast<smallsize>(p);
-
-            // Which inserted batch should be deleted next
-            size_t next_del_idx = 0;
-
-            // For alternating mode, we’ll delete the earliest *not yet deleted* batch;
-            // for all-inserts-then-deletes, we’ll delete in order once we switch to delete rounds.
+            std::vector<key_type> live_keys;
+            live_map.reserve(key_generation_size);
+            live_keys.reserve(key_generation_size);
+            for (size_t p = 0; p < build_size; ++p)
+            {
+                const key_type key = generated_keys[p];
+                const auto [it, inserted] = live_map.emplace(
+                    key, static_cast<smallsize>(p));
+                if (inserted)
+                    live_keys.push_back(key);
+                else
+                    it->second = static_cast<smallsize>(p);
+            }
+            std::mt19937_64 delete_gen(uniform_delete_seed + run);
 
 #ifdef COMBINE_INSERT_DELETE
 #pragma message "COMBINE_INSERT_DELETE=YES"
@@ -1509,18 +1548,15 @@ void benchmark_updates(
                     tc.alternating_insert_delete && !tc.insert_before_delete && !((step & 1) == 1);
                 bool do_delete = !do_insert;
 
-                // --  size_t new_active_range_end = do_insert ? active_range_end + insert_batch_size : active_range_end ;
-                // --  size_t new_active_range_start = do_delete ? active_range_start + delete_batch_size : active_range_start;
+                const size_t new_inserted_range_end = do_insert
+                    ? inserted_range_end + insert_batch_size
+                    : inserted_range_end;
+                size_t before_update_size = live_keys.size();
+                size_t after_update_size = before_update_size;
 
-                size_t new_active_range_end = do_insert ? active_range_end + insert_batch_size : active_range_end - delete_batch_size;
-                size_t new_active_range_start = do_delete ? active_range_start : active_range_start;
-
-                size_t before_update_size = active_range_end - active_range_start;
-                size_t after_update_size = new_active_range_end - new_active_range_start;
-
-                // use cerr to print out new_active ranges begin and end and prior ones
-                std::cerr << "----> Update step " << step << ": Active Range [" << active_range_start << ", " << active_range_end << ")"
-                          << " -> This Round Updates starts at [" << active_range_end << "]" << std::endl;
+                std::cerr << "----> Update step " << step
+                          << ": introduced range [0, " << inserted_range_end
+                          << "), live keys " << live_keys.size() << std::endl;
 
                 // print key generartion size
                 // std::cerr << "    key_generation_size: " << key_generation_size << std::endl;
@@ -1536,9 +1572,14 @@ void benchmark_updates(
                                                                : "nothing")
                           << std::endl;
 
-                // active range has to be non-empty
-                if (new_active_range_start >= new_active_range_end)
+                if (do_insert && new_inserted_range_end > generated_keys.size())
                 {
+                    std::cerr << "WARNING: insert batch exceeds generated key set\n";
+                    goto end_run;
+                }
+                if (do_delete && delete_batch_size > live_keys.size())
+                {
+                    std::cerr << "WARNING: delete batch exceeds live key set\n";
                     goto end_run;
                 }
 
@@ -1550,9 +1591,11 @@ void benchmark_updates(
                     // insert the next batch
                     if (do_insert)
                     {
-                        std::vector<key_type> relevant_inserts(generated_keys.begin() + active_range_end, generated_keys.begin() + active_range_end + insert_batch_size);
+                        std::vector<key_type> relevant_inserts(
+                            generated_keys.begin() + inserted_range_end,
+                            generated_keys.begin() + inserted_range_end + insert_batch_size);
                         std::vector<smallsize> associated_offsets(insert_batch_size);
-                        std::iota(associated_offsets.begin(), associated_offsets.end(), active_range_end);
+                        std::iota(associated_offsets.begin(), associated_offsets.end(), inserted_range_end);
                         // unsorted insert batch (pre-sort disabled for the GPU LSM Opt benchmark):
                         // auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
                         // apply_permutation(relevant_inserts, sort_perm);
@@ -1578,7 +1621,9 @@ void benchmark_updates(
                     // or delete the next batch
                     if (do_delete)
                     {
-                        std::vector<key_type> relevant_deletes(generated_keys.begin() + active_range_start, generated_keys.begin() + active_range_start + delete_batch_size);
+                        std::vector<key_type> relevant_deletes =
+                            draw_uniform_live_deletes<key_type>(
+                                delete_batch_size, live_keys, delete_gen);
                         std::sort(relevant_deletes.begin(), relevant_deletes.end());
                         delete_keys_buffer.upload(relevant_deletes.data(), delete_batch_size);
                         C2EX
@@ -1613,17 +1658,14 @@ void benchmark_updates(
                     // insert the next batch
                     if (do_insert)
                     {
-                        const size_t ins_begin = active_range_end;
+                        const size_t ins_begin = inserted_range_end;
                         const size_t ins_end = ins_begin + insert_batch_size;
 
-                        // Record the exact keys that will be inserted this round
-                        insert_batches.emplace_back(ins_begin, ins_end);
-                        std::cerr << "      Recorded insert batch " << insert_batches.size() - 1
-                                  << ": [" << ins_begin << ", " << ins_end << ")\n";
-
-                        std::vector<key_type> relevant_inserts(generated_keys.begin() + active_range_end, generated_keys.begin() + active_range_end + insert_batch_size);
+                        std::vector<key_type> relevant_inserts(
+                            generated_keys.begin() + ins_begin,
+                            generated_keys.begin() + ins_end);
                         std::vector<smallsize> associated_offsets(insert_batch_size);
-                        std::iota(associated_offsets.begin(), associated_offsets.end(), active_range_end);
+                        std::iota(associated_offsets.begin(), associated_offsets.end(), ins_begin);
                         // unsorted insert batch (pre-sort disabled for the GPU LSM Opt benchmark):
                         // auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
                         // apply_permutation(relevant_inserts, sort_perm);
@@ -1646,36 +1688,23 @@ void benchmark_updates(
                         std::cerr << "After Insert  #of Used New Nodes: " << next_free << " of total available nodes: " << total_alloc_nodes << std::endl;
 #endif
 
-                        // keep the oracle in sync with this insert batch (newest value = position)
                         for (size_t p = ins_begin; p < ins_end; ++p)
-                            live_map[generated_keys[p]] = static_cast<smallsize>(p);
+                        {
+                            const key_type key = generated_keys[p];
+                            const auto [it, inserted] = live_map.emplace(
+                                key, static_cast<smallsize>(p));
+                            if (inserted)
+                                live_keys.push_back(key);
+                            else
+                                it->second = static_cast<smallsize>(p);
+                        }
                     }
 
-                    // or delete the next batch
                     if (do_delete)
                     {
-                        // Guard: ensure we have something to delete
-                        if (next_del_idx >= insert_batches.size())
-                        {
-                            std::cerr << "WARNING: no recorded insert batch available for deletion at step "
-                                      << step << " (next_del_idx=" << next_del_idx
-                                      << ", recorded=" << insert_batches.size() << ")\n";
-                            goto end_run; // or `continue;` depending on your preference
-                        }
-
-                        // const auto [del_begin, del_end] = insert_batches[next_del_idx];
-                        //  go backwards from the end
-
-                        const auto [del_begin, del_end] = insert_batches[insert_batches.size() - next_del_idx - 1];
-                        std::cerr << "---- Recorded delete batch " << next_del_idx
-                                  << ": [" << del_begin << ", " << del_end << ")\n";
-
-                        const size_t del_count = del_end - del_begin;
-
-                        // Extract *exactly* those keys that were inserted in that batch
-                        std::vector<key_type> relevant_deletes(generated_keys.begin() + del_begin,
-                                                               generated_keys.begin() + del_end);
-                        // std::vector<key_type> relevant_deletes(generated_keys.begin() + active_range_start, generated_keys.begin() + active_range_start + delete_batch_size);
+                        std::vector<key_type> relevant_deletes =
+                            draw_uniform_live_deletes<key_type>(
+                                delete_batch_size, live_keys, delete_gen);
                         std::sort(relevant_deletes.begin(), relevant_deletes.end());
                         insert_delete_keys_buffer.upload(relevant_deletes.data(), delete_batch_size);
                         C2EX
@@ -1692,22 +1721,16 @@ void benchmark_updates(
                         // smallsize total_alloc_nodes= index.allocation_buffer_total_nodes();
                         std::cerr << "After Delete  #of Used New Nodes: " << next_free << " of total available nodes: " << total_alloc_nodes << std::endl;
 #endif
-                        // keep the oracle in sync: remove() deletes every copy of each key
-                        for (size_t p = del_begin; p < del_end; ++p)
-                            live_map.erase(generated_keys[p]);
+                        for (const key_type key : relevant_deletes)
+                            live_map.erase(key);
 
-                        // Save the exact deleted keys for the post-delete miss-probe (at ---->>> HERE)
                         last_deleted_keys = std::move(relevant_deletes);
                         did_delete_this_step = true;
-                        // Advance to the next recorded insert batch for future deletions
-                        next_del_idx++;
                     }
 
 #endif
                 }
 
-                // ---------------upload done, get after-update size
-                // NEW FOR CHECKING DELS-- ADD THIS BLOCK at ---->>> HERE (right before adjusting active_range_*) ---
                 if constexpr (supports_updates)
                 {
                     if (did_delete_this_step && !last_deleted_keys.empty())
@@ -1789,16 +1812,37 @@ void benchmark_updates(
                            //       << " (keys=" << del_probe_size << ", sort=" << del_sort_time_ms << " ms)"
                             //      << std::endl;
                     }
-                } //---------------------- EXTRA PROBE FOR DELETED KEYS BLOCK END
-                // adjust active range
-                active_range_end = new_active_range_end;
-                active_range_start = new_active_range_start;
+                }
 
                 if constexpr (!supports_updates)
                 {
+                    if (do_insert)
+                    {
+                        for (size_t p = inserted_range_end;
+                             p < new_inserted_range_end; ++p)
+                        {
+                            const key_type key = generated_keys[p];
+                            const auto [it, inserted] = live_map.emplace(
+                                key, static_cast<smallsize>(p));
+                            if (inserted)
+                                live_keys.push_back(key);
+                            else
+                                it->second = static_cast<smallsize>(p);
+                        }
+                    }
+                    else
+                    {
+                        const std::vector<key_type> relevant_deletes =
+                            draw_uniform_live_deletes<key_type>(
+                                delete_batch_size, live_keys, delete_gen);
+                        for (const key_type key : relevant_deletes)
+                            live_map.erase(key);
+                    }
+
                     index.destroy();
-                    size_t rebuild_size = active_range_end - active_range_start;
-                    insert_delete_keys_buffer.upload(generated_keys.data() + active_range_start, rebuild_size);
+                    const size_t rebuild_size = live_keys.size();
+                    insert_delete_keys_buffer.upload(
+                        live_keys.data(), rebuild_size);
                     try
                     {
                         index.build(insert_delete_keys_buffer.ptr(), rebuild_size, rebuild_size, available_bytes_for_index, &insert_or_delete_time_ms, nullptr);
@@ -1808,7 +1852,12 @@ void benchmark_updates(
                         std::cerr << " -> SKIP " << e.what() << std::endl;
                         break;
                     }
+                    for (size_t p = 0; p < rebuild_size; ++p)
+                        live_map[live_keys[p]] = static_cast<smallsize>(p);
                 }
+
+                inserted_range_end = new_inserted_range_end;
+                after_update_size = live_keys.size();
 
                 std::cerr << "     -> " << insert_or_delete_time_ms << " ms" << std::endl;
 
@@ -1848,22 +1897,15 @@ void benchmark_updates(
                 //*************************************************************************** */
 
                 // SECOND APPROACH WITH NO INDEX LAYER and SORTED PROBES
-                if (active_range_end > active_range_start)
+                if (!live_keys.empty())
                 {
                     sort_time_ms = 0.0;
                     std::vector<key_type> probe_keys;
                     std::vector<smallsize> expected_result;
 
-                    // ADD in a Range of Keys to Ignore (in the)
-                    draw_probes(probe_size, generated_keys, begin_probe_range, active_range_end,
-                                !supports_updates, probe_keys, expected_result);
-
-                    // expected = oracle's newest-wins value per key (not_found if absent)
-                    for (size_t i = 0; i < probe_keys.size(); ++i)
-                    {
-                        auto it = live_map.find(probe_keys[i]);
-                        expected_result[i] = (it != live_map.end()) ? it->second : not_found;
-                    }
+                    draw_live_probes(
+                        probe_size, live_keys, live_map,
+                        probe_keys, expected_result);
 
                     // Keep original host order for validation
                     const auto probe_keys_orig = probe_keys;
@@ -2003,7 +2045,7 @@ void benchmark_updates(
                             // std::vector<key_type> probe_keys;
                             // std::vector<smallsize> expected_result;
 
-                            // draw_probes(probe_size, generated_keys, begin_probe_range, active_range_end,
+                            // draw_probes(probe_size, generated_keys, 0, inserted_range_end,
                             //             !supports_updates, probe_keys, expected_result);
 
                             // Keep original host order for validation
@@ -2102,22 +2144,21 @@ void benchmark_updates(
                 // ----------------------------------------------------------------------
 
 #if !defined(UNSORTED_PROBES_CHECKS)
-                if (active_range_end < key_generation_size)
+                if (inserted_range_end < key_generation_size)
                 {
                     std::vector<key_type> probe_keys_misses;
                     bool skip_miss2_checks = false;
                     std::vector<smallsize> expected_result_misses;
                     smallsize probe_size_misses = probe_size;
-                    smallsize totalleftover_keys = key_generation_size - active_range_end;
+                    smallsize totalleftover_keys = key_generation_size - inserted_range_end;
                     // bool skip_miss2_checks = false;
 
-                    DBG_MISS2_CERR("  ----> Sorting 2nd miss probes: active range start " << active_range_start
-                                                                                          << ", active range end " << active_range_end
+                    DBG_MISS2_CERR("  ----> Sorting 2nd miss probes: introduced range end " << inserted_range_end
                                                                                           << " probe size misses " << probe_size_misses);
 
                     smallsize actual_generated_key_size = generated_keys.size();
 
-                    DBG_MISS2_CERR("Drawing second miss probes beginning " << active_range_end
+                    DBG_MISS2_CERR("Drawing second miss probes beginning " << inserted_range_end
                                                                            << " to " << key_generation_size
                                                                            << " generated key size " << actual_generated_key_size
                                                                            << " requested probe miss size " << probe_size_misses);
@@ -2132,7 +2173,7 @@ void benchmark_updates(
 
                     if (!skip_miss2_checks)
                     {
-                        draw_probes(probe_size_misses, generated_keys, active_range_end, key_generation_size,
+                        draw_probes(probe_size_misses, generated_keys, inserted_range_end, key_generation_size,
                                     supports_updates, probe_keys_misses, expected_result_misses);
 
                         // drop "miss" probes that are actually present as duplicates, so all-misses stays valid
@@ -2179,7 +2220,7 @@ void benchmark_updates(
 
                         const bool sort_probes = true;
 
-                        DBG_MISS2_CERR("active range end " << active_range_end
+                        DBG_MISS2_CERR("introduced range end " << inserted_range_end
                                                            << ", key_generation_size " << key_generation_size
                                                            << " and probe misses size " << probe_size_misses);
 
@@ -2352,15 +2393,13 @@ void benchmark_updates(
                                     // Download b = tmp_results_sorted_keys (successor results)
                                     auto b_succ_miss_keys = tmp_results_sorted_keys.download(probe_size_misses);
 
-                                    // Validate ceiling (>=) against generated_keys[0:active_range_end)
                                     assert_ceiling_results<key_type>(
                                         a_sorted_miss_keys,
                                         b_succ_miss_keys,
-                                        generated_keys,
-                                        active_range_end,
+                                        live_keys,
                                         "d_sorted_keys(miss)",
                                         "tmp_results_sorted_keys(miss)",
-                                        "generated_keys");
+                                        "live_keys");
                                 }
 
                                 std::cerr
@@ -2415,6 +2454,8 @@ void benchmark_updates(
                         .add_parameter("batch_count", tc.batch_count)
                         .add_parameter("total_inserts_percentage_of_build_size", tc.total_inserts_percentage_of_build_size)
                         .add_parameter("total_deletes_percentage_of_build_size", tc.total_deletes_percentage_of_build_size)
+                        .add_parameter("delete_selection", "uniform_live")
+                        .add_parameter("delete_seed", uniform_delete_seed + run)
                         // -----> .add_parameter("cache_line_size", tc.cache_line)
                         // -----> .add_parameter("node_size_log", tc.node_size_log)
                         .add_parameter("alternating_insert_delete", tc.alternating_insert_delete)
