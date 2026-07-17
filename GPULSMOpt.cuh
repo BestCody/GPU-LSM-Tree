@@ -80,7 +80,7 @@ constexpr int kEpochSubgroupBits = 4;
 constexpr int kEpochQuotients = 1 << kEpochQuotientBits;
 constexpr int kEpochSubgroups = 1 << kEpochSubgroupBits;
 constexpr int kEpochSubgroupPlanes = kEpochSubgroupBits;
-constexpr int kEpochSubgroupPrefixStride = kEpochSubgroups + 1;
+constexpr int kEpochSubgroupPrefixStride = kEpochSubgroups;
 constexpr int kEpochHeavySortCap = 128;
 constexpr int kEpochQuotientBitmapWords = kEpochQuotients / 32;
 constexpr int kEpochStorageMax = kEpochMax + 1;
@@ -323,6 +323,7 @@ struct SpineView {
   const std::uint32_t *micro_base;
   const std::uint16_t *micro_offsets;
   const std::uint8_t *micro_bits;
+  const std::uint32_t *death_mask;
   const std::uint64_t *death;
   std::size_t count;
 };
@@ -608,8 +609,12 @@ __device__ inline std::uint32_t epoch_successor_candidate(
 }
 
 __device__ inline std::uint32_t spine_death_mask(
-    const std::uint64_t *death, std::size_t word) {
-  return death ? static_cast<std::uint32_t>(death[word]) : 0u;
+    const SpineView &spine, std::size_t word) {
+  if (spine.death_mask)
+    return spine.death_mask[word];
+  return spine.death
+             ? static_cast<std::uint32_t>(spine.death[word])
+             : 0u;
 }
 
 __device__ inline std::uint32_t spine_death_value(
@@ -623,9 +628,9 @@ __device__ inline std::uint64_t spine_death_state(
          (static_cast<std::uint64_t>(value) << 32);
 }
 
-__device__ inline bool spine_dead(const std::uint64_t *death,
+__device__ inline bool spine_dead(const SpineView &spine,
                                    std::size_t position) {
-  return (spine_death_mask(death, position >> 5) >>
+  return (spine_death_mask(spine, position >> 5) >>
           (position & 31u)) & 1u;
 }
 
@@ -707,7 +712,7 @@ __device__ inline bool spine_point_find(
     return false;
   const std::size_t position = spine_lower_rank(spine, key);
   if (position >= spine.count || spine.keys[position] != key ||
-        spine_dead(spine.death, position))
+        spine_dead(spine, position))
     return false;
   if (out_value)
     *out_value = spine.values[position];
@@ -715,9 +720,9 @@ __device__ inline bool spine_point_find(
 }
 
 __device__ inline std::uint32_t spine_dead_count_range(
-    const std::uint64_t *death, const std::uint32_t *dead_prefix,
+    const SpineView &spine, const std::uint32_t *dead_prefix,
     std::size_t begin, std::size_t end) {
-  if (!death || begin >= end)
+  if ((!spine.death && !spine.death_mask) || begin >= end)
     return 0u;
   const std::size_t first = begin >> kSpineDeathWordShift;
   const std::size_t last = (end - 1) >> kSpineDeathWordShift;
@@ -728,12 +733,12 @@ __device__ inline std::uint32_t spine_dead_count_range(
   const std::uint32_t last_mask =
       last_bits == 32u ? 0xffffffffu : (1u << last_bits) - 1u;
   if (first == last) {
-    return __popc(spine_death_mask(death, first) &
+    return __popc(spine_death_mask(spine, first) &
                   first_mask & last_mask);
   }
   std::uint32_t total =
-      __popc(spine_death_mask(death, first) & first_mask) +
-      __popc(spine_death_mask(death, last) & last_mask);
+      __popc(spine_death_mask(spine, first) & first_mask) +
+      __popc(spine_death_mask(spine, last) & last_mask);
   if (last > first + 1)
     total += dead_prefix[last] - dead_prefix[first + 1];
   return total;
@@ -752,10 +757,9 @@ __device__ inline std::uint32_t spine_masked_value_sum(
 }
 
 __device__ inline std::uint32_t spine_dead_sum_range(
-    const std::uint32_t *values, const std::uint64_t *death,
-    const std::uint32_t *dead_prefix, std::size_t begin,
-    std::size_t end) {
-  if (!death || begin >= end)
+    const SpineView &spine, const std::uint32_t *dead_prefix,
+    std::size_t begin, std::size_t end) {
+  if ((!spine.death && !spine.death_mask) || begin >= end)
     return 0u;
   const std::size_t first = begin >> kSpineDeathWordShift;
   const std::size_t last = (end - 1) >> kSpineDeathWordShift;
@@ -767,16 +771,16 @@ __device__ inline std::uint32_t spine_dead_sum_range(
       last_bits == 32u ? 0xffffffffu : (1u << last_bits) - 1u;
   if (first == last) {
     const std::uint32_t mask =
-        spine_death_mask(death, first) & first_mask & last_mask;
+        spine_death_mask(spine, first) & first_mask & last_mask;
     return spine_masked_value_sum(
-        values, first << kSpineDeathWordShift, mask);
+        spine.values, first << kSpineDeathWordShift, mask);
   }
   std::uint32_t total = spine_masked_value_sum(
-      values, first << kSpineDeathWordShift,
-      spine_death_mask(death, first) & first_mask);
+      spine.values, first << kSpineDeathWordShift,
+      spine_death_mask(spine, first) & first_mask);
   total += spine_masked_value_sum(
-      values, last << kSpineDeathWordShift,
-      spine_death_mask(death, last) & last_mask);
+      spine.values, last << kSpineDeathWordShift,
+      spine_death_mask(spine, last) & last_mask);
   if (last > first + 1)
     total += dead_prefix[last] - dead_prefix[first + 1];
   return total;
@@ -790,7 +794,7 @@ __device__ inline std::uint32_t spine_range_count(
   std::size_t begin = 0, end = 0;
   spine_range_ranks(spine, lo, hi, &begin, &end);
   return static_cast<std::uint32_t>(end - begin) -
-         spine_dead_count_range(spine.death, dead_prefix, begin, end);
+         spine_dead_count_range(spine, dead_prefix, begin, end);
 }
 
 __device__ inline std::uint32_t spine_range_sum(
@@ -802,8 +806,7 @@ __device__ inline std::uint32_t spine_range_sum(
   std::size_t begin = 0, end = 0;
   spine_range_ranks(spine, lo, hi, &begin, &end);
   return value_prefix[end] - value_prefix[begin] -
-           spine_dead_sum_range(spine.values, spine.death,
-                              dead_value_prefix, begin, end);
+           spine_dead_sum_range(spine, dead_value_prefix, begin, end);
 }
 
 __device__ inline std::uint32_t spine_successor_candidate(
@@ -814,7 +817,7 @@ __device__ inline std::uint32_t spine_successor_candidate(
   std::size_t position = spine_lower_rank(spine, key);
   for (; position < spine.count; ++position) {
     const std::uint32_t candidate = spine.keys[position];
-    if (!spine_dead(spine.death, position) &&
+    if (!spine_dead(spine, position) &&
         !epoch_key_killed(candidate, killed_keys, killed_count))
       return candidate;
   }
@@ -972,12 +975,11 @@ __global__ void spine_locator_build_kernel(
 }
 
 __global__ void spine_death_count_kernel(
-    const std::uint64_t *death, std::size_t words,
-    std::uint32_t *counts) {
+    SpineView spine, std::size_t words, std::uint32_t *counts) {
   const std::size_t word = blockIdx.x * blockDim.x + threadIdx.x;
   if (word >= words)
     return;
-  counts[word] = __popc(spine_death_mask(death, word));
+  counts[word] = __popc(spine_death_mask(spine, word));
 }
 
 __global__ void spine_death_value_kernel(
@@ -989,99 +991,123 @@ __global__ void spine_death_value_kernel(
 }
 
 __global__ void spine_death_rebuild_value_kernel(
-    const std::uint32_t *values, const std::uint64_t *death,
-    std::size_t count, std::uint32_t *sums) {
+    SpineView spine, std::size_t count, std::uint32_t *sums) {
   const std::size_t word = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t base = word << kSpineDeathWordShift;
   if (base >= count)
     return;
-  std::uint32_t mask = spine_death_mask(death, word);
+  std::uint32_t mask = spine_death_mask(spine, word);
   if (count - base < kSpineDeathWordSize) {
     const std::uint32_t valid = static_cast<std::uint32_t>(count - base);
     mask &= valid == 32u ? 0xffffffffu : (1u << valid) - 1u;
   }
-  sums[word] = spine_masked_value_sum(values, base, mask);
-}
-
-__global__ void spine_live_input_kernel(
-    const std::uint64_t *death, std::size_t count,
-    std::uint32_t *live) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < count)
-    live[i] = spine_dead(death, i) ? 0u : 1u;
-}
-
-__global__ void spine_gather_live_kernel(
-    const std::uint32_t *keys, const std::uint32_t *values,
-    const std::uint64_t *death, const std::uint32_t *prefix,
-    std::size_t count, std::uint32_t *out_keys,
-    std::uint32_t *out_values) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count || spine_dead(death, i))
-    return;
-  const std::size_t output = prefix[i];
-  out_keys[output] = keys[i];
-  out_values[output] = values[i];
+  sums[word] = spine_masked_value_sum(spine.values, base, mask);
 }
 
 __global__ void epoch_quotient_metadata_kernel(
     const std::uint32_t *keys, std::uint32_t record_count,
     std::uint32_t *offsets, std::uint32_t *subgroup_masks,
     std::uint32_t *quotient_live) {
-  const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::uint32_t stride = gridDim.x * blockDim.x;
-  for (std::uint32_t i = tid; i < record_count; i += stride) {
-    const std::uint32_t quotient = keys[i] >> kEpochQuotientBits;
-    const unsigned active = __activemask();
-    std::uint32_t previous = __shfl_up_sync(active, quotient, 1);
-    if ((threadIdx.x & 31) == 0 && i != 0u)
-      previous = keys[i - 1] >> kEpochQuotientBits;
-    if (i != 0u && quotient == previous)
-      continue;
-    std::uint32_t planes[kEpochSubgroupPlanes] = {};
-    std::uint32_t end = i;
-    while (end < record_count) {
-      const std::uint32_t current_key = end == i ? keys[i] : keys[end];
-      if ((current_key >> kEpochQuotientBits) != quotient)
-        break;
-      const std::uint32_t local = end - i;
-      if (local < 32u) {
+  constexpr unsigned full = 0xffffffffu;
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t warp_begin = i & ~31u;
+  const int lane = threadIdx.x & 31;
+  const bool valid = i < record_count;
+  const std::uint32_t key = valid ? keys[i] : 0u;
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
+  std::uint32_t previous = __shfl_up_sync(full, quotient, 1);
+  if (lane == 0 && valid)
+    previous = i == 0u ? quotient
+                       : keys[i - 1] >> kEpochQuotientBits;
+  const bool starts = valid &&
+                      (i == 0u || quotient != previous);
+  unsigned starts_mask = __ballot_sync(full, starts);
+  while (starts_mask != 0u) {
+    const int start_lane = __ffs(starts_mask) - 1;
+    const std::uint32_t start = warp_begin + start_lane;
+    const std::uint32_t segment_quotient =
+        __shfl_sync(full, quotient, start_lane);
+    const std::uint32_t segment_previous =
+        __shfl_sync(full, previous, start_lane);
+    const unsigned later = start_lane == 31
+                               ? 0u
+                               : starts_mask &
+                                     (0xffffffffu << (start_lane + 1));
+    const int end_lane = later == 0u ? 32 : __ffs(later) - 1;
+    std::uint32_t end = warp_begin + end_lane;
+    const std::uint32_t warp_end =
+        min(warp_begin + 32u, record_count);
+    if (later == 0u) {
+      if (lane == 0) {
+        end = warp_end;
+        while (end < record_count &&
+               (keys[end] >> kEpochQuotientBits) == segment_quotient)
+          ++end;
+      }
+      end = __shfl_sync(full, end, 0);
+    }
+    const std::uint32_t count = end - start;
+    std::uint32_t tail_planes[kEpochSubgroupPlanes] = {};
+    if (lane == 0 && count <= 32u && end > warp_end) {
+      for (std::uint32_t position = warp_end; position < end; ++position) {
         const std::uint32_t subgroup =
-            (current_key >>
+            (keys[position] >>
              (kEpochQuotientBits - kEpochSubgroupBits)) &
-            (kEpochSubgroups - 1);
-        const std::uint32_t position = 1u << local;
+            (kEpochSubgroups - 1u);
+        const std::uint32_t bit_position = 1u << (position - start);
 #pragma unroll
         for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
-          planes[bit] |= (0u - ((subgroup >> bit) & 1u)) & position;
+          tail_planes[bit] |=
+              (0u - ((subgroup >> bit) & 1u)) & bit_position;
       }
-      ++end;
     }
-    if (i == 0u) {
-      for (std::uint32_t q = 0; q <= quotient; ++q)
-        offsets[q] = 0u;
-      for (std::uint32_t q = 0; q < quotient; ++q)
-        quotient_live[q] = 0u;
-    } else {
-      for (std::uint32_t q = previous + 1u; q <= quotient; ++q)
-        offsets[q] = i;
-      for (std::uint32_t q = previous + 1u; q < quotient; ++q)
-        quotient_live[q] = 0u;
-    }
-    if (end == record_count) {
-      for (std::uint32_t q = quotient + 1u; q <= kEpochQuotients; ++q)
-        offsets[q] = record_count;
-      for (std::uint32_t q = quotient + 1u; q < kEpochQuotients; ++q)
-        quotient_live[q] = 0u;
-    }
-    const std::uint32_t count = end - i;
     if (count <= 32u) {
-      const std::uint32_t base = quotient * kEpochSubgroupPlanes;
+      const unsigned low = 0xffffffffu << start_lane;
+      const unsigned high = end_lane == 32
+                                ? 0xffffffffu
+                                : (1u << end_lane) - 1u;
+      const unsigned segment = low & high;
+      const std::uint32_t subgroup =
+          (key >> (kEpochQuotientBits - kEpochSubgroupBits)) &
+          (kEpochSubgroups - 1u);
+      const std::uint32_t base =
+          segment_quotient * kEpochSubgroupPlanes;
 #pragma unroll
-      for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
-        subgroup_masks[base + bit] = planes[bit];
+      for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit) {
+        const unsigned local = __ballot_sync(
+            full, valid && ((subgroup >> bit) & 1u));
+        const std::uint32_t tail =
+            __shfl_sync(full, tail_planes[bit], 0);
+        if (lane == 0)
+          subgroup_masks[base + bit] =
+              ((local & segment) >> start_lane) | tail;
+      }
     }
-    quotient_live[quotient] = count;
+    if (lane == 0) {
+      if (start == 0u) {
+        for (std::uint32_t q = 0; q <= segment_quotient; ++q)
+          offsets[q] = 0u;
+        for (std::uint32_t q = 0; q < segment_quotient; ++q)
+          quotient_live[q] = 0u;
+      } else {
+        for (std::uint32_t q = segment_previous + 1u;
+             q <= segment_quotient; ++q)
+          offsets[q] = start;
+        for (std::uint32_t q = segment_previous + 1u;
+             q < segment_quotient; ++q)
+          quotient_live[q] = 0u;
+      }
+      if (end == record_count) {
+        for (std::uint32_t q = segment_quotient + 1u;
+             q <= kEpochQuotients; ++q)
+          offsets[q] = record_count;
+        for (std::uint32_t q = segment_quotient + 1u;
+             q < kEpochQuotients; ++q)
+          quotient_live[q] = 0u;
+      }
+      quotient_live[segment_quotient] = count;
+    }
+    starts_mask &= starts_mask - 1u;
   }
 }
 
@@ -1110,7 +1136,6 @@ __global__ void epoch_subgroup_value_prefix_kernel(
     subgroup_prefix[base + subgroup] = prefix;
     prefix += sums[subgroup];
   }
-  subgroup_prefix[base + kEpochSubgroups] = prefix;
   ev.quotient_value_sum[quotient] = prefix;
 }
 
@@ -1371,10 +1396,16 @@ __global__ void epoch_spine_delete_kernel(
   const std::uint32_t word_bits = __reduce_or_sync(word_peers, bit);
   std::uint32_t old_word = 0u;
   if (lane == word_leader) {
-    old_word = atomicOr(
-        reinterpret_cast<std::uint32_t *>(
-            const_cast<std::uint64_t *>(spine.death)) + 2 * word,
-        word_bits);
+    if constexpr (MarkOnly) {
+      old_word = atomicOr(
+          const_cast<std::uint32_t *>(spine.death_mask) + word,
+          word_bits);
+    } else {
+      old_word = atomicOr(
+          reinterpret_cast<std::uint32_t *>(
+              const_cast<std::uint64_t *>(spine.death)) + 2 * word,
+          word_bits);
+    }
   }
   old_word = __shfl_sync(word_peers, old_word, word_leader);
   const unsigned bit_peers = __match_any_sync(word_peers, bit);
@@ -1485,14 +1516,21 @@ __global__ void epoch_spine_owner_delete_kernel(
               word, kSpineDeathWordShift,
               spine_begin, spine_end, spine.count);
           if (lane == leader) {
-            auto *death = const_cast<std::uint64_t *>(spine.death);
-            if (owned) {
-              old_state = death[word];
-              old_word = static_cast<std::uint32_t>(old_state);
+            if constexpr (MarkOnly) {
+              auto *death =
+                  const_cast<std::uint32_t *>(spine.death_mask);
+              old_word = owned ? death[word]
+                               : atomicOr(death + word, bits);
             } else {
-              auto *mask = reinterpret_cast<std::uint32_t *>(death) +
-                           2 * word;
-              old_word = atomicOr(mask, bits);
+              auto *death = const_cast<std::uint64_t *>(spine.death);
+              if (owned) {
+                old_state = death[word];
+                old_word = static_cast<std::uint32_t>(old_state);
+              } else {
+                auto *mask = reinterpret_cast<std::uint32_t *>(death) +
+                             2 * word;
+                old_word = atomicOr(mask, bits);
+              }
             }
           }
           old_word = __shfl_sync(word_peers, old_word, leader);
@@ -1501,9 +1539,9 @@ __global__ void epoch_spine_owner_delete_kernel(
                        (old_word & bit) == 0u;
           if constexpr (MarkOnly) {
             if (lane == leader && owned) {
-              auto *death = const_cast<std::uint64_t *>(spine.death);
-              death[word] = spine_death_state(
-                  old_word | bits, spine_death_value(old_state));
+              auto *death =
+                  const_cast<std::uint32_t *>(spine.death_mask);
+              death[word] = old_word | bits;
             }
           } else {
             const std::uint32_t value =
@@ -1608,12 +1646,16 @@ __global__ void set_last_quotient_offset_kernel(
 
 __global__ void epoch_pack_quotients_kernel(
     const EpochView *epochs, int epoch_count,
-    std::uint32_t *write_cursor, std::uint32_t *out_keys,
+    const std::uint32_t *offsets, std::uint32_t *out_keys,
     std::uint32_t *out_values) {
+  __shared__ std::uint32_t write_cursor;
   const std::uint32_t quotient = blockIdx.x;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int warp_count = blockDim.x >> 5;
+  if (threadIdx.x == 0)
+    write_cursor = offsets[quotient];
+  __syncthreads();
   for (int e = 0; e < epoch_count; ++e) {
     const EpochView &ev = epochs[e];
     const std::uint32_t begin = ev.quotient_off[quotient];
@@ -1629,7 +1671,7 @@ __global__ void epoch_pack_quotients_kernel(
       const int leader = __ffs(live_mask) - 1;
       std::uint32_t output_base = 0u;
       if (lane == leader)
-        output_base = atomicAdd(write_cursor + quotient,
+        output_base = atomicAdd(&write_cursor,
                                 static_cast<std::uint32_t>(__popc(live_mask)));
       output_base = __shfl_sync(0xffffffffu, output_base, leader);
       if (live) {
@@ -1679,7 +1721,8 @@ __global__ void c0_log_append_kernel(
   const std::uint32_t idx = old_count + static_cast<std::uint32_t>(i);
   log_keys[idx] = keys[i];
   log_values[idx] = values ? values[i] : keys[i];
-  log_ops[idx] = op;
+  if (log_ops)
+    log_ops[idx] = op;
 }
 
 __global__ void pack_sort_payload_kernel(
@@ -1800,18 +1843,27 @@ __device__ inline std::uint32_t overlay_count_range(const std::uint32_t *keys,
   return static_cast<std::uint32_t>(e - b);
 }
 
-__global__ void base_point_values_kernel(
-    const std::uint32_t *keys, std::size_t n, SpineView spine,
-    const EpochView *epochs, int epoch_count,
-    std::uint32_t *out_val,
-    std::uint32_t *out_flag) {
+__global__ void overlay_tomb_values_kernel(
+    const std::uint32_t *keys, std::size_t n,
+    const std::uint32_t *ins_keys, const std::uint32_t *ins_values,
+    std::size_t ins_count, SpineView spine, const EpochView *epochs,
+    int epoch_count, std::uint32_t *out_val, std::uint32_t *out_flag,
+    std::uint32_t *live_insert_flags) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
+  const std::uint32_t key = keys[i];
+  const std::size_t insert = lower_bound_u32(ins_keys, ins_count, key);
+  if (insert < ins_count && ins_keys[insert] == key) {
+    out_val[i] = ins_values[insert];
+    out_flag[i] = 1u;
+    live_insert_flags[insert] = 0u;
+    return;
+  }
   std::uint32_t v = 0;
-  bool f = spine_point_find(spine, keys[i], &v);
+  bool f = spine_point_find(spine, key, &v);
   for (int e = epoch_count - 1; !f && e >= 0; --e)
-    f = epoch_point_find(epochs[e], keys[i], &v);
+    f = epoch_point_find(epochs[e], key, &v);
   out_val[i] = f ? v : 0u;
   out_flag[i] = f ? 1u : 0u;
 }
@@ -1862,36 +1914,6 @@ __global__ void range_query_kernel(
     }
     out_counts[i] = c;
   }
-}
-
-template <bool HasOverlay, bool HasEpochs>
-__global__ void count_query_kernel(
-    const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_counts,
-    std::size_t query_count, SpineView spine,
-    const std::uint32_t *spine_dead_count_prefix,
-    const EpochView *epochs, int epoch_count,
-    const std::uint32_t *ins_keys,
-    std::size_t ins_count, const std::uint32_t *tomb_keys,
-    const std::uint32_t *tomb_cnt_prefix, std::size_t tomb_count) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= query_count)
-    return;
-  const std::uint32_t l = lo[i], h = hi[i];
-  if (l > h) {
-    out_counts[i] = 0;
-    return;
-  }
-  std::uint32_t c =
-      spine_range_count(spine, spine_dead_count_prefix, l, h);
-  if constexpr (HasEpochs) {
-    for (int e = 0; e < epoch_count; ++e)
-      c += epoch_range_count_one(epochs[e], l, h);
-  }
-  if constexpr (HasOverlay) {
-    c += overlay_count_range(ins_keys, ins_count, l, h);
-    c -= overlay_prefix_range(tomb_cnt_prefix, tomb_keys, tomb_count, l, h);
-  }
-  out_counts[i] = c;
 }
 
 }
@@ -1984,8 +2006,7 @@ public:
                               prof_runmerge_ms_ + prof_resolve_ms_ +
                               prof_delete_ms_ + prof_epoch_ingest_ms_ +
                               prof_delta_sort_ms_ +
-                              prof_delta_ingest_ms_ +
-                              prof_delta_consolidate_ms_;
+                              prof_delta_ingest_ms_;
       const double other = total - measured;
       auto pct = [total](double x) {
         return total > 0.0 ? 100.0 * x / total : 0.0;
@@ -1995,8 +2016,6 @@ public:
              prof_delta_sort_ms_, pct(prof_delta_sort_ms_));
       printf("[prof]   delta_write = %.3f ms (%5.1f%%)\n",
              prof_delta_ingest_ms_, pct(prof_delta_ingest_ms_));
-      printf("[prof]   consolidate = %.3f ms (%5.1f%%)\n",
-             prof_delta_consolidate_ms_, pct(prof_delta_consolidate_ms_));
       printf("[prof]   append      = %.3f ms (%5.1f%%)\n", prof_append_ms_,
              pct(prof_append_ms_));
       printf("[prof]   flush_sort  = %.3f ms (%5.1f%%)\n", prof_flushsort_ms_,
@@ -2081,60 +2100,6 @@ public:
     lookup_layered(batch, stream);
   }
 
-  void count(const DeviceRangeBatch &batch, cudaStream_t stream) {
-    if (batch.count == 0)
-      return;
-    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
-                                                   std::defer_lock);
-    if (epoch_delete_pending_ && !epoch_delete_deferred_) {
-      guard.unlock();
-      exclusive.lock();
-      reap_pending_deletes(stream);
-    } else if (epoch_delete_pending_ &&
-               stream != epoch_delete_stream_) {
-      CUDA_CHECK(cudaStreamWaitEvent(stream, epoch_delete_ready_, 0));
-    }
-    const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
-    const bool overlay_pending =
-        !no_overlay &&
-        (overlay_dirty_ || !cached_overlay_.count_prefix_ready);
-    if (!spine_micro_ready_ || epoch_heavy_pending() ||
-        epoch_count_prefix_pending() ||
-        (spine_has_dead_ && !spine_dead_count_prefix_ready_) ||
-        overlay_pending) {
-      if (!exclusive.owns_lock()) {
-        guard.unlock();
-        exclusive.lock();
-      }
-      ensure_spine_microdirectory(stream);
-      ensure_epoch_heavy_sorted(stream);
-      ensure_epoch_count_prefixes(stream);
-      ensure_spine_dead_count_prefix(stream);
-      if (!no_overlay) {
-        auto &overlay = resolved_overlay(stream);
-        ensure_overlay_count_prefix(overlay, stream);
-      }
-    }
-    const OverlayReadIndex *ix =
-        no_overlay ? nullptr : &resolved_overlay(stream);
-    const std::uint32_t *ins_keys = no_overlay ? nullptr : raw_or_null(ix->gk);
-    const std::uint32_t *tomb_keys =
-        no_overlay ? nullptr : raw_or_null(ix->gk) + ix->ins;
-    const std::uint32_t *tomb_cnt =
-        no_overlay ? nullptr : raw_or_null(ix->tomb_cnt_prefix);
-    const int block = 128;
-    const int grid = static_cast<int>((batch.count + block - 1) / block);
-    const auto spine = make_spine_view();
-    gpulsmopt_detail::count_query_kernel<true, true>
-        <<<grid, block, 0, stream>>>(
-            batch.lo, batch.hi, batch.out_counts, batch.count, spine,
-            spine_dead_count_prefix_.data(), epoch_view_ptr(), epoch_count(),
-            ins_keys, no_overlay ? 0 : ix->ins, tomb_keys, tomb_cnt,
-            no_overlay ? 0 : ix->u - ix->ins);
-    CUDA_CHECK(cudaGetLastError());
-  }
-
   void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
@@ -2167,22 +2132,19 @@ public:
         ensure_overlay_successor(overlay, stream);
       }
     }
+    const bool has_epochs = !epochs_.empty();
     const OverlayReadIndex *ix =
         no_overlay ? nullptr : &resolved_overlay(stream);
-    const std::uint32_t *killed =
-        no_overlay ? nullptr : raw_or_null(ix->killed_keys);
-    const std::size_t killed_count = no_overlay ? 0 : ix->killed_count;
-    const std::uint32_t *live_ins =
-        no_overlay ? nullptr : raw_or_null(ix->live_ins_keys);
-    const std::size_t live_ins_count = no_overlay ? 0 : ix->live_ins_count;
-    const int block = 128;
-    const int grid = static_cast<int>((batch.count + block - 1) / block);
-    gpulsmopt_detail::successor_index_kernel<true, true>
-        <<<grid, block, 0, stream>>>(
-            batch.queries, batch.count, batch.out_keys, make_spine_view(),
-            epoch_view_ptr(), epoch_count(), killed, killed_count, live_ins,
-            live_ins_count);
-    CUDA_CHECK(cudaGetLastError());
+    if (no_overlay) {
+      if (has_epochs)
+        launch_successor_query<false, true>(batch, nullptr, stream);
+      else
+        launch_successor_query<false, false>(batch, nullptr, stream);
+    } else if (has_epochs) {
+      launch_successor_query<true, true>(batch, ix, stream);
+    } else {
+      launch_successor_query<true, false>(batch, ix, stream);
+    }
   }
 
   void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
@@ -2230,29 +2192,19 @@ public:
           ensure_overlay_count_prefix(overlay, stream);
       }
     }
+    const bool has_epochs = !epochs_.empty();
     const OverlayReadIndex *ix =
         no_overlay ? nullptr : &resolved_overlay(stream);
-    const std::uint32_t *ins_keys = no_overlay ? nullptr : raw_or_null(ix->gk);
-    const std::uint32_t *ins_prefix =
-        no_overlay ? nullptr : raw_or_null(ix->ins_prefix);
-    const std::uint32_t *tomb_keys =
-        no_overlay ? nullptr : raw_or_null(ix->gk) + ix->ins;
-    const std::uint32_t *tomb_val =
-        no_overlay ? nullptr : raw_or_null(ix->tomb_val_prefix);
-    const std::uint32_t *tomb_cnt =
-        no_overlay ? nullptr : raw_or_null(ix->tomb_cnt_prefix);
-    const int block = 128;
-    const int grid = static_cast<int>((batch.query_count + block - 1) / block);
-    const auto spine = make_spine_view();
-    gpulsmopt_detail::range_query_kernel<true, true>
-        <<<grid, block, 0, stream>>>(
-            batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-            batch.query_count, spine, spine_value_prefix_.data(),
-            spine_dead_count_prefix_.data(),
-            spine_dead_value_prefix_.data(), epoch_view_ptr(), epoch_count(),
-            ins_keys, ins_prefix, no_overlay ? 0 : ix->ins, tomb_keys,
-            tomb_val, tomb_cnt, no_overlay ? 0 : ix->u - ix->ins);
-    CUDA_CHECK(cudaGetLastError());
+    if (no_overlay) {
+      if (has_epochs)
+        launch_range_query<false, true>(batch, nullptr, stream);
+      else
+        launch_range_query<false, false>(batch, nullptr, stream);
+    } else if (has_epochs) {
+      launch_range_query<true, true>(batch, ix, stream);
+    } else {
+      launch_range_query<true, false>(batch, ix, stream);
+    }
   }
 
   void consolidate(cudaStream_t stream) {
@@ -2302,17 +2254,15 @@ public:
         epoch_views_, epoch_removed_,
         c0_log_keys_, c0_log_values_, c0_log_ops_, direct_sort_keys_,
         direct_sort_values_,
-        sort_key_output_, sort_payload_input_, sort_payload_output_,
+        sort_key_output_, sort_value_output_, sort_payload_input_,
+        sort_payload_output_,
         sort_temp_storage_, epoch_merge_keys_, epoch_merge_values_,
         epoch_quotient_counts_, epoch_quotient_offsets_,
-        epoch_quotient_cursor_,
         spine_keys_, spine_values_, spine_value_prefix_, spine_radix_,
         spine_micro_base_, spine_micro_offsets_, spine_micro_bits_,
         spine_locator_slots_, spine_locator_enabled_,
-          spine_death_words_, spine_dead_scan_input_,
-          spine_dead_count_prefix_, spine_dead_value_prefix_,
-        spine_live_counts_, spine_live_prefix_, spine_gather_keys_,
-        spine_gather_values_, spine_merge_keys_, spine_merge_values_,
+        spine_dead_masks_, spine_death_words_, spine_dead_scan_input_,
+        spine_dead_count_prefix_, spine_dead_value_prefix_,
         delete_sort_keys_, delete_layer_stats_, delete_layer_order_, ov_c0k_,
         ov_c0v_, ov_c0op_, ov_mk_, ov_mv_,
         ov_mop_, overlay_tomb_values_, overlay_tomb_flags_,
@@ -2400,14 +2350,31 @@ private:
             spine_micro_ready_ ? spine_micro_base_.data() : nullptr,
             spine_micro_ready_ ? spine_micro_offsets_.data() : nullptr,
             spine_micro_ready_ ? spine_micro_bits_.data() : nullptr,
-              spine_has_dead_ ? spine_death_words_.data() : nullptr,
+            spine_has_dead_ &&
+                    base_delete_value_policy_ ==
+                        BaseDeleteValuePolicy::mark_only
+                ? spine_dead_masks_.data()
+                : nullptr,
+            spine_has_dead_ &&
+                    base_delete_value_policy_ ==
+                        BaseDeleteValuePolicy::eager
+                ? spine_death_words_.data()
+                : nullptr,
             spine_count_};
   }
 
   gpulsmopt_detail::SpineView make_spine_delete_view() const {
     auto view = make_spine_view();
-    view.death = spine_death_words_.data();
+    if (base_delete_value_policy_ == BaseDeleteValuePolicy::mark_only)
+      view.death_mask = spine_dead_masks_.data();
+    else
+      view.death = spine_death_words_.data();
     return view;
+  }
+
+  std::size_t spine_death_word_count() const {
+    return (spine_count_ + gpulsmopt_detail::kSpineDeathWordSize - 1) /
+           gpulsmopt_detail::kSpineDeathWordSize;
   }
 
   gpulsmopt_detail::SpineLocatorView make_spine_locator_view() const {
@@ -2432,6 +2399,7 @@ private:
     spine_locator_slots_.resize_discard(0);
     spine_locator_enabled_.resize_discard(0);
     spine_locator_ready_ = false;
+    spine_dead_masks_.resize_discard(0);
     spine_death_words_.resize_discard(0);
     spine_dead_scan_input_.resize_discard(0);
     spine_dead_count_prefix_.resize_discard(0);
@@ -2459,13 +2427,22 @@ private:
                              spine_value_prefix_.data() + 1);
     }
     const std::size_t words = (count + 31) / 32;
-    spine_death_words_.resize_discard(words);
-    if (words > 0)
-      CUDA_CHECK(cudaMemsetAsync(spine_death_words_.data(), 0,
-                                 words * sizeof(std::uint64_t), stream));
-    spine_dead_scan_input_.resize_discard(words + 1);
-    spine_dead_count_prefix_.resize_discard(words + 1);
-    spine_dead_value_prefix_.resize_discard(words + 1);
+    if (base_delete_value_policy_ == BaseDeleteValuePolicy::mark_only) {
+      spine_dead_masks_.resize_discard(words);
+      spine_death_words_.resize_discard(0);
+      if (words > 0)
+        CUDA_CHECK(cudaMemsetAsync(spine_dead_masks_.data(), 0,
+                                   words * sizeof(std::uint32_t), stream));
+    } else {
+      spine_dead_masks_.resize_discard(0);
+      spine_death_words_.resize_discard(words);
+      if (words > 0)
+        CUDA_CHECK(cudaMemsetAsync(spine_death_words_.data(), 0,
+                                   words * sizeof(std::uint64_t), stream));
+    }
+    spine_dead_scan_input_.resize_discard(words);
+    spine_dead_count_prefix_.resize_discard(words);
+    spine_dead_value_prefix_.resize_discard(words);
     spine_live_count_ = count;
     spine_has_dead_ = false;
     spine_dead_count_prefix_ready_ = true;
@@ -2528,39 +2505,35 @@ private:
   void ensure_spine_dead_count_prefix(cudaStream_t stream) {
     if (!spine_has_dead_ || spine_dead_count_prefix_ready_)
       return;
-    const std::size_t words = spine_death_words_.size();
+    const std::size_t words = spine_death_word_count();
     constexpr int block = 256;
     const int grid = static_cast<int>((words + block - 1) / block);
     gpulsmopt_detail::spine_death_count_kernel<<<grid, block, 0, stream>>>(
-        spine_death_words_.data(), words, spine_dead_scan_input_.data());
+        make_spine_delete_view(), words, spine_dead_scan_input_.data());
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemsetAsync(spine_dead_scan_input_.data() + words, 0,
-                               sizeof(std::uint32_t), stream));
     exclusive_scan_u32(spine_dead_scan_input_.data(),
-                       spine_dead_count_prefix_.data(), words + 1, stream);
+                       spine_dead_count_prefix_.data(), words, stream);
     spine_dead_count_prefix_ready_ = true;
   }
 
   void ensure_spine_dead_value_prefix(cudaStream_t stream) {
     if (!spine_has_dead_ || spine_dead_value_prefix_ready_)
       return;
-    const std::size_t words = spine_death_words_.size();
+    const std::size_t words = spine_death_word_count();
     constexpr int block = 256;
     const int grid = static_cast<int>((words + block - 1) / block);
     if (base_delete_value_policy_ == BaseDeleteValuePolicy::mark_only) {
       gpulsmopt_detail::spine_death_rebuild_value_kernel<<<
           grid, block, 0, stream>>>(
-          spine_values_.data(), spine_death_words_.data(), spine_count_,
+          make_spine_delete_view(), spine_count_,
           spine_dead_scan_input_.data());
     } else {
       gpulsmopt_detail::spine_death_value_kernel<<<grid, block, 0, stream>>>(
           spine_death_words_.data(), words, spine_dead_scan_input_.data());
     }
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemsetAsync(spine_dead_scan_input_.data() + words, 0,
-                               sizeof(std::uint32_t), stream));
     exclusive_scan_u32(spine_dead_scan_input_.data(),
-                       spine_dead_value_prefix_.data(), words + 1, stream);
+                       spine_dead_value_prefix_.data(), words, stream);
     spine_dead_value_prefix_ready_ = true;
   }
 
@@ -3082,7 +3055,8 @@ private:
     }
     if (!epochs_.empty()) {
       ensure_epoch_heavy_sorted(stream);
-      ensure_epoch_bitmaps(stream);
+      if (!defer_results)
+        ensure_epoch_bitmaps(stream);
     }
     const std::size_t ecount = epochs_.size();
     for (auto &epoch : epochs_) {
@@ -3219,7 +3193,6 @@ private:
       epoch.value_prefix_ready = false;
       epoch.subgroup_value_prefix_ready = false;
       epoch.count_prefix_ready = false;
-      epoch.bitmap_ready = true;
       epoch.has_dead = true;
     }
     const bool cache_observed_order =
@@ -3327,8 +3300,6 @@ private:
         gpulsmopt_detail::kEpochQuotients);
     epoch_quotient_offsets_.resize_discard(
         gpulsmopt_detail::kEpochQuotients + 1);
-    epoch_quotient_cursor_.resize_discard(
-        gpulsmopt_detail::kEpochQuotients);
     delete_layer_stats_.resize_discard(
         2 * gpulsmopt_detail::kDeleteLayerMax + 1);
     delete_layer_order_.resize_discard(gpulsmopt_detail::kDeleteLayerMax);
@@ -3365,10 +3336,42 @@ private:
     return std::max<std::size_t>(budget, 1);
   }
 
+  enum class RunKind : std::uint8_t {
+    empty,
+    inserts,
+    tombstones,
+    mixed,
+  };
+
+  static RunKind operation_kind(std::uint8_t op) {
+    return op == gpulsmopt_detail::kInsert
+               ? RunKind::inserts
+               : RunKind::tombstones;
+  }
+
+  static RunKind counts_kind(std::size_t count,
+                             std::size_t inserts) {
+    if (count == 0)
+      return RunKind::empty;
+    if (inserts == count)
+      return RunKind::inserts;
+    if (inserts == 0)
+      return RunKind::tombstones;
+    return RunKind::mixed;
+  }
+
+  static std::uint8_t operation_value(RunKind kind) {
+    return kind == RunKind::inserts
+               ? static_cast<std::uint8_t>(gpulsmopt_detail::kInsert)
+               : static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone);
+  }
+
   struct SortedRun {
     std::uint32_t log_total = 0;
     std::uint32_t insert_total = 0;
     std::uint32_t level = 0;
+    RunKind kind = RunKind::empty;
+    bool ops_materialized = false;
     thrust::device_vector<std::uint32_t> keys;
     thrust::device_vector<std::uint32_t> values;
     thrust::device_vector<std::uint8_t> ops;
@@ -3414,13 +3417,25 @@ private:
     ensure_c0_log(stream);
     const std::uint32_t old_total = c0_log_count_;
     const std::size_t new_total = static_cast<std::size_t>(old_total) + count;
+    const RunKind incoming_kind = operation_kind(op);
+    if (c0_kind_ == RunKind::empty) {
+      c0_kind_ = incoming_kind;
+    } else if (c0_kind_ != incoming_kind && c0_kind_ != RunKind::mixed) {
+      CUDA_CHECK(cudaMemsetAsync(raw_or_null(c0_log_ops_),
+                                 operation_value(c0_kind_), old_total,
+                                 stream));
+      c0_kind_ = RunKind::mixed;
+    }
+    std::uint8_t *ops = c0_kind_ == RunKind::mixed
+                            ? raw_or_null(c0_log_ops_)
+                            : nullptr;
     {
       GPULSMOPT_PROF_PHASE(prof_append_ms_);
       const int block = 256;
       const int grid = static_cast<int>((count + block - 1) / block);
       gpulsmopt_detail::c0_log_append_kernel<<<grid, block, 0, stream>>>(
           keys_in, values_in, op, old_total, count, raw_or_null(c0_log_keys_),
-          raw_or_null(c0_log_values_), raw_or_null(c0_log_ops_));
+          raw_or_null(c0_log_values_), ops);
       CUDA_CHECK(cudaGetLastError());
     }
     c0_log_count_ = static_cast<std::uint32_t>(new_total);
@@ -3435,6 +3450,7 @@ private:
       return;
     c0_log_count_ = 0;
     c0_insert_count_ = 0;
+    c0_kind_ = RunKind::empty;
     (void)stream;
   }
 
@@ -3521,6 +3537,8 @@ private:
     run.log_total = static_cast<std::uint32_t>(count);
     run.insert_total = 0;
     run.level = level;
+    run.kind = RunKind::empty;
+    run.ops_materialized = false;
     return run;
   }
 
@@ -3528,7 +3546,18 @@ private:
     run.log_total = 0;
     run.insert_total = 0;
     run.level = 0;
+    run.kind = RunKind::empty;
+    run.ops_materialized = false;
     run_buffer_pool_.push_back(std::move(run));
+  }
+
+  void materialize_run_ops(SortedRun &run, cudaStream_t stream) {
+    if (run.ops_materialized || run.kind == RunKind::empty)
+      return;
+    CUDA_CHECK(cudaMemsetAsync(raw_or_null(run.ops),
+                               operation_value(run.kind),
+                               run.log_total, stream));
+    run.ops_materialized = true;
   }
 
   void reserve_run_storage(std::size_t count) {
@@ -3622,7 +3651,8 @@ private:
                             cudaStream_t stream) {
     direct_sort_keys_.resize_discard(direct_count);
     direct_sort_values_.resize_discard(direct_count);
-    sort_key_output_.resize_discard(log_count);
+    resize_reuse(sort_key_output_, log_count);
+    resize_reuse(sort_value_output_, log_count);
     sort_payload_input_.resize_discard(log_count);
     sort_payload_output_.resize_discard(log_count);
     std::size_t direct_bytes = 0;
@@ -3635,13 +3665,20 @@ private:
       direct_sort_temp_bytes_ = direct_bytes;
     }
     std::size_t log_bytes = 0;
+    std::size_t log_value_bytes = 0;
     if (log_count > 0) {
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
           nullptr, log_bytes, raw_or_null(c0_log_keys_),
-          sort_key_output_.data(), sort_payload_input_.data(),
+          raw_or_null(sort_key_output_), sort_payload_input_.data(),
           sort_payload_output_.data(), log_count, 0, 32, stream));
       log_sort_count_ = log_count;
       log_sort_temp_bytes_ = log_bytes;
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          nullptr, log_value_bytes, raw_or_null(c0_log_keys_),
+          raw_or_null(sort_key_output_), raw_or_null(c0_log_values_),
+          raw_or_null(sort_value_output_), log_count, 0, 32, stream));
+      log_value_sort_count_ = log_count;
+      log_value_sort_temp_bytes_ = log_value_bytes;
     }
     std::size_t epoch_bytes = 0;
     std::size_t delete_bytes = 0;
@@ -3668,8 +3705,8 @@ private:
     scan_u32_count_ = gpulsmopt_detail::kEpochQuotients;
     scan_u32_temp_bytes_ = scan_bytes;
     ensure_sort_temp(
-        std::max({direct_bytes, log_bytes, epoch_bytes, delete_bytes,
-                  scan_bytes}));
+        std::max({direct_bytes, log_bytes, log_value_bytes, epoch_bytes,
+                  delete_bytes, scan_bytes}));
   }
 
   // Reserve direct-path buffers before timed updates.
@@ -3741,11 +3778,30 @@ private:
   void sort_log(thrust::device_vector<std::uint32_t> &k,
                 thrust::device_vector<std::uint32_t> &v,
                 thrust::device_vector<std::uint8_t> &op, std::size_t n,
-                cudaStream_t stream) {
-    if (n == 0) {
+                RunKind kind, cudaStream_t stream) {
+    if (n == 0)
+      return;
+    resize_reuse(sort_key_output_, n);
+    if (kind != RunKind::mixed) {
+      resize_reuse(sort_value_output_, n);
+      if (n > log_value_sort_count_) {
+        log_value_sort_temp_bytes_ = 0;
+        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+            nullptr, log_value_sort_temp_bytes_, raw_or_null(k),
+            raw_or_null(sort_key_output_), raw_or_null(v),
+            raw_or_null(sort_value_output_), n, 0, 32, stream));
+        log_value_sort_count_ = n;
+      }
+      std::size_t temp_bytes = log_value_sort_temp_bytes_;
+      ensure_sort_temp(temp_bytes);
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          sort_temp_storage_.data(), temp_bytes, raw_or_null(k),
+          raw_or_null(sort_key_output_), raw_or_null(v),
+          raw_or_null(sort_value_output_), n, 0, 32, stream));
+      k.swap(sort_key_output_);
+      v.swap(sort_value_output_);
       return;
     }
-    sort_key_output_.resize_discard(n);
     sort_payload_input_.resize_discard(n);
     sort_payload_output_.resize_discard(n);
     const int block = 256;
@@ -3757,7 +3813,7 @@ private:
       log_sort_temp_bytes_ = 0;
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
           nullptr, log_sort_temp_bytes_, raw_or_null(k),
-          sort_key_output_.data(), sort_payload_input_.data(),
+          raw_or_null(sort_key_output_), sort_payload_input_.data(),
           sort_payload_output_.data(), n, 0, 32, stream));
       log_sort_count_ = n;
     }
@@ -3765,11 +3821,9 @@ private:
     ensure_sort_temp(temp_bytes);
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         sort_temp_storage_.data(), temp_bytes, raw_or_null(k),
-        sort_key_output_.data(), sort_payload_input_.data(),
+        raw_or_null(sort_key_output_), sort_payload_input_.data(),
         sort_payload_output_.data(), n, 0, 32, stream));
-    CUDA_CHECK(cudaMemcpyAsync(raw_or_null(k), sort_key_output_.data(),
-                               n * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToDevice, stream));
+    k.swap(sort_key_output_);
     gpulsmopt_detail::unpack_sort_payload_kernel<<<grid, block, 0, stream>>>(
         sort_payload_output_.data(), n, raw_or_null(v), raw_or_null(op));
     CUDA_CHECK(cudaGetLastError());
@@ -3779,16 +3833,29 @@ private:
     auto policy = thrust::cuda::par.on(stream);
     const std::size_t na = a.log_total, nb = b.log_total;
     SortedRun out = acquire_run_storage(na + nb, a.level + 1);
-    thrust::merge_by_key(
-        policy, b.keys.begin(), b.keys.begin() + nb, a.keys.begin(),
-        a.keys.begin() + na,
-        thrust::make_zip_iterator(
-            thrust::make_tuple(b.values.begin(), b.ops.begin())),
-        thrust::make_zip_iterator(
-            thrust::make_tuple(a.values.begin(), a.ops.begin())),
-        out.keys.begin(),
-        thrust::make_zip_iterator(
-            thrust::make_tuple(out.values.begin(), out.ops.begin())));
+    if (a.kind == b.kind && a.kind != RunKind::mixed) {
+      thrust::merge_by_key(
+          policy, b.keys.begin(), b.keys.begin() + nb, a.keys.begin(),
+          a.keys.begin() + na, b.values.begin(), a.values.begin(),
+          out.keys.begin(), out.values.begin());
+      out.kind = a.kind;
+      out.ops_materialized = false;
+    } else {
+      materialize_run_ops(a, stream);
+      materialize_run_ops(b, stream);
+      thrust::merge_by_key(
+          policy, b.keys.begin(), b.keys.begin() + nb, a.keys.begin(),
+          a.keys.begin() + na,
+          thrust::make_zip_iterator(
+              thrust::make_tuple(b.values.begin(), b.ops.begin())),
+          thrust::make_zip_iterator(
+              thrust::make_tuple(a.values.begin(), a.ops.begin())),
+          out.keys.begin(),
+          thrust::make_zip_iterator(
+              thrust::make_tuple(out.values.begin(), out.ops.begin())));
+      out.kind = RunKind::mixed;
+      out.ops_materialized = true;
+    }
     out.insert_total = a.insert_total + b.insert_total;
     return out;
   }
@@ -3854,8 +3921,6 @@ private:
           gpulsmopt_detail::kEpochQuotients);
       epoch_quotient_offsets_.resize_discard(
           gpulsmopt_detail::kEpochQuotients + 1);
-      epoch_quotient_cursor_.resize_discard(
-          gpulsmopt_detail::kEpochQuotients);
       constexpr int metadata_block = 256;
       constexpr int metadata_grid =
           gpulsmopt_detail::kEpochQuotients / metadata_block;
@@ -3870,13 +3935,9 @@ private:
           epoch_quotient_offsets_.data(),
           static_cast<std::uint32_t>(live_total));
       CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemcpyAsync(
-          epoch_quotient_cursor_.data(), epoch_quotient_offsets_.data(),
-          gpulsmopt_detail::kEpochQuotients * sizeof(std::uint32_t),
-          cudaMemcpyDeviceToDevice, stream));
       gpulsmopt_detail::epoch_pack_quotients_kernel<<<
           gpulsmopt_detail::kEpochQuotients, 128, 0, stream>>>(
-          epoch_view_ptr(), epoch_count(), epoch_quotient_cursor_.data(),
+          epoch_view_ptr(), epoch_count(), epoch_quotient_offsets_.data(),
           epoch_merge_keys_.data(), epoch_merge_values_.data());
       CUDA_CHECK(cudaGetLastError());
       sort_packed_epoch_quotients(live_total, stream);
@@ -3892,16 +3953,8 @@ private:
       delta.live_count = live_total;
       delta.fully_sorted = true;
       delta.is_delta = true;
-      delta.keys.resize_discard(live_total);
-      delta.values.resize_discard(live_total);
-      CUDA_CHECK(cudaMemcpyAsync(
-          delta.keys.data(), direct_sort_keys_.data(),
-          live_total * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice,
-          stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          delta.values.data(), direct_sort_values_.data(),
-          live_total * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice,
-          stream));
+      std::swap(delta.keys, direct_sort_keys_);
+      std::swap(delta.values, direct_sort_values_);
       commit_epoch_metadata(delta, stream);
     }
     invalidate_overlay_derivatives();
@@ -3992,15 +4045,18 @@ private:
     run.keys = std::move(c0_log_keys_);
     run.values = std::move(c0_log_values_);
     run.ops = std::move(c0_log_ops_);
+    run.kind = c0_kind_;
+    run.ops_materialized = run.kind == RunKind::mixed;
     {
       GPULSMOPT_PROF_PHASE(prof_flushsort_ms_);
-      sort_log(run.keys, run.values, run.ops, c0_total, stream);
+      sort_log(run.keys, run.values, run.ops, c0_total, run.kind, stream);
     }
     run.log_total = static_cast<std::uint32_t>(c0_total);
     run.insert_total = c0_insert_count_;
     run.level = 0;
     c0_log_count_ = 0;
     c0_insert_count_ = 0;
+    c0_kind_ = RunKind::empty;
     append_sorted_run(std::move(run), stream);
   }
 
@@ -4080,9 +4136,13 @@ private:
                  c0_log_keys_.begin() + c0_log_count_, ov_c0k_.begin());
     thrust::copy(policy, c0_log_values_.begin() + suffix_begin,
                  c0_log_values_.begin() + c0_log_count_, ov_c0v_.begin());
-    thrust::copy(policy, c0_log_ops_.begin() + suffix_begin,
-                 c0_log_ops_.begin() + c0_log_count_, ov_c0op_.begin());
-    sort_log(ov_c0k_, ov_c0v_, ov_c0op_, delta, stream);
+    const RunKind suffix_kind =
+        counts_kind(delta, overlay_pending_insert_count_);
+    if (suffix_kind == RunKind::mixed) {
+      thrust::copy(policy, c0_log_ops_.begin() + suffix_begin,
+                   c0_log_ops_.begin() + c0_log_count_, ov_c0op_.begin());
+    }
+    sort_log(ov_c0k_, ov_c0v_, ov_c0op_, delta, suffix_kind, stream);
     const std::size_t suffix_inserts = partition_overlay(
         ov_c0k_, ov_c0v_, ov_c0op_, delta,
         overlay_pending_insert_count_, stream);
@@ -4093,7 +4153,6 @@ private:
     const std::size_t total_inserts = old_inserts + suffix_inserts;
     resize_reuse(ov_mk_, total);
     resize_reuse(ov_mv_, total);
-    resize_reuse(ov_mop_, total);
     auto merge_partition = [&](std::size_t old_begin, std::size_t old_count,
                                std::size_t suffix_offset,
                                std::size_t suffix_count,
@@ -4125,17 +4184,8 @@ private:
     merge_partition(0, old_inserts, 0, suffix_inserts, 0);
     merge_partition(ix.ins, old_tombs, suffix_inserts, suffix_tombs,
                     total_inserts);
-    if (total_inserts > 0)
-      CUDA_CHECK(cudaMemsetAsync(raw_or_null(ov_mop_),
-                                 gpulsmopt_detail::kInsert,
-                                 total_inserts, stream));
-    if (total > total_inserts)
-      CUDA_CHECK(cudaMemsetAsync(raw_or_null(ov_mop_) + total_inserts,
-                                 gpulsmopt_detail::kTombstone,
-                                 total - total_inserts, stream));
     ix.gk.swap(ov_mk_);
     ix.gv.swap(ov_mv_);
-    ix.gop.swap(ov_mop_);
     ix.u = total;
     ix.ins = total_inserts;
     overlay_pending_count_ = 0;
@@ -4161,6 +4211,7 @@ private:
     if (total == 0) {
       return;
     }
+    const RunKind overlay_kind = counts_kind(total, insert_total);
     auto policy = thrust::cuda::par.on(stream);
     if (consume && c0_log_count_ == 0 && runs_.size() == 1) {
       SortedRun run = std::move(runs_.back());
@@ -4174,13 +4225,15 @@ private:
     }
     if (consume && runs_.empty() && c0_log_count_ > 0) {
       const std::size_t c0_inserts = c0_insert_count_;
+      const RunKind kind = c0_kind_;
       gk = std::move(c0_log_keys_);
       gv = std::move(c0_log_values_);
       gop = std::move(c0_log_ops_);
       u = c0_log_count_;
       c0_log_count_ = 0;
       c0_insert_count_ = 0;
-      sort_log(gk, gv, gop, u, stream);
+      c0_kind_ = RunKind::empty;
+      sort_log(gk, gv, gop, u, kind, stream);
       ins = partition_overlay(gk, gv, gop, u, c0_inserts, stream);
       return;
     }
@@ -4193,9 +4246,11 @@ private:
                    c0_log_keys_.begin() + count, gk.begin());
       thrust::copy(policy, c0_log_values_.begin(),
                    c0_log_values_.begin() + count, gv.begin());
-      thrust::copy(policy, c0_log_ops_.begin(),
-                   c0_log_ops_.begin() + count, gop.begin());
-      sort_log(gk, gv, gop, count, stream);
+      if (c0_kind_ == RunKind::mixed) {
+        thrust::copy(policy, c0_log_ops_.begin(),
+                     c0_log_ops_.begin() + count, gop.begin());
+      }
+      sort_log(gk, gv, gop, count, c0_kind_, stream);
       u = count;
       ins = partition_overlay(gk, gv, gop, u, c0_insert_count_, stream);
       return;
@@ -4221,16 +4276,34 @@ private:
                    ov_c0k_.begin());
       thrust::copy(policy, c0_log_values_.begin(), c0_log_values_.begin() + s,
                    ov_c0v_.begin());
-      thrust::copy(policy, c0_log_ops_.begin(), c0_log_ops_.begin() + s,
-                   ov_c0op_.begin());
-      sort_log(ov_c0k_, ov_c0v_, ov_c0op_, s, stream);
+      if (overlay_kind == RunKind::mixed) {
+        if (c0_kind_ == RunKind::mixed) {
+          thrust::copy(policy, c0_log_ops_.begin(), c0_log_ops_.begin() + s,
+                       ov_c0op_.begin());
+        } else {
+          CUDA_CHECK(cudaMemsetAsync(raw_or_null(ov_c0op_),
+                                     operation_value(c0_kind_), s,
+                                     stream));
+        }
+      }
+      sort_log(ov_c0k_, ov_c0v_, ov_c0op_, s, c0_kind_, stream);
       src.push_back({raw_or_null(ov_c0k_), raw_or_null(ov_c0v_),
-                     raw_or_null(ov_c0op_), s});
+                     overlay_kind == RunKind::mixed
+                         ? raw_or_null(ov_c0op_)
+                         : nullptr,
+                     s});
     }
-    for (auto &g : runs_)
-      if (g.log_total)
+    for (auto &g : runs_) {
+      if (g.log_total) {
+        if (overlay_kind == RunKind::mixed)
+          materialize_run_ops(g, stream);
         src.push_back({raw_or_null(g.keys), raw_or_null(g.values),
-                       raw_or_null(g.ops), g.log_total});
+                       overlay_kind == RunKind::mixed
+                           ? raw_or_null(g.ops)
+                           : nullptr,
+                       g.log_total});
+      }
+    }
 
     if (src.size() == 1) {
       const Src &s = src[0];
@@ -4238,14 +4311,17 @@ private:
                    thrust::device_pointer_cast(s.k) + s.n, gk.begin());
       thrust::copy(policy, thrust::device_pointer_cast(s.v),
                    thrust::device_pointer_cast(s.v) + s.n, gv.begin());
-      thrust::copy(policy, thrust::device_pointer_cast(s.op),
-                   thrust::device_pointer_cast(s.op) + s.n, gop.begin());
+      if (overlay_kind == RunKind::mixed) {
+        thrust::copy(policy, thrust::device_pointer_cast(s.op),
+                     thrust::device_pointer_cast(s.op) + s.n, gop.begin());
+      }
     } else {
       const std::size_t nmerge = src.size() - 1;
       if (nmerge >= 2) {
         resize_reuse(ov_mk_, total);
         resize_reuse(ov_mv_, total);
-        resize_reuse(ov_mop_, total);
+        if (overlay_kind == RunKind::mixed)
+          resize_reuse(ov_mop_, total);
       }
       const std::uint32_t *curK = src[0].k;
       const std::uint32_t *curV = src[0].v;
@@ -4255,25 +4331,40 @@ private:
         const bool to_g = (((nmerge - 1 - j) & 1u) == 0u);
         std::uint32_t *dK = to_g ? raw_or_null(gk) : raw_or_null(ov_mk_);
         std::uint32_t *dV = to_g ? raw_or_null(gv) : raw_or_null(ov_mv_);
-        std::uint8_t *dOp = to_g ? raw_or_null(gop) : raw_or_null(ov_mop_);
         const Src &s = src[j + 1];
-        auto aval = thrust::make_zip_iterator(
-            thrust::make_tuple(thrust::device_pointer_cast(curV),
-                               thrust::device_pointer_cast(curOp)));
-        auto bval = thrust::make_zip_iterator(
-            thrust::make_tuple(thrust::device_pointer_cast(s.v),
-                               thrust::device_pointer_cast(s.op)));
-        auto oval = thrust::make_zip_iterator(
-            thrust::make_tuple(thrust::device_pointer_cast(dV),
-                               thrust::device_pointer_cast(dOp)));
-        thrust::merge_by_key(policy, thrust::device_pointer_cast(curK),
-                             thrust::device_pointer_cast(curK) + curN,
-                             thrust::device_pointer_cast(s.k),
-                             thrust::device_pointer_cast(s.k) + s.n, aval, bval,
-                             thrust::device_pointer_cast(dK), oval);
+        std::uint8_t *dOp = nullptr;
+        if (overlay_kind == RunKind::mixed) {
+          dOp = to_g ? raw_or_null(gop) : raw_or_null(ov_mop_);
+          auto aval = thrust::make_zip_iterator(
+              thrust::make_tuple(thrust::device_pointer_cast(curV),
+                                 thrust::device_pointer_cast(curOp)));
+          auto bval = thrust::make_zip_iterator(
+              thrust::make_tuple(thrust::device_pointer_cast(s.v),
+                                 thrust::device_pointer_cast(s.op)));
+          auto oval = thrust::make_zip_iterator(
+              thrust::make_tuple(thrust::device_pointer_cast(dV),
+                                 thrust::device_pointer_cast(dOp)));
+          thrust::merge_by_key(
+              policy, thrust::device_pointer_cast(curK),
+              thrust::device_pointer_cast(curK) + curN,
+              thrust::device_pointer_cast(s.k),
+              thrust::device_pointer_cast(s.k) + s.n, aval, bval,
+              thrust::device_pointer_cast(dK), oval);
+        } else {
+          thrust::merge_by_key(
+              policy, thrust::device_pointer_cast(curK),
+              thrust::device_pointer_cast(curK) + curN,
+              thrust::device_pointer_cast(s.k),
+              thrust::device_pointer_cast(s.k) + s.n,
+              thrust::device_pointer_cast(curV),
+              thrust::device_pointer_cast(s.v),
+              thrust::device_pointer_cast(dK),
+              thrust::device_pointer_cast(dV));
+        }
         curK = dK;
         curV = dV;
-        curOp = dOp;
+        if (overlay_kind == RunKind::mixed)
+          curOp = dOp;
         curN += s.n;
       }
     }
@@ -4306,13 +4397,20 @@ private:
     const std::size_t tomb = ix.u - ix.ins;
     overlay_tomb_values_.resize_discard(tomb);
     overlay_tomb_flags_.resize_discard(tomb);
+    if (tomb > 0)
+      overlay_live_flags_.resize_discard(ix.ins);
+    if (tomb > 0 && ix.ins > 0)
+      CUDA_CHECK(cudaMemsetAsync(overlay_live_flags_.data(), 1,
+                                 ix.ins * sizeof(std::uint32_t), stream));
     if (tomb > 0) {
       const int block = 256;
       const int grid = static_cast<int>((tomb + block - 1) / block);
-      gpulsmopt_detail::base_point_values_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(ix.gk) + ix.ins, tomb, make_spine_view(),
-          epoch_view_ptr(), epoch_count(), overlay_tomb_values_.data(),
-          overlay_tomb_flags_.data());
+      gpulsmopt_detail::overlay_tomb_values_kernel<<<grid, block, 0,
+                                                     stream>>>(
+          raw_or_null(ix.gk) + ix.ins, tomb, raw_or_null(ix.gk),
+          raw_or_null(ix.gv), ix.ins, make_spine_view(), epoch_view_ptr(),
+          epoch_count(), overlay_tomb_values_.data(),
+          overlay_tomb_flags_.data(), overlay_live_flags_.data());
       CUDA_CHECK(cudaGetLastError());
     }
     ix.base_values_ready = true;
@@ -4379,16 +4477,9 @@ private:
       ix.killed_count = static_cast<std::size_t>(
           end - thrust::device_pointer_cast(ix.killed_keys.data()));
     }
-    ix.live_ins_keys.resize_discard(ix.ins);
-    ix.live_ins_count = 0;
-    if (ix.ins > 0) {
-      overlay_live_flags_.resize_discard(ix.ins);
-      const int block = 256;
-      const int grid = static_cast<int>((ix.ins + block - 1) / block);
-      gpulsmopt_detail::mark_live_inserts_kernel<<<grid, block, 0, stream>>>(
-          raw_or_null(ix.gk), ix.ins, raw_or_null(ix.gk) + ix.ins, tomb,
-          overlay_live_flags_.data());
-      CUDA_CHECK(cudaGetLastError());
+    ix.live_ins_count = ix.ins;
+    if (ix.ins > 0 && tomb > 0) {
+      ix.live_ins_keys.resize_discard(ix.ins);
       auto end = thrust::copy_if(
           policy, ix.gk.begin(), ix.gk.begin() + ix.ins,
           thrust::device_pointer_cast(overlay_live_flags_.data()),
@@ -4472,24 +4563,110 @@ private:
       merge_down(stream);
   }
 
+  template <bool HasOverlay, bool HasEpochs>
+  void launch_range_query(const DeviceRangeOutputBatch &batch,
+                          const OverlayReadIndex *ix,
+                          cudaStream_t stream) {
+    const std::uint32_t *ins_keys = nullptr;
+    const std::uint32_t *ins_prefix = nullptr;
+    const std::uint32_t *tomb_keys = nullptr;
+    const std::uint32_t *tomb_val = nullptr;
+    const std::uint32_t *tomb_cnt = nullptr;
+    std::size_t insert_count = 0;
+    std::size_t tomb_count = 0;
+    if constexpr (HasOverlay) {
+      ins_keys = raw_or_null(ix->gk);
+      ins_prefix = raw_or_null(ix->ins_prefix);
+      tomb_keys = raw_or_null(ix->gk) + ix->ins;
+      tomb_val = raw_or_null(ix->tomb_val_prefix);
+      tomb_cnt = raw_or_null(ix->tomb_cnt_prefix);
+      insert_count = ix->ins;
+      tomb_count = ix->u - ix->ins;
+    }
+    const int block = 128;
+    const int grid = static_cast<int>(
+        (batch.query_count + block - 1) / block);
+    gpulsmopt_detail::range_query_kernel<HasOverlay, HasEpochs>
+        <<<grid, block, 0, stream>>>(
+            batch.lo, batch.hi, batch.out_sums, batch.out_counts,
+            batch.query_count, make_spine_view(), spine_value_prefix_.data(),
+            spine_dead_count_prefix_.data(),
+            spine_dead_value_prefix_.data(),
+            HasEpochs ? epoch_view_ptr() : nullptr,
+            HasEpochs ? epoch_count() : 0, ins_keys, ins_prefix,
+            insert_count, tomb_keys, tomb_val, tomb_cnt, tomb_count);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  template <bool HasOverlay, bool HasEpochs>
+  void launch_successor_query(const DeviceSuccessorBatch &batch,
+                              const OverlayReadIndex *ix,
+                              cudaStream_t stream) {
+    const std::uint32_t *killed = nullptr;
+    const std::uint32_t *live_ins = nullptr;
+    std::size_t killed_count = 0;
+    std::size_t live_ins_count = 0;
+    if constexpr (HasOverlay) {
+      killed = raw_or_null(ix->killed_keys);
+      killed_count = ix->killed_count;
+      live_ins = ix->u == ix->ins
+                     ? raw_or_null(ix->gk)
+                     : raw_or_null(ix->live_ins_keys);
+      live_ins_count = ix->live_ins_count;
+    }
+    const int block = 128;
+    const int grid = static_cast<int>((batch.count + block - 1) / block);
+    gpulsmopt_detail::successor_index_kernel<HasOverlay, HasEpochs>
+        <<<grid, block, 0, stream>>>(
+            batch.queries, batch.count, batch.out_keys, make_spine_view(),
+            HasEpochs ? epoch_view_ptr() : nullptr,
+            HasEpochs ? epoch_count() : 0, killed, killed_count, live_ins,
+            live_ins_count);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  template <bool HasOverlay, bool HasEpochs>
+  void launch_point_lookup(const DeviceLookupBatch &batch,
+                           const OverlayReadIndex *ix,
+                           cudaStream_t stream) {
+    const std::uint32_t *ins_keys = nullptr;
+    const std::uint32_t *ins_values = nullptr;
+    const std::uint32_t *tomb_keys = nullptr;
+    std::size_t insert_count = 0;
+    std::size_t tomb_count = 0;
+    if constexpr (HasOverlay) {
+      ins_keys = raw_or_null(ix->gk);
+      ins_values = raw_or_null(ix->gv);
+      tomb_keys = raw_or_null(ix->gk) + ix->ins;
+      insert_count = ix->ins;
+      tomb_count = ix->u - ix->ins;
+    }
+    const int block = 256;
+    const int grid = static_cast<int>((batch.count + block - 1) / block);
+    gpulsmopt_detail::point_lookup_kernel<HasOverlay, HasEpochs>
+        <<<grid, block, 0, stream>>>(
+            batch.queries, batch.count, batch.out_values, batch.out_found,
+            ins_keys, ins_values, insert_count, tomb_keys, tomb_count,
+            make_spine_view(), HasEpochs ? epoch_view_ptr() : nullptr,
+            HasEpochs ? epoch_count() : 0);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
   void lookup_layered(const DeviceLookupBatch &batch, cudaStream_t stream) {
-    const std::size_t n = batch.count;
     const bool no_overlay = c0_log_count_ == 0 && runs_.empty();
+    const bool has_epochs = !epochs_.empty();
     const OverlayReadIndex *ix =
         no_overlay ? nullptr : &resolved_overlay(stream);
-    const int block = 256;
-    const int grid = static_cast<int>((n + block - 1) / block);
-    const auto spine = make_spine_view();
-    gpulsmopt_detail::point_lookup_kernel<true, true>
-        <<<grid, block, 0, stream>>>(
-            batch.queries, n, batch.out_values, batch.out_found,
-            no_overlay ? nullptr : raw_or_null(ix->gk),
-            no_overlay ? nullptr : raw_or_null(ix->gv),
-            no_overlay ? 0 : ix->ins,
-            no_overlay ? nullptr : raw_or_null(ix->gk) + ix->ins,
-            no_overlay ? 0 : ix->u - ix->ins, spine,
-            epoch_view_ptr(), epoch_count());
-    CUDA_CHECK(cudaGetLastError());
+    if (no_overlay) {
+      if (has_epochs)
+        launch_point_lookup<false, true>(batch, nullptr, stream);
+      else
+        launch_point_lookup<false, false>(batch, nullptr, stream);
+    } else if (has_epochs) {
+      launch_point_lookup<true, true>(batch, ix, stream);
+    } else {
+      launch_point_lookup<true, false>(batch, ix, stream);
+    }
   }
 
   std::size_t max_elements_ = 0;
@@ -4508,6 +4685,7 @@ private:
 
   std::uint32_t c0_log_count_ = 0;
   std::uint32_t c0_insert_count_ = 0;
+  RunKind c0_kind_ = RunKind::empty;
   thrust::device_vector<std::uint32_t> c0_log_keys_;
   thrust::device_vector<std::uint32_t> c0_log_values_;
   thrust::device_vector<std::uint8_t> c0_log_ops_;
@@ -4521,12 +4699,10 @@ private:
   double prof_epoch_ingest_ms_ = 0.0;
   double prof_delta_sort_ms_ = 0.0;
   double prof_delta_ingest_ms_ = 0.0;
-  double prof_delta_consolidate_ms_ = 0.0;
   void reset_insert_prof_() {
     prof_append_ms_ = prof_flushsort_ms_ = prof_runmerge_ms_ = 0.0;
     prof_resolve_ms_ = prof_delete_ms_ = prof_epoch_ingest_ms_ = 0.0;
     prof_delta_sort_ms_ = prof_delta_ingest_ms_ = 0.0;
-    prof_delta_consolidate_ms_ = 0.0;
   }
 #endif
 
@@ -4553,7 +4729,8 @@ private:
 
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> sort_key_output_;
+  thrust::device_vector<std::uint32_t> sort_key_output_;
+  thrust::device_vector<std::uint32_t> sort_value_output_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> sort_payload_input_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> sort_payload_output_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> sort_temp_storage_;
@@ -4561,7 +4738,6 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_merge_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_quotient_counts_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_quotient_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> epoch_quotient_cursor_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_value_prefix_;
@@ -4571,16 +4747,11 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> spine_micro_bits_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_locator_slots_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> spine_locator_enabled_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_masks_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> spine_death_words_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_scan_input_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_count_prefix_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_dead_value_prefix_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_live_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_live_prefix_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_gather_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_gather_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_merge_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> spine_merge_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> delete_sort_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> delete_layer_stats_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> delete_layer_order_;
@@ -4594,6 +4765,8 @@ private:
   std::size_t delete_sort_temp_bytes_ = 0;
   std::size_t log_sort_count_ = 0;
   std::size_t log_sort_temp_bytes_ = 0;
+  std::size_t log_value_sort_count_ = 0;
+  std::size_t log_value_sort_temp_bytes_ = 0;
   std::size_t scan_u32_count_ = 0;
   std::size_t scan_u32_temp_bytes_ = 0;
   bool spine_micro_ready_ = false;
