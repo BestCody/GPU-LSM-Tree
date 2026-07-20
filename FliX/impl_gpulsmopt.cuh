@@ -259,7 +259,6 @@ public:
     batch.count = size;
     batch.sorted = true;
     dictionary_->erase(batch, stream);
-    dictionary_->finish_pending_delete(stream);
   }
 
   void lookups_successor(const key_type *keys, key_type *result, size_t size,

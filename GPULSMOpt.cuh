@@ -1,13 +1,17 @@
 #pragma once
 #include "gpu_dictionary_adapter.cuh"
 
+#include <cub/block/block_radix_sort.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
+#include <cub/device/device_reduce.cuh>
 #include <cuda_runtime.h>
 
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
+#include <thrust/iterator/reverse_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
 
@@ -65,6 +69,8 @@ static_assert(GPULSMOPT_EPOCH_MAX == kRunCapacity,
 constexpr int kEpochQuotientBits = 16;
 constexpr int kEpochSubgroupBits = 4;
 constexpr int kEpochQuotients = 1 << kEpochQuotientBits;
+constexpr std::size_t kAdaptiveTransitionMaxRecords =
+    2u * static_cast<std::size_t>(kEpochQuotients);
 constexpr int kEpochSubgroups = 1 << kEpochSubgroupBits;
 constexpr int kEpochSubgroupPlanes = kEpochSubgroupBits;
 constexpr int kEpochSubgroupPrefixStride = kEpochSubgroups;
@@ -379,18 +385,21 @@ struct RangeDeltaView {
 
 struct OwnerView {
   std::uint64_t *primary;
-  std::uint64_t *overflow;
-  std::uint32_t *heads;
-  std::uint32_t *next;
-  std::uint32_t *page_alloc;
-  std::uint32_t *error;
+  std::uint64_t *spill_keys;
+  std::uint32_t *spill_values;
+  std::uint32_t *spill_count;
   std::uint32_t *quotient_live;
-  std::uint32_t page_capacity;
+  std::uint64_t spill_mask;
 };
 
 constexpr std::uint32_t kOwnerEmpty = 0u;
 constexpr std::uint32_t kOwnerLive = 1u;
 constexpr std::uint32_t kOwnerTomb = 2u;
+// Terminal insertion failure: publish no delta.
+constexpr std::uint32_t kOwnerFail = 3u;
+constexpr std::uint64_t kSpillEmpty = 0u;
+constexpr std::uint64_t kSpillTomb = 1u;
+constexpr std::uint64_t kSpillLock = std::uint64_t{1} << 63;
 __host__ __device__ inline std::uint64_t
 owner_pack(std::uint32_t low, std::uint32_t value, std::uint32_t state) {
   return static_cast<std::uint64_t>(value) |
@@ -412,6 +421,21 @@ __host__ __device__ inline std::uint32_t owner_value(std::uint64_t slot) {
 
 __host__ __device__ inline std::uint32_t owner_slot(std::uint32_t low) {
   return (low * 0x9e3779b1u) >> (32 - kOwnerSlotBits);
+}
+
+__host__ __device__ inline std::uint64_t spill_token(std::uint32_t key) {
+  return static_cast<std::uint64_t>(key) + 2u;
+}
+
+__host__ __device__ inline std::uint64_t
+spill_slot(std::uint32_t key, std::uint64_t mask) {
+  std::uint64_t x = key;
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x & mask;
 }
 
 __device__ inline void owner_add_live(OwnerView owner, std::uint32_t quotient,
@@ -439,6 +463,116 @@ __device__ inline bool owner_find_in_page(const std::uint64_t *page,
   return false;
 }
 
+// Update the value of a key already resident in spill.
+__device__ inline bool spill_try_update(OwnerView owner, std::uint32_t key,
+                                        std::uint32_t value,
+                                        std::uint64_t *previous) {
+  const std::uint32_t low = key & 0xffffu;
+  const std::uint64_t token = spill_token(key);
+  std::uint64_t slot = spill_slot(key, owner.spill_mask);
+  for (std::uint64_t probe = 0; probe <= owner.spill_mask; ++probe) {
+    std::uint64_t state = *reinterpret_cast<volatile const std::uint64_t *>(
+        owner.spill_keys + slot);
+    if (state == kSpillEmpty)
+      return false;
+    if ((state & ~kSpillLock) == token) {
+      while (*reinterpret_cast<volatile const std::uint64_t *>(
+                 owner.spill_keys + slot) == (token | kSpillLock)) {
+      }
+      const std::uint32_t old = atomicExch(owner.spill_values + slot, value);
+      *previous = owner_pack(low, old, kOwnerLive);
+      return true;
+    }
+    slot = (slot + 1u) & owner.spill_mask;
+  }
+  return false;
+}
+
+// Insert a key proven absent; claims empty or tomb slots.
+__device__ inline bool spill_insert_fresh(OwnerView owner, std::uint32_t key,
+                                          std::uint32_t value) {
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
+  const std::uint64_t token = spill_token(key);
+  for (;;) {
+    std::uint64_t slot = spill_slot(key, owner.spill_mask);
+    std::uint64_t reusable = ~std::uint64_t{0};
+    bool retry = false;
+    for (std::uint64_t probe = 0; probe <= owner.spill_mask; ++probe) {
+      const std::uint64_t state =
+          *reinterpret_cast<volatile const std::uint64_t *>(owner.spill_keys +
+                                                            slot);
+      if (state == kSpillEmpty) {
+        const std::uint64_t target =
+            reusable != ~std::uint64_t{0} ? reusable : slot;
+        const std::uint64_t expected =
+            reusable != ~std::uint64_t{0} ? kSpillTomb : kSpillEmpty;
+        const std::uint64_t old = atomicCAS(
+            reinterpret_cast<unsigned long long *>(owner.spill_keys + target),
+            expected, token | kSpillLock);
+        if (old == expected) {
+          owner.spill_values[target] = value;
+          __threadfence();
+          *reinterpret_cast<volatile std::uint64_t *>(owner.spill_keys +
+                                                      target) = token;
+          atomicAdd(owner.spill_count + quotient, 1u);
+          return true;
+        }
+        retry = true;
+        break;
+      }
+      if (state == kSpillTomb && reusable == ~std::uint64_t{0})
+        reusable = slot;
+      slot = (slot + 1u) & owner.spill_mask;
+    }
+    if (retry)
+      continue;
+    if (reusable != ~std::uint64_t{0}) {
+      const std::uint64_t old = atomicCAS(
+          reinterpret_cast<unsigned long long *>(owner.spill_keys + reusable),
+          kSpillTomb, token | kSpillLock);
+      if (old == kSpillTomb) {
+        owner.spill_values[reusable] = value;
+        __threadfence();
+        *reinterpret_cast<volatile std::uint64_t *>(owner.spill_keys +
+                                                    reusable) = token;
+        atomicAdd(owner.spill_count + quotient, 1u);
+        return true;
+      }
+      continue;
+    }
+    return false;
+  }
+}
+
+// Remove a spilled key; returns its packed live entry or 0.
+__device__ inline std::uint64_t spill_erase(OwnerView owner,
+                                            std::uint32_t key) {
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
+  const std::uint32_t low = key & 0xffffu;
+  const std::uint64_t token = spill_token(key);
+  std::uint64_t slot = spill_slot(key, owner.spill_mask);
+  for (std::uint64_t probe = 0; probe <= owner.spill_mask; ++probe) {
+    const std::uint64_t state =
+        *reinterpret_cast<volatile const std::uint64_t *>(owner.spill_keys +
+                                                          slot);
+    if (state == kSpillEmpty)
+      return 0u;
+    if ((state & ~kSpillLock) == token) {
+      while (*reinterpret_cast<volatile const std::uint64_t *>(
+                 owner.spill_keys + slot) == (token | kSpillLock)) {
+      }
+      const std::uint32_t value = owner.spill_values[slot];
+      atomicExch(reinterpret_cast<unsigned long long *>(owner.spill_keys +
+                                                        slot),
+                 kSpillTomb);
+      atomicSub(owner.spill_count + quotient, 1u);
+      return owner_pack(low, value, kOwnerLive);
+    }
+    slot = (slot + 1u) & owner.spill_mask;
+  }
+  return 0u;
+}
+
 __device__ inline bool owner_find(OwnerView owner, std::uint32_t key,
                                   std::uint64_t *found) {
   const std::uint32_t quotient = key >> kEpochQuotientBits;
@@ -447,178 +581,92 @@ __device__ inline bool owner_find(OwnerView owner, std::uint32_t key,
       owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
   if (owner_find_in_page(page, low, found))
     return true;
-  std::uint32_t link = owner.heads[quotient];
-  while (link != kOwnerNoPage) {
-    page = owner.overflow + static_cast<std::size_t>(link) * kOwnerSlots;
-    if (owner_find_in_page(page, low, found))
-      return true;
-    link = owner.next[link];
-  }
-  return false;
-}
-__device__ inline bool owner_insert_in_page(std::uint64_t *page,
-                                            std::uint32_t low,
-                                            std::uint32_t value,
-                                            std::uint64_t *previous) {
-  std::uint32_t slot = owner_slot(low);
-  std::uint32_t reusable = kOwnerNoPage;
-  for (int probe = 0; probe < kOwnerSlots; ++probe) {
-    const std::uint64_t packed = page[slot];
-    const std::uint32_t state = owner_state(packed);
-    if (state == kOwnerEmpty) {
-      const std::uint32_t target = reusable == kOwnerNoPage ? slot : reusable;
-      *previous = page[target];
-      page[target] = owner_pack(low, value, kOwnerLive);
-      return true;
-    }
-    if (owner_low(packed) == low) {
-      *previous = packed;
-      page[slot] = owner_pack(low, value, kOwnerLive);
-      return true;
-    }
-    if (state == kOwnerTomb && reusable == kOwnerNoPage)
-      reusable = slot;
-    slot = (slot + 1u) & kOwnerSlotMask;
-  }
-  if (reusable != kOwnerNoPage) {
-    *previous = page[reusable];
-    page[reusable] = owner_pack(low, value, kOwnerLive);
-    return true;
-  }
-  return false;
-}
-
-__device__ inline std::uint32_t owner_allocate_page(OwnerView owner) {
-  const std::uint32_t page = atomicAdd(owner.page_alloc, 1u);
-  if (page < owner.page_capacity)
-    return page;
-  atomicExch(owner.error, 1u);
-  return kOwnerNoPage;
-}
-
-__device__ inline bool owner_update_in_page(std::uint64_t *page,
-                                            std::uint32_t low,
-                                            std::uint32_t value,
-                                            std::uint64_t *previous) {
-  std::uint32_t slot = owner_slot(low);
-  for (int probe = 0; probe < kOwnerSlots; ++probe) {
-    const std::uint64_t packed = page[slot];
-    const std::uint32_t state = owner_state(packed);
-    if (state == kOwnerEmpty)
+  if (owner.spill_count[quotient] == 0u)
+    return false;
+  const std::uint64_t token = spill_token(key);
+  std::uint64_t slot = spill_slot(key, owner.spill_mask);
+  for (std::uint64_t probe = 0; probe <= owner.spill_mask; ++probe) {
+    std::uint64_t state =
+        *reinterpret_cast<volatile const std::uint64_t *>(owner.spill_keys + slot);
+    if (state == kSpillEmpty)
       return false;
-    if (owner_low(packed) == low) {
-      *previous = packed;
-      page[slot] = owner_pack(low, value, kOwnerLive);
+    if (state == (token | kSpillLock)) {
+      do {
+        state = *reinterpret_cast<volatile const std::uint64_t *>(
+            owner.spill_keys + slot);
+      } while (state == (token | kSpillLock));
+    }
+    if (state == token) {
+      const std::uint32_t value =
+          *reinterpret_cast<volatile const std::uint32_t *>(owner.spill_values +
+                                                            slot);
+      *found = owner_pack(low, value, kOwnerLive);
       return true;
     }
-    slot = (slot + 1u) & kOwnerSlotMask;
+    slot = (slot + 1u) & owner.spill_mask;
   }
   return false;
 }
-
-__device__ inline std::uint64_t owner_upsert(OwnerView owner, std::uint32_t key,
-                                             std::uint32_t value) {
-  const std::uint32_t quotient = key >> kEpochQuotientBits;
-  const std::uint32_t low = key & 0xffffu;
-  std::uint64_t previous = 0u;
-  std::uint64_t *primary =
-      owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
-  if (owner.heads[quotient] == kOwnerNoPage) {
-    if (owner_insert_in_page(primary, low, value, &previous))
-      return previous;
-    const std::uint32_t index = owner_allocate_page(owner);
-    if (index == kOwnerNoPage)
-      return 0u;
-    owner.heads[quotient] = index;
-    std::uint64_t *page =
-        owner.overflow + static_cast<std::size_t>(index) * kOwnerSlots;
-    owner_insert_in_page(page, low, value, &previous);
-    return previous;
-  }
-  if (owner_update_in_page(primary, low, value, &previous))
-    return previous;
-  std::uint32_t page_index = owner.heads[quotient];
-  while (page_index != kOwnerNoPage) {
-    std::uint64_t *page =
-        owner.overflow + static_cast<std::size_t>(page_index) * kOwnerSlots;
-    if (owner_update_in_page(page, low, value, &previous))
-      return previous;
-    page_index = owner.next[page_index];
-  }
-  if (owner_insert_in_page(primary, low, value, &previous))
-    return previous;
-  std::uint32_t *link = owner.heads + quotient;
-  while (*link != kOwnerNoPage) {
-    const std::uint32_t index = *link;
-    std::uint64_t *page =
-        owner.overflow + static_cast<std::size_t>(index) * kOwnerSlots;
-    if (owner_insert_in_page(page, low, value, &previous))
-      return previous;
-    link = owner.next + index;
-  }
-  const std::uint32_t index = owner_allocate_page(owner);
-  if (index == kOwnerNoPage)
-    return 0u;
-  *link = index;
-  std::uint64_t *page =
-      owner.overflow + static_cast<std::size_t>(index) * kOwnerSlots;
-  owner_insert_in_page(page, low, value, &previous);
-  return previous;
-}
-
-__device__ inline std::uint64_t owner_erase(OwnerView owner,
-                                            std::uint32_t key) {
-  const std::uint32_t quotient = key >> kEpochQuotientBits;
-  const std::uint32_t low = key & 0xffffu;
-  std::uint32_t page_index = kOwnerNoPage;
-  std::uint64_t *page =
-      owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
-  for (;;) {
-    std::uint32_t slot = owner_slot(low);
-    for (int probe = 0; probe < kOwnerSlots; ++probe) {
-      const std::uint64_t packed = page[slot];
-      const std::uint32_t state = owner_state(packed);
-      if (state == kOwnerEmpty)
-        return 0u;
-      if (owner_low(packed) == low) {
-        if (state == kOwnerLive)
-          page[slot] = owner_pack(low, 0u, kOwnerTomb);
-        return packed;
-      }
-      slot = (slot + 1u) & kOwnerSlotMask;
-    }
-    page_index = page_index == kOwnerNoPage ? owner.heads[quotient]
-                                            : owner.next[page_index];
-    if (page_index == kOwnerNoPage)
-      return 0u;
-    page = owner.overflow + static_cast<std::size_t>(page_index) * kOwnerSlots;
-  }
-}
+// Build each primary page in shared memory; write coalesced.
 __global__ void owner_build_kernel(OwnerView owner, const std::uint32_t *keys,
                                    const std::uint32_t *values,
                                    const std::uint32_t *offsets) {
+  __shared__ std::uint64_t page[kOwnerSlots];
   const std::uint32_t quotient = blockIdx.x;
-  if (quotient >= kEpochQuotients || threadIdx.x != 0)
+  if (quotient >= kEpochQuotients)
     return;
   const std::uint32_t begin = offsets[quotient];
   const std::uint32_t end = offsets[quotient + 1u];
-  owner.quotient_live[quotient] = end - begin;
-  for (std::uint32_t position = begin; position < end; ++position)
-    owner_upsert(owner, keys[position], values[position]);
+  for (int s = threadIdx.x; s < kOwnerSlots; s += blockDim.x)
+    page[s] = 0u;
+  if (threadIdx.x == 0)
+    owner.quotient_live[quotient] = end - begin;
+  __syncthreads();
+  for (std::uint32_t position = begin + threadIdx.x; position < end;
+       position += blockDim.x) {
+    const std::uint32_t key = keys[position];
+    const std::uint32_t low = key & 0xffffu;
+    const std::uint64_t packed = owner_pack(low, values[position], kOwnerLive);
+    std::uint32_t slot = owner_slot(low);
+    bool placed = false;
+    for (int probe = 0; probe < kOwnerSlots; ++probe) {
+      const std::uint64_t old = atomicCAS(
+          reinterpret_cast<unsigned long long *>(page + slot), 0ull, packed);
+      if (old == 0ull) {
+        placed = true;
+        break;
+      }
+      if (owner_low(old) == low) {
+        atomicExch(reinterpret_cast<unsigned long long *>(page + slot),
+                   packed);
+        placed = true;
+        break;
+      }
+      slot = (slot + 1u) & kOwnerSlotMask;
+    }
+    if (!placed)
+      spill_insert_fresh(owner, key, values[position]);
+  }
+  __syncthreads();
+  std::uint64_t *destination =
+      owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
+  for (int s = threadIdx.x; s < kOwnerSlots; s += blockDim.x)
+    destination[s] = page[s];
 }
 
-__device__ inline bool owner_atomic_upsert_primary(OwnerView owner,
-                                                   std::uint32_t key,
-                                                   std::uint32_t value,
-                                                   std::uint64_t *previous) {
+// The page may live in global or staged shared memory.
+__device__ inline bool owner_atomic_upsert(OwnerView owner,
+                                           std::uint64_t *page,
+                                           std::uint32_t key,
+                                           std::uint32_t value,
+                                           std::uint64_t *previous) {
   const std::uint32_t quotient = key >> kEpochQuotientBits;
   const std::uint32_t low = key & 0xffffu;
-  std::uint64_t *page =
-      owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
   for (;;) {
     std::uint32_t slot = owner_slot(low);
     std::uint32_t reusable = kOwnerNoPage;
     std::uint64_t reusable_value = 0u;
+    bool full_scan = true;
     for (int probe = 0; probe < kOwnerSlots; ++probe) {
       const std::uint64_t packed =
           *reinterpret_cast<volatile std::uint64_t *>(page + slot);
@@ -635,6 +683,7 @@ __device__ inline bool owner_atomic_upsert_primary(OwnerView owner,
           *previous = old;
           return true;
         }
+        full_scan = false;
         break;
       }
       if (owner_low(packed) == low) {
@@ -645,6 +694,7 @@ __device__ inline bool owner_atomic_upsert_primary(OwnerView owner,
           *previous = old;
           return true;
         }
+        full_scan = false;
         break;
       }
       if (state == kOwnerTomb && reusable == kOwnerNoPage) {
@@ -653,6 +703,12 @@ __device__ inline bool owner_atomic_upsert_primary(OwnerView owner,
       }
       slot = (slot + 1u) & kOwnerSlotMask;
     }
+    if (!full_scan)
+      continue;
+    // No empty in the page: the key may live in spill.
+    if (owner.spill_count[quotient] != 0u &&
+        spill_try_update(owner, key, value, previous))
+      return true;
     if (reusable != kOwnerNoPage) {
       auto *atomic_slot =
           reinterpret_cast<unsigned long long *>(page + reusable);
@@ -664,16 +720,20 @@ __device__ inline bool owner_atomic_upsert_primary(OwnerView owner,
       }
       continue;
     }
-    return false;
+    if (spill_insert_fresh(owner, key, value)) {
+      *previous = 0u;
+      return true;
+    }
+    *previous = owner_pack(0u, 0u, kOwnerFail);
+    return true;
   }
 }
 
-__device__ inline std::uint64_t owner_atomic_erase_primary(OwnerView owner,
-                                                           std::uint32_t key) {
+__device__ inline std::uint64_t owner_atomic_erase(OwnerView owner,
+                                                   std::uint64_t *page,
+                                                   std::uint32_t key) {
   const std::uint32_t quotient = key >> kEpochQuotientBits;
   const std::uint32_t low = key & 0xffffu;
-  std::uint64_t *page =
-      owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
   std::uint32_t slot = owner_slot(low);
   for (int probe = 0; probe < kOwnerSlots; ++probe) {
     const std::uint64_t packed =
@@ -689,24 +749,24 @@ __device__ inline std::uint64_t owner_atomic_erase_primary(OwnerView owner,
     }
     slot = (slot + 1u) & kOwnerSlotMask;
   }
+  if (owner.spill_count[quotient] != 0u)
+    return spill_erase(owner, key);
   return 0u;
 }
 
 __device__ inline void
-owner_apply_transition(OwnerView owner, std::uint32_t key, std::uint8_t op,
-                       std::uint32_t input_value, bool atomic_primary,
+owner_apply_transition(OwnerView owner, std::uint64_t *page, std::uint32_t key,
+                       std::uint8_t op, std::uint32_t input_value,
                        std::uint32_t *value_delta, std::int8_t *count_delta) {
   std::uint64_t previous = 0u;
   if (op == kInsert) {
-    const bool applied =
-        !atomic_primary ||
-        owner_atomic_upsert_primary(owner, key, input_value, &previous);
-    if (!applied) {
-      *count_delta = 127;
+    owner_atomic_upsert(owner, page, key, input_value, &previous);
+    if (owner_state(previous) == kOwnerFail) {
+      // Publish no delta for a key that was not stored.
+      *value_delta = 0u;
+      *count_delta = 0;
       return;
     }
-    if (!atomic_primary)
-      previous = owner_upsert(owner, key, input_value);
     if (owner_state(previous) == kOwnerLive) {
       *value_delta = input_value - owner_value(previous);
       *count_delta = 0;
@@ -716,8 +776,7 @@ owner_apply_transition(OwnerView owner, std::uint32_t key, std::uint8_t op,
     }
     return;
   }
-  previous = atomic_primary ? owner_atomic_erase_primary(owner, key)
-                            : owner_erase(owner, key);
+  previous = owner_atomic_erase(owner, page, key);
   if (owner_state(previous) == kOwnerLive) {
     *value_delta = 0u - owner_value(previous);
     *count_delta = -1;
@@ -726,76 +785,44 @@ owner_apply_transition(OwnerView owner, std::uint32_t key, std::uint8_t op,
     *count_delta = 0;
   }
 }
-__global__ void
-owner_transition_kernel(OwnerView owner, const std::uint32_t *keys,
-                        std::uint32_t *values, const std::uint8_t *ops,
-                        std::uint8_t constant_op, const std::uint32_t *offsets,
-                        std::int8_t *count_delta,
-                        std::uint32_t *quotient_count_sum) {
+
+__global__ void owner_transition_quotient_kernel(
+    OwnerView owner, const std::uint32_t *keys, std::uint32_t *values,
+    const std::uint8_t *ops, std::uint8_t constant_op,
+    const std::uint32_t *offsets, std::int8_t *count_delta,
+    std::uint32_t *quotient_count_sum) {
   const std::uint32_t quotient = blockIdx.x;
   if (quotient >= kEpochQuotients)
     return;
+  const int lane = threadIdx.x & 31;
   const std::uint32_t begin = offsets[quotient];
   const std::uint32_t end = offsets[quotient + 1u];
-  const int lane = threadIdx.x & 31;
-  const bool serial =
-      owner.heads[quotient] != kOwnerNoPage || end - begin > 32u;
-  if (serial) {
-    if (lane != 0)
-      return;
-    std::int32_t count_sum = 0;
-    for (std::uint32_t position = begin; position < end; ++position) {
-      const std::uint8_t op = ops ? ops[position] : constant_op;
-      std::uint32_t value_delta = 0u;
-      std::int8_t delta = 0;
-      owner_apply_transition(owner, keys[position], op, values[position], false,
-                             &value_delta, &delta);
-      values[position] = value_delta;
-      count_delta[position] = delta;
-      count_sum += static_cast<std::int32_t>(delta);
-    }
-    quotient_count_sum[quotient] = static_cast<std::uint32_t>(count_sum);
-    if (count_sum != 0)
-      owner_add_live(owner, quotient, count_sum);
-    return;
-  }
-  for (std::uint32_t position = begin + lane; position < end; position += 32u) {
-    const std::uint32_t key = keys[position];
-    const unsigned active = __activemask();
-    const unsigned peers = __match_any_sync(active, key);
-    const bool final_occurrence = lane == 31 - __clz(peers);
-    if (!final_occurrence) {
-      values[position] = 0u;
-      count_delta[position] = 0;
-      continue;
-    }
-    const std::uint8_t op = ops ? ops[position] : constant_op;
-    std::uint32_t value_delta = 0u;
-    std::int8_t delta = 0;
-    owner_apply_transition(owner, key, op, values[position], true, &value_delta,
-                           &delta);
-    if (delta != 127)
-      values[position] = value_delta;
-    count_delta[position] = delta;
-  }
-  __syncwarp();
-  if (lane == 0) {
-    for (std::uint32_t position = begin; position < end; ++position) {
-      if (count_delta[position] != 127)
-        continue;
-      const std::uint8_t op = ops ? ops[position] : constant_op;
-      std::uint32_t value_delta = 0u;
-      std::int8_t delta = 0;
-      owner_apply_transition(owner, keys[position], op, values[position], false,
-                             &value_delta, &delta);
-      values[position] = value_delta;
-      count_delta[position] = delta;
-    }
-  }
-  __syncwarp();
+  std::uint64_t *page =
+      owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
   std::int32_t local_sum = 0;
-  for (std::uint32_t position = begin + lane; position < end; position += 32u) {
-    local_sum += static_cast<std::int32_t>(count_delta[position]);
+  for (std::uint32_t base = begin; base < end; base += 32u) {
+    const std::uint32_t position = base + static_cast<std::uint32_t>(lane);
+    const bool active = position < end;
+    const unsigned active_mask = __ballot_sync(0xffffffffu, active);
+    std::int8_t delta = 0;
+    if (active) {
+      const std::uint32_t key = keys[position];
+      const unsigned peers = __match_any_sync(active_mask, key);
+      const bool final_occurrence = lane == 31 - __clz(peers);
+      if (final_occurrence) {
+        const std::uint8_t op = ops ? ops[position] : constant_op;
+        std::uint32_t value_delta = 0u;
+        owner_apply_transition(owner, page, key, op, values[position],
+                               &value_delta, &delta);
+        values[position] = value_delta;
+        count_delta[position] = delta;
+      } else {
+        values[position] = 0u;
+        count_delta[position] = 0;
+      }
+    }
+    local_sum += static_cast<std::int32_t>(delta);
+    __syncwarp(0xffffffffu);
   }
   for (int offset = 16; offset > 0; offset >>= 1)
     local_sum += __shfl_down_sync(0xffffffffu, local_sum, offset);
@@ -803,6 +830,149 @@ owner_transition_kernel(OwnerView owner, const std::uint32_t *keys,
     quotient_count_sum[quotient] = static_cast<std::uint32_t>(local_sum);
     if (local_sum != 0)
       owner_add_live(owner, quotient, local_sum);
+  }
+}
+
+// Occupancy-adaptive transitions: W lanes per quotient.
+template <int W>
+__global__ void owner_transition_subwarp_kernel(
+    OwnerView owner, const std::uint32_t *keys, std::uint32_t *values,
+    const std::uint8_t *ops, std::uint8_t constant_op,
+    const std::uint32_t *offsets, std::int8_t *count_delta,
+    std::uint32_t *quotient_count_sum, const std::uint32_t *class_list,
+    const std::uint32_t *class_count) {
+  const std::uint32_t items = class_count[0];
+  const int lane = threadIdx.x & 31;
+  const int sub = lane / W;
+  const int s = lane % W;
+  const unsigned sub_bits = W == 32 ? 0xffffffffu : (1u << W) - 1u;
+  const unsigned sub_mask = sub_bits << (sub * W);
+  const std::uint32_t groups =
+      static_cast<std::uint32_t>(gridDim.x) * blockDim.x / W;
+  for (std::uint32_t group =
+           (blockIdx.x * blockDim.x + threadIdx.x) / W;
+       group < items; group += groups) {
+    const std::uint32_t quotient = class_list[group];
+    const std::uint32_t begin = offsets[quotient];
+    const std::uint32_t len = offsets[quotient + 1u] - begin;
+    const bool active = static_cast<std::uint32_t>(s) < len;
+    const std::uint32_t position = begin + static_cast<std::uint32_t>(s);
+    std::int8_t delta = 0;
+    const unsigned voters = __ballot_sync(sub_mask, active) & sub_mask;
+    if (active) {
+      std::uint64_t *page =
+          owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
+      const std::uint32_t key = keys[position];
+      const unsigned peers = __match_any_sync(voters, key);
+      const bool final_occurrence = lane == 31 - __clz(peers);
+      if (!final_occurrence) {
+        values[position] = 0u;
+        count_delta[position] = 0;
+      } else {
+        const std::uint8_t op = ops ? ops[position] : constant_op;
+        std::uint32_t value_delta = 0u;
+        owner_apply_transition(owner, page, key, op, values[position],
+                               &value_delta, &delta);
+        values[position] = value_delta;
+        count_delta[position] = delta;
+      }
+    }
+    std::int32_t sum = static_cast<std::int32_t>(delta);
+#pragma unroll
+    for (int offset = W / 2; offset > 0; offset >>= 1)
+      sum += __shfl_down_sync(sub_mask, sum, offset, W);
+    if (s == 0) {
+      quotient_count_sum[quotient] = static_cast<std::uint32_t>(sum);
+      if (sum != 0)
+        owner_add_live(owner, quotient, sum);
+    }
+  }
+}
+
+// Dense quotients: sort low bits with sequence numbers so
+// the last write wins, then apply distinct keys in parallel.
+constexpr int kDenseChunk = 2048;
+constexpr int kDenseThreads = 256;
+constexpr int kDenseItems = kDenseChunk / kDenseThreads;
+__global__ void owner_transition_dense_kernel(
+    OwnerView owner, const std::uint32_t *keys, std::uint32_t *values,
+    const std::uint8_t *ops, std::uint8_t constant_op,
+    const std::uint32_t *offsets, std::int8_t *count_delta,
+    std::uint32_t *quotient_count_sum, const std::uint32_t *class_list,
+    const std::uint32_t *class_count) {
+  using BlockSort =
+      cub::BlockRadixSort<std::uint32_t, kDenseThreads, kDenseItems>;
+  __shared__ union DenseShared {
+    typename BlockSort::TempStorage sort;
+    std::uint32_t sorted[kDenseChunk];
+  } shared;
+  // Stage the 16 KiB primary page for dense updates.
+  __shared__ std::uint64_t page[kOwnerSlots];
+  __shared__ std::int32_t block_sum;
+  const std::uint32_t items = class_count[0];
+  for (std::uint32_t item = blockIdx.x; item < items; item += gridDim.x) {
+    const std::uint32_t quotient = class_list[item];
+    const std::uint32_t begin = offsets[quotient];
+    const std::uint32_t end = offsets[quotient + 1u];
+    std::uint64_t *global_page =
+        owner.primary + static_cast<std::size_t>(quotient) * kOwnerSlots;
+    for (int s = threadIdx.x; s < kOwnerSlots; s += blockDim.x)
+      page[s] = global_page[s];
+    if (threadIdx.x == 0)
+      block_sum = 0;
+    __syncthreads();
+    for (std::uint32_t chunk = begin; chunk < end; chunk += kDenseChunk) {
+      const std::uint32_t n =
+          min(static_cast<std::uint32_t>(kDenseChunk), end - chunk);
+      std::uint32_t local[kDenseItems];
+#pragma unroll
+      for (int r = 0; r < kDenseItems; ++r) {
+        const std::uint32_t seq =
+            static_cast<std::uint32_t>(threadIdx.x) * kDenseItems + r;
+        local[r] = seq < n ? ((keys[chunk + seq] & 0xffffu) << 11) | seq
+                           : 0x0fffffffu;
+      }
+      BlockSort(shared.sort).Sort(local, 0, 28);
+      __syncthreads();
+#pragma unroll
+      for (int r = 0; r < kDenseItems; ++r)
+        shared.sorted[threadIdx.x * kDenseItems + r] = local[r];
+      __syncthreads();
+      std::int32_t sum = 0;
+      for (std::uint32_t slot = threadIdx.x; slot < n; slot += blockDim.x) {
+        const std::uint32_t packed = shared.sorted[slot];
+        const std::uint32_t position = chunk + (packed & 0x7ffu);
+        const bool applier =
+            slot + 1u >= n ||
+            (shared.sorted[slot + 1u] >> 11) != (packed >> 11);
+        if (!applier) {
+          values[position] = 0u;
+          count_delta[position] = 0;
+          continue;
+        }
+        const std::uint8_t op = ops ? ops[position] : constant_op;
+        std::uint32_t value_delta = 0u;
+        std::int8_t delta = 0;
+        owner_apply_transition(owner, page, keys[position], op,
+                               values[position], &value_delta, &delta);
+        values[position] = value_delta;
+        count_delta[position] = delta;
+        sum += static_cast<std::int32_t>(delta);
+      }
+      for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+      if ((threadIdx.x & 31) == 0 && sum != 0)
+        atomicAdd(&block_sum, sum);
+      __syncthreads();
+    }
+    for (int s = threadIdx.x; s < kOwnerSlots; s += blockDim.x)
+      global_page[s] = page[s];
+    if (threadIdx.x == 0) {
+      quotient_count_sum[quotient] = static_cast<std::uint32_t>(block_sum);
+      if (block_sum != 0)
+        owner_add_live(owner, quotient, block_sum);
+    }
+    __syncthreads();
   }
 }
 
@@ -822,11 +992,6 @@ __global__ void owner_lookup_kernel(OwnerView owner,
     out_found[i] = found ? 1u : 0u;
 }
 
-__device__ inline bool owner_key_live(OwnerView owner, std::uint32_t key) {
-  std::uint64_t packed = 0u;
-  return owner_find(owner, key, &packed) && owner_state(packed) == kOwnerLive;
-}
-
 __device__ inline std::uint32_t epoch_subgroup_mask(const RunView &ev,
                                                     std::uint32_t quotient,
                                                     std::uint32_t subgroup,
@@ -841,63 +1006,6 @@ __device__ inline std::uint32_t epoch_subgroup_mask(const RunView &ev,
   return mask;
 }
 
-__device__ inline bool
-epoch_point_position_bounds(const RunView &ev, std::uint32_t key,
-                            std::uint32_t quotient, std::uint32_t begin,
-                            std::uint32_t end, std::uint32_t *position) {
-  const std::uint32_t count = end - begin;
-  if (count <= 32u) {
-    const std::uint32_t subgroup =
-        (key >> (kEpochQuotientBits - kEpochSubgroupBits)) &
-        (kEpochSubgroups - 1);
-    std::uint32_t mask = epoch_subgroup_mask(ev, quotient, subgroup, count);
-    while (mask != 0u) {
-      const std::uint32_t bit = __ffs(mask) - 1;
-      const std::uint32_t p = begin + bit;
-      if (ev.keys[p] == key) {
-        *position = p;
-        return true;
-      }
-      mask &= mask - 1;
-    }
-    return false;
-  }
-  if (ev.fully_sorted || count <= kEpochHeavySortCap) {
-    const std::uint32_t p = begin + static_cast<std::uint32_t>(lower_bound_u32(
-                                        ev.keys + begin, end - begin, key));
-    if (p < end && ev.keys[p] == key) {
-      *position = p;
-      return true;
-    }
-    return false;
-  }
-  for (std::uint32_t p = begin; p < end; ++p) {
-    if (ev.keys[p] == key) {
-      *position = p;
-      return true;
-    }
-  }
-  return false;
-}
-
-__device__ inline bool epoch_point_position(const RunView &ev,
-                                            std::uint32_t key,
-                                            std::uint32_t *position) {
-  const std::uint32_t quotient = key >> kEpochQuotientBits;
-  const std::uint32_t begin = ev.quotient_off[quotient];
-  const std::uint32_t end = ev.quotient_off[quotient + 1];
-  return epoch_point_position_bounds(ev, key, quotient, begin, end, position);
-}
-
-__device__ inline bool epoch_point_find(const RunView &ev, std::uint32_t key,
-                                        std::uint32_t *out_value) {
-  std::uint32_t position;
-  if (!epoch_point_position(ev, key, &position))
-    return false;
-  if (out_value)
-    *out_value = ev.values[position];
-  return true;
-}
 
 __device__ inline std::uint32_t epoch_quotient_count_bounds(const RunView &ev,
                                                             std::uint32_t begin,
@@ -1339,37 +1447,6 @@ __device__ inline void range_delta_accumulate_warp(
   }
 }
 
-__device__ inline void
-range_delta_pack_warp(const std::uint32_t *keys, const std::uint32_t *values,
-                      std::uint32_t begin, std::uint32_t end,
-                      std::uint32_t *cursors, std::uint32_t *out_keys,
-                      std::uint32_t *out_values) {
-  const unsigned full = 0xffffffffu;
-  const int lane = threadIdx.x & 31;
-  for (std::uint32_t base = begin; base < end; base += 32u) {
-    const std::uint32_t position = base + lane;
-    const bool included = position < end;
-    const unsigned active = __ballot_sync(full, included);
-    if (included) {
-      const std::uint32_t key = keys[position];
-      const std::uint32_t subgroup =
-          (key >> kRangeProjectionShift) & (kEpochSubgroups - 1u);
-      const unsigned peers = __match_any_sync(active, subgroup);
-      const int leader = __ffs(peers) - 1;
-      std::uint32_t output = 0u;
-      if (lane == leader) {
-        output = cursors[subgroup];
-        cursors[subgroup] += __popc(peers);
-      }
-      output = __shfl_sync(peers, output, leader);
-      const unsigned lower = lane == 0 ? 0u : (1u << lane) - 1u;
-      output += __popc(peers & lower);
-      out_keys[output] = key;
-      out_values[output] = values[position];
-    }
-    __syncwarp(full);
-  }
-}
 
 __global__ void range_delta_plan_kernel(const RunView *epochs, int epoch_count,
                                         int skip_run, std::uint32_t *bin_counts,
@@ -1405,40 +1482,118 @@ __global__ void range_delta_plan_kernel(const RunView *epochs, int epoch_count,
   }
 }
 
+// Repack records quotient-locally, then write each bin
+// as one contiguous segment.
+constexpr int kPackChunk = 512;
+constexpr int kPackThreads = 256;
+constexpr int kPackPerThread = kPackChunk / kPackThreads;
 __global__ void range_delta_pack_kernel(const RunView *epochs, int epoch_count,
                                         int skip_run,
                                         const std::uint32_t *bin_offsets,
                                         std::uint32_t *out_keys,
                                         std::uint32_t *out_values) {
-  constexpr int warps = 8;
-  __shared__ std::uint32_t cursors[warps][kEpochSubgroups];
-  const int warp = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  const std::uint32_t quotient =
-      blockIdx.x * warps + static_cast<std::uint32_t>(warp);
+  __shared__ std::uint32_t slice_prefix[kRunCapacity + 1];
+  __shared__ std::uint32_t staged_keys[kPackChunk];
+  __shared__ std::uint32_t staged_values[kPackChunk];
+  __shared__ std::uint32_t bin_count[kEpochSubgroups];
+  __shared__ std::uint32_t bin_start[kEpochSubgroups];
+  __shared__ std::uint32_t bin_fill[kEpochSubgroups];
+  __shared__ std::uint32_t cursors[kEpochSubgroups];
+  const std::uint32_t quotient = blockIdx.x;
   if (quotient >= kEpochQuotients)
     return;
-  if (lane < kEpochSubgroups) {
-    const std::uint32_t bin = quotient * kEpochSubgroups + lane;
-    cursors[warp][lane] = bin_offsets[bin];
+  if (threadIdx.x == 0) {
+    std::uint32_t running = 0u;
+    slice_prefix[0] = 0u;
+    for (int e = 0; e < epoch_count; ++e) {
+      if (e != skip_run)
+        running += epochs[e].quotient_off[quotient + 1u] -
+                   epochs[e].quotient_off[quotient];
+      slice_prefix[e + 1] = running;
+    }
   }
-  __syncwarp();
-  for (int e = 0; e < epoch_count; ++e) {
-    if (e == skip_run)
-      continue;
-    const RunView epoch = epochs[e];
-    const std::uint32_t begin = epoch.quotient_off[quotient];
-    const std::uint32_t end = epoch.quotient_off[quotient + 1u];
-    range_delta_pack_warp(epoch.keys, epoch.values, begin, end, cursors[warp],
-                          out_keys, out_values);
+  if (threadIdx.x < kEpochSubgroups)
+    cursors[threadIdx.x] =
+        bin_offsets[quotient * kEpochSubgroups + threadIdx.x];
+  __syncthreads();
+  const std::uint32_t total = slice_prefix[epoch_count];
+  for (std::uint32_t chunk = 0; chunk < total; chunk += kPackChunk) {
+    const std::uint32_t n =
+        min(static_cast<std::uint32_t>(kPackChunk), total - chunk);
+    if (threadIdx.x < kEpochSubgroups) {
+      bin_count[threadIdx.x] = 0u;
+      bin_fill[threadIdx.x] = 0u;
+    }
+    __syncthreads();
+    std::uint32_t local_keys[kPackPerThread];
+    std::uint32_t local_values[kPackPerThread];
+    std::uint32_t local_subs[kPackPerThread];
+#pragma unroll
+    for (int r = 0; r < kPackPerThread; ++r) {
+      const std::uint32_t i =
+          static_cast<std::uint32_t>(r) * blockDim.x + threadIdx.x;
+      if (i >= n)
+        continue;
+      const std::uint32_t g = chunk + i;
+      int run = 0;
+      int hi_run = epoch_count;
+      while (run + 1 < hi_run) {
+        const int mid = (run + hi_run) >> 1;
+        if (slice_prefix[mid] <= g)
+          run = mid;
+        else
+          hi_run = mid;
+      }
+      const RunView ev = epochs[run];
+      const std::uint32_t p =
+          ev.quotient_off[quotient] + (g - slice_prefix[run]);
+      local_keys[r] = ev.keys[p];
+      local_values[r] = ev.values[p];
+      local_subs[r] =
+          (local_keys[r] >> kRangeProjectionShift) & (kEpochSubgroups - 1u);
+      atomicAdd(bin_count + local_subs[r], 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      std::uint32_t running = 0u;
+      for (int b = 0; b < kEpochSubgroups; ++b) {
+        bin_start[b] = running;
+        running += bin_count[b];
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < kPackPerThread; ++r) {
+      const std::uint32_t i =
+          static_cast<std::uint32_t>(r) * blockDim.x + threadIdx.x;
+      if (i >= n)
+        continue;
+      const std::uint32_t position =
+          bin_start[local_subs[r]] + atomicAdd(bin_fill + local_subs[r], 1u);
+      staged_keys[position] = local_keys[r];
+      staged_values[position] = local_values[r];
+    }
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+      const std::uint32_t key = staged_keys[i];
+      const std::uint32_t sub =
+          (key >> kRangeProjectionShift) & (kEpochSubgroups - 1u);
+      const std::uint32_t destination = cursors[sub] + (i - bin_start[sub]);
+      out_keys[destination] = key;
+      out_values[destination] = staged_values[i];
+    }
+    __syncthreads();
+    if (threadIdx.x < kEpochSubgroups)
+      cursors[threadIdx.x] += bin_count[threadIdx.x];
+    __syncthreads();
   }
 }
 
-__global__ void epoch_quotient_metadata_kernel(const std::uint32_t *keys,
-                                               std::uint32_t record_count,
-                                               std::uint32_t *offsets,
-                                               std::uint32_t *subgroup_masks,
-                                               std::uint32_t *quotient_live) {
+// Scatter quotient starts; mask warp-contained segments.
+__global__ void run_boundary_scatter_kernel(
+    const std::uint32_t *keys, std::uint32_t record_count,
+    std::uint32_t *offsets, std::uint32_t *subgroup_masks,
+    std::uint32_t *pending, std::uint32_t *pending_count) {
   constexpr unsigned full = 0xffffffffu;
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t warp_begin = i & ~31u;
@@ -1450,81 +1605,100 @@ __global__ void epoch_quotient_metadata_kernel(const std::uint32_t *keys,
   if (lane == 0 && valid)
     previous = i == 0u ? quotient : keys[i - 1] >> kEpochQuotientBits;
   const bool starts = valid && (i == 0u || quotient != previous);
+  if (starts)
+    offsets[quotient] = i;
+  if (i == 0u)
+    offsets[kEpochQuotients] = record_count;
+  if (warp_begin >= record_count)
+    return;
+  const std::uint32_t warp_end = min(warp_begin + 32u, record_count);
+  std::uint32_t next_quotient = kEpochQuotients;
+  if (lane == 0 && warp_end < record_count)
+    next_quotient = keys[warp_end] >> kEpochQuotientBits;
+  next_quotient = __shfl_sync(full, next_quotient, 0);
   unsigned starts_mask = __ballot_sync(full, starts);
   while (starts_mask != 0u) {
     const int start_lane = __ffs(starts_mask) - 1;
-    const std::uint32_t start = warp_begin + start_lane;
     const std::uint32_t segment_quotient =
         __shfl_sync(full, quotient, start_lane);
-    const std::uint32_t segment_previous =
-        __shfl_sync(full, previous, start_lane);
     const unsigned later =
         start_lane == 31 ? 0u : starts_mask & (0xffffffffu << (start_lane + 1));
-    const int end_lane = later == 0u ? 32 : __ffs(later) - 1;
-    std::uint32_t end = warp_begin + end_lane;
-    const std::uint32_t warp_end = min(warp_begin + 32u, record_count);
-    if (later == 0u) {
-      if (lane == 0) {
-        end = warp_end;
-        while (end < record_count &&
-               (keys[end] >> kEpochQuotientBits) == segment_quotient)
-          ++end;
-      }
-      end = __shfl_sync(full, end, 0);
+    const int end_lane = later == 0u
+                             ? static_cast<int>(warp_end - warp_begin)
+                             : __ffs(later) - 1;
+    const bool contained = later != 0u || segment_quotient != next_quotient;
+    if (!contained) {
+      // Crosses the warp boundary: finish in completion pass.
+      if (lane == 0)
+        pending[atomicAdd(pending_count, 1u)] = segment_quotient;
+      starts_mask &= starts_mask - 1u;
+      continue;
     }
-    const std::uint32_t count = end - start;
-    std::uint32_t tail_planes[kEpochSubgroupPlanes] = {};
-    if (lane == 0 && count <= 32u && end > warp_end) {
-      for (std::uint32_t position = warp_end; position < end; ++position) {
-        const std::uint32_t subgroup =
-            (keys[position] >> (kEpochQuotientBits - kEpochSubgroupBits)) &
-            (kEpochSubgroups - 1u);
-        const std::uint32_t bit_position = 1u << (position - start);
+    const unsigned low = 0xffffffffu << start_lane;
+    const unsigned high =
+        end_lane >= 32 ? 0xffffffffu : (1u << end_lane) - 1u;
+    const unsigned segment = low & high;
+    const std::uint32_t subgroup =
+        (key >> (kEpochQuotientBits - kEpochSubgroupBits)) &
+        (kEpochSubgroups - 1u);
+    const std::uint32_t base = segment_quotient * kEpochSubgroupPlanes;
 #pragma unroll
-        for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
-          tail_planes[bit] |= (0u - ((subgroup >> bit) & 1u)) & bit_position;
-      }
-    }
-    if (count <= 32u) {
-      const unsigned low = 0xffffffffu << start_lane;
-      const unsigned high =
-          end_lane == 32 ? 0xffffffffu : (1u << end_lane) - 1u;
-      const unsigned segment = low & high;
-      const std::uint32_t subgroup =
-          (key >> (kEpochQuotientBits - kEpochSubgroupBits)) &
-          (kEpochSubgroups - 1u);
-      const std::uint32_t base = segment_quotient * kEpochSubgroupPlanes;
-#pragma unroll
-      for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit) {
-        const unsigned local =
-            __ballot_sync(full, valid && ((subgroup >> bit) & 1u));
-        const std::uint32_t tail = __shfl_sync(full, tail_planes[bit], 0);
-        if (lane == 0)
-          subgroup_masks[base + bit] = ((local & segment) >> start_lane) | tail;
-      }
-    }
-    if (lane == 0) {
-      if (start == 0u) {
-        for (std::uint32_t q = 0; q <= segment_quotient; ++q)
-          offsets[q] = 0u;
-        for (std::uint32_t q = 0; q < segment_quotient; ++q)
-          quotient_live[q] = 0u;
-      } else {
-        for (std::uint32_t q = segment_previous + 1u; q <= segment_quotient;
-             ++q)
-          offsets[q] = start;
-        for (std::uint32_t q = segment_previous + 1u; q < segment_quotient; ++q)
-          quotient_live[q] = 0u;
-      }
-      if (end == record_count) {
-        for (std::uint32_t q = segment_quotient + 1u; q <= kEpochQuotients; ++q)
-          offsets[q] = record_count;
-        for (std::uint32_t q = segment_quotient + 1u; q < kEpochQuotients; ++q)
-          quotient_live[q] = 0u;
-      }
-      quotient_live[segment_quotient] = count;
+    for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit) {
+      const unsigned local =
+          __ballot_sync(full, valid && ((subgroup >> bit) & 1u));
+      if (lane == 0)
+        subgroup_masks[base + bit] = (local & segment) >> start_lane;
     }
     starts_mask &= starts_mask - 1u;
+  }
+}
+
+// Lengths, live counts, and transition size classes.
+__global__ void run_finalize_metadata_kernel(const std::uint32_t *offsets,
+                                             std::uint32_t *quotient_live,
+                                             std::uint32_t *quotient_count_sum,
+                                             std::uint32_t *class_list,
+                                             std::uint32_t *class_count) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  const std::uint32_t len = offsets[q + 1u] - offsets[q];
+  quotient_live[q] = len;
+  quotient_count_sum[q] = 0u;
+  if (len == 0u || !class_list || !class_count)
+    return;
+  const int cls = len <= 8u ? 0 : len <= 16u ? 1 : len <= 32u ? 2 : 3;
+  class_list[cls * kEpochQuotients + atomicAdd(class_count + cls, 1u)] = q;
+}
+
+// Finish masks for quotients that crossed a warp boundary.
+__global__ void run_pending_masks_kernel(const std::uint32_t *keys,
+                                         const std::uint32_t *offsets,
+                                         const std::uint32_t *pending,
+                                         const std::uint32_t *pending_count,
+                                         std::uint32_t *subgroup_masks) {
+  const std::uint32_t items = pending_count[0];
+  for (std::uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+       item < items; item += gridDim.x * blockDim.x) {
+    const std::uint32_t q = pending[item];
+    const std::uint32_t begin = offsets[q];
+    const std::uint32_t len = offsets[q + 1u] - begin;
+    if (len > 32u)
+      continue;
+    std::uint32_t planes[kEpochSubgroupPlanes] = {};
+    for (std::uint32_t p = 0; p < len; ++p) {
+      const std::uint32_t subgroup =
+          (keys[begin + p] >> (kEpochQuotientBits - kEpochSubgroupBits)) &
+          (kEpochSubgroups - 1u);
+      const std::uint32_t bit_position = 1u << p;
+#pragma unroll
+      for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
+        planes[bit] |= (0u - ((subgroup >> bit) & 1u)) & bit_position;
+    }
+    const std::uint32_t base = q * kEpochSubgroupPlanes;
+#pragma unroll
+    for (int bit = 0; bit < kEpochSubgroupPlanes; ++bit)
+      subgroup_masks[base + bit] = planes[bit];
   }
 }
 
@@ -1724,34 +1898,45 @@ __global__ void succ_rebuild_from_owner_kernel(OwnerView owner,
     return;
   const std::uint64_t *page =
       owner.primary + static_cast<std::size_t>(warp) * kOwnerSlots;
-  std::uint32_t link = kOwnerNoPage;
-  for (;;) {
-    for (int slot = lane; slot < kOwnerSlots; slot += 32) {
-      const std::uint64_t packed = page[slot];
-      if (owner_state(packed) != kOwnerLive)
-        continue;
-      const std::uint32_t key =
-          (warp << kEpochQuotientBits) | owner_low(packed);
-      atomicOr(bits + (key >> 5), 1u << (key & 31u));
-    }
-    link = link == kOwnerNoPage ? owner.heads[warp] : owner.next[link];
-    if (link == kOwnerNoPage)
-      return;
-    page = owner.overflow + static_cast<std::size_t>(link) * kOwnerSlots;
+  for (int slot = lane; slot < kOwnerSlots; slot += 32) {
+    const std::uint64_t packed = page[slot];
+    if (owner_state(packed) != kOwnerLive)
+      continue;
+    const std::uint32_t key = (warp << kEpochQuotientBits) | owner_low(packed);
+    atomicOr(bits + (key >> 5), 1u << (key & 31u));
   }
 }
 
+// Spilled keys are always live: scan the table flat.
+__global__ void succ_rebuild_from_spill_kernel(OwnerView owner,
+                                               std::uint32_t *bits) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i > owner.spill_mask)
+    return;
+  const std::uint64_t token = owner.spill_keys[i];
+  if (token < 2u)
+    return;
+  const std::uint32_t key = static_cast<std::uint32_t>(token - 2u);
+  atomicOr(bits + (key >> 5), 1u << (key & 31u));
+}
+
 // Apply one delta run; owner state decides liveness.
-__global__ void succ_apply_epoch_kernel(OwnerView owner,
-                                        const std::uint32_t *keys,
+// Count deltas encode liveness transitions directly.
+// Relies on runs never holding both +1 and -1 for a key.
+__global__ void succ_apply_epoch_kernel(const std::uint32_t *keys,
+                                        const std::int8_t *count_delta,
                                         std::size_t count,
                                         std::uint32_t *bits) {
   const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count)
     return;
+  const std::int8_t delta = count_delta[i];
+  if (delta == 0)
+    return;
   const std::uint32_t key = keys[i];
   const std::uint32_t mask = 1u << (key & 31u);
-  if (owner_key_live(owner, key))
+  if (delta > 0)
     atomicOr(bits + (key >> 5), mask);
   else
     atomicAnd(bits + (key >> 5), ~mask);
@@ -1836,113 +2021,138 @@ __global__ void succ_query_kernel(const std::uint32_t *queries,
 
 // Combined and padded record counts per quotient shard.
 __global__ void compact_plan_kernel(const RunView *views, int group_count,
-                                    std::uint32_t *combined,
-                                    std::uint32_t *padded) {
+                                    std::uint32_t *combined) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q > kEpochQuotients)
     return;
   if (q == kEpochQuotients) {
     combined[q] = 0u;
-    padded[q] = 0u;
     return;
   }
   std::uint32_t total = 0u;
   for (int e = 0; e < group_count; ++e)
     total += views[e].quotient_off[q + 1u] - views[e].quotient_off[q];
   combined[q] = total;
-  padded[q] =
-      total > kCompactSharedCap ? 1u << (32 - __clz(total - 1u)) : total;
 }
 
-// Concatenate group shard segments into staging.
-__global__ void compact_gather_kernel(const RunView *views, int group_count,
-                                      const std::uint32_t *segoff,
-                                      std::uint32_t *skeys,
-                                      std::uint32_t *svalues,
-                                      std::int8_t *scounts) {
-  const std::uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int lane = threadIdx.x & 31;
-  if (warp >= kEpochQuotients)
-    return;
-  std::uint32_t cursor = segoff[warp];
-  for (int e = 0; e < group_count; ++e) {
-    const std::uint32_t begin = views[e].quotient_off[warp];
-    const std::uint32_t n = views[e].quotient_off[warp + 1u] - begin;
-    for (std::uint32_t i = lane; i < n; i += 32u) {
-      skeys[cursor + i] = views[e].keys[begin + i];
-      svalues[cursor + i] = views[e].values[begin + i];
-      scounts[cursor + i] = views[e].count_delta[begin + i];
+__host__ __device__ inline std::uint64_t
+compact_pack_payload(std::uint32_t value, std::int8_t count) {
+  return (static_cast<std::uint64_t>(value) << 32) |
+         static_cast<std::uint32_t>(static_cast<std::int32_t>(count));
+}
+
+// Stage heavy shards with packed payloads for the sorter.
+__global__ void compact_gather_heavy_kernel(
+    const RunView *views, int group_count, const std::uint32_t *heavy_list,
+    const std::uint32_t *heavy_count, const std::uint32_t *segoff,
+    std::uint32_t *skeys, std::uint64_t *spayload) {
+  const std::uint32_t items = heavy_count[0];
+  for (std::uint32_t item = blockIdx.x; item < items; item += gridDim.x) {
+    const std::uint32_t q = heavy_list[item];
+    std::uint32_t cursor = segoff[q];
+    for (int e = 0; e < group_count; ++e) {
+      const std::uint32_t begin = views[e].quotient_off[q];
+      const std::uint32_t n = views[e].quotient_off[q + 1u] - begin;
+      for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        skeys[cursor + i] = views[e].keys[begin + i];
+        spayload[cursor + i] = compact_pack_payload(
+            views[e].values[begin + i], views[e].count_delta[begin + i]);
+      }
+      cursor += n;
     }
-    cursor += n;
   }
 }
 
-__global__ void compact_pad_kernel(const std::uint32_t *combined,
-                                   const std::uint32_t *segoff,
-                                   std::uint32_t *keys, std::uint32_t *values,
-                                   std::int8_t *counts) {
-  const std::uint32_t q = blockIdx.x;
-  if (q >= kEpochQuotients)
+// Segment bounds of heavy shards for the segmented sort.
+__global__ void compact_heavy_bounds_kernel(const std::uint32_t *heavy_list,
+                                            const std::uint32_t *heavy_count,
+                                            const std::uint32_t *segoff,
+                                            const std::uint32_t *combined,
+                                            std::uint32_t *begins,
+                                            std::uint32_t *ends) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= heavy_count[0])
     return;
-  const std::uint32_t begin = segoff[q] + combined[q];
-  const std::uint32_t end = segoff[q + 1u];
-  for (std::uint32_t p = begin + threadIdx.x; p < end; p += blockDim.x) {
-    keys[p] = kEmptyKey;
-    values[p] = 0u;
-    counts[p] = 0;
+  const std::uint32_t q = heavy_list[i];
+  begins[i] = segoff[q];
+  ends[i] = segoff[q] + combined[q];
+}
+
+// Return sorted heavy segments into primary staging.
+__global__ void compact_heavy_copyback_kernel(
+    const std::uint32_t *heavy_list, const std::uint32_t *heavy_count,
+    const std::uint32_t *segoff, const std::uint32_t *combined,
+    const std::uint32_t *alt_keys, const std::uint64_t *alt_payload,
+    std::uint32_t *skeys, std::uint64_t *spayload) {
+  const std::uint32_t items = heavy_count[0];
+  for (std::uint32_t item = blockIdx.x; item < items; item += gridDim.x) {
+    const std::uint32_t q = heavy_list[item];
+    const std::uint32_t base = segoff[q];
+    const std::uint32_t n = combined[q];
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+      skeys[base + i] = alt_keys[base + i];
+      spayload[base + i] = alt_payload[base + i];
+    }
   }
 }
 
-// Sort light shards in shared memory; mark head flags.
-__global__ void compact_sort_light_kernel(const std::uint32_t *combined,
+// Fused gather plus 16-bit block radix sort per shard.
+constexpr int kCompactThreads = 256;
+constexpr int kCompactItems =
+    static_cast<int>(kCompactSharedCap) / kCompactThreads;
+__global__ void compact_sort_light_kernel(const RunView *views,
+                                          int group_count,
+                                          const std::uint32_t *combined,
                                           const std::uint32_t *segoff,
                                           std::uint32_t *skeys,
-                                          std::uint32_t *svalues,
-                                          std::int8_t *scounts,
-                                          std::uint32_t *flags) {
-  __shared__ std::uint32_t sk[kCompactSharedCap];
-  __shared__ std::uint32_t sv[kCompactSharedCap];
-  __shared__ std::int8_t sc[kCompactSharedCap];
+                                          std::uint64_t *spayload) {
+  using BlockSort = cub::BlockRadixSort<std::uint32_t, kCompactThreads,
+                                        kCompactItems, std::uint64_t>;
+  __shared__ union LightShared {
+    struct {
+      std::uint32_t keys[kCompactSharedCap];
+      std::uint64_t payload[kCompactSharedCap];
+    } stage;
+    typename BlockSort::TempStorage sort;
+  } shared;
   const std::uint32_t q = blockIdx.x;
   const std::uint32_t n = combined[q];
   if (n == 0u || n > kCompactSharedCap)
     return;
-  const std::uint32_t base = segoff[q];
-  const std::uint32_t n2 = n <= 1u ? 1u : 1u << (32 - __clz(n - 1u));
-  for (std::uint32_t i = threadIdx.x; i < n2; i += blockDim.x) {
-    sk[i] = i < n ? skeys[base + i] : kEmptyKey;
-    sv[i] = i < n ? svalues[base + i] : 0u;
-    sc[i] = i < n ? scounts[base + i] : 0;
+  std::uint32_t cursor = 0u;
+  for (int e = 0; e < group_count; ++e) {
+    const std::uint32_t begin = views[e].quotient_off[q];
+    const std::uint32_t len = views[e].quotient_off[q + 1u] - begin;
+    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+      shared.stage.keys[cursor + i] = views[e].keys[begin + i];
+      shared.stage.payload[cursor + i] = compact_pack_payload(
+          views[e].values[begin + i], views[e].count_delta[begin + i]);
+    }
+    cursor += len;
   }
   __syncthreads();
-  for (std::uint32_t size = 2u; size <= n2; size <<= 1) {
-    for (std::uint32_t stride = size >> 1; stride > 0u; stride >>= 1) {
-      for (std::uint32_t i = threadIdx.x; i < n2; i += blockDim.x) {
-        const std::uint32_t peer = i ^ stride;
-        if (peer > i) {
-          const bool ascending = (i & size) == 0u;
-          const std::uint32_t a = sk[i];
-          const std::uint32_t b = sk[peer];
-          if (ascending ? a > b : a < b) {
-            sk[i] = b;
-            sk[peer] = a;
-            const std::uint32_t av = sv[i];
-            sv[i] = sv[peer];
-            sv[peer] = av;
-            const std::int8_t ac = sc[i];
-            sc[i] = sc[peer];
-            sc[peer] = ac;
-          }
-        }
-      }
-      __syncthreads();
-    }
+  // Bit 16 pushes padding past every real low key.
+  std::uint32_t sort_keys[kCompactItems];
+  std::uint64_t sort_payload[kCompactItems];
+#pragma unroll
+  for (int r = 0; r < kCompactItems; ++r) {
+    const std::uint32_t slot =
+        static_cast<std::uint32_t>(threadIdx.x) * kCompactItems + r;
+    sort_keys[r] = slot < n ? shared.stage.keys[slot] & 0xffffu : 0x10000u;
+    sort_payload[r] = slot < n ? shared.stage.payload[slot] : 0u;
   }
-  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-    skeys[base + i] = sk[i];
-    svalues[base + i] = sv[i];
-    scounts[base + i] = sc[i];
-    flags[base + i] = i == 0u || sk[i] != sk[i - 1u] ? 1u : 0u;
+  __syncthreads();
+  BlockSort(shared.sort).Sort(sort_keys, sort_payload, 0, 17);
+  const std::uint32_t base = segoff[q];
+  const std::uint32_t high = q << kEpochQuotientBits;
+#pragma unroll
+  for (int r = 0; r < kCompactItems; ++r) {
+    const std::uint32_t slot =
+        static_cast<std::uint32_t>(threadIdx.x) * kCompactItems + r;
+    if (slot < n) {
+      skeys[base + slot] = high | sort_keys[r];
+      spayload[base + slot] = sort_payload[r];
+    }
   }
 }
 
@@ -1956,90 +2166,36 @@ __global__ void compact_classify_heavy_kernel(const std::uint32_t *combined,
     heavy_list[atomicAdd(heavy_count, 1u)] = q;
 }
 
-// Global-memory bitonic fallback for heavy shards.
-__global__ void compact_sort_heavy_kernel(
-    const std::uint32_t *combined, const std::uint32_t *segoff,
-    const std::uint32_t *heavy_list, const std::uint32_t *heavy_count,
-    std::uint32_t *skeys, std::uint32_t *svalues, std::int8_t *scounts,
-    std::uint32_t *flags) {
-  constexpr std::uint32_t shards = 64u;
-  const std::uint32_t items = heavy_count[0];
-  for (std::uint32_t item = blockIdx.x; item < items; item += shards) {
-    const std::uint32_t q = heavy_list[item];
-    const std::uint32_t n = combined[q];
-    const std::uint32_t base = segoff[q];
-    const std::uint32_t n2 = 1u << (32 - __clz(n - 1u));
-    std::uint32_t *k = skeys + base;
-    std::uint32_t *v = svalues + base;
-    std::int8_t *c = scounts + base;
-    for (std::uint32_t size = 2u; size <= n2; size <<= 1) {
-      for (std::uint32_t stride = size >> 1; stride > 0u; stride >>= 1) {
-        for (std::uint32_t i = threadIdx.x; i < n2; i += blockDim.x) {
-          const std::uint32_t peer = i ^ stride;
-          if (peer > i) {
-            const bool ascending = (i & size) == 0u;
-            const std::uint32_t a = k[i];
-            const std::uint32_t b = k[peer];
-            if (ascending ? a > b : a < b) {
-              k[i] = b;
-              k[peer] = a;
-              const std::uint32_t av = v[i];
-              v[i] = v[peer];
-              v[peer] = av;
-              const std::int8_t ac = c[i];
-              c[i] = c[peer];
-              c[peer] = ac;
-            }
-          }
-        }
-        __syncthreads();
-      }
-    }
-    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
-      flags[base + i] = i == 0u || k[i] != k[i - 1u] ? 1u : 0u;
-    __syncthreads();
-  }
-}
-
-// Reduce heads and discard zero-net records.
-__global__ void compact_reduce_heads_kernel(const std::uint32_t *keys,
-                                            std::uint32_t *values,
-                                            std::int8_t *counts,
-                                            std::uint32_t *flags,
-                                            std::size_t padded_total) {
-  const std::size_t s =
+// Zero-net filter over the reduced duplicate groups.
+__global__ void compact_filter_flags_kernel(const std::uint64_t *payload,
+                                            const int *num_runs,
+                                            std::size_t total,
+                                            std::uint32_t *flags) {
+  const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (s >= padded_total || flags[s] == 0u)
+  if (i >= total)
     return;
-  const std::uint32_t key = keys[s];
-  std::uint32_t value = values[s];
-  std::int32_t count = counts[s];
-  for (std::size_t j = s + 1u;
-       j < padded_total && keys[j] == key && flags[j] == 0u; ++j) {
-    value += values[j];
-    count += counts[j];
-  }
-  values[s] = value;
-  counts[s] = static_cast<std::int8_t>(count);
-  flags[s] = value != 0u || count != 0 ? 1u : 0u;
+  const std::size_t runs = static_cast<std::size_t>(num_runs[0]);
+  flags[i] = i < runs && payload[i] != 0u ? 1u : 0u;
 }
 
-// Combine duplicate keys; write the merged delta run.
+// Unpack surviving records into the merged delta run.
 __global__ void
-compact_scatter_kernel(const std::uint32_t *skeys, const std::uint32_t *svalues,
-                       const std::int8_t *scounts, const std::uint32_t *flags,
-                       const std::uint32_t *pos, std::size_t padded_total,
-                       std::uint32_t *out_keys, std::uint32_t *out_values,
-                       std::int8_t *out_counts) {
-  const std::size_t s =
+compact_scatter_kernel(const std::uint32_t *unique_keys,
+                       const std::uint64_t *unique_payload,
+                       const std::uint32_t *flags, const std::uint32_t *pos,
+                       std::size_t total, std::uint32_t *out_keys,
+                       std::uint32_t *out_values, std::int8_t *out_counts) {
+  const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (s >= padded_total || flags[s] == 0u)
+  if (i >= total || flags[i] == 0u)
     return;
-  const std::uint32_t key = skeys[s];
-  const std::uint32_t p = pos[s];
-  out_keys[p] = key;
-  out_values[p] = svalues[s];
-  out_counts[p] = scounts[s];
+  const std::uint64_t payload = unique_payload[i];
+  const std::uint32_t p = pos[i];
+  out_keys[p] = unique_keys[i];
+  out_values[p] = static_cast<std::uint32_t>(payload >> 32);
+  out_counts[p] = static_cast<std::int8_t>(
+      static_cast<std::int32_t>(static_cast<std::uint32_t>(payload)));
 }
 
 __global__ void compact_unique_count_kernel(const std::uint32_t *flags,
@@ -2055,56 +2211,133 @@ __global__ void compact_unique_count_kernel(const std::uint32_t *flags,
   }
   counts[group] = pos[capacity - 1u] + flags[capacity - 1u];
 }
-// Fill active run columns in transposed tables.
+// 8 runs x 32 quotients tiles: both sides coalesce.
+constexpr int kTransposeRuns = 8;
+constexpr int kTransposeQuots = 32;
 __global__ void run_transpose_meta_kernel(const RunView *epochs,
                                           int epoch_count, int skip_run,
                                           std::uint32_t *off_t,
                                           std::uint32_t *vp_t,
                                           std::uint32_t *cp_t) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  constexpr std::size_t rows = kEpochQuotients + 1;
-  if (i >= rows * static_cast<std::size_t>(epoch_count))
-    return;
-  const std::uint32_t epoch = static_cast<std::uint32_t>(i % epoch_count);
-  const std::uint32_t q = static_cast<std::uint32_t>(i / epoch_count);
-  const std::uint32_t slot = epoch;
-  const std::size_t dst = static_cast<std::size_t>(q) * kRunStride + slot;
-  if (static_cast<int>(epoch) == skip_run) {
-    off_t[dst] = 0u;
+  __shared__ std::uint32_t t_off[kTransposeRuns][kTransposeQuots + 1];
+  __shared__ std::uint32_t t_vp[kTransposeRuns][kTransposeQuots + 1];
+  __shared__ std::uint32_t t_cp[kTransposeRuns][kTransposeQuots + 1];
+  constexpr std::uint32_t rows = kEpochQuotients + 1;
+  const std::uint32_t run_tiles =
+      (static_cast<std::uint32_t>(epoch_count) + kTransposeRuns - 1u) /
+      kTransposeRuns;
+  const std::uint32_t q_base =
+      (blockIdx.x / run_tiles) * kTransposeQuots;
+  const std::uint32_t r_base =
+      (blockIdx.x % run_tiles) * kTransposeRuns;
+  const int rr = threadIdx.x / kTransposeQuots;
+  const int qq = threadIdx.x % kTransposeQuots;
+  const std::uint32_t run = r_base + static_cast<std::uint32_t>(rr);
+  const std::uint32_t q = q_base + static_cast<std::uint32_t>(qq);
+  std::uint32_t off = 0u;
+  std::uint32_t vp = 0u;
+  std::uint32_t cp = 0u;
+  if (run < static_cast<std::uint32_t>(epoch_count) &&
+      static_cast<int>(run) != skip_run && q < rows) {
+    off = epochs[run].quotient_off[q];
     if (q < kEpochQuotients) {
-      vp_t[dst] = 0u;
+      vp = epochs[run].quotient_value_prefix[q];
       if (cp_t)
-        cp_t[dst] = 0u;
+        cp = epochs[run].quotient_count_prefix[q];
     }
-    return;
   }
-  const RunView ev = epochs[epoch];
-  off_t[dst] = ev.quotient_off[q];
-  if (q >= kEpochQuotients)
+  t_off[rr][qq] = off;
+  t_vp[rr][qq] = vp;
+  t_cp[rr][qq] = cp;
+  __syncthreads();
+  const int wq = threadIdx.x / kTransposeRuns;
+  const int wr = threadIdx.x % kTransposeRuns;
+  const std::uint32_t out_q = q_base + static_cast<std::uint32_t>(wq);
+  const std::uint32_t out_run = r_base + static_cast<std::uint32_t>(wr);
+  if (out_q >= rows || out_run >= static_cast<std::uint32_t>(epoch_count))
     return;
-  vp_t[dst] = ev.quotient_value_prefix[q];
+  const std::size_t dst =
+      static_cast<std::size_t>(out_q) * kRunStride + out_run;
+  off_t[dst] = t_off[wr][wq];
+  if (out_q >= kEpochQuotients)
+    return;
+  vp_t[dst] = t_vp[wr][wq];
   if (cp_t)
-    cp_t[dst] = ev.quotient_count_prefix[q];
+    cp_t[dst] = t_cp[wr][wq];
 }
 
 __global__ void run_transpose_count_kernel(const RunView *epochs,
                                            int epoch_count, int skip_run,
                                            std::uint32_t *cp_t) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::size_t total =
-      static_cast<std::size_t>(kEpochQuotients) * epoch_count;
-  if (i >= total)
+  __shared__ std::uint32_t t_cp[kTransposeRuns][kTransposeQuots + 1];
+  const std::uint32_t run_tiles =
+      (static_cast<std::uint32_t>(epoch_count) + kTransposeRuns - 1u) /
+      kTransposeRuns;
+  const std::uint32_t q_base =
+      (blockIdx.x / run_tiles) * kTransposeQuots;
+  const std::uint32_t r_base =
+      (blockIdx.x % run_tiles) * kTransposeRuns;
+  const int rr = threadIdx.x / kTransposeQuots;
+  const int qq = threadIdx.x % kTransposeQuots;
+  const std::uint32_t run = r_base + static_cast<std::uint32_t>(rr);
+  const std::uint32_t q = q_base + static_cast<std::uint32_t>(qq);
+  std::uint32_t cp = 0u;
+  if (run < static_cast<std::uint32_t>(epoch_count) &&
+      static_cast<int>(run) != skip_run && q < kEpochQuotients)
+    cp = epochs[run].quotient_count_prefix[q];
+  t_cp[rr][qq] = cp;
+  __syncthreads();
+  const int wq = threadIdx.x / kTransposeRuns;
+  const int wr = threadIdx.x % kTransposeRuns;
+  const std::uint32_t out_q = q_base + static_cast<std::uint32_t>(wq);
+  const std::uint32_t out_run = r_base + static_cast<std::uint32_t>(wr);
+  if (out_q >= kEpochQuotients ||
+      out_run >= static_cast<std::uint32_t>(epoch_count))
     return;
-  const std::uint32_t epoch = static_cast<std::uint32_t>(i % epoch_count);
-  const std::uint32_t q = static_cast<std::uint32_t>(i / epoch_count);
-  const std::size_t dst = static_cast<std::size_t>(q) * kRunStride + epoch;
-  if (static_cast<int>(epoch) == skip_run) {
-    cp_t[dst] = 0u;
+  cp_t[static_cast<std::size_t>(out_q) * kRunStride + out_run] =
+      t_cp[wr][wq];
+}
+
+// Pack 32/W queries per warp for small run counts.
+__global__ void run_subwarp_range_kernel(
+    const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_sums,
+    std::uint32_t *out_counts, std::size_t query_count,
+    const LogicalRunView *runs, int run_count, int width,
+    const std::uint32_t *off_t, const std::uint32_t *vp_t,
+    const std::uint32_t *cp_t) {
+  const int lane = threadIdx.x & 31;
+  const int sub = lane / width;
+  const int s = lane % width;
+  const unsigned sub_bits =
+      width == 32 ? 0xffffffffu : (1u << width) - 1u;
+  const unsigned sub_mask = sub_bits << (sub * width);
+  const std::size_t query =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
+      static_cast<std::size_t>(width);
+  if (query >= query_count)
     return;
+  const std::uint32_t l = lo[query];
+  const std::uint32_t h = hi[query];
+  std::uint32_t sum = 0u;
+  std::uint32_t count = 0u;
+  if (l <= h && s < run_count) {
+    const LogicalRunView run = runs[s];
+    sum = logical_run_sum_transposed(run, off_t, vp_t,
+                                     static_cast<std::uint32_t>(s), l, h);
+    if (out_counts) {
+      count = logical_run_count_transposed(
+          run, off_t, cp_t, static_cast<std::uint32_t>(s), l, h);
+    }
   }
-  cp_t[dst] = epochs[epoch].quotient_count_prefix[q];
+  for (int offset = width / 2; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(sub_mask, sum, offset, width);
+    count += __shfl_down_sync(sub_mask, count, offset, width);
+  }
+  if (s == 0) {
+    out_sums[query] = sum;
+    if (out_counts)
+      out_counts[query] = count;
+  }
 }
 
 // One block per query; one thread per logical run.
@@ -2299,8 +2532,6 @@ public:
     }
   }
 
-  void finish_pending_delete(cudaStream_t) {}
-
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
@@ -2464,12 +2695,13 @@ public:
         run_merge_keys_, sorted_value_prefix_, sorted_count_prefix_,
         sorted_radix_, sorted_range_cdf_, sorted_micro_base_,
         sorted_micro_offsets_, sorted_micro_bits_, owner_primary_,
-        owner_overflow_, owner_heads_, owner_next_, owner_page_alloc_,
-        owner_error_, owner_quotient_live_, merge_ops_, logical_run_views_,
+        owner_spill_keys_, owner_spill_values_, owner_spill_count_,
+        owner_quotient_live_, merge_ops_, logical_run_views_,
         run_off_t_, run_vp_t_, run_cp_t_, succ_bits_, compact_views_,
-        compact_combined_, compact_padded_, compact_segoff_,
-        compact_heavy_list_, compact_heavy_count_, compact_keys_,
-        compact_values_, compact_counts_, compact_flags_, compact_pos_,
+        compact_combined_, compact_segoff_, compact_heavy_list_,
+        compact_heavy_count_, compact_heavy_begin_, compact_heavy_end_,
+        compact_keys_, compact_payload_, compact_alt_keys_,
+        compact_alt_payload_, compact_num_runs_, compact_flags_, compact_pos_,
         compact_group_unique_, compact_output_keys_, compact_output_values_,
         compact_output_counts_);
     for (const auto &epoch : runs_)
@@ -2586,47 +2818,41 @@ private:
   }
 
   gpulsmopt_detail::OwnerView make_owner_view() {
-    return {owner_primary_.data(),       owner_overflow_.data(),
-            owner_heads_.data(),         owner_next_.data(),
-            owner_page_alloc_.data(),    owner_error_.data(),
-            owner_quotient_live_.data(), owner_page_capacity_};
+    return {owner_primary_.data(),     owner_spill_keys_.data(),
+            owner_spill_values_.data(), owner_spill_count_.data(),
+            owner_quotient_live_.data(),
+            static_cast<std::uint64_t>(owner_spill_slots_ - 1u)};
   }
 
-  void initialize_owner_storage(cudaStream_t stream) {
+  void initialize_owner_storage(cudaStream_t stream,
+                                bool clear_primary = true) {
     const std::size_t primary_count =
         static_cast<std::size_t>(gpulsmopt_detail::kEpochQuotients) *
         gpulsmopt_detail::kOwnerSlots;
     const std::size_t capacity =
         std::max({std::size_t{1}, max_elements_, batch_capacity_});
-    const std::size_t pages = (capacity + gpulsmopt_detail::kOwnerSlots - 1u) /
-                              gpulsmopt_detail::kOwnerSlots;
-    if (pages > std::numeric_limits<std::uint32_t>::max())
-      throw std::runtime_error("owner page capacity overflow");
-    owner_page_capacity_ = static_cast<std::uint32_t>(pages);
+    // Below 50% load: two spill slots per possible key.
+    std::size_t spill_slots = 1;
+    while (spill_slots < capacity * 2u)
+      spill_slots <<= 1;
+    owner_spill_slots_ = spill_slots;
     owner_primary_.resize_discard_exact(primary_count);
-    owner_overflow_.resize_discard_exact(pages * gpulsmopt_detail::kOwnerSlots);
-    owner_heads_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients);
-    owner_next_.resize_discard_exact(pages);
-    owner_page_alloc_.resize_discard_exact(1);
-    owner_error_.resize_discard_exact(1);
+    owner_spill_keys_.resize_discard_exact(spill_slots);
+    owner_spill_values_.resize_discard_exact(spill_slots);
+    owner_spill_count_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients);
     owner_quotient_live_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients);
-    CUDA_CHECK(cudaMemsetAsync(owner_primary_.data(), 0,
-                               owner_primary_.size() * sizeof(std::uint64_t),
+    if (clear_primary) {
+      CUDA_CHECK(cudaMemsetAsync(owner_primary_.data(), 0,
+                                 owner_primary_.size() * sizeof(std::uint64_t),
+                                 stream));
+    }
+    CUDA_CHECK(cudaMemsetAsync(owner_spill_keys_.data(), 0,
+                               spill_slots * sizeof(std::uint64_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(owner_spill_count_.data(), 0,
+                               gpulsmopt_detail::kEpochQuotients *
+                                   sizeof(std::uint32_t),
                                stream));
-    CUDA_CHECK(cudaMemsetAsync(owner_overflow_.data(), 0,
-                               owner_overflow_.size() * sizeof(std::uint64_t),
-                               stream));
-    CUDA_CHECK(cudaMemsetAsync(owner_heads_.data(), 0xff,
-                               owner_heads_.size() * sizeof(std::uint32_t),
-                               stream));
-    CUDA_CHECK(cudaMemsetAsync(owner_next_.data(), 0xff,
-                               owner_next_.size() * sizeof(std::uint32_t),
-                               stream));
-    CUDA_CHECK(cudaMemsetAsync(owner_page_alloc_.data(), 0,
-                               sizeof(std::uint32_t), stream));
-    CUDA_CHECK(
-        cudaMemsetAsync(owner_error_.data(), 0, sizeof(std::uint32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(
         owner_quotient_live_.data(), 0,
         owner_quotient_live_.size() * sizeof(std::uint32_t), stream));
@@ -2634,14 +2860,16 @@ private:
   }
 
   void build_owner_index(cudaStream_t stream) {
-    initialize_owner_storage(stream);
-    if (runs_.empty())
+    // The build kernel writes every primary slot itself.
+    const bool have_run = !runs_.empty();
+    initialize_owner_storage(stream, !have_run);
+    if (!have_run)
       return;
     RunStorage &run = runs_.front();
-    gpulsmopt_detail::
-        owner_build_kernel<<<gpulsmopt_detail::kEpochQuotients, 1, 0, stream>>>(
-            make_owner_view(), run.keys.data(), run.values.data(),
-            run.quotient_off.data());
+    gpulsmopt_detail::owner_build_kernel<<<gpulsmopt_detail::kEpochQuotients,
+                                           256, 0, stream>>>(
+        make_owner_view(), run.keys.data(), run.values.data(),
+        run.quotient_off.data());
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -2650,18 +2878,13 @@ private:
       CUDA_CHECK(cudaMemsetAsync(owner_primary_.data(), 0,
                                  owner_primary_.size() * sizeof(std::uint64_t),
                                  stream));
-      CUDA_CHECK(cudaMemsetAsync(owner_overflow_.data(), 0,
-                                 owner_overflow_.size() * sizeof(std::uint64_t),
+      CUDA_CHECK(cudaMemsetAsync(owner_spill_keys_.data(), 0,
+                                 owner_spill_keys_.size() *
+                                     sizeof(std::uint64_t),
                                  stream));
-      CUDA_CHECK(cudaMemsetAsync(owner_heads_.data(), 0xff,
-                                 owner_heads_.size() * sizeof(std::uint32_t),
-                                 stream));
-      CUDA_CHECK(cudaMemsetAsync(owner_next_.data(), 0xff,
-                                 owner_next_.size() * sizeof(std::uint32_t),
-                                 stream));
-      CUDA_CHECK(cudaMemsetAsync(owner_page_alloc_.data(), 0,
-                                 sizeof(std::uint32_t), stream));
-      CUDA_CHECK(cudaMemsetAsync(owner_error_.data(), 0, sizeof(std::uint32_t),
+      CUDA_CHECK(cudaMemsetAsync(owner_spill_count_.data(), 0,
+                                 owner_spill_count_.size() *
+                                     sizeof(std::uint32_t),
                                  stream));
       CUDA_CHECK(cudaMemsetAsync(
           owner_quotient_live_.data(), 0,
@@ -2965,8 +3188,11 @@ private:
     range_delta_keys_.resize_discard(physical_count);
     range_delta_values_.resize_discard(physical_count);
     if (physical_count > 0) {
+      // Block per quotient: bins write contiguously.
       gpulsmopt_detail::
-          range_delta_pack_kernel<<<quotient_grid, block, 0, stream>>>(
+          range_delta_pack_kernel<<<gpulsmopt_detail::kEpochQuotients,
+                                    gpulsmopt_detail::kPackThreads, 0,
+                                    stream>>>(
               run_view_ptr(), active_run_count(), skip_run,
               range_delta_offsets_.data(), range_delta_keys_.data(),
               range_delta_values_.data());
@@ -3060,14 +3286,37 @@ private:
     epoch.heavy_count.resize_discard(1);
   }
 
+  void reverse_min_scan_offsets(std::uint32_t *offsets, cudaStream_t stream) {
+    constexpr int items = gpulsmopt_detail::kEpochQuotients + 1;
+    auto reverse = thrust::make_reverse_iterator(
+        thrust::device_pointer_cast(offsets + items));
+    if (metadata_scan_temp_bytes_ == 0u) {
+      CUDA_CHECK(cub::DeviceScan::InclusiveScan(
+          nullptr, metadata_scan_temp_bytes_, reverse, reverse,
+          thrust::minimum<std::uint32_t>(), items, stream));
+      ensure_sort_temp(metadata_scan_temp_bytes_);
+    }
+    std::size_t temp_bytes = metadata_scan_temp_bytes_;
+    CUDA_CHECK(cub::DeviceScan::InclusiveScan(
+        sort_temp_storage_.data(), temp_bytes, reverse, reverse,
+        thrust::minimum<std::uint32_t>(), items, stream));
+  }
+
   void launch_run_metadata_kernels(RunStorage &epoch, std::size_t count,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream,
+                                   bool build_owner_classes) {
     constexpr int block = 256;
     const std::uint32_t *keys = epoch.keys.data();
     std::uint32_t record_count = static_cast<std::uint32_t>(count);
     std::uint32_t *offsets = epoch.quotient_off.data();
     std::uint32_t *subgroup_masks = epoch.subgroup_masks.data();
     std::uint32_t *quotient_live = epoch.quotient_live.data();
+    if (build_owner_classes) {
+      owner_class_list_.resize_discard(4u * gpulsmopt_detail::kEpochQuotients);
+      owner_class_count_.resize_discard(4);
+      CUDA_CHECK(cudaMemsetAsync(owner_class_count_.data(), 0,
+                                 4u * sizeof(std::uint32_t), stream));
+    }
     if (record_count == 0u) {
       CUDA_CHECK(cudaMemsetAsync(offsets, 0,
                                  (gpulsmopt_detail::kEpochQuotients + 1u) *
@@ -3083,10 +3332,30 @@ private:
           gpulsmopt_detail::kEpochQuotients * sizeof(std::uint32_t), stream));
       return;
     }
+    meta_pending_list_.resize_discard((count + 31u) / 32u + 1u);
+    meta_pending_count_.resize_discard(1);
+    CUDA_CHECK(cudaMemsetAsync(offsets, 0xff,
+                               (gpulsmopt_detail::kEpochQuotients + 1u) *
+                                   sizeof(std::uint32_t),
+                               stream));
+    CUDA_CHECK(cudaMemsetAsync(meta_pending_count_.data(), 0,
+                               sizeof(std::uint32_t), stream));
     const int grid = static_cast<int>((record_count + block - 1) / block);
+    gpulsmopt_detail::run_boundary_scatter_kernel<<<grid, block, 0, stream>>>(
+        keys, record_count, offsets, subgroup_masks, meta_pending_list_.data(),
+        meta_pending_count_.data());
+    CUDA_CHECK(cudaGetLastError());
+    reverse_min_scan_offsets(offsets, stream);
+    constexpr int finalize_grid = gpulsmopt_detail::kEpochQuotients / block;
     gpulsmopt_detail::
-        epoch_quotient_metadata_kernel<<<grid, block, 0, stream>>>(
-            keys, record_count, offsets, subgroup_masks, quotient_live);
+        run_finalize_metadata_kernel<<<finalize_grid, block, 0, stream>>>(
+            offsets, quotient_live, epoch.quotient_count_sum.data(),
+            build_owner_classes ? owner_class_list_.data() : nullptr,
+            build_owner_classes ? owner_class_count_.data() : nullptr);
+    CUDA_CHECK(cudaGetLastError());
+    gpulsmopt_detail::run_pending_masks_kernel<<<256, block, 0, stream>>>(
+        keys, offsets, meta_pending_list_.data(), meta_pending_count_.data(),
+        subgroup_masks);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -3096,16 +3365,55 @@ private:
                                gpulsmopt_detail::kInsert),
                            bool apply_owner = true) {
     prepare_run_metadata_storage(epoch);
-    launch_run_metadata_kernels(epoch, epoch.count, stream);
+    const bool adaptive_owner =
+        apply_owner &&
+        epoch.count <= gpulsmopt_detail::kAdaptiveTransitionMaxRecords;
+    launch_run_metadata_kernels(epoch, epoch.count, stream, adaptive_owner);
     if (apply_owner) {
       if (!owner_ready_)
         throw std::runtime_error("owner directory is not initialized");
-      gpulsmopt_detail::owner_transition_kernel<<<
-          gpulsmopt_detail::kEpochQuotients, 32, 0, stream>>>(
-          make_owner_view(), epoch.keys.data(), epoch.values.data(), ops,
-          constant_op, epoch.quotient_off.data(), epoch.count_delta.data(),
-          epoch.quotient_count_sum.data());
-      CUDA_CHECK(cudaGetLastError());
+      const auto owner_view = make_owner_view();
+      if (!adaptive_owner) {
+        gpulsmopt_detail::owner_transition_quotient_kernel<<<
+            gpulsmopt_detail::kEpochQuotients, 32, 0, stream>>>(
+            owner_view, epoch.keys.data(), epoch.values.data(), ops,
+            constant_op, epoch.quotient_off.data(), epoch.count_delta.data(),
+            epoch.quotient_count_sum.data());
+        CUDA_CHECK(cudaGetLastError());
+      } else {
+        const std::uint32_t *cls = owner_class_list_.data();
+        const std::uint32_t *cnt = owner_class_count_.data();
+        constexpr int block = 256;
+        constexpr int quotients = gpulsmopt_detail::kEpochQuotients;
+        gpulsmopt_detail::owner_transition_subwarp_kernel<8>
+            <<<1024, block, 0, stream>>>(
+                owner_view, epoch.keys.data(), epoch.values.data(), ops,
+                constant_op, epoch.quotient_off.data(),
+                epoch.count_delta.data(), epoch.quotient_count_sum.data(), cls,
+                cnt);
+        CUDA_CHECK(cudaGetLastError());
+        gpulsmopt_detail::owner_transition_subwarp_kernel<16>
+            <<<1024, block, 0, stream>>>(
+                owner_view, epoch.keys.data(), epoch.values.data(), ops,
+                constant_op, epoch.quotient_off.data(),
+                epoch.count_delta.data(), epoch.quotient_count_sum.data(),
+                cls + quotients, cnt + 1);
+        CUDA_CHECK(cudaGetLastError());
+        gpulsmopt_detail::owner_transition_subwarp_kernel<32>
+            <<<1024, block, 0, stream>>>(
+                owner_view, epoch.keys.data(), epoch.values.data(), ops,
+                constant_op, epoch.quotient_off.data(),
+                epoch.count_delta.data(), epoch.quotient_count_sum.data(),
+                cls + 2 * quotients, cnt + 2);
+        CUDA_CHECK(cudaGetLastError());
+        gpulsmopt_detail::
+            owner_transition_dense_kernel<<<1024, block, 0, stream>>>(
+                owner_view, epoch.keys.data(), epoch.values.data(), ops,
+                constant_op, epoch.quotient_off.data(),
+                epoch.count_delta.data(), epoch.quotient_count_sum.data(),
+                cls + 3 * quotients, cnt + 3);
+        CUDA_CHECK(cudaGetLastError());
+      }
     } else {
       constexpr int block = 256;
       constexpr int grid = gpulsmopt_detail::kEpochQuotients / block;
@@ -3322,30 +3630,48 @@ private:
 
     const std::size_t input_capacity =
         compact_output_capacity_ + tail_runs * run_capacity;
-    const std::size_t padded_capacity = input_capacity * 2u;
     compact_views_.resize_discard_exact(gpulsmopt_detail::kCompactMergeRuns);
     compact_combined_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients +
                                            1u);
-    compact_padded_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients +
-                                         1u);
     compact_segoff_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients +
                                          1u);
-    compact_keys_.resize_discard_exact(padded_capacity);
-    compact_values_.resize_discard_exact(padded_capacity);
-    compact_counts_.resize_discard_exact(padded_capacity);
-    compact_flags_.resize_discard_exact(padded_capacity);
-    compact_pos_.resize_discard_exact(padded_capacity);
+    compact_keys_.resize_discard_exact(input_capacity);
+    compact_payload_.resize_discard_exact(input_capacity);
+    compact_alt_keys_.resize_discard_exact(input_capacity);
+    compact_alt_payload_.resize_discard_exact(input_capacity);
+    compact_flags_.resize_discard_exact(input_capacity);
+    compact_pos_.resize_discard_exact(input_capacity);
     compact_heavy_list_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients);
     compact_heavy_count_.resize_discard_exact(1u);
+    compact_heavy_begin_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients);
+    compact_heavy_end_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients);
+    compact_num_runs_.resize_discard_exact(1u);
     compact_group_unique_.resize_discard_exact(1u);
 
-    if (padded_capacity <= scan_u32_count_)
+    // Prewarm CUB temp storage for the compaction pipeline.
+    std::size_t seg_bytes = 0u;
+    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+        nullptr, seg_bytes, compact_keys_.data(), compact_alt_keys_.data(),
+        compact_payload_.data(), compact_alt_payload_.data(),
+        static_cast<int>(input_capacity),
+        gpulsmopt_detail::kEpochQuotients, compact_heavy_begin_.data(),
+        compact_heavy_end_.data(), 0, 16, stream));
+    std::size_t reduce_bytes = 0u;
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+        nullptr, reduce_bytes, compact_keys_.data(), compact_alt_keys_.data(),
+        compact_payload_.data(), compact_alt_payload_.data(),
+        compact_num_runs_.data(), gpulsmopt_detail::SumDeltaPayload{},
+        static_cast<int>(input_capacity), stream));
+    ensure_sort_temp(std::max(seg_bytes, reduce_bytes));
+
+    if (input_capacity <= scan_u32_count_)
       return;
     std::size_t temp_bytes = 0u;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, temp_bytes, compact_flags_.data(), compact_pos_.data(),
-        static_cast<int>(padded_capacity), stream));
-    scan_u32_count_ = padded_capacity;
+        static_cast<int>(input_capacity), stream));
+    scan_u32_count_ = input_capacity;
     scan_u32_temp_bytes_ = temp_bytes;
     ensure_sort_temp(temp_bytes);
   }
@@ -3441,8 +3767,6 @@ private:
       CUDA_CHECK(cudaGetLastError());
     }
     c0_log_count_ = static_cast<std::uint32_t>(new_total);
-    if (op == static_cast<std::uint8_t>(gpulsmopt_detail::kInsert))
-      c0_insert_count_ += static_cast<std::uint32_t>(count);
     return true;
   }
 
@@ -3450,7 +3774,6 @@ private:
     if (c0_log_count_ == 0)
       return;
     c0_log_count_ = 0;
-    c0_insert_count_ = 0;
     c0_kind_ = RunKind::empty;
     (void)stream;
   }
@@ -3568,6 +3891,11 @@ private:
         max_elements_, std::max(4 * c0_flush_budget(), batch_capacity_));
     ensure_c0_log(stream);
     reserve_run_storage(direct_count);
+    owner_class_list_.resize_discard_exact(4u *
+                                           gpulsmopt_detail::kEpochQuotients);
+    owner_class_count_.resize_discard_exact(4u);
+    meta_pending_list_.resize_discard_exact((direct_count + 31u) / 32u + 1u);
+    meta_pending_count_.resize_discard_exact(1u);
     prepare_sort_storage(direct_count, c0_flush_budget(), stream);
     reserve_compaction_storage(direct_count, stream);
     prebind_run_views(stream);
@@ -3717,8 +4045,9 @@ private:
         static_cast<std::size_t>(std::numeric_limits<int>::max() / 2)) {
       throw std::runtime_error("compaction group is too large");
     }
-    const std::size_t capacity = group.total * 2u;
-    if (capacity > compact_keys_.capacity()) {
+    // Exact record count: no padded tail work anywhere.
+    const std::size_t total = group.total;
+    if (total > compact_keys_.capacity()) {
       throw std::runtime_error("compaction workspace was not preallocated");
     }
     constexpr int block = 256;
@@ -3726,15 +4055,18 @@ private:
     const std::size_t group_count = group.end - group.begin;
     compact_views_.resize_discard(group_count);
     compact_combined_.resize_discard(rows);
-    compact_padded_.resize_discard(rows);
     compact_segoff_.resize_discard(rows);
-    compact_keys_.resize_discard(capacity);
-    compact_values_.resize_discard(capacity);
-    compact_counts_.resize_discard(capacity);
-    compact_flags_.resize_discard(capacity);
-    compact_pos_.resize_discard(capacity);
+    compact_keys_.resize_discard(total);
+    compact_payload_.resize_discard(total);
+    compact_alt_keys_.resize_discard(total);
+    compact_alt_payload_.resize_discard(total);
+    compact_flags_.resize_discard(total);
+    compact_pos_.resize_discard(total);
     compact_heavy_list_.resize_discard(gpulsmopt_detail::kEpochQuotients);
     compact_heavy_count_.resize_discard(1u);
+    compact_heavy_begin_.resize_discard(gpulsmopt_detail::kEpochQuotients);
+    compact_heavy_end_.resize_discard(gpulsmopt_detail::kEpochQuotients);
+    compact_num_runs_.resize_discard(1u);
     compact_group_unique_.resize_discard(1u);
 
     std::vector<gpulsmopt_detail::RunView> views;
@@ -3748,57 +4080,88 @@ private:
     const int plan_grid = static_cast<int>((rows + block - 1u) / block);
     gpulsmopt_detail::compact_plan_kernel<<<plan_grid, block, 0, stream>>>(
         compact_views_.data(), static_cast<int>(views.size()),
-        compact_combined_.data(), compact_padded_.data());
+        compact_combined_.data());
     CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(compact_padded_.data(), compact_segoff_.data(), rows,
+    exclusive_scan_u32(compact_combined_.data(), compact_segoff_.data(), rows,
                        stream);
-    CUDA_CHECK(cudaMemsetAsync(compact_keys_.data(), 0xff,
-                               capacity * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(compact_flags_.data(), 0,
-                               capacity * sizeof(std::uint32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(compact_heavy_count_.data(), 0,
                                sizeof(std::uint32_t), stream));
-
-    const int gather_grid = gpulsmopt_detail::kEpochQuotients * 32 / block;
-    gpulsmopt_detail::compact_gather_kernel<<<gather_grid, block, 0, stream>>>(
-        compact_views_.data(), static_cast<int>(views.size()),
-        compact_segoff_.data(), compact_keys_.data(), compact_values_.data(),
-        compact_counts_.data());
-    CUDA_CHECK(cudaGetLastError());
-    gpulsmopt_detail::compact_pad_kernel<<<gpulsmopt_detail::kEpochQuotients,
-                                           block, 0, stream>>>(
-        compact_combined_.data(), compact_segoff_.data(), compact_keys_.data(),
-        compact_values_.data(), compact_counts_.data());
-    CUDA_CHECK(cudaGetLastError());
-    gpulsmopt_detail::compact_sort_light_kernel<<<
-        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
-        compact_combined_.data(), compact_segoff_.data(), compact_keys_.data(),
-        compact_values_.data(), compact_counts_.data(), compact_flags_.data());
-    CUDA_CHECK(cudaGetLastError());
-
     const int classify_grid = gpulsmopt_detail::kEpochQuotients / block;
     gpulsmopt_detail::
         compact_classify_heavy_kernel<<<classify_grid, block, 0, stream>>>(
             compact_combined_.data(), compact_heavy_list_.data(),
             compact_heavy_count_.data());
     CUDA_CHECK(cudaGetLastError());
-    gpulsmopt_detail::compact_sort_heavy_kernel<<<64, block, 0, stream>>>(
-        compact_combined_.data(), compact_segoff_.data(),
+    std::uint32_t heavy_items = 0u;
+    CUDA_CHECK(cudaMemcpyAsync(&heavy_items, compact_heavy_count_.data(),
+                               sizeof(heavy_items), cudaMemcpyDeviceToHost,
+                               stream));
+    gpulsmopt_detail::compact_sort_light_kernel<<<
+        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
+        compact_views_.data(), static_cast<int>(views.size()),
+        compact_combined_.data(), compact_segoff_.data(), compact_keys_.data(),
+        compact_payload_.data());
+    CUDA_CHECK(cudaGetLastError());
+    gpulsmopt_detail::compact_gather_heavy_kernel<<<64, block, 0, stream>>>(
+        compact_views_.data(), static_cast<int>(views.size()),
         compact_heavy_list_.data(), compact_heavy_count_.data(),
-        compact_keys_.data(), compact_values_.data(), compact_counts_.data(),
-        compact_flags_.data());
+        compact_segoff_.data(), compact_keys_.data(),
+        compact_payload_.data());
     CUDA_CHECK(cudaGetLastError());
-
-    const int item_grid = static_cast<int>((capacity + block - 1u) / block);
     gpulsmopt_detail::
-        compact_reduce_heads_kernel<<<item_grid, block, 0, stream>>>(
-            compact_keys_.data(), compact_values_.data(),
-            compact_counts_.data(), compact_flags_.data(), capacity);
+        compact_heavy_bounds_kernel<<<classify_grid, block, 0, stream>>>(
+            compact_heavy_list_.data(), compact_heavy_count_.data(),
+            compact_segoff_.data(), compact_combined_.data(),
+            compact_heavy_begin_.data(), compact_heavy_end_.data());
     CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(compact_flags_.data(), compact_pos_.data(), capacity,
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (heavy_items > 0u) {
+      // Installed segmented radix fallback, low 16 bits only.
+      std::size_t seg_bytes = 0u;
+      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+          nullptr, seg_bytes, compact_keys_.data(), compact_alt_keys_.data(),
+          compact_payload_.data(), compact_alt_payload_.data(),
+          static_cast<int>(total), static_cast<int>(heavy_items),
+          compact_heavy_begin_.data(), compact_heavy_end_.data(), 0, 16,
+          stream));
+      ensure_sort_temp(seg_bytes);
+      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+          sort_temp_storage_.data(), seg_bytes, compact_keys_.data(),
+          compact_alt_keys_.data(), compact_payload_.data(),
+          compact_alt_payload_.data(), static_cast<int>(total),
+          static_cast<int>(heavy_items), compact_heavy_begin_.data(),
+          compact_heavy_end_.data(), 0, 16, stream));
+      gpulsmopt_detail::
+          compact_heavy_copyback_kernel<<<64, block, 0, stream>>>(
+              compact_heavy_list_.data(), compact_heavy_count_.data(),
+              compact_segoff_.data(), compact_combined_.data(),
+              compact_alt_keys_.data(), compact_alt_payload_.data(),
+              compact_keys_.data(), compact_payload_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    // Sum duplicate deltas across the group in one pass.
+    std::size_t reduce_bytes = 0u;
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+        nullptr, reduce_bytes, compact_keys_.data(), compact_alt_keys_.data(),
+        compact_payload_.data(), compact_alt_payload_.data(),
+        compact_num_runs_.data(), gpulsmopt_detail::SumDeltaPayload{},
+        static_cast<int>(total), stream));
+    ensure_sort_temp(reduce_bytes);
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+        sort_temp_storage_.data(), reduce_bytes, compact_keys_.data(),
+        compact_alt_keys_.data(), compact_payload_.data(),
+        compact_alt_payload_.data(), compact_num_runs_.data(),
+        gpulsmopt_detail::SumDeltaPayload{}, static_cast<int>(total), stream));
+    const int item_grid = static_cast<int>((total + block - 1u) / block);
+    gpulsmopt_detail::
+        compact_filter_flags_kernel<<<item_grid, block, 0, stream>>>(
+            compact_alt_payload_.data(), compact_num_runs_.data(), total,
+            compact_flags_.data());
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(compact_flags_.data(), compact_pos_.data(), total,
                        stream);
     gpulsmopt_detail::compact_unique_count_kernel<<<1, 1, 0, stream>>>(
-        compact_flags_.data(), compact_pos_.data(), capacity,
+        compact_flags_.data(), compact_pos_.data(), total,
         compact_group_unique_.data(), 0u);
     CUDA_CHECK(cudaGetLastError());
 
@@ -3815,8 +4178,8 @@ private:
     compact_output_values_.resize_discard(unique_count);
     compact_output_counts_.resize_discard(unique_count);
     gpulsmopt_detail::compact_scatter_kernel<<<item_grid, block, 0, stream>>>(
-        compact_keys_.data(), compact_values_.data(), compact_counts_.data(),
-        compact_flags_.data(), compact_pos_.data(), capacity,
+        compact_alt_keys_.data(), compact_alt_payload_.data(),
+        compact_flags_.data(), compact_pos_.data(), total,
         compact_output_keys_.data(), compact_output_values_.data(),
         compact_output_counts_.data());
     CUDA_CHECK(cudaGetLastError());
@@ -3863,7 +4226,7 @@ private:
 
     RunStorage &out = runs_[group.begin];
     prepare_run_metadata_storage(out);
-    launch_run_metadata_kernels(out, out.count, stream);
+    launch_run_metadata_kernels(out, out.count, stream, false);
     constexpr int count_grid = gpulsmopt_detail::kEpochQuotients / block;
     gpulsmopt_detail::
         epoch_count_delta_sum_kernel<<<count_grid, block, 0, stream>>>(
@@ -3889,14 +4252,19 @@ private:
     run_vp_t_.resize_discard(capacity);
     if (wants_counts)
       run_cp_t_.resize_discard(capacity);
-    constexpr int block = 256;
+    constexpr int block =
+        gpulsmopt_detail::kTransposeRuns * gpulsmopt_detail::kTransposeQuots;
     const int skip_run =
         sorted_run_ready() ? static_cast<int>(sorted_run_index_) : -1;
+    const int run_tiles =
+        (active_run_count() + gpulsmopt_detail::kTransposeRuns - 1) /
+        gpulsmopt_detail::kTransposeRuns;
     if (!run_meta_ready_) {
-      const std::size_t active =
-          rows * static_cast<std::size_t>(active_run_count());
-      const int grid = static_cast<int>((active + block - 1) / block);
-      gpulsmopt_detail::run_transpose_meta_kernel<<<grid, block, 0, stream>>>(
+      const int q_tiles = static_cast<int>(
+          (rows + gpulsmopt_detail::kTransposeQuots - 1) /
+          gpulsmopt_detail::kTransposeQuots);
+      gpulsmopt_detail::run_transpose_meta_kernel<<<q_tiles * run_tiles, block,
+                                                    0, stream>>>(
           run_view_ptr(), active_run_count(), skip_run, run_off_t_.data(),
           run_vp_t_.data(), wants_counts ? run_cp_t_.data() : nullptr);
       CUDA_CHECK(cudaGetLastError());
@@ -3904,11 +4272,10 @@ private:
       run_meta_counts_ready_ = wants_counts;
       return;
     }
-    const std::size_t active =
-        static_cast<std::size_t>(gpulsmopt_detail::kEpochQuotients) *
-        active_run_count();
-    const int grid = static_cast<int>((active + block - 1) / block);
-    gpulsmopt_detail::run_transpose_count_kernel<<<grid, block, 0, stream>>>(
+    constexpr int count_q_tiles = gpulsmopt_detail::kEpochQuotients /
+                                  gpulsmopt_detail::kTransposeQuots;
+    gpulsmopt_detail::run_transpose_count_kernel<<<count_q_tiles * run_tiles,
+                                                   block, 0, stream>>>(
         run_view_ptr(), active_run_count(), skip_run, run_cp_t_.data());
     CUDA_CHECK(cudaGetLastError());
     run_meta_counts_ready_ = true;
@@ -3917,7 +4284,25 @@ private:
   void launch_run_parallel_range(const DeviceRangeOutputBatch &batch,
                                  cudaStream_t stream) {
     const int runs = logical_run_count();
-    const int block = runs <= 32 ? 32 : runs <= 64 ? 64 : 128;
+    if (runs <= 32) {
+      // Subgroup width: 32/W queries share each warp.
+      int width = 1;
+      while (width < runs)
+        width <<= 1;
+      constexpr int block = 256;
+      const std::size_t queries_per_block =
+          static_cast<std::size_t>(block / width);
+      const int grid = static_cast<int>(
+          (batch.query_count + queries_per_block - 1u) / queries_per_block);
+      gpulsmopt_detail::run_subwarp_range_kernel<<<grid, block, 0, stream>>>(
+          batch.lo, batch.hi, batch.out_sums, batch.out_counts,
+          batch.query_count, logical_run_views_.data(), runs, width,
+          run_off_t_.data(), run_vp_t_.data(),
+          batch.out_counts ? run_cp_t_.data() : nullptr);
+      CUDA_CHECK(cudaGetLastError());
+      return;
+    }
+    const int block = runs <= 64 ? 64 : 128;
     const int grid = static_cast<int>(batch.query_count);
     gpulsmopt_detail::run_parallel_range_kernel<<<grid, block, 0, stream>>>(
         batch.lo, batch.hi, batch.out_sums, batch.out_counts, batch.query_count,
@@ -3958,6 +4343,12 @@ private:
           succ_rebuild_from_owner_kernel<<<grid, block, 0, stream>>>(
               make_owner_view(), succ_bits_.data());
       CUDA_CHECK(cudaGetLastError());
+      const int spill_grid =
+          static_cast<int>((owner_spill_slots_ + block - 1) / block);
+      gpulsmopt_detail::
+          succ_rebuild_from_spill_kernel<<<spill_grid, block, 0, stream>>>(
+              make_owner_view(), succ_bits_.data());
+      CUDA_CHECK(cudaGetLastError());
     } else {
       for (std::size_t e = succ_synced_runs_; e < runs_.size(); ++e) {
         const std::size_t n = runs_[e].count;
@@ -3965,7 +4356,8 @@ private:
           continue;
         const int grid = static_cast<int>((n + block - 1) / block);
         gpulsmopt_detail::succ_apply_epoch_kernel<<<grid, block, 0, stream>>>(
-            make_owner_view(), runs_[e].keys.data(), n, succ_bits_.data());
+            runs_[e].keys.data(), runs_[e].count_delta.data(), n,
+            succ_bits_.data());
         CUDA_CHECK(cudaGetLastError());
       }
     }
@@ -4113,7 +4505,6 @@ private:
   mutable std::shared_mutex snapshot_mutex_;
 
   std::uint32_t c0_log_count_ = 0;
-  std::uint32_t c0_insert_count_ = 0;
   RunKind c0_kind_ = RunKind::empty;
   thrust::device_vector<std::uint32_t> c0_log_keys_;
   thrust::device_vector<std::uint32_t> c0_log_values_;
@@ -4158,13 +4549,17 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint16_t> sorted_micro_offsets_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> sorted_micro_bits_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> owner_primary_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> owner_overflow_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_heads_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_next_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_page_alloc_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_error_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> owner_spill_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_spill_values_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_spill_count_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_quotient_live_;
-  std::uint32_t owner_page_capacity_ = 0;
+  std::size_t owner_spill_slots_ = 0;
+  // Boundary-scatter metadata scratch.
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> meta_pending_list_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> meta_pending_count_;
+  // Per-commit transition size classes (fix 5 consumers).
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_class_list_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_class_count_;
   bool owner_ready_ = false;
   cudaStream_t last_update_stream_ = nullptr;
   std::size_t direct_sort_count_ = 0;
@@ -4175,6 +4570,7 @@ private:
   std::size_t log_sort_temp_bytes_ = 0;
   std::size_t scan_u32_count_ = 0;
   std::size_t scan_u32_temp_bytes_ = 0;
+  std::size_t metadata_scan_temp_bytes_ = 0;
   bool sorted_micro_ready_ = false;
   bool sorted_range_cdf_ready_ = false;
 
@@ -4199,13 +4595,16 @@ private:
   // Shard-parallel compaction staging.
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::RunView> compact_views_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_combined_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_padded_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_segoff_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_list_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_count_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_begin_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_end_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::int8_t> compact_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> compact_payload_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_alt_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> compact_alt_payload_;
+  gpulsmopt_detail::RawDeviceBuffer<int> compact_num_runs_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_flags_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_pos_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_group_unique_;
