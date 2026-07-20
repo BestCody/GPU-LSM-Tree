@@ -13,10 +13,6 @@
 #include "cuda_buffer.cuh"
 #include "definitions.cuh"
 
-#ifndef GPULSMOPT_BASE_DELETE_MARK_ONLY
-#define GPULSMOPT_BASE_DELETE_MARK_ONLY 1
-#endif
-
 #ifdef CUDA_CHECK
 #define GPULSMOPT_RESTORE_FLIX_CUDA_CHECK
 #undef CUDA_CHECK
@@ -115,7 +111,7 @@ inline void fill_sequence(std::uint32_t *values, size_t size,
   check_cuda(cudaGetLastError());
 }
 
-}
+} // namespace gpulsmopt_adapter_detail
 
 template <typename key_type_> class gpulsmopt final {
 public:
@@ -139,31 +135,20 @@ public:
   static constexpr operation_support can_update = operation_support::async;
   static constexpr operation_support can_successor = operation_support::async;
 
-  static std::string short_description() {
-    return "gpulsmopt";
-  }
+  static std::string short_description() { return "gpulsmopt"; }
 
   static parameters_type parameters() {
     return {
         {"batch_capacity",
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
-        {"delete_order", "uniform_live"},
-        {"base_delete_values",
-         GPULSMOPT_BASE_DELETE_MARK_ONLY ? "mark_only" : "eager"},
         {"c0_log", "1"},
         {"sorted_runs", "1"},
         {"c0_flush_budget",
          std::to_string(static_cast<size_t>(GPULSMOPT_C0_FLUSH_BUDGET))},
-        {"epoch_min_batch",
+        {"direct_run_min_batch",
          std::to_string(static_cast<size_t>(GPULSMOPT_SCATTER_MIN_BATCH))},
-        {"epoch_max",
-         std::to_string(static_cast<size_t>(GPULSMOPT_EPOCH_MAX))},
-        {"delete_range_min",
-         std::to_string(
-             static_cast<size_t>(GPULSMOPT_DELETE_RANGE_MIN_BATCH))},
-        {"delete_range_target",
-         std::to_string(
-             static_cast<size_t>(GPULSMOPT_DELETE_RANGE_TARGET))},
+        {"run_capacity",
+         std::to_string(static_cast<size_t>(gpulsmopt_detail::kRunCapacity))},
     };
   }
 
@@ -199,11 +184,6 @@ public:
     DictionaryConfig config;
     config.max_elements = configured_max_size;
     config.batch_capacity = config_batch_capacity;
-    config.delete_order = DeleteOrderPolicy::uniform_live;
-    config.base_delete_values = GPULSMOPT_BASE_DELETE_MARK_ONLY
-                                    ? BaseDeleteValuePolicy::mark_only
-                                    : BaseDeleteValuePolicy::eager;
-
     gpulsmopt_adapter_detail::scoped_cuda_event_timer timer(0, build_time_ms);
     dictionary_ = std::make_unique<GPULSMOpt>(config);
     gpulsmopt_adapter_detail::fill_sequence(
