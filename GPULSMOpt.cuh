@@ -5,7 +5,6 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
-#include <cub/device/device_reduce.cuh>
 #include <cuda_runtime.h>
 
 #include <thrust/device_vector.h>
@@ -22,6 +21,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -35,7 +35,9 @@
   do {                                                                         \
     cudaError_t err__ = (stmt);                                                \
     if (err__ != cudaSuccess) {                                                \
-      throw std::runtime_error(cudaGetErrorString(err__));                     \
+      throw std::runtime_error(                                                \
+          std::string(cudaGetErrorString(err__)) + " at " + __FILE__ + ":" +   \
+          std::to_string(__LINE__) + " (" #stmt ")");                          \
     }                                                                          \
   } while (false)
 #endif
@@ -61,7 +63,18 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_RANGE_CDF_MAX_RATIO
 #define GPULSMOPT_RANGE_CDF_MAX_RATIO 4
 #endif
+#ifndef GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES
+#define GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES (1 << 16)
+#endif
+#ifndef GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS
+#define GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS 8
+#endif
+#ifndef GPULSMOPT_NARROW_RANGE_MAX_QUERIES
+#define GPULSMOPT_NARROW_RANGE_MAX_QUERIES 4096
+#endif
 constexpr int kRunCapacity = 128;
+// Assignment runs merged per contiguous compaction.
+constexpr int kCompactGroup = 64;
 #ifdef GPULSMOPT_EPOCH_MAX
 static_assert(GPULSMOPT_EPOCH_MAX == kRunCapacity,
               "GPULSMOPT_EPOCH_MAX must be 128");
@@ -80,13 +93,7 @@ constexpr int kOwnerSlots = 1 << kOwnerSlotBits;
 constexpr int kOwnerSlotMask = kOwnerSlots - 1;
 constexpr std::uint32_t kOwnerNoPage = 0xffffffffu;
 constexpr int kRunStride = kRunCapacity;
-constexpr int kCompactTargetRuns = 64;
-constexpr int kCompactMergeRuns = kRunCapacity - kCompactTargetRuns + 1;
 constexpr int kGpuResidentWarps = 9024;
-static_assert(kCompactMergeRuns == 65);
-static_assert(kRunCapacity - kCompactMergeRuns + 1 == kCompactTargetRuns);
-// Shards up to this size sort in shared memory.
-constexpr std::uint32_t kCompactSharedCap = 2048;
 constexpr int kSortedRunRadixBits = 20;
 constexpr int kSortedRunRadixShift = 32 - kSortedRunRadixBits;
 constexpr int kSortedRunMicroTarget = 4;
@@ -127,6 +134,11 @@ constexpr std::size_t kSuccTotalWords =
 constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
 constexpr std::uint32_t kC0LogMaxIndex = 0x00fffffeu;
+
+// Immutable assignment runs replace the owner-transition path.
+enum class RunOperation : std::uint8_t { Insert, Delete };
+// High-water reserve for one update batch.
+constexpr std::size_t kRawRunReserve = std::size_t{1} << 21;
 
 #if GPULSMOPT_SM120_RADIX
 struct Sm120RadixPolicy
@@ -1792,91 +1804,6 @@ struct TakeLastU32 {
   }
 };
 
-__global__ void c0_log_append_kernel(const std::uint32_t *keys,
-                                     const std::uint32_t *values,
-                                     std::uint8_t op, std::uint32_t old_count,
-                                     std::size_t n, std::uint32_t *log_keys,
-                                     std::uint32_t *log_values,
-                                     std::uint8_t *log_ops) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  const std::uint32_t idx = old_count + static_cast<std::uint32_t>(i);
-  log_keys[idx] = keys[i];
-  log_values[idx] = values ? values[i] : keys[i];
-  if (log_ops)
-    log_ops[idx] = op;
-}
-
-struct TakeLatestPayload {
-  __host__ __device__ std::uint64_t operator()(std::uint64_t older,
-                                               std::uint64_t newer) const {
-    const std::uint32_t older_sequence = static_cast<std::uint32_t>(older) >> 1;
-    const std::uint32_t newer_sequence = static_cast<std::uint32_t>(newer) >> 1;
-    return newer_sequence >= older_sequence ? newer : older;
-  }
-};
-
-__global__ void pack_latest_payload_kernel(const std::uint32_t *values,
-                                           const std::uint8_t *ops,
-                                           std::uint8_t constant_op,
-                                           std::size_t count,
-                                           std::uint64_t *payload) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  const std::uint8_t op = ops ? ops[i] : constant_op;
-  const std::uint32_t sequence = static_cast<std::uint32_t>(i);
-  payload[i] = (static_cast<std::uint64_t>(values[i]) << 32) |
-               (static_cast<std::uint64_t>(sequence) << 1) | op;
-}
-
-__global__ void unpack_latest_payload_kernel(const std::uint64_t *payload,
-                                             std::size_t count,
-                                             std::uint32_t *values,
-                                             std::uint8_t *ops) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
-  ops[i] = static_cast<std::uint8_t>(payload[i] & 1u);
-}
-struct SumDeltaPayload {
-  __host__ __device__ std::uint64_t operator()(std::uint64_t left,
-                                               std::uint64_t right) const {
-    const std::uint32_t value = static_cast<std::uint32_t>(left >> 32) +
-                                static_cast<std::uint32_t>(right >> 32);
-    const std::int32_t count =
-        static_cast<std::int32_t>(static_cast<std::uint32_t>(left)) +
-        static_cast<std::int32_t>(static_cast<std::uint32_t>(right));
-    return (static_cast<std::uint64_t>(value) << 32) |
-           static_cast<std::uint32_t>(count);
-  }
-};
-
-__global__ void pack_delta_payload_kernel(const std::uint32_t *values,
-                                          const std::int8_t *counts,
-                                          std::size_t count,
-                                          std::uint64_t *payload) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  const std::int32_t count_delta = static_cast<std::int32_t>(counts[i]);
-  payload[i] = (static_cast<std::uint64_t>(values[i]) << 32) |
-               static_cast<std::uint32_t>(count_delta);
-}
-
-__global__ void unpack_delta_payload_kernel(const std::uint64_t *payload,
-                                            std::size_t count,
-                                            std::uint32_t *values,
-                                            std::int8_t *counts) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
-  counts[i] = static_cast<std::int8_t>(
-      static_cast<std::int32_t>(static_cast<std::uint32_t>(payload[i])));
-}
 
 __global__ void epoch_count_delta_sum_kernel(RunView epoch) {
   const std::uint32_t quotient = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2019,198 +1946,6 @@ __global__ void succ_query_kernel(const std::uint32_t *queries,
   out_keys[i] = best == kEmptyKey ? 0u : best;
 }
 
-// Combined and padded record counts per quotient shard.
-__global__ void compact_plan_kernel(const RunView *views, int group_count,
-                                    std::uint32_t *combined) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
-    return;
-  if (q == kEpochQuotients) {
-    combined[q] = 0u;
-    return;
-  }
-  std::uint32_t total = 0u;
-  for (int e = 0; e < group_count; ++e)
-    total += views[e].quotient_off[q + 1u] - views[e].quotient_off[q];
-  combined[q] = total;
-}
-
-__host__ __device__ inline std::uint64_t
-compact_pack_payload(std::uint32_t value, std::int8_t count) {
-  return (static_cast<std::uint64_t>(value) << 32) |
-         static_cast<std::uint32_t>(static_cast<std::int32_t>(count));
-}
-
-// Stage heavy shards with packed payloads for the sorter.
-__global__ void compact_gather_heavy_kernel(
-    const RunView *views, int group_count, const std::uint32_t *heavy_list,
-    const std::uint32_t *heavy_count, const std::uint32_t *segoff,
-    std::uint32_t *skeys, std::uint64_t *spayload) {
-  const std::uint32_t items = heavy_count[0];
-  for (std::uint32_t item = blockIdx.x; item < items; item += gridDim.x) {
-    const std::uint32_t q = heavy_list[item];
-    std::uint32_t cursor = segoff[q];
-    for (int e = 0; e < group_count; ++e) {
-      const std::uint32_t begin = views[e].quotient_off[q];
-      const std::uint32_t n = views[e].quotient_off[q + 1u] - begin;
-      for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        skeys[cursor + i] = views[e].keys[begin + i];
-        spayload[cursor + i] = compact_pack_payload(
-            views[e].values[begin + i], views[e].count_delta[begin + i]);
-      }
-      cursor += n;
-    }
-  }
-}
-
-// Segment bounds of heavy shards for the segmented sort.
-__global__ void compact_heavy_bounds_kernel(const std::uint32_t *heavy_list,
-                                            const std::uint32_t *heavy_count,
-                                            const std::uint32_t *segoff,
-                                            const std::uint32_t *combined,
-                                            std::uint32_t *begins,
-                                            std::uint32_t *ends) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= heavy_count[0])
-    return;
-  const std::uint32_t q = heavy_list[i];
-  begins[i] = segoff[q];
-  ends[i] = segoff[q] + combined[q];
-}
-
-// Return sorted heavy segments into primary staging.
-__global__ void compact_heavy_copyback_kernel(
-    const std::uint32_t *heavy_list, const std::uint32_t *heavy_count,
-    const std::uint32_t *segoff, const std::uint32_t *combined,
-    const std::uint32_t *alt_keys, const std::uint64_t *alt_payload,
-    std::uint32_t *skeys, std::uint64_t *spayload) {
-  const std::uint32_t items = heavy_count[0];
-  for (std::uint32_t item = blockIdx.x; item < items; item += gridDim.x) {
-    const std::uint32_t q = heavy_list[item];
-    const std::uint32_t base = segoff[q];
-    const std::uint32_t n = combined[q];
-    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-      skeys[base + i] = alt_keys[base + i];
-      spayload[base + i] = alt_payload[base + i];
-    }
-  }
-}
-
-// Fused gather plus 16-bit block radix sort per shard.
-constexpr int kCompactThreads = 256;
-constexpr int kCompactItems =
-    static_cast<int>(kCompactSharedCap) / kCompactThreads;
-__global__ void compact_sort_light_kernel(const RunView *views,
-                                          int group_count,
-                                          const std::uint32_t *combined,
-                                          const std::uint32_t *segoff,
-                                          std::uint32_t *skeys,
-                                          std::uint64_t *spayload) {
-  using BlockSort = cub::BlockRadixSort<std::uint32_t, kCompactThreads,
-                                        kCompactItems, std::uint64_t>;
-  __shared__ union LightShared {
-    struct {
-      std::uint32_t keys[kCompactSharedCap];
-      std::uint64_t payload[kCompactSharedCap];
-    } stage;
-    typename BlockSort::TempStorage sort;
-  } shared;
-  const std::uint32_t q = blockIdx.x;
-  const std::uint32_t n = combined[q];
-  if (n == 0u || n > kCompactSharedCap)
-    return;
-  std::uint32_t cursor = 0u;
-  for (int e = 0; e < group_count; ++e) {
-    const std::uint32_t begin = views[e].quotient_off[q];
-    const std::uint32_t len = views[e].quotient_off[q + 1u] - begin;
-    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
-      shared.stage.keys[cursor + i] = views[e].keys[begin + i];
-      shared.stage.payload[cursor + i] = compact_pack_payload(
-          views[e].values[begin + i], views[e].count_delta[begin + i]);
-    }
-    cursor += len;
-  }
-  __syncthreads();
-  // Bit 16 pushes padding past every real low key.
-  std::uint32_t sort_keys[kCompactItems];
-  std::uint64_t sort_payload[kCompactItems];
-#pragma unroll
-  for (int r = 0; r < kCompactItems; ++r) {
-    const std::uint32_t slot =
-        static_cast<std::uint32_t>(threadIdx.x) * kCompactItems + r;
-    sort_keys[r] = slot < n ? shared.stage.keys[slot] & 0xffffu : 0x10000u;
-    sort_payload[r] = slot < n ? shared.stage.payload[slot] : 0u;
-  }
-  __syncthreads();
-  BlockSort(shared.sort).Sort(sort_keys, sort_payload, 0, 17);
-  const std::uint32_t base = segoff[q];
-  const std::uint32_t high = q << kEpochQuotientBits;
-#pragma unroll
-  for (int r = 0; r < kCompactItems; ++r) {
-    const std::uint32_t slot =
-        static_cast<std::uint32_t>(threadIdx.x) * kCompactItems + r;
-    if (slot < n) {
-      skeys[base + slot] = high | sort_keys[r];
-      spayload[base + slot] = sort_payload[r];
-    }
-  }
-}
-
-__global__ void compact_classify_heavy_kernel(const std::uint32_t *combined,
-                                              std::uint32_t *heavy_list,
-                                              std::uint32_t *heavy_count) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kEpochQuotients)
-    return;
-  if (combined[q] > kCompactSharedCap)
-    heavy_list[atomicAdd(heavy_count, 1u)] = q;
-}
-
-// Zero-net filter over the reduced duplicate groups.
-__global__ void compact_filter_flags_kernel(const std::uint64_t *payload,
-                                            const int *num_runs,
-                                            std::size_t total,
-                                            std::uint32_t *flags) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= total)
-    return;
-  const std::size_t runs = static_cast<std::size_t>(num_runs[0]);
-  flags[i] = i < runs && payload[i] != 0u ? 1u : 0u;
-}
-
-// Unpack surviving records into the merged delta run.
-__global__ void
-compact_scatter_kernel(const std::uint32_t *unique_keys,
-                       const std::uint64_t *unique_payload,
-                       const std::uint32_t *flags, const std::uint32_t *pos,
-                       std::size_t total, std::uint32_t *out_keys,
-                       std::uint32_t *out_values, std::int8_t *out_counts) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= total || flags[i] == 0u)
-    return;
-  const std::uint64_t payload = unique_payload[i];
-  const std::uint32_t p = pos[i];
-  out_keys[p] = unique_keys[i];
-  out_values[p] = static_cast<std::uint32_t>(payload >> 32);
-  out_counts[p] = static_cast<std::int8_t>(
-      static_cast<std::int32_t>(static_cast<std::uint32_t>(payload)));
-}
-
-__global__ void compact_unique_count_kernel(const std::uint32_t *flags,
-                                            const std::uint32_t *pos,
-                                            std::size_t capacity,
-                                            std::uint32_t *counts,
-                                            std::uint32_t group) {
-  if (blockIdx.x != 0 || threadIdx.x != 0)
-    return;
-  if (capacity == 0) {
-    counts[group] = 0u;
-    return;
-  }
-  counts[group] = pos[capacity - 1u] + flags[capacity - 1u];
-}
 // 8 runs x 32 quotients tiles: both sides coalesce.
 constexpr int kTransposeRuns = 8;
 constexpr int kTransposeQuots = 32;
@@ -2434,13 +2169,483 @@ __global__ void range_projection_query_kernel(
                 range_delta_sum(projection, l, h);
 }
 
+// Immutable assignment run seen by device readers.
+struct AssignmentRunView {
+  const std::uint32_t *keys;
+  const std::uint32_t *values;
+  const std::uint32_t *offsets;
+  const std::uint32_t *op_words; // null for homogeneous leaves
+  std::uint8_t constant_op;      // 1 insert, 0 delete
+  std::uint8_t mixed;            // 1 if op_words is used
+};
+
+// Scalar op for a leaf, or one packed bit for a mixed run.
+__device__ inline int assignment_op_at(const std::uint32_t *op_words,
+                                       std::uint8_t constant_op,
+                                       std::uint8_t mixed, std::uint32_t p) {
+  if (!mixed)
+    return constant_op;
+  return (op_words[p >> 5] >> (p & 31u)) & 1u;
+}
+
+struct PinnedHostState {
+  AssignmentRunView views[kRunCapacity];
+  std::uint32_t narrow_overflow;
+};
+
+__global__ void assignment_group_count_kernel(
+    const AssignmentRunView *runs, int run_count,
+    std::uint32_t *counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kEpochQuotients)
+    return;
+  if (q == kEpochQuotients) {
+    counts[q] = 0u;
+    return;
+  }
+  std::uint32_t total = 0u;
+  for (int r = 0; r < run_count; ++r)
+    total += runs[r].offsets[q + 1u] - runs[r].offsets[q];
+  counts[q] = total;
+}
+
+__global__ void assignment_group_gather_kernel(
+    const AssignmentRunView *runs, int run_count,
+    const std::uint32_t *offsets, std::uint32_t *out_keys,
+    std::uint64_t *out_payload) {
+  const std::uint32_t q = blockIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  std::uint32_t cursor = offsets[q];
+  for (int r = 0; r < run_count; ++r) {
+    const AssignmentRunView run = runs[r];
+    const std::uint32_t begin = run.offsets[q];
+    const std::uint32_t count = run.offsets[q + 1u] - begin;
+    for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+      const std::uint32_t p = begin + i;
+      const int op =
+          assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
+      const std::uint32_t value = op != 0 ? run.values[p] : 0u;
+      out_keys[cursor + i] = run.keys[p];
+      out_payload[cursor + i] =
+          (static_cast<std::uint64_t>(value) << 32) |
+          static_cast<std::uint64_t>(op != 0);
+    }
+    cursor += count;
+  }
+}
+
+// Descriptors are stored oldest->newest; scan newest first so the
+// backward quotient scan finds the latest duplicate. The base owner
+// answers keys no run touched.
+__global__ void temporal_lookup_kernel(const AssignmentRunView *runs,
+                                       int run_count, OwnerView base,
+                                       int base_ready,
+                                       const std::uint32_t *queries,
+                                       std::size_t n,
+                                       std::uint32_t *out_values,
+                                       std::uint8_t *out_found) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  const std::uint32_t key = queries[i];
+  const std::uint32_t q = key >> kEpochQuotientBits;
+  for (int r = run_count - 1; r >= 0; --r) {
+    const AssignmentRunView run = runs[r];
+    const std::uint32_t b = run.offsets[q];
+    std::uint32_t p = run.offsets[q + 1u];
+    while (p-- > b) {
+      if (run.keys[p] == key) {
+        const bool live =
+            assignment_op_at(run.op_words, run.constant_op, run.mixed, p) != 0;
+        out_values[i] = live ? run.values[p] : kEmptyKey;
+        if (out_found)
+          out_found[i] = live ? 1u : 0u;
+        return;
+      }
+    }
+  }
+  if (base_ready) {
+    std::uint64_t packed = 0u;
+    if (owner_find(base, key, &packed) &&
+        owner_state(packed) == kOwnerLive) {
+      out_values[i] = owner_value(packed);
+      if (out_found)
+        out_found[i] = 1u;
+      return;
+    }
+  }
+  out_values[i] = kEmptyKey;
+  if (out_found)
+    out_found[i] = 0u;
+}
+
+// Pack one run into the resolve staging arrays. Concatenation
+// order (oldest run first, input order within) is the timestamp.
+__global__ void resolve_pack_run_kernel(const std::uint32_t *keys,
+                                        const std::uint32_t *values,
+                                        const std::uint32_t *op_words,
+                                        std::uint8_t constant_op,
+                                        std::uint8_t mixed, std::size_t n,
+                                        std::uint32_t *out_keys,
+                                        std::uint64_t *out_payload) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  const std::uint32_t v = values ? values[i] : 0u;
+  const int op = assignment_op_at(op_words, constant_op, mixed,
+                                  static_cast<std::uint32_t>(i));
+  out_keys[i] = keys[i];
+  out_payload[i] =
+      (static_cast<std::uint64_t>(v) << 32) | (op != 0 ? 1u : 0u);
+}
+
+// Boundary-only offsets for an assignment leaf: no masks, no
+// pending list, no per-quotient counts.
+__global__ void assignment_boundary_kernel(const std::uint32_t *keys,
+                                           std::uint32_t count,
+                                           std::uint32_t *offsets) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  if (i == 0u)
+    offsets[kEpochQuotients] = count;
+  const std::uint32_t q = keys[i] >> kEpochQuotientBits;
+  const std::uint32_t prev = i == 0u ? q : keys[i - 1u] >> kEpochQuotientBits;
+  if (i == 0u || q != prev)
+    offsets[q] = i;
+}
+
+// After a stable full-key sort, the last record of each equal-key
+// group is the newest assignment.
+__global__ void resolve_flag_last_kernel(const std::uint32_t *keys,
+                                         std::size_t n,
+                                         std::uint8_t *flags) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  flags[i] = (i + 1u == n || keys[i] != keys[i + 1u]) ? 1u : 0u;
+}
+
+// Diff each latest assignment against the base snapshot; emit
+// signed value/count corrections and keep only real changes.
+__global__ void resolve_diff_kernel(const std::uint32_t *keys,
+                                    const std::uint64_t *payload,
+                                    std::size_t m, OwnerView base,
+                                    int base_ready, std::uint32_t *out_keys,
+                                    std::uint32_t *out_value_delta,
+                                    std::int8_t *out_count_delta,
+                                    std::uint8_t *out_flags) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= m)
+    return;
+  const std::uint32_t key = keys[i];
+  const std::uint32_t value = static_cast<std::uint32_t>(payload[i] >> 32);
+  const bool insert = (payload[i] & 1u) != 0u;
+  std::uint32_t base_value = 0u;
+  bool base_live = false;
+  if (base_ready) {
+    std::uint64_t packed = 0u;
+    if (owner_find(base, key, &packed) &&
+        owner_state(packed) == kOwnerLive) {
+      base_live = true;
+      base_value = owner_value(packed);
+    }
+  }
+  std::uint32_t value_delta = 0u;
+  std::int32_t count_delta = 0;
+  if (insert) {
+    value_delta = base_live ? value - base_value : value;
+    count_delta = base_live ? 0 : 1;
+  } else if (base_live) {
+    value_delta = 0u - base_value;
+    count_delta = -1;
+  }
+  out_keys[i] = key;
+  out_value_delta[i] = value_delta;
+  out_count_delta[i] = static_cast<std::int8_t>(count_delta);
+  out_flags[i] = (value_delta != 0u || count_delta != 0) ? 1u : 0u;
+}
+
+// Split latest assignments into absolute value + keep flag.
+// A key whose latest op is delete is dropped from the new base.
+__global__ void resolve_base_extract_kernel(const std::uint64_t *payload,
+                                            std::size_t m,
+                                            std::uint32_t *out_values,
+                                            std::uint8_t *out_keep) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= m)
+    return;
+  out_values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
+  out_keep[i] = (payload[i] & 1u) != 0u ? 1u : 0u;
+}
+
+// Base range sum/count plus one resolved correction run.
+__global__ void resolved_range_kernel(
+    const std::uint32_t *lo, const std::uint32_t *hi, std::uint32_t *out_sums,
+    std::uint32_t *out_counts, std::size_t query_count, SortedRunView base,
+    SortedRunRangeView base_range, const std::uint32_t *base_value_prefix,
+    const std::uint32_t *base_count_prefix, RunView resolved,
+    int resolved_ready) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= query_count)
+    return;
+  const std::uint32_t l = lo[i];
+  const std::uint32_t h = hi[i];
+  if (l > h) {
+    out_sums[i] = 0u;
+    if (out_counts)
+      out_counts[i] = 0u;
+    return;
+  }
+  std::uint32_t sum =
+      sorted_range_sum(base, base_range, base_value_prefix, l, h);
+  if (resolved_ready)
+    sum += epoch_range_sum_one(resolved, l, h);
+  out_sums[i] = sum;
+  if (out_counts) {
+    std::uint32_t count = sorted_range_count(base, base_count_prefix, l, h);
+    if (resolved_ready)
+      count += epoch_range_count_one(resolved, l, h);
+    out_counts[i] = count;
+  }
+}
+
+// One block maps its lanes directly to chronological runs.
+__global__ void temporal_lookup_run_parallel_kernel(
+    const AssignmentRunView *runs, int run_count, OwnerView base,
+    int base_ready, const std::uint32_t *queries, std::size_t n,
+    std::uint32_t *out_values, std::uint8_t *out_found) {
+  const std::size_t query = blockIdx.x;
+  if (query >= n)
+    return;
+  __shared__ unsigned long long candidates[kRunCapacity];
+  const int run_index = threadIdx.x;
+  const std::uint32_t key = queries[query];
+  unsigned long long candidate = 0u;
+  if (run_index < run_count) {
+    const AssignmentRunView run = runs[run_index];
+    const std::uint32_t q = key >> kEpochQuotientBits;
+    const std::uint32_t begin = run.offsets[q];
+    std::uint32_t position = run.offsets[q + 1u];
+    while (position-- > begin) {
+      if (run.keys[position] != key)
+        continue;
+      const int op = assignment_op_at(
+          run.op_words, run.constant_op, run.mixed, position);
+      const std::uint32_t value = op != 0 ? run.values[position] : kEmptyKey;
+      candidate =
+          (static_cast<unsigned long long>(run_index + 1) << 33) |
+          (static_cast<unsigned long long>(op != 0) << 32) | value;
+      break;
+    }
+  }
+  candidates[run_index] = candidate;
+  __syncthreads();
+  for (int stride = kRunCapacity / 2; stride > 0; stride >>= 1) {
+    if (run_index < stride) {
+      const unsigned long long other = candidates[run_index + stride];
+      if (other > candidates[run_index])
+        candidates[run_index] = other;
+    }
+    __syncthreads();
+  }
+  if (run_index != 0)
+    return;
+  const unsigned long long best = candidates[0];
+  if (best != 0u) {
+    const bool live = ((best >> 32) & 1u) != 0u;
+    out_values[query] =
+        live ? static_cast<std::uint32_t>(best) : kEmptyKey;
+    if (out_found)
+      out_found[query] = live ? 1u : 0u;
+    return;
+  }
+  std::uint32_t value = kEmptyKey;
+  std::uint8_t found = 0u;
+  if (base_ready) {
+    std::uint64_t packed = 0u;
+    if (owner_find(base, key, &packed) &&
+        owner_state(packed) == kOwnerLive) {
+      value = owner_value(packed);
+      found = 1u;
+    }
+  }
+  out_values[query] = value;
+  if (out_found)
+    out_found[query] = found;
+}
+
+constexpr int kNarrowSeenCap = 128;
+constexpr int kNarrowHashSlots = 2 * kNarrowSeenCap;
+static_assert((kNarrowHashSlots & (kNarrowHashSlots - 1)) == 0);
+
+__device__ inline void narrow_record_latest(
+    std::uint32_t *keys, unsigned long long *references,
+    std::uint32_t key, unsigned long long reference) {
+  std::uint32_t slot =
+      static_cast<std::uint32_t>(spill_slot(key, kNarrowHashSlots - 1u));
+  for (int probe = 0; probe < kNarrowHashSlots; ++probe) {
+    const std::uint32_t previous =
+        atomicCAS(keys + slot, kEmptyKey, key);
+    if (previous == kEmptyKey || previous == key) {
+      atomicMax(references + slot, reference);
+      return;
+    }
+    slot = (slot + 1u) & (kNarrowHashSlots - 1u);
+  }
+}
+
+// One block resolves one bounded range in shared memory.
+__global__ void narrow_range_kernel(
+    const std::uint32_t *lo, const std::uint32_t *hi,
+    std::uint32_t *out_sums, std::uint32_t *out_counts,
+    std::size_t query_count, const AssignmentRunView *runs,
+    int run_count, OwnerView base, int base_ready,
+    SortedRunView base_view, SortedRunRangeView base_range,
+    const std::uint32_t *base_value_prefix,
+    const std::uint32_t *base_count_prefix,
+    std::uint32_t *overflow) {
+  const std::size_t query = blockIdx.x;
+  if (query >= query_count)
+    return;
+  const int lane = threadIdx.x;
+  const std::uint32_t l = lo[query];
+  const std::uint32_t h = hi[query];
+  if (l > h) {
+    if (lane == 0) {
+      out_sums[query] = 0u;
+      if (out_counts)
+        out_counts[query] = 0u;
+    }
+    return;
+  }
+
+  __shared__ std::uint32_t hash_keys[kNarrowHashSlots];
+  __shared__ unsigned long long hash_refs[kNarrowHashSlots];
+  __shared__ std::uint32_t reduce_sum[kNarrowSeenCap];
+  __shared__ std::int32_t reduce_count[kNarrowSeenCap];
+  for (int slot = lane; slot < kNarrowHashSlots; slot += blockDim.x) {
+    hash_keys[slot] = kEmptyKey;
+    hash_refs[slot] = 0u;
+  }
+
+  const std::uint32_t qlo = l >> kEpochQuotientBits;
+  const std::uint32_t qhi = h >> kEpochQuotientBits;
+  std::uint32_t candidates = 0u;
+  for (int r = lane; r < run_count; r += blockDim.x) {
+    const AssignmentRunView run = runs[r];
+    candidates += run.offsets[qhi + 1u] - run.offsets[qlo];
+  }
+  reduce_sum[lane] = candidates;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (lane < stride)
+      reduce_sum[lane] += reduce_sum[lane + stride];
+    __syncthreads();
+  }
+  if (reduce_sum[0] > kNarrowSeenCap) {
+    if (lane == 0)
+      atomicExch(overflow, 1u);
+    return;
+  }
+
+  if (lane < run_count) {
+    const AssignmentRunView run = runs[lane];
+    const std::uint32_t begin = run.offsets[qlo];
+    const std::uint32_t end = run.offsets[qhi + 1u];
+    for (std::uint32_t p = begin; p < end; ++p) {
+      const std::uint32_t key = run.keys[p];
+      if (key < l || key > h)
+        continue;
+      const unsigned long long reference =
+          (static_cast<unsigned long long>(lane + 1) << 32) | p;
+      narrow_record_latest(hash_keys, hash_refs, key, reference);
+    }
+  }
+  __syncthreads();
+
+  std::uint32_t correction = 0u;
+  std::int32_t count_correction = 0;
+  for (int slot = lane; slot < kNarrowHashSlots; slot += blockDim.x) {
+    const std::uint32_t key = hash_keys[slot];
+    if (key == kEmptyKey)
+      continue;
+    const unsigned long long reference = hash_refs[slot];
+    const int r = static_cast<int>(reference >> 32) - 1;
+    const std::uint32_t p = static_cast<std::uint32_t>(reference);
+    const AssignmentRunView run = runs[r];
+    const int op =
+        assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
+    std::uint32_t base_value = 0u;
+    bool base_live = false;
+    if (base_ready) {
+      std::uint64_t packed = 0u;
+      if (owner_find(base, key, &packed) &&
+          owner_state(packed) == kOwnerLive) {
+        base_live = true;
+        base_value = owner_value(packed);
+      }
+    }
+    if (op != 0) {
+      const std::uint32_t value = run.values[p];
+      correction += base_live ? value - base_value : value;
+      count_correction += base_live ? 0 : 1;
+    } else if (base_live) {
+      correction += 0u - base_value;
+      --count_correction;
+    }
+  }
+  reduce_sum[lane] = correction;
+  reduce_count[lane] = count_correction;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (lane < stride) {
+      reduce_sum[lane] += reduce_sum[lane + stride];
+      reduce_count[lane] += reduce_count[lane + stride];
+    }
+    __syncthreads();
+  }
+  if (lane == 0) {
+    out_sums[query] =
+        sorted_range_sum(base_view, base_range, base_value_prefix, l, h) +
+        reduce_sum[0];
+    if (out_counts) {
+      const std::uint32_t base_count =
+          sorted_range_count(base_view, base_count_prefix, l, h);
+      out_counts[query] =
+          base_count + static_cast<std::uint32_t>(reduce_count[0]);
+    }
+  }
+}
+
+// Split resolved latest payloads into absolute values plus a
+// packed op bitset for a mixed (compacted) assignment run.
+__global__ void compact_split_kernel(const std::uint64_t *payload,
+                                     std::size_t m, std::uint32_t *out_values,
+                                     std::uint32_t *op_words) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= m)
+    return;
+  out_values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
+  if (payload[i] & 1u)
+    atomicOr(op_words + (i >> 5), 1u << (i & 31u));
+}
+
 } // namespace gpulsmopt_detail
 
 class GPULSMOpt {
 public:
   using DeviceKeyBatch = gpulsmopt_detail::DeviceKeyBatch;
 
-  explicit GPULSMOpt(const DictionaryConfig &config)
+explicit GPULSMOpt(const DictionaryConfig &config)
       : max_elements_(config.max_elements),
         batch_capacity_(config.batch_capacity) {
     if (max_elements_ > 0x7fffffffu) {
@@ -2455,16 +2660,36 @@ public:
     bound_run_view_valid_.resize(gpulsmopt_detail::kRunCapacity);
     logical_run_views_.resize_discard_exact(gpulsmopt_detail::kRunCapacity);
     bound_logical_run_views_.resize(gpulsmopt_detail::kRunCapacity);
+    CUDA_CHECK(cudaMallocHost(
+        reinterpret_cast<void **>(&host_state_), sizeof(*host_state_)));
+    const cudaError_t event_error =
+        cudaEventCreateWithFlags(&stream_handoff_, cudaEventDisableTiming);
+    if (event_error != cudaSuccess) {
+      cudaFreeHost(host_state_);
+      host_state_ = nullptr;
+      CUDA_CHECK(event_error);
+    }
+  }
+
+  ~GPULSMOpt() {
+    if (stream_handoff_)
+      cudaEventDestroy(stream_handoff_);
+    if (host_state_)
+      cudaFreeHost(host_state_);
   }
 
   void clear(cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    last_update_stream_ = stream;
+    order_stream_locked(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     clear_run_state();
     clear_owner_state(stream);
     live_count_ = 0;
-    clear_c0_log(stream);
+    run_sequence_ = 0;
+    chrono_views_.clear();
+    invalidate_resolved();
+    succ_built_ = false;
+    succ_bits_.release();
   }
 
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
@@ -2472,9 +2697,7 @@ public:
       return;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-      last_update_stream_ = stream;
-      if (!owner_ready_)
-        initialize_owner_storage(stream);
+      order_stream_locked(stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       reset_insert_prof_();
       const auto prof_t0 = std::chrono::high_resolution_clock::now();
@@ -2482,7 +2705,6 @@ public:
       insert_records(batch.keys, batch.values,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
                      batch.count, false, stream);
-      maybe_flush_and_merge(stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       CUDA_CHECK(cudaStreamSynchronize(stream));
       const auto prof_t1 = std::chrono::high_resolution_clock::now();
@@ -2511,9 +2733,7 @@ public:
       return;
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-      last_update_stream_ = stream;
-      if (!owner_ready_)
-        initialize_owner_storage(stream);
+      order_stream_locked(stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       reset_insert_prof_();
       const auto prof_t0 = std::chrono::high_resolution_clock::now();
@@ -2521,7 +2741,6 @@ public:
       insert_records(batch.keys, batch.keys,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
                      batch.count, batch.sorted, stream);
-      maybe_flush_and_merge(stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       CUDA_CHECK(cudaStreamSynchronize(stream));
       const auto prof_t1 = std::chrono::high_resolution_clock::now();
@@ -2535,29 +2754,30 @@ public:
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    std::unique_lock<std::shared_mutex> exclusive(snapshot_mutex_,
-                                                  std::defer_lock);
-    if (c0_log_count_ != 0) {
-      guard.unlock();
-      exclusive.lock();
-      if (c0_log_count_ != 0)
-        merge_down(stream);
+    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+    order_stream_locked(stream);
+    const int run_count = static_cast<int>(chrono_views_.size());
+    const bool run_parallel =
+        batch.count <=
+            static_cast<std::size_t>(
+                GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES) &&
+        run_count >= GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS;
+    if (run_parallel) {
+      constexpr int block = gpulsmopt_detail::kRunCapacity;
+      const int grid = static_cast<int>(batch.count);
+      gpulsmopt_detail::temporal_lookup_run_parallel_kernel<<<
+          grid, block, 0, stream>>>(
+          assignment_views_.data(), run_count, make_owner_view(),
+          owner_ready_ ? 1 : 0, batch.queries, batch.count,
+          batch.out_values, batch.out_found);
+    } else {
+      const int block = 256;
+      const int grid = static_cast<int>((batch.count + block - 1) / block);
+      gpulsmopt_detail::temporal_lookup_kernel<<<grid, block, 0, stream>>>(
+          assignment_views_.data(), run_count, make_owner_view(),
+          owner_ready_ ? 1 : 0, batch.queries, batch.count,
+          batch.out_values, batch.out_found);
     }
-    if (!owner_ready_) {
-      CUDA_CHECK(cudaMemsetAsync(batch.out_values, 0xff,
-                                 batch.count * sizeof(std::uint32_t), stream));
-      if (batch.out_found) {
-        CUDA_CHECK(cudaMemsetAsync(batch.out_found, 0,
-                                   batch.count * sizeof(std::uint8_t), stream));
-      }
-      return;
-    }
-    const int block = 256;
-    const int grid = static_cast<int>((batch.count + block - 1) / block);
-    gpulsmopt_detail::owner_lookup_kernel<<<grid, block, 0, stream>>>(
-        make_owner_view(), batch.queries, batch.count, batch.out_values,
-        batch.out_found);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -2565,8 +2785,8 @@ public:
     if (batch.count == 0)
       return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    if (c0_log_count_ != 0)
-      merge_down(stream);
+    order_stream_locked(stream);
+    ensure_resolved(stream);
     ensure_successor_bitmap(stream);
     const int block = 256;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
@@ -2579,57 +2799,69 @@ public:
     if (batch.query_count == 0)
       return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    if (c0_log_count_ != 0)
-      merge_down(stream);
-    if (runs_.empty()) {
-      CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
-                                 batch.query_count * sizeof(std::uint32_t),
-                                 stream));
-      if (batch.out_counts) {
-        CUDA_CHECK(cudaMemsetAsync(batch.out_counts, 0,
-                                   batch.query_count * sizeof(std::uint32_t),
-                                   stream));
-      }
-      return;
-    }
+    order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
-    const bool use_projection = should_use_range_delta_projection(
-        batch.query_count, batch.out_counts != nullptr);
-    if (!use_projection) {
-      ensure_run_heavy_sorted(stream);
-      ensure_run_value_prefixes(stream);
+    const int run_count = static_cast<int>(chrono_views_.size());
+    const bool try_narrow =
+        !resolved_ready_ &&
+        batch.query_count <=
+            static_cast<std::size_t>(
+                GPULSMOPT_NARROW_RANGE_MAX_QUERIES) &&
+        run_count > 0;
+    if (try_narrow) {
+      narrow_overflow_.resize_discard(1);
+      CUDA_CHECK(cudaMemsetAsync(narrow_overflow_.data(), 0,
+                                 sizeof(std::uint32_t), stream));
+      constexpr int block = gpulsmopt_detail::kNarrowSeenCap;
+      const int grid = static_cast<int>(batch.query_count);
+      gpulsmopt_detail::narrow_range_kernel<<<grid, block, 0, stream>>>(
+          batch.lo, batch.hi, batch.out_sums, batch.out_counts,
+          batch.query_count, assignment_views_.data(), run_count,
+          make_owner_view(), owner_ready_ ? 1 : 0, make_sorted_view(),
+          make_sorted_range_view(), sorted_value_prefix_.data(),
+          sorted_count_prefix_.data(), narrow_overflow_.data());
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaMemcpyAsync(&host_state_->narrow_overflow,
+                                 narrow_overflow_.data(),
+                                 sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (host_state_->narrow_overflow == 0u)
+        return;
     }
+    ensure_resolved(stream);
     if (batch.out_counts)
-      ensure_run_count_prefixes(stream);
-    if (use_projection) {
-      if (!range_delta_projection_ready_)
-        build_range_delta_projection(stream);
-      launch_range_projection(batch, stream);
-      return;
-    }
-    ensure_logical_run_views(stream);
-    if (should_use_run_parallel(batch.query_count)) {
-      ensure_run_transposed_metadata(batch.out_counts != nullptr, stream);
-      launch_run_parallel_range(batch, stream);
-    } else {
-      launch_run_sequential_range(batch, stream);
-    }
+      ensure_resolved_count_prefix(stream);
+    ensure_resolved_value_prefix(stream);
+    const int block = 128;
+    const int grid =
+        static_cast<int>((batch.query_count + block - 1) / block);
+    gpulsmopt_detail::resolved_range_kernel<<<grid, block, 0, stream>>>(
+        batch.lo, batch.hi, batch.out_sums, batch.out_counts,
+        batch.query_count, make_sorted_view(), make_sorted_range_view(),
+        sorted_value_prefix_.data(), sorted_count_prefix_.data(),
+        make_run_view(resolved_), resolved_.count > 0 ? 1 : 0);
+    CUDA_CHECK(cudaGetLastError());
   }
 
   void consolidate(cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    merge_down(stream);
-    consolidate_all_runs(stream);
+    order_stream_locked(stream);
+    fold_into_base(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
 
   void bulk_build(const std::uint32_t *keys, const std::uint32_t *values,
                   std::size_t n, cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    last_update_stream_ = stream;
+    order_stream_locked(stream);
     clear_run_state();
-    clear_c0_log(stream);
     live_count_ = 0;
+    run_sequence_ = 0;
+    chrono_views_.clear();
+    invalidate_resolved();
+    succ_built_ = false;
+    succ_bits_.release();
     if (n == 0) {
       clear_owner_state(stream);
       prepare_for_insert(stream);
@@ -2669,16 +2901,20 @@ public:
   std::size_t live_count() const {
     auto *self = const_cast<GPULSMOpt *>(this);
     std::unique_lock<std::shared_mutex> guard(self->snapshot_mutex_);
-    const cudaStream_t stream = self->last_update_stream_;
-    if (self->c0_log_count_ != 0)
-      self->merge_down(stream);
-    if (!self->owner_ready_)
-      return 0;
+    const cudaStream_t stream = self->operation_stream_;
+    self->ensure_resolved(stream);
+    std::size_t live = 0;
     auto policy = thrust::cuda::par.on(stream);
-    const std::size_t live = thrust::reduce(
-        policy, self->owner_quotient_live_.data(),
-        self->owner_quotient_live_.data() + gpulsmopt_detail::kEpochQuotients,
-        std::size_t{0}, thrust::plus<std::size_t>());
+    if (self->owner_ready_)
+      live = thrust::reduce(
+          policy, self->owner_quotient_live_.data(),
+          self->owner_quotient_live_.data() + gpulsmopt_detail::kEpochQuotients,
+          std::size_t{0}, thrust::plus<std::size_t>());
+    if (self->resolved_.count > 0)
+      live += static_cast<std::size_t>(thrust::reduce(
+          policy, self->resolved_.count_delta.data(),
+          self->resolved_.count_delta.data() + self->resolved_.count,
+          std::int64_t{0}, thrust::plus<std::int64_t>()));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     self->live_count_ = live;
     return self->live_count_;
@@ -2688,36 +2924,44 @@ public:
     std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
     std::size_t total = device_bytes_all(
         run_views_, range_delta_counts_, range_delta_sums_,
-        range_delta_offsets_, range_delta_value_prefix_, range_delta_keys_,
-        range_delta_values_, c0_log_keys_, c0_log_values_, c0_log_ops_,
-        direct_sort_keys_, direct_sort_values_, sort_key_output_,
-        sort_payload_input_, sort_payload_output_, sort_temp_storage_,
-        run_merge_keys_, sorted_value_prefix_, sorted_count_prefix_,
-        sorted_radix_, sorted_range_cdf_, sorted_micro_base_,
-        sorted_micro_offsets_, sorted_micro_bits_, owner_primary_,
-        owner_spill_keys_, owner_spill_values_, owner_spill_count_,
-        owner_quotient_live_, merge_ops_, logical_run_views_,
-        run_off_t_, run_vp_t_, run_cp_t_, succ_bits_, compact_views_,
-        compact_combined_, compact_segoff_, compact_heavy_list_,
-        compact_heavy_count_, compact_heavy_begin_, compact_heavy_end_,
-        compact_keys_, compact_payload_, compact_alt_keys_,
-        compact_alt_payload_, compact_num_runs_, compact_flags_, compact_pos_,
-        compact_group_unique_, compact_output_keys_, compact_output_values_,
-        compact_output_counts_);
+        range_delta_offsets_, range_delta_value_prefix_,
+        range_delta_keys_, range_delta_values_, resolve_keys_,
+        resolve_payload_, resolve_alt_keys_, resolve_alt_payload_,
+        resolve_flags_, resolve_sel_vdelta_, resolve_sel_cdelta_,
+        resolve_count_, compaction_counts_, compaction_offsets_,
+        narrow_overflow_, assignment_views_, direct_sort_keys_,
+        direct_sort_values_, sort_key_output_, sort_temp_storage_,
+        sorted_value_prefix_, sorted_count_prefix_, sorted_radix_,
+        sorted_range_cdf_, sorted_micro_base_, sorted_micro_offsets_,
+        sorted_micro_bits_, owner_primary_, owner_spill_keys_,
+        owner_spill_values_, owner_spill_count_, owner_quotient_live_,
+        meta_pending_list_, meta_pending_count_, owner_class_list_,
+        owner_class_count_, logical_run_views_, run_off_t_, run_vp_t_,
+        run_cp_t_, succ_bits_);
+    total += device_bytes_all(
+        resolved_.keys, resolved_.values, resolved_.count_delta,
+        resolved_.quotient_count_sum, resolved_.quotient_off,
+        resolved_.subgroup_masks, resolved_.quotient_live,
+        resolved_.quotient_value_sum, resolved_.quotient_count_prefix,
+        resolved_.quotient_value_prefix,
+        resolved_.subgroup_value_prefix, resolved_.heavy_list,
+        resolved_.heavy_count, resolved_.op_words);
     for (const auto &epoch : runs_)
       total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_count_sum,
-          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
+          epoch.keys, epoch.values, epoch.count_delta,
+          epoch.quotient_count_sum, epoch.quotient_off,
+          epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
           epoch.quotient_value_prefix, epoch.subgroup_value_prefix,
-          epoch.heavy_list, epoch.heavy_count);
+          epoch.heavy_list, epoch.heavy_count, epoch.op_words);
     for (const auto &epoch : run_pool_)
       total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_count_sum,
-          epoch.quotient_off, epoch.subgroup_masks, epoch.quotient_live,
+          epoch.keys, epoch.values, epoch.count_delta,
+          epoch.quotient_count_sum, epoch.quotient_off,
+          epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
           epoch.quotient_value_prefix, epoch.subgroup_value_prefix,
-          epoch.heavy_list, epoch.heavy_count);
+          epoch.heavy_list, epoch.heavy_count, epoch.op_words);
     return total;
   }
 
@@ -2736,7 +2980,15 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> subgroup_value_prefix;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> heavy_list;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> heavy_count;
+    // Packed op bits for mixed (compacted) assignment runs.
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
     std::size_t count = 0;
+    // Temporal identity of an immutable assignment run.
+    std::uint64_t sequence = 0;
+    gpulsmopt_detail::RunOperation operation =
+        gpulsmopt_detail::RunOperation::Insert;
+    bool mixed = false;
+    bool assignment = false;
     bool heavy_sorted = true;
     bool value_sums_ready = true;
     bool value_prefix_ready = true;
@@ -2746,6 +2998,19 @@ private:
     bool unit_counts = false;
     bool unique_keys = false;
   };
+
+  void order_stream_locked(cudaStream_t stream) {
+    if (!operation_stream_valid_) {
+      operation_stream_ = stream;
+      operation_stream_valid_ = true;
+      return;
+    }
+    if (stream == operation_stream_)
+      return;
+    CUDA_CHECK(cudaEventRecord(stream_handoff_, operation_stream_));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, stream_handoff_, 0));
+    operation_stream_ = stream;
+  }
 
   template <class T> static T *raw_or_null(thrust::device_vector<T> &v) {
     return v.empty() ? nullptr : thrust::raw_pointer_cast(v.data());
@@ -3507,53 +3772,97 @@ private:
     }
   }
 
-  void create_unsorted_run(const std::uint32_t *keys,
-                           const std::uint32_t *values, std::size_t count,
-                           cudaStream_t stream) {
-    if (run_count() >= static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity))
-      compact_runs(stream);
+  // Immutable assignment run: upper-16 sort + quotient offsets,
+  // NO previous-state resolution. This is the insert/delete path.
+  void create_assignment_run(bool is_insert, const std::uint32_t *keys,
+                             const std::uint32_t *values, std::size_t count,
+                             cudaStream_t stream) {
+    if (run_count() >=
+        static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity) - 1u)
+      compact_contiguous(stream);
     acquire_run_slot();
-    RunStorage &epoch = runs_.back();
-    epoch.count = count;
-    epoch.fully_sorted = false;
-    epoch.unit_counts = false;
-    epoch.unique_keys = false;
-    epoch.keys.resize_discard(count);
-    epoch.values.resize_discard(count);
+    RunStorage &run = runs_.back();
+    run.count = count;
+    run.assignment = true;
+    run.mixed = false;
+    run.operation = is_insert ? gpulsmopt_detail::RunOperation::Insert
+                              : gpulsmopt_detail::RunOperation::Delete;
+    run.sequence = ++run_sequence_;
+    run.fully_sorted = false;
+    run.unit_counts = false;
+    run.unique_keys = false;
+    run.keys.resize_discard(count);
     {
       GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
-      sort_run_batch(keys, values, count, epoch.keys.data(),
-                     epoch.values.data(), stream);
+      // Stable upper-16 sort keeps each quotient in input order.
+      if (is_insert) {
+        run.values.resize_discard(count);
+        sort_run_batch(keys, values, count, run.keys.data(),
+                       run.values.data(), stream);
+      } else {
+        // Deletion leaves are key-only: no value traffic.
+        run.values.resize_discard(0);
+        sort_delete_batch(keys, count, run.keys.data(), stream);
+      }
     }
     {
       GPULSMOPT_PROF_PHASE(prof_delta_ingest_ms_);
-      commit_run_metadata(epoch, stream);
+      // Leaf metadata is quotient offsets only: no masks, no counts.
+      build_assignment_offsets(run, static_cast<std::uint32_t>(count), stream);
     }
+    publish_assignment_view(run, stream);
+    invalidate_resolved();
+    logical_run_views_ready_ = false;
+    ++structure_generation_;
   }
 
-  void create_delete_run(const std::uint32_t *keys, std::size_t count,
-                         bool sorted, cudaStream_t stream) {
-    if (run_count() >= static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity))
-      compact_runs(stream);
-    acquire_run_slot();
-    RunStorage &epoch = runs_.back();
-    epoch.count = count;
-    epoch.fully_sorted = sorted;
-    epoch.unit_counts = false;
-    epoch.unique_keys = false;
-    epoch.keys.resize_discard(count);
-    epoch.values.resize_discard(count);
-    if (sorted) {
-      CUDA_CHECK(cudaMemcpyAsync(epoch.keys.data(), keys,
-                                 count * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToDevice, stream));
-    } else {
-      sort_run_batch(keys, keys, count, epoch.keys.data(), epoch.values.data(),
-                     stream);
+  // Offsets-only leaf metadata; richer metadata is built only for
+  // resolved delta runs and the BaseRun.
+  void build_assignment_offsets(RunStorage &run, std::uint32_t count,
+                                cudaStream_t stream) {
+    run.quotient_off.resize_discard(gpulsmopt_detail::kEpochQuotients + 1);
+    std::uint32_t *offsets = run.quotient_off.data();
+    if (count == 0u) {
+      CUDA_CHECK(cudaMemsetAsync(offsets, 0,
+                                 (gpulsmopt_detail::kEpochQuotients + 1u) *
+                                     sizeof(std::uint32_t),
+                                 stream));
+      return;
     }
-    commit_run_metadata(
-        epoch, stream, nullptr,
-        static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone));
+    CUDA_CHECK(cudaMemsetAsync(offsets, 0xff,
+                               (gpulsmopt_detail::kEpochQuotients + 1u) *
+                                   sizeof(std::uint32_t),
+                               stream));
+    constexpr int block = 256;
+    const int grid = static_cast<int>((count + block - 1) / block);
+    gpulsmopt_detail::assignment_boundary_kernel<<<grid, block, 0, stream>>>(
+        run.keys.data(), count, offsets);
+    CUDA_CHECK(cudaGetLastError());
+    reverse_min_scan_offsets(offsets, stream);
+  }
+
+  // Publish one chronological descriptor so the run is queryable.
+  void publish_assignment_view(RunStorage &run, cudaStream_t stream) {
+    gpulsmopt_detail::AssignmentRunView view{
+        run.keys.data(),
+        run.operation == gpulsmopt_detail::RunOperation::Insert
+            ? run.values.data()
+            : nullptr,
+        run.quotient_off.data(),
+        run.mixed ? run.op_words.data() : nullptr,
+        static_cast<std::uint8_t>(
+            run.operation == gpulsmopt_detail::RunOperation::Insert ? 1u : 0u),
+        static_cast<std::uint8_t>(run.mixed ? 1u : 0u)};
+    const std::size_t slot = chrono_views_.size();
+    if (slot >= static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity))
+      throw std::runtime_error("assignment descriptor capacity exceeded");
+    chrono_views_.push_back(view);
+    host_state_->views[slot] = view;
+    if (assignment_views_.size() < chrono_views_.size())
+      assignment_views_.resize_discard(gpulsmopt_detail::kRunCapacity);
+    CUDA_CHECK(cudaMemcpyAsync(assignment_views_.data() + slot,
+                               host_state_->views + slot, sizeof(view),
+                               cudaMemcpyHostToDevice, stream));
   }
   void acquire_run_slot() {
     if (run_pool_.empty()) {
@@ -3562,6 +3871,20 @@ private:
     }
     runs_.push_back(std::move(run_pool_.back()));
     run_pool_.pop_back();
+  }
+
+  void acquire_compaction_slot() {
+    if (run_pool_.empty()) {
+      runs_.emplace_back();
+      return;
+    }
+    auto best = std::max_element(
+        run_pool_.begin(), run_pool_.end(),
+        [](const RunStorage &left, const RunStorage &right) {
+          return left.keys.capacity() < right.keys.capacity();
+        });
+    runs_.push_back(std::move(*best));
+    run_pool_.erase(best);
   }
 
   void reserve_run_storage(std::size_t count) {
@@ -3590,90 +3913,6 @@ private:
       epoch.heavy_list.resize_discard(gpulsmopt_detail::kEpochQuotients);
       epoch.heavy_count.resize_discard(1);
     }
-    const std::size_t pending_capacity =
-        count * static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity);
-    run_merge_keys_.resize_discard(pending_capacity);
-  }
-
-  void reserve_compaction_storage(std::size_t run_capacity,
-                                  cudaStream_t stream) {
-    if (max_elements_ == 0u || run_pool_.empty())
-      return;
-    compact_output_capacity_ = max_elements_ * 2u;
-    constexpr std::size_t tail_runs = gpulsmopt_detail::kCompactMergeRuns - 1u;
-    const std::size_t scan_limit =
-        static_cast<std::size_t>(std::numeric_limits<int>::max() / 2);
-    if (compact_output_capacity_ > scan_limit ||
-        run_capacity > (scan_limit - compact_output_capacity_) / tail_runs) {
-      compact_output_capacity_ = 0u;
-      return;
-    }
-
-    compact_output_keys_.resize_discard_exact(compact_output_capacity_);
-    compact_output_values_.resize_discard_exact(compact_output_capacity_);
-    compact_output_counts_.resize_discard_exact(compact_output_capacity_);
-
-    auto first_slot = run_pool_.begin();
-    for (auto it = run_pool_.begin(); it != run_pool_.end(); ++it) {
-      if (it->keys.capacity() > first_slot->keys.capacity())
-        first_slot = it;
-    }
-    const std::size_t large_index = std::min<std::size_t>(
-        gpulsmopt_detail::kCompactTargetRuns, run_pool_.size() - 1u);
-    auto large_slot = run_pool_.begin() + large_index;
-    if (first_slot != large_slot)
-      std::iter_swap(first_slot, large_slot);
-    RunStorage &first = *large_slot;
-    first.keys.resize_discard_exact(compact_output_capacity_);
-    first.values.resize_discard_exact(compact_output_capacity_);
-    first.count_delta.resize_discard_exact(compact_output_capacity_);
-
-    const std::size_t input_capacity =
-        compact_output_capacity_ + tail_runs * run_capacity;
-    compact_views_.resize_discard_exact(gpulsmopt_detail::kCompactMergeRuns);
-    compact_combined_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients +
-                                           1u);
-    compact_segoff_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients +
-                                         1u);
-    compact_keys_.resize_discard_exact(input_capacity);
-    compact_payload_.resize_discard_exact(input_capacity);
-    compact_alt_keys_.resize_discard_exact(input_capacity);
-    compact_alt_payload_.resize_discard_exact(input_capacity);
-    compact_flags_.resize_discard_exact(input_capacity);
-    compact_pos_.resize_discard_exact(input_capacity);
-    compact_heavy_list_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients);
-    compact_heavy_count_.resize_discard_exact(1u);
-    compact_heavy_begin_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients);
-    compact_heavy_end_.resize_discard_exact(gpulsmopt_detail::kEpochQuotients);
-    compact_num_runs_.resize_discard_exact(1u);
-    compact_group_unique_.resize_discard_exact(1u);
-
-    // Prewarm CUB temp storage for the compaction pipeline.
-    std::size_t seg_bytes = 0u;
-    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-        nullptr, seg_bytes, compact_keys_.data(), compact_alt_keys_.data(),
-        compact_payload_.data(), compact_alt_payload_.data(),
-        static_cast<int>(input_capacity),
-        gpulsmopt_detail::kEpochQuotients, compact_heavy_begin_.data(),
-        compact_heavy_end_.data(), 0, 16, stream));
-    std::size_t reduce_bytes = 0u;
-    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
-        nullptr, reduce_bytes, compact_keys_.data(), compact_alt_keys_.data(),
-        compact_payload_.data(), compact_alt_payload_.data(),
-        compact_num_runs_.data(), gpulsmopt_detail::SumDeltaPayload{},
-        static_cast<int>(input_capacity), stream));
-    ensure_sort_temp(std::max(seg_bytes, reduce_bytes));
-
-    if (input_capacity <= scan_u32_count_)
-      return;
-    std::size_t temp_bytes = 0u;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, temp_bytes, compact_flags_.data(), compact_pos_.data(),
-        static_cast<int>(input_capacity), stream));
-    scan_u32_count_ = input_capacity;
-    scan_u32_temp_bytes_ = temp_bytes;
-    ensure_sort_temp(temp_bytes);
   }
 
   void clear_run_state() {
@@ -3694,127 +3933,17 @@ private:
     ++structure_generation_;
   }
 
-  std::size_t c0_log_live() const { return c0_log_count_; }
-
-  std::size_t c0_flush_budget() const {
-    std::size_t budget = std::min<std::size_t>(
-        static_cast<std::size_t>(GPULSMOPT_C0_FLUSH_BUDGET),
-        gpulsmopt_detail::kC0LogMaxIndex);
-    if (max_elements_ > 0)
-      budget = std::min(budget, max_elements_);
-    return std::max<std::size_t>(budget, 1);
-  }
-
-  enum class RunKind : std::uint8_t {
-    empty,
-    inserts,
-    tombstones,
-    mixed,
-  };
-
-  static RunKind operation_kind(std::uint8_t op) {
-    return op == gpulsmopt_detail::kInsert ? RunKind::inserts
-                                           : RunKind::tombstones;
-  }
-
-  static std::uint8_t operation_value(RunKind kind) {
-    return kind == RunKind::inserts
-               ? static_cast<std::uint8_t>(gpulsmopt_detail::kInsert)
-               : static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone);
-  }
-
-  void ensure_c0_log(cudaStream_t stream) {
-    (void)stream;
-    const std::size_t reserve_count = c0_flush_budget();
-    c0_log_keys_.reserve(reserve_count);
-    c0_log_values_.reserve(reserve_count);
-    c0_log_ops_.reserve(reserve_count);
-    if (c0_log_keys_.size() < reserve_count)
-      c0_log_keys_.resize(reserve_count);
-    if (c0_log_values_.size() < reserve_count)
-      c0_log_values_.resize(reserve_count);
-    if (c0_log_ops_.size() < reserve_count)
-      c0_log_ops_.resize(reserve_count);
-  }
-
-  bool append_c0_log(const std::uint32_t *keys_in,
-                     const std::uint32_t *values_in, std::uint8_t op,
-                     std::size_t count, cudaStream_t stream) {
-    if (count == 0)
-      return true;
-    if (count > gpulsmopt_detail::kC0LogMaxIndex - c0_log_count_)
-      return false;
-    ensure_c0_log(stream);
-    const std::uint32_t old_total = c0_log_count_;
-    const std::size_t new_total = static_cast<std::size_t>(old_total) + count;
-    const RunKind incoming_kind = operation_kind(op);
-    if (c0_kind_ == RunKind::empty) {
-      c0_kind_ = incoming_kind;
-    } else if (c0_kind_ != incoming_kind && c0_kind_ != RunKind::mixed) {
-      CUDA_CHECK(cudaMemsetAsync(raw_or_null(c0_log_ops_),
-                                 operation_value(c0_kind_), old_total, stream));
-      c0_kind_ = RunKind::mixed;
-    }
-    std::uint8_t *ops =
-        c0_kind_ == RunKind::mixed ? raw_or_null(c0_log_ops_) : nullptr;
-    {
-      GPULSMOPT_PROF_PHASE(prof_append_ms_);
-      const int block = 256;
-      const int grid = static_cast<int>((count + block - 1) / block);
-      gpulsmopt_detail::c0_log_append_kernel<<<grid, block, 0, stream>>>(
-          keys_in, values_in, op, old_total, count, raw_or_null(c0_log_keys_),
-          raw_or_null(c0_log_values_), ops);
-      CUDA_CHECK(cudaGetLastError());
-    }
-    c0_log_count_ = static_cast<std::uint32_t>(new_total);
-    return true;
-  }
-
-  void clear_c0_log(cudaStream_t stream) {
-    if (c0_log_count_ == 0)
-      return;
-    c0_log_count_ = 0;
-    c0_kind_ = RunKind::empty;
-    (void)stream;
-  }
-
-  void drain_c0_for_space(cudaStream_t stream) {
-    if (c0_log_count_ != 0)
-      merge_down(stream);
-  }
-
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
                       std::size_t count, bool keys_sorted,
                       cudaStream_t stream) {
-    if (op == static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone) &&
-        try_direct_delete(keys_in, count, keys_sorted, stream))
+    (void)keys_sorted;
+    if (count == 0)
       return;
-    if (try_create_epoch(keys_in, values_in, op, count, stream))
-      return;
-    std::size_t off = 0;
-    while (off < count) {
-      const std::size_t budget = c0_flush_budget();
-      if (c0_log_count_ >= budget)
-        drain_c0_for_space(stream);
-      if (c0_log_count_ >= gpulsmopt_detail::kC0LogMaxIndex)
-        drain_c0_for_space(stream);
-      const std::size_t cap_left =
-          gpulsmopt_detail::kC0LogMaxIndex - c0_log_count_;
-      const std::size_t budget_left =
-          budget > c0_log_count_ ? budget - c0_log_count_ : cap_left;
-      std::size_t chunk = count - off;
-      chunk = std::min(chunk, cap_left);
-      chunk = std::min(chunk, budget_left);
-      if (chunk == 0) {
-        drain_c0_for_space(stream);
-        continue;
-      }
-      const std::uint32_t *vals = values_in ? values_in + off : nullptr;
-      if (!append_c0_log(keys_in + off, vals, op, chunk, stream))
-        throw std::runtime_error("C0 log append failed");
-      off += chunk;
-    }
+    const bool is_insert =
+        op == static_cast<std::uint8_t>(gpulsmopt_detail::kInsert);
+    create_assignment_run(is_insert, keys_in, is_insert ? values_in : nullptr,
+                          count, stream);
   }
 
   void ensure_sort_temp(std::size_t bytes) {
@@ -3840,13 +3969,9 @@ private:
                                              static_cast<int>(count), stream));
   }
 
-  void prepare_sort_storage(std::size_t direct_count, std::size_t log_count,
-                            cudaStream_t stream) {
+  void prepare_sort_storage(std::size_t direct_count, cudaStream_t stream) {
     direct_sort_keys_.resize_discard(direct_count);
     direct_sort_values_.resize_discard(direct_count);
-    resize_reuse(sort_key_output_, log_count);
-    sort_payload_input_.resize_discard(log_count);
-    sort_payload_output_.resize_discard(log_count);
     RunStorage &sample = run_pool_.back();
     std::size_t direct_bytes = 0;
     if (direct_count > 0) {
@@ -3857,15 +3982,6 @@ private:
       direct_sort_count_ = direct_count;
       direct_sort_temp_bytes_ = direct_bytes;
     }
-    std::size_t log_bytes = 0;
-    if (log_count > 0) {
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, log_bytes, raw_or_null(c0_log_keys_),
-          raw_or_null(sort_key_output_), sort_payload_input_.data(),
-          sort_payload_output_.data(), log_count, 0, 32, stream));
-      log_sort_count_ = log_count;
-      log_sort_temp_bytes_ = log_bytes;
-    }
     std::size_t epoch_bytes = 0;
     if (direct_count > 0) {
       CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
@@ -3875,29 +3991,95 @@ private:
       run_sort_count_ = direct_count;
       run_sort_temp_bytes_ = epoch_bytes;
     }
+    // Resolve staging reuses the same high-water sizing.
+    resolve_keys_.resize_discard(direct_count);
+    resolve_payload_.resize_discard(direct_count);
+    resolve_alt_keys_.resize_discard(direct_count);
+    resolve_alt_payload_.resize_discard(direct_count);
+    resolve_flags_.resize_discard(direct_count);
+    resolve_sel_vdelta_.resize_discard(direct_count);
+    resolve_sel_cdelta_.resize_discard(direct_count);
+    resolve_count_.resize_discard(1);
     std::size_t scan_bytes = 0;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, scan_bytes, direct_sort_keys_.data(),
         direct_sort_values_.data(), gpulsmopt_detail::kEpochQuotients, stream));
     scan_u32_count_ = gpulsmopt_detail::kEpochQuotients;
     scan_u32_temp_bytes_ = scan_bytes;
-    ensure_sort_temp(
-        std::max({direct_bytes, log_bytes, epoch_bytes, scan_bytes}));
+    ensure_sort_temp(std::max({direct_bytes, epoch_bytes, scan_bytes}));
+  }
+
+  void reserve_temporal_compaction_storage(
+      std::size_t run_capacity, cudaStream_t stream) {
+    compaction_counts_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    compaction_offsets_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    if (run_capacity == 0u || max_elements_ == 0u || run_pool_.empty())
+      return;
+    const std::size_t run_limit =
+        run_capacity > std::numeric_limits<std::size_t>::max() /
+                           gpulsmopt_detail::kCompactGroup
+            ? std::numeric_limits<std::size_t>::max()
+            : run_capacity * gpulsmopt_detail::kCompactGroup;
+    const std::size_t live_limit =
+        max_elements_ > std::numeric_limits<std::size_t>::max() / 2u
+            ? std::numeric_limits<std::size_t>::max()
+            : max_elements_ * 2u;
+    const std::size_t capacity = std::min(
+        {run_limit, live_limit,
+         static_cast<std::size_t>(std::numeric_limits<int>::max())});
+    if (capacity == 0u)
+      return;
+
+    resolve_keys_.resize_discard_exact(capacity);
+    resolve_payload_.resize_discard_exact(capacity);
+    resolve_alt_keys_.resize_discard_exact(capacity);
+    resolve_alt_payload_.resize_discard_exact(capacity);
+    RunStorage &destination = run_pool_.front();
+    destination.keys.resize_discard_exact(capacity);
+    destination.values.resize_discard_exact(capacity);
+    destination.op_words.resize_discard_exact(
+        (capacity + 31u) / 32u + 1u);
+
+    std::size_t sort_bytes = 0u;
+    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+        nullptr, sort_bytes, resolve_keys_.data(),
+        resolve_alt_keys_.data(), resolve_payload_.data(),
+        resolve_alt_payload_.data(), static_cast<int>(capacity),
+        gpulsmopt_detail::kEpochQuotients,
+        compaction_offsets_.data(), compaction_offsets_.data() + 1u,
+        0, 16, stream));
+    compaction_sort_count_ = capacity;
+    compaction_sort_temp_bytes_ = sort_bytes;
+    ensure_sort_temp(sort_bytes);
   }
 
   // Reserve direct-path buffers before timed updates.
   void prepare_for_insert(cudaStream_t stream) {
-    const std::size_t direct_count = std::min(
-        max_elements_, std::max(4 * c0_flush_budget(), batch_capacity_));
-    ensure_c0_log(stream);
+    const std::size_t direct_count =
+        std::min(max_elements_,
+                 std::max<std::size_t>(gpulsmopt_detail::kRawRunReserve,
+                                       batch_capacity_));
     reserve_run_storage(direct_count);
+    assignment_views_.resize_discard_exact(gpulsmopt_detail::kRunCapacity);
+    chrono_views_.reserve(gpulsmopt_detail::kRunCapacity);
+    if (direct_count > 0) {
+      delete_sort_temp_bytes_ = 0;
+      CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+          nullptr, delete_sort_temp_bytes_, direct_sort_keys_.data(),
+          direct_sort_keys_.data(), static_cast<int>(direct_count), 16, 32,
+          stream));
+      delete_sort_count_ = direct_count;
+      ensure_sort_temp(delete_sort_temp_bytes_);
+    }
     owner_class_list_.resize_discard_exact(4u *
                                            gpulsmopt_detail::kEpochQuotients);
     owner_class_count_.resize_discard_exact(4u);
     meta_pending_list_.resize_discard_exact((direct_count + 31u) / 32u + 1u);
     meta_pending_count_.resize_discard_exact(1u);
-    prepare_sort_storage(direct_count, c0_flush_budget(), stream);
-    reserve_compaction_storage(direct_count, stream);
+    prepare_sort_storage(direct_count, stream);
+    reserve_temporal_compaction_storage(direct_count, stream);
     prebind_run_views(stream);
   }
 
@@ -3919,6 +4101,25 @@ private:
         values, direct_sort_values_.data(), n, 0, 32, stream));
   }
 
+  // Key-only upper-16 sort for deletion leaves.
+  void sort_delete_batch(const std::uint32_t *keys, std::size_t n,
+                         std::uint32_t *out_keys, cudaStream_t stream) {
+    if (n > delete_sort_count_) {
+      delete_sort_temp_bytes_ = 0;
+      CUDA_CHECK(cub::DeviceRadixSort::SortKeys(nullptr, delete_sort_temp_bytes_,
+                                                keys, out_keys,
+                                                static_cast<int>(n), 16, 32,
+                                                stream));
+      delete_sort_count_ = n;
+    }
+    std::size_t temp_bytes = delete_sort_temp_bytes_;
+    ensure_sort_temp(temp_bytes);
+    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(sort_temp_storage_.data(),
+                                              temp_bytes, keys, out_keys,
+                                              static_cast<int>(n), 16, 32,
+                                              stream));
+  }
+
   void sort_run_batch(const std::uint32_t *keys, const std::uint32_t *values,
                       std::size_t n, std::uint32_t *out_keys,
                       std::uint32_t *out_values, cudaStream_t stream) {
@@ -3936,312 +4137,6 @@ private:
         out_values, static_cast<std::uint32_t>(n), 16, 32, stream));
   }
 
-  void consolidate_all_runs(cudaStream_t stream) {
-    if (runs_.size() < 2)
-      return;
-    std::size_t total = 0;
-    for (const auto &epoch : runs_)
-      total += epoch.count;
-    if (total == 0) {
-      clear_run_state();
-      return;
-    }
-    run_merge_keys_.resize_discard(total);
-    sort_payload_input_.resize_discard(total);
-    sort_payload_output_.resize_discard(total);
-    direct_sort_keys_.resize_discard(total);
-    std::size_t offset = 0;
-    constexpr int block = 256;
-    for (const auto &epoch : runs_) {
-      CUDA_CHECK(cudaMemcpyAsync(run_merge_keys_.data() + offset,
-                                 epoch.keys.data(),
-                                 epoch.count * sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToDevice, stream));
-      const int grid = static_cast<int>((epoch.count + block - 1) / block);
-      gpulsmopt_detail::pack_delta_payload_kernel<<<grid, block, 0, stream>>>(
-          epoch.values.data(), epoch.count_delta.data(), epoch.count,
-          sort_payload_input_.data() + offset);
-      CUDA_CHECK(cudaGetLastError());
-      offset += epoch.count;
-    }
-    std::size_t temp_bytes = 0;
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, temp_bytes, run_merge_keys_.data(), direct_sort_keys_.data(),
-        sort_payload_input_.data(), sort_payload_output_.data(), total, 0, 32,
-        stream));
-    ensure_sort_temp(temp_bytes);
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        sort_temp_storage_.data(), temp_bytes, run_merge_keys_.data(),
-        direct_sort_keys_.data(), sort_payload_input_.data(),
-        sort_payload_output_.data(), total, 0, 32, stream));
-    auto policy = thrust::cuda::par.on(stream);
-    auto unique_end = thrust::reduce_by_key(
-        policy, direct_sort_keys_.data(), direct_sort_keys_.data() + total,
-        sort_payload_output_.data(), run_merge_keys_.data(),
-        sort_payload_input_.data(), thrust::equal_to<std::uint32_t>(),
-        gpulsmopt_detail::SumDeltaPayload{});
-    const std::size_t unique_count =
-        static_cast<std::size_t>(unique_end.first - run_merge_keys_.data());
-    clear_run_state();
-    acquire_run_slot();
-    RunStorage &epoch = runs_.back();
-    epoch.count = unique_count;
-    epoch.fully_sorted = true;
-    epoch.unit_counts = false;
-    epoch.unique_keys = true;
-    epoch.keys.resize_discard(unique_count);
-    epoch.values.resize_discard(unique_count);
-    epoch.count_delta.resize_discard(unique_count);
-    CUDA_CHECK(cudaMemcpyAsync(epoch.keys.data(), run_merge_keys_.data(),
-                               unique_count * sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToDevice, stream));
-    const int grid = static_cast<int>((unique_count + block - 1) / block);
-    gpulsmopt_detail::unpack_delta_payload_kernel<<<grid, block, 0, stream>>>(
-        sort_payload_input_.data(), unique_count, epoch.values.data(),
-        epoch.count_delta.data());
-    CUDA_CHECK(cudaGetLastError());
-    commit_run_metadata(epoch, stream, nullptr,
-                        static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
-                        false);
-  }
-
-  struct CompactRange {
-    std::size_t begin;
-    std::size_t end;
-    std::size_t total;
-  };
-
-  CompactRange plan_compaction_group() const {
-    const std::size_t n = runs_.size();
-    const std::size_t target = gpulsmopt_detail::kCompactTargetRuns;
-    if (n <= target)
-      return {0u, 0u, 0u};
-    const std::size_t merge_count = n - target + 1u;
-    if (merge_count >
-        static_cast<std::size_t>(gpulsmopt_detail::kCompactMergeRuns)) {
-      throw std::runtime_error("run capacity exceeded");
-    }
-    std::size_t window = 0u;
-    for (std::size_t r = 0; r < merge_count; ++r)
-      window += runs_[r].count;
-    std::size_t best_begin = 0u;
-    std::size_t best_total = window;
-    for (std::size_t begin = 1u; begin + merge_count <= n; ++begin) {
-      window -= runs_[begin - 1u].count;
-      window += runs_[begin + merge_count - 1u].count;
-      if (window <= best_total) {
-        best_begin = begin;
-        best_total = window;
-      }
-    }
-    return {best_begin, best_begin + merge_count, best_total};
-  }
-
-  void compact_runs(cudaStream_t stream) {
-    const CompactRange group = plan_compaction_group();
-    if (group.end == 0u)
-      return;
-    if (group.total >
-        static_cast<std::size_t>(std::numeric_limits<int>::max() / 2)) {
-      throw std::runtime_error("compaction group is too large");
-    }
-    // Exact record count: no padded tail work anywhere.
-    const std::size_t total = group.total;
-    if (total > compact_keys_.capacity()) {
-      throw std::runtime_error("compaction workspace was not preallocated");
-    }
-    constexpr int block = 256;
-    const std::size_t rows = gpulsmopt_detail::kEpochQuotients + 1u;
-    const std::size_t group_count = group.end - group.begin;
-    compact_views_.resize_discard(group_count);
-    compact_combined_.resize_discard(rows);
-    compact_segoff_.resize_discard(rows);
-    compact_keys_.resize_discard(total);
-    compact_payload_.resize_discard(total);
-    compact_alt_keys_.resize_discard(total);
-    compact_alt_payload_.resize_discard(total);
-    compact_flags_.resize_discard(total);
-    compact_pos_.resize_discard(total);
-    compact_heavy_list_.resize_discard(gpulsmopt_detail::kEpochQuotients);
-    compact_heavy_count_.resize_discard(1u);
-    compact_heavy_begin_.resize_discard(gpulsmopt_detail::kEpochQuotients);
-    compact_heavy_end_.resize_discard(gpulsmopt_detail::kEpochQuotients);
-    compact_num_runs_.resize_discard(1u);
-    compact_group_unique_.resize_discard(1u);
-
-    std::vector<gpulsmopt_detail::RunView> views;
-    views.reserve(group_count);
-    for (std::size_t r = group.begin; r < group.end; ++r)
-      views.push_back(make_run_view(runs_[r]));
-    CUDA_CHECK(cudaMemcpyAsync(compact_views_.data(), views.data(),
-                               views.size() * sizeof(views[0]),
-                               cudaMemcpyHostToDevice, stream));
-
-    const int plan_grid = static_cast<int>((rows + block - 1u) / block);
-    gpulsmopt_detail::compact_plan_kernel<<<plan_grid, block, 0, stream>>>(
-        compact_views_.data(), static_cast<int>(views.size()),
-        compact_combined_.data());
-    CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(compact_combined_.data(), compact_segoff_.data(), rows,
-                       stream);
-    CUDA_CHECK(cudaMemsetAsync(compact_heavy_count_.data(), 0,
-                               sizeof(std::uint32_t), stream));
-    const int classify_grid = gpulsmopt_detail::kEpochQuotients / block;
-    gpulsmopt_detail::
-        compact_classify_heavy_kernel<<<classify_grid, block, 0, stream>>>(
-            compact_combined_.data(), compact_heavy_list_.data(),
-            compact_heavy_count_.data());
-    CUDA_CHECK(cudaGetLastError());
-    std::uint32_t heavy_items = 0u;
-    CUDA_CHECK(cudaMemcpyAsync(&heavy_items, compact_heavy_count_.data(),
-                               sizeof(heavy_items), cudaMemcpyDeviceToHost,
-                               stream));
-    gpulsmopt_detail::compact_sort_light_kernel<<<
-        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
-        compact_views_.data(), static_cast<int>(views.size()),
-        compact_combined_.data(), compact_segoff_.data(), compact_keys_.data(),
-        compact_payload_.data());
-    CUDA_CHECK(cudaGetLastError());
-    gpulsmopt_detail::compact_gather_heavy_kernel<<<64, block, 0, stream>>>(
-        compact_views_.data(), static_cast<int>(views.size()),
-        compact_heavy_list_.data(), compact_heavy_count_.data(),
-        compact_segoff_.data(), compact_keys_.data(),
-        compact_payload_.data());
-    CUDA_CHECK(cudaGetLastError());
-    gpulsmopt_detail::
-        compact_heavy_bounds_kernel<<<classify_grid, block, 0, stream>>>(
-            compact_heavy_list_.data(), compact_heavy_count_.data(),
-            compact_segoff_.data(), compact_combined_.data(),
-            compact_heavy_begin_.data(), compact_heavy_end_.data());
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (heavy_items > 0u) {
-      // Installed segmented radix fallback, low 16 bits only.
-      std::size_t seg_bytes = 0u;
-      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-          nullptr, seg_bytes, compact_keys_.data(), compact_alt_keys_.data(),
-          compact_payload_.data(), compact_alt_payload_.data(),
-          static_cast<int>(total), static_cast<int>(heavy_items),
-          compact_heavy_begin_.data(), compact_heavy_end_.data(), 0, 16,
-          stream));
-      ensure_sort_temp(seg_bytes);
-      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-          sort_temp_storage_.data(), seg_bytes, compact_keys_.data(),
-          compact_alt_keys_.data(), compact_payload_.data(),
-          compact_alt_payload_.data(), static_cast<int>(total),
-          static_cast<int>(heavy_items), compact_heavy_begin_.data(),
-          compact_heavy_end_.data(), 0, 16, stream));
-      gpulsmopt_detail::
-          compact_heavy_copyback_kernel<<<64, block, 0, stream>>>(
-              compact_heavy_list_.data(), compact_heavy_count_.data(),
-              compact_segoff_.data(), compact_combined_.data(),
-              compact_alt_keys_.data(), compact_alt_payload_.data(),
-              compact_keys_.data(), compact_payload_.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
-    // Sum duplicate deltas across the group in one pass.
-    std::size_t reduce_bytes = 0u;
-    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
-        nullptr, reduce_bytes, compact_keys_.data(), compact_alt_keys_.data(),
-        compact_payload_.data(), compact_alt_payload_.data(),
-        compact_num_runs_.data(), gpulsmopt_detail::SumDeltaPayload{},
-        static_cast<int>(total), stream));
-    ensure_sort_temp(reduce_bytes);
-    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
-        sort_temp_storage_.data(), reduce_bytes, compact_keys_.data(),
-        compact_alt_keys_.data(), compact_payload_.data(),
-        compact_alt_payload_.data(), compact_num_runs_.data(),
-        gpulsmopt_detail::SumDeltaPayload{}, static_cast<int>(total), stream));
-    const int item_grid = static_cast<int>((total + block - 1u) / block);
-    gpulsmopt_detail::
-        compact_filter_flags_kernel<<<item_grid, block, 0, stream>>>(
-            compact_alt_payload_.data(), compact_num_runs_.data(), total,
-            compact_flags_.data());
-    CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(compact_flags_.data(), compact_pos_.data(), total,
-                       stream);
-    gpulsmopt_detail::compact_unique_count_kernel<<<1, 1, 0, stream>>>(
-        compact_flags_.data(), compact_pos_.data(), total,
-        compact_group_unique_.data(), 0u);
-    CUDA_CHECK(cudaGetLastError());
-
-    std::uint32_t unique_count = 0u;
-    CUDA_CHECK(cudaMemcpyAsync(&unique_count, compact_group_unique_.data(),
-                               sizeof(unique_count), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (unique_count > compact_output_keys_.capacity()) {
-      throw std::runtime_error("compaction output exceeds configured capacity");
-    }
-
-    compact_output_keys_.resize_discard(unique_count);
-    compact_output_values_.resize_discard(unique_count);
-    compact_output_counts_.resize_discard(unique_count);
-    gpulsmopt_detail::compact_scatter_kernel<<<item_grid, block, 0, stream>>>(
-        compact_alt_keys_.data(), compact_alt_payload_.data(),
-        compact_flags_.data(), compact_pos_.data(), total,
-        compact_output_keys_.data(), compact_output_values_.data(),
-        compact_output_counts_.data());
-    CUDA_CHECK(cudaGetLastError());
-
-    const std::size_t old_sorted = sorted_run_index_;
-    const bool cache_selected =
-        old_sorted >= group.begin && old_sorted < group.end;
-    std::size_t next_sorted = std::numeric_limits<std::size_t>::max();
-    if (sorted_run_ready() && !cache_selected) {
-      next_sorted = old_sorted < group.begin ? old_sorted
-                                             : old_sorted - (group_count - 1u);
-    }
-    if (cache_selected)
-      clear_sorted_state();
-
-    RunStorage merged = std::move(runs_[group.begin]);
-    std::swap(merged.keys, compact_output_keys_);
-    std::swap(merged.values, compact_output_values_);
-    std::swap(merged.count_delta, compact_output_counts_);
-    merged.count = unique_count;
-    merged.fully_sorted = true;
-    merged.unit_counts = false;
-    merged.unique_keys = true;
-    merged.keys.resize_discard(unique_count);
-    merged.values.resize_discard(unique_count);
-    merged.count_delta.resize_discard(unique_count);
-    compact_output_keys_.resize_discard(compact_output_capacity_);
-    compact_output_values_.resize_discard(compact_output_capacity_);
-    compact_output_counts_.resize_discard(compact_output_capacity_);
-
-    std::vector<RunStorage> next;
-    next.reserve(gpulsmopt_detail::kRunCapacity);
-    for (std::size_t r = 0; r < group.begin; ++r)
-      next.push_back(std::move(runs_[r]));
-    next.push_back(std::move(merged));
-    for (std::size_t r = group.begin + 1u; r < group.end; ++r)
-      run_pool_.push_back(std::move(runs_[r]));
-    for (std::size_t r = group.end; r < runs_.size(); ++r)
-      next.push_back(std::move(runs_[r]));
-    runs_ = std::move(next);
-    runs_.reserve(gpulsmopt_detail::kRunCapacity);
-    if (!cache_selected)
-      sorted_run_index_ = next_sorted;
-
-    RunStorage &out = runs_[group.begin];
-    prepare_run_metadata_storage(out);
-    launch_run_metadata_kernels(out, out.count, stream, false);
-    constexpr int count_grid = gpulsmopt_detail::kEpochQuotients / block;
-    gpulsmopt_detail::
-        epoch_count_delta_sum_kernel<<<count_grid, block, 0, stream>>>(
-            make_run_view(out));
-    CUDA_CHECK(cudaGetLastError());
-
-    prebind_run_views(stream);
-    invalidate_range_delta_projection();
-    run_meta_ready_ = false;
-    run_meta_counts_ready_ = false;
-    logical_run_views_ready_ = false;
-    ++structure_generation_;
-  }
-
-  // Lazy [quotient][run] tables for run-parallel reads.
   void ensure_run_transposed_metadata(bool wants_counts, cudaStream_t stream) {
     const bool need_counts = wants_counts && !run_meta_counts_ready_;
     if (run_meta_ready_ && !need_counts)
@@ -4321,23 +4216,20 @@ private:
     CUDA_CHECK(cudaGetLastError());
   }
 
-  // Refresh the successor bitmap only on reads.
+  // Successor bitmap = base live keys + resolved corrections.
   void ensure_successor_bitmap(cudaStream_t stream) {
-    if (!owner_ready_)
-      initialize_owner_storage(stream);
-    const bool fresh = succ_bits_.size() == 0;
-    if (fresh)
+    if (succ_bits_.size() == 0)
       succ_bits_.resize_discard_exact(gpulsmopt_detail::kSuccTotalWords);
-    const bool rebuild = fresh || succ_generation_ != structure_generation_;
-    if (!rebuild && succ_synced_runs_ == runs_.size())
+    if (succ_generation_ == structure_generation_ && succ_bits_.size() != 0 &&
+        succ_built_)
       return;
     constexpr int block = 256;
-    if (rebuild) {
-      CUDA_CHECK(cudaMemsetAsync(
-          succ_bits_.data(), 0,
-          static_cast<std::size_t>(gpulsmopt_detail::succ_level_words(0)) *
-              sizeof(std::uint32_t),
-          stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        succ_bits_.data(), 0,
+        static_cast<std::size_t>(gpulsmopt_detail::succ_level_words(0)) *
+            sizeof(std::uint32_t),
+        stream));
+    if (owner_ready_) {
       const int grid = gpulsmopt_detail::kEpochQuotients * 32 / block;
       gpulsmopt_detail::
           succ_rebuild_from_owner_kernel<<<grid, block, 0, stream>>>(
@@ -4349,142 +4241,525 @@ private:
           succ_rebuild_from_spill_kernel<<<spill_grid, block, 0, stream>>>(
               make_owner_view(), succ_bits_.data());
       CUDA_CHECK(cudaGetLastError());
-    } else {
-      for (std::size_t e = succ_synced_runs_; e < runs_.size(); ++e) {
-        const std::size_t n = runs_[e].count;
-        if (n == 0)
-          continue;
-        const int grid = static_cast<int>((n + block - 1) / block);
-        gpulsmopt_detail::succ_apply_epoch_kernel<<<grid, block, 0, stream>>>(
-            runs_[e].keys.data(), runs_[e].count_delta.data(), n,
-            succ_bits_.data());
-        CUDA_CHECK(cudaGetLastError());
-      }
     }
-    if (rebuild) {
-      for (int level = 1; level < 6; ++level) {
-        const std::uint32_t upper_words =
-            gpulsmopt_detail::succ_level_words(level);
-        const int grid = static_cast<int>((upper_words + block - 1) / block);
-        gpulsmopt_detail::succ_build_level_kernel<<<grid, block, 0, stream>>>(
-            succ_bits_.data() + gpulsmopt_detail::succ_level_off(level - 1),
-            succ_bits_.data() + gpulsmopt_detail::succ_level_off(level),
-            upper_words);
-        CUDA_CHECK(cudaGetLastError());
-      }
-    } else {
-      for (int level = 1; level < 6; ++level) {
-        const std::uint32_t *lower =
-            succ_bits_.data() + gpulsmopt_detail::succ_level_off(level - 1);
-        std::uint32_t *upper =
-            succ_bits_.data() + gpulsmopt_detail::succ_level_off(level);
-        for (std::size_t e = succ_synced_runs_; e < runs_.size(); ++e) {
-          const std::size_t n = runs_[e].count;
-          if (n == 0)
-            continue;
-          const int grid = static_cast<int>((n + block - 1) / block);
-          gpulsmopt_detail::
-              succ_update_level_kernel<<<grid, block, 0, stream>>>(
-                  runs_[e].keys.data(), n, lower, upper, level * 5);
-          CUDA_CHECK(cudaGetLastError());
-        }
-      }
+    if (resolved_.count > 0) {
+      const int grid = static_cast<int>((resolved_.count + block - 1) / block);
+      gpulsmopt_detail::succ_apply_epoch_kernel<<<grid, block, 0, stream>>>(
+          resolved_.keys.data(), resolved_.count_delta.data(), resolved_.count,
+          succ_bits_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    for (int level = 1; level < 6; ++level) {
+      const std::uint32_t upper_words =
+          gpulsmopt_detail::succ_level_words(level);
+      const int grid = static_cast<int>((upper_words + block - 1) / block);
+      gpulsmopt_detail::succ_build_level_kernel<<<grid, block, 0, stream>>>(
+          succ_bits_.data() + gpulsmopt_detail::succ_level_off(level - 1),
+          succ_bits_.data() + gpulsmopt_detail::succ_level_off(level),
+          upper_words);
+      CUDA_CHECK(cudaGetLastError());
     }
     succ_generation_ = structure_generation_;
-    succ_synced_runs_ = runs_.size();
+    succ_built_ = true;
   }
 
-  bool try_create_epoch(const std::uint32_t *keys_in,
-                        const std::uint32_t *values_in, std::uint8_t op,
-                        std::size_t count, cudaStream_t stream) {
-    const std::size_t threshold = GPULSMOPT_SCATTER_MIN_BATCH;
-    if (op != gpulsmopt_detail::kInsert || values_in == nullptr ||
-        count < threshold || count > std::numeric_limits<std::uint32_t>::max())
-      return false;
-    if (c0_log_count_ != 0)
-      merge_down(stream);
-    create_unsorted_run(keys_in, values_in, count, stream);
-    return true;
+  void invalidate_resolved() {
+    resolved_ready_ = false;
+    resolved_value_prefix_ready_ = false;
+    resolved_count_prefix_ready_ = false;
   }
 
-  bool try_direct_delete(const std::uint32_t *keys, std::size_t count,
-                         bool sorted, cudaStream_t stream) {
-    if (count < GPULSMOPT_SCATTER_MIN_BATCH ||
-        count > std::numeric_limits<std::uint32_t>::max())
-      return false;
-    if (c0_log_count_ > 0)
-      merge_down(stream);
-    create_delete_run(keys, count, sorted, stream);
-    return true;
-  }
-
-  void merge_down(cudaStream_t stream) {
-    if (c0_log_count_ == 0)
+  // Wide-range resolved sidecar: collapse every assignment run
+  // into one signed correction run against the base snapshot.
+  void ensure_resolved(cudaStream_t stream) {
+    if (resolved_ready_)
       return;
-    last_update_stream_ = stream;
-    const std::size_t count = c0_log_count_;
-    if (run_count() >= static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity))
-      compact_runs(stream);
-    resize_reuse(sort_key_output_, count);
-    sort_payload_input_.resize_discard(count);
-    sort_payload_output_.resize_discard(count);
-    const std::uint8_t *ops =
-        c0_kind_ == RunKind::mixed ? raw_or_null(c0_log_ops_) : nullptr;
-    const std::uint8_t constant_op = operation_value(c0_kind_);
-    const int block = 256;
-    const int grid = static_cast<int>((count + block - 1) / block);
-    gpulsmopt_detail::pack_latest_payload_kernel<<<grid, block, 0, stream>>>(
-        raw_or_null(c0_log_values_), ops, constant_op, count,
-        sort_payload_input_.data());
-    CUDA_CHECK(cudaGetLastError());
-    if (count > log_sort_count_) {
-      log_sort_temp_bytes_ = 0;
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, log_sort_temp_bytes_, raw_or_null(c0_log_keys_),
-          raw_or_null(sort_key_output_), sort_payload_input_.data(),
-          sort_payload_output_.data(), count, 0, 32, stream));
-      log_sort_count_ = count;
+    std::vector<std::size_t> idx;
+    std::size_t total = 0;
+    for (std::size_t r = 0; r < runs_.size(); ++r)
+      if (runs_[r].assignment) {
+        idx.push_back(r);
+        total += runs_[r].count;
+      }
+    std::sort(idx.begin(), idx.end(), [this](std::size_t a, std::size_t b) {
+      return runs_[a].sequence < runs_[b].sequence;
+    });
+    if (total == 0) {
+      resolved_.count = 0;
+      resolved_.assignment = false;
+      prepare_run_metadata_storage(resolved_);
+      launch_run_metadata_kernels(resolved_, 0, stream, false);
+      resolved_ready_ = true;
+      return;
     }
-    std::size_t temp_bytes = log_sort_temp_bytes_;
-    ensure_sort_temp(temp_bytes);
+    resolve_keys_.resize_discard(total);
+    resolve_payload_.resize_discard(total);
+    resolve_alt_keys_.resize_discard(total);
+    resolve_alt_payload_.resize_discard(total);
+    resolve_flags_.resize_discard(total);
+    resolve_count_.resize_discard(1);
+    constexpr int block = 256;
+    std::size_t off = 0;
+    for (const std::size_t r : idx) {
+      RunStorage &run = runs_[r];
+      if (run.count == 0)
+        continue;
+      const int grid = static_cast<int>((run.count + block - 1) / block);
+      const bool is_insert =
+          run.operation == gpulsmopt_detail::RunOperation::Insert;
+      gpulsmopt_detail::resolve_pack_run_kernel<<<grid, block, 0, stream>>>(
+          run.keys.data(), is_insert ? run.values.data() : nullptr,
+          run.mixed ? run.op_words.data() : nullptr,
+          static_cast<std::uint8_t>(is_insert ? 1u : 0u),
+          static_cast<std::uint8_t>(run.mixed ? 1u : 0u), run.count,
+          resolve_keys_.data() + off, resolve_payload_.data() + off);
+      CUDA_CHECK(cudaGetLastError());
+      off += run.count;
+    }
+    // Stable full-key sort leaves the newest equal-key record last.
+    std::size_t sort_bytes = 0;
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        sort_temp_storage_.data(), temp_bytes, raw_or_null(c0_log_keys_),
-        raw_or_null(sort_key_output_), sort_payload_input_.data(),
-        sort_payload_output_.data(), count, 0, 32, stream));
-    acquire_run_slot();
-    RunStorage &epoch = runs_.back();
-    epoch.keys.resize_discard(count);
-    epoch.values.resize_discard(count);
-    resize_reuse(merge_ops_, count);
-    auto policy = thrust::cuda::par.on(stream);
-    auto unique_end = thrust::reduce_by_key(
-        policy, sort_key_output_.begin(), sort_key_output_.begin() + count,
-        thrust::device_pointer_cast(sort_payload_output_.data()),
-        thrust::device_pointer_cast(epoch.keys.data()),
-        thrust::device_pointer_cast(sort_payload_input_.data()),
-        thrust::equal_to<std::uint32_t>(),
-        gpulsmopt_detail::TakeLatestPayload{});
-    const std::size_t unique_count = static_cast<std::size_t>(
-        unique_end.first - thrust::device_pointer_cast(epoch.keys.data()));
-    epoch.count = unique_count;
-    epoch.fully_sorted = true;
-    epoch.unit_counts = false;
-    epoch.unique_keys = true;
-    epoch.keys.resize_discard(unique_count);
-    epoch.values.resize_discard(unique_count);
-    gpulsmopt_detail::unpack_latest_payload_kernel<<<
-        static_cast<int>((unique_count + block - 1) / block), block, 0,
-        stream>>>(sort_payload_input_.data(), unique_count, epoch.values.data(),
-                  raw_or_null(merge_ops_));
+        nullptr, sort_bytes, resolve_keys_.data(), resolve_alt_keys_.data(),
+        resolve_payload_.data(), resolve_alt_payload_.data(),
+        static_cast<int>(total), 0, 32, stream));
+    ensure_sort_temp(sort_bytes);
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
+        resolve_alt_keys_.data(), resolve_payload_.data(),
+        resolve_alt_payload_.data(), static_cast<int>(total), 0, 32, stream));
+    const int grid = static_cast<int>((total + block - 1) / block);
+    gpulsmopt_detail::resolve_flag_last_kernel<<<grid, block, 0, stream>>>(
+        resolve_alt_keys_.data(), total, resolve_flags_.data());
     CUDA_CHECK(cudaGetLastError());
-    commit_run_metadata(epoch, stream, raw_or_null(merge_ops_),
-                        static_cast<std::uint8_t>(gpulsmopt_detail::kInsert));
-    clear_c0_log(stream);
+    std::size_t key_sel_bytes = 0;
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        nullptr, key_sel_bytes, resolve_alt_keys_.data(),
+        resolve_flags_.data(),
+        resolve_keys_.data(), resolve_count_.data(), static_cast<int>(total),
+        stream));
+    std::size_t payload_sel_bytes = 0;
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        nullptr, payload_sel_bytes, resolve_alt_payload_.data(),
+        resolve_flags_.data(), resolve_payload_.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    std::size_t sel_bytes =
+        std::max(key_sel_bytes, payload_sel_bytes);
+    ensure_sort_temp(sel_bytes);
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        sort_temp_storage_.data(), sel_bytes, resolve_alt_keys_.data(),
+        resolve_flags_.data(), resolve_keys_.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        sort_temp_storage_.data(), sel_bytes, resolve_alt_payload_.data(),
+        resolve_flags_.data(), resolve_payload_.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    std::uint32_t latest = 0u;
+    CUDA_CHECK(cudaMemcpyAsync(&latest, resolve_count_.data(), sizeof(latest),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Diff each latest assignment against the base snapshot.
+    resolve_alt_keys_.resize_discard(latest);
+    resolved_.values.resize_discard(latest);
+    resolved_.count_delta.resize_discard(latest);
+    resolve_flags_.resize_discard(latest);
+    if (latest > 0) {
+      const int dgrid = static_cast<int>((latest + block - 1) / block);
+      gpulsmopt_detail::resolve_diff_kernel<<<dgrid, block, 0, stream>>>(
+          resolve_keys_.data(), resolve_payload_.data(), latest,
+          make_owner_view(), owner_ready_ ? 1 : 0, resolve_alt_keys_.data(),
+          resolved_.values.data(), resolved_.count_delta.data(),
+          resolve_flags_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    // Keep only keys whose latest assignment differs from base.
+    resolved_.keys.resize_discard(latest);
+    resolve_sel_cdelta_.resize_discard(latest);
+    resolve_sel_vdelta_.resize_discard(latest);
+    std::uint32_t changed = 0u;
+    if (latest > 0) {
+      std::size_t key_bytes = 0;
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          nullptr, key_bytes, resolve_alt_keys_.data(), resolve_flags_.data(),
+          resolved_.keys.data(), resolve_count_.data(),
+          static_cast<int>(latest), stream));
+      std::size_t value_bytes = 0;
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          nullptr, value_bytes, resolved_.values.data(),
+          resolve_flags_.data(), resolve_sel_vdelta_.data(),
+          resolve_count_.data(), static_cast<int>(latest), stream));
+      std::size_t count_bytes = 0;
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          nullptr, count_bytes, resolved_.count_delta.data(),
+          resolve_flags_.data(), resolve_sel_cdelta_.data(),
+          resolve_count_.data(), static_cast<int>(latest), stream));
+      std::size_t k_bytes =
+          std::max({key_bytes, value_bytes, count_bytes});
+      ensure_sort_temp(k_bytes);
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          sort_temp_storage_.data(), k_bytes, resolve_alt_keys_.data(),
+          resolve_flags_.data(), resolved_.keys.data(), resolve_count_.data(),
+          static_cast<int>(latest), stream));
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          sort_temp_storage_.data(), k_bytes, resolved_.values.data(),
+          resolve_flags_.data(), resolve_sel_vdelta_.data(),
+          resolve_count_.data(), static_cast<int>(latest), stream));
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          sort_temp_storage_.data(), k_bytes, resolved_.count_delta.data(),
+          resolve_flags_.data(), resolve_sel_cdelta_.data(),
+          resolve_count_.data(), static_cast<int>(latest), stream));
+      CUDA_CHECK(cudaMemcpyAsync(&changed, resolve_count_.data(),
+                                 sizeof(changed), cudaMemcpyDeviceToHost,
+                                 stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    resolved_.count = changed;
+    resolved_.assignment = false;
+    resolved_.fully_sorted = true;
+    resolved_.unit_counts = false;
+    resolved_.unique_keys = true;
+    resolved_.values.resize_discard(changed);
+    resolved_.count_delta.resize_discard(changed);
+    if (changed > 0) {
+      CUDA_CHECK(cudaMemcpyAsync(resolved_.values.data(),
+                                 resolve_sel_vdelta_.data(),
+                                 changed * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(resolved_.count_delta.data(),
+                                 resolve_sel_cdelta_.data(),
+                                 changed * sizeof(std::int8_t),
+                                 cudaMemcpyDeviceToDevice, stream));
+    }
+    prepare_run_metadata_storage(resolved_);
+    launch_run_metadata_kernels(resolved_, changed, stream, false);
+    resolved_ready_ = true;
   }
 
-  void maybe_flush_and_merge(cudaStream_t stream) {
-    if (c0_log_live() >= c0_flush_budget())
-      merge_down(stream);
+  void ensure_resolved_value_prefix(cudaStream_t stream) {
+    if (resolved_value_prefix_ready_)
+      return;
+    constexpr int block = 256;
+    constexpr int grid = gpulsmopt_detail::kEpochQuotients / block;
+    resolved_.subgroup_value_prefix.resize_discard(
+        gpulsmopt_detail::kEpochQuotients *
+        gpulsmopt_detail::kEpochSubgroupPrefixStride);
+    gpulsmopt_detail::epoch_subgroup_value_prefix_kernel<<<grid, block, 0,
+                                                           stream>>>(
+        make_run_view(resolved_), resolved_.subgroup_value_prefix.data());
+    CUDA_CHECK(cudaGetLastError());
+    resolved_.subgroup_value_prefix_ready = true;
+    exclusive_scan_u32(resolved_.quotient_value_sum.data(),
+                       resolved_.quotient_value_prefix.data(),
+                       gpulsmopt_detail::kEpochQuotients, stream);
+    resolved_value_prefix_ready_ = true;
+  }
+
+  void ensure_resolved_count_prefix(cudaStream_t stream) {
+    if (resolved_count_prefix_ready_)
+      return;
+    constexpr int block = 256;
+    constexpr int grid = gpulsmopt_detail::kEpochQuotients / block;
+    gpulsmopt_detail::epoch_count_delta_sum_kernel<<<grid, block, 0, stream>>>(
+        make_run_view(resolved_));
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(resolved_.quotient_count_sum.data(),
+                       resolved_.quotient_count_prefix.data(),
+                       gpulsmopt_detail::kEpochQuotients, stream);
+    resolved_count_prefix_ready_ = true;
+  }
+
+  // Fold the base snapshot and every assignment run into one
+  // fresh sorted base via last-wins; drops resolved tombstones.
+  void fold_into_base(cudaStream_t stream) {
+    std::vector<std::size_t> idx;
+    std::size_t total = 0;
+    if (sorted_run_ready()) {
+      idx.push_back(sorted_run_index_);
+      total += runs_[sorted_run_index_].count;
+    }
+    std::vector<std::size_t> updates;
+    for (std::size_t r = 0; r < runs_.size(); ++r)
+      if (runs_[r].assignment) {
+        updates.push_back(r);
+        total += runs_[r].count;
+      }
+    std::sort(updates.begin(), updates.end(),
+              [this](std::size_t a, std::size_t b) {
+                return runs_[a].sequence < runs_[b].sequence;
+              });
+    for (const std::size_t r : updates)
+      idx.push_back(r);
+    if (total == 0)
+      return;
+    resolve_keys_.resize_discard(total);
+    resolve_payload_.resize_discard(total);
+    resolve_alt_keys_.resize_discard(total);
+    resolve_alt_payload_.resize_discard(total);
+    resolve_flags_.resize_discard(total);
+    resolve_count_.resize_discard(1);
+    constexpr int block = 256;
+    std::size_t off = 0;
+    for (std::size_t j = 0; j < idx.size(); ++j) {
+      RunStorage &run = runs_[idx[j]];
+      if (run.count == 0)
+        continue;
+      // Base run packs as all-insert; assignment leaves use their op.
+      const bool is_insert =
+          !run.assignment ||
+          run.operation == gpulsmopt_detail::RunOperation::Insert;
+      const int grid = static_cast<int>((run.count + block - 1) / block);
+      gpulsmopt_detail::resolve_pack_run_kernel<<<grid, block, 0, stream>>>(
+          run.keys.data(), is_insert ? run.values.data() : nullptr,
+          run.mixed ? run.op_words.data() : nullptr,
+          static_cast<std::uint8_t>(is_insert ? 1u : 0u),
+          static_cast<std::uint8_t>(run.mixed ? 1u : 0u), run.count,
+          resolve_keys_.data() + off, resolve_payload_.data() + off);
+      CUDA_CHECK(cudaGetLastError());
+      off += run.count;
+    }
+    std::size_t sort_bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, sort_bytes, resolve_keys_.data(), resolve_alt_keys_.data(),
+        resolve_payload_.data(), resolve_alt_payload_.data(),
+        static_cast<int>(total), 0, 32, stream));
+    ensure_sort_temp(sort_bytes);
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
+        resolve_alt_keys_.data(), resolve_payload_.data(),
+        resolve_alt_payload_.data(), static_cast<int>(total), 0, 32, stream));
+    const int grid = static_cast<int>((total + block - 1) / block);
+    gpulsmopt_detail::resolve_flag_last_kernel<<<grid, block, 0, stream>>>(
+        resolve_alt_keys_.data(), total, resolve_flags_.data());
+    CUDA_CHECK(cudaGetLastError());
+    std::size_t key_sel_bytes = 0;
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        nullptr, key_sel_bytes, resolve_alt_keys_.data(),
+        resolve_flags_.data(),
+        resolve_keys_.data(), resolve_count_.data(), static_cast<int>(total),
+        stream));
+    std::size_t payload_sel_bytes = 0;
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        nullptr, payload_sel_bytes, resolve_alt_payload_.data(),
+        resolve_flags_.data(), resolve_payload_.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    std::size_t sel_bytes =
+        std::max(key_sel_bytes, payload_sel_bytes);
+    ensure_sort_temp(sel_bytes);
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        sort_temp_storage_.data(), sel_bytes, resolve_alt_keys_.data(),
+        resolve_flags_.data(), resolve_keys_.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        sort_temp_storage_.data(), sel_bytes, resolve_alt_payload_.data(),
+        resolve_flags_.data(), resolve_payload_.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    std::uint32_t latest = 0u;
+    CUDA_CHECK(cudaMemcpyAsync(&latest, resolve_count_.data(), sizeof(latest),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    resolve_sel_vdelta_.resize_discard(latest);
+    resolve_flags_.resize_discard(latest);
+    if (latest > 0) {
+      const int egrid = static_cast<int>((latest + block - 1) / block);
+      gpulsmopt_detail::resolve_base_extract_kernel<<<egrid, block, 0,
+                                                      stream>>>(
+          resolve_payload_.data(), latest, resolve_sel_vdelta_.data(),
+          resolve_flags_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    clear_sorted_state();
+    for (auto &run : runs_)
+      run_pool_.push_back(std::move(run));
+    runs_.clear();
+    acquire_run_slot();
+    RunStorage &base = runs_.back();
+    base.assignment = false;
+    base.sequence = 0;
+    base.fully_sorted = true;
+    base.unit_counts = true;
+    base.unique_keys = true;
+    base.keys.resize_discard(latest);
+    base.values.resize_discard(latest);
+    std::uint32_t kept = 0u;
+    if (latest > 0) {
+      std::size_t b_bytes = 0;
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          nullptr, b_bytes, resolve_keys_.data(), resolve_flags_.data(),
+          base.keys.data(), resolve_count_.data(), static_cast<int>(latest),
+          stream));
+      ensure_sort_temp(b_bytes);
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          sort_temp_storage_.data(), b_bytes, resolve_keys_.data(),
+          resolve_flags_.data(), base.keys.data(), resolve_count_.data(),
+          static_cast<int>(latest), stream));
+      CUDA_CHECK(cub::DeviceSelect::Flagged(
+          sort_temp_storage_.data(), b_bytes, resolve_sel_vdelta_.data(),
+          resolve_flags_.data(), base.values.data(), resolve_count_.data(),
+          static_cast<int>(latest), stream));
+      CUDA_CHECK(cudaMemcpyAsync(&kept, resolve_count_.data(), sizeof(kept),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    base.count = kept;
+    base.keys.resize_discard(kept);
+    base.values.resize_discard(kept);
+    base.count_delta.resize_discard(kept);
+    if (kept > 0)
+      CUDA_CHECK(cudaMemsetAsync(base.count_delta.data(), 1,
+                                 kept * sizeof(std::int8_t), stream));
+    prepare_run_metadata_storage(base);
+    launch_run_metadata_kernels(base, kept, stream, false);
+    build_sorted_run_cache(0u, stream);
+    build_owner_index(stream);
+    prebind_run_views(stream);
+    run_sequence_ = 0;
+    chrono_views_.clear();
+    invalidate_resolved();
+    succ_built_ = false;
+    ++structure_generation_;
+  }
+
+  // Republish the chronological descriptor array after the run set
+  // changes (compaction). Assignment runs, oldest sequence first.
+  void rebuild_chrono_views(cudaStream_t stream) {
+    std::vector<std::size_t> idx;
+    for (std::size_t r = 0; r < runs_.size(); ++r)
+      if (runs_[r].assignment)
+        idx.push_back(r);
+    std::sort(idx.begin(), idx.end(), [this](std::size_t a, std::size_t b) {
+      return runs_[a].sequence < runs_[b].sequence;
+    });
+    chrono_views_.clear();
+    for (const std::size_t r : idx)
+      publish_assignment_view(runs_[r], stream);
+  }
+
+  // Temporally-contiguous last-write-wins compaction. Merges the
+  // oldest group of assignment runs into ONE mixed run, retaining
+  // tombstones (unlike fold_into_base). Falls back to fold when a
+  // group cannot be formed.
+  void compact_contiguous(cudaStream_t stream) {
+    std::vector<std::size_t> idx;
+    for (std::size_t r = 0; r < runs_.size(); ++r)
+      if (runs_[r].assignment)
+        idx.push_back(r);
+    if (idx.size() < 2) {
+      fold_into_base(stream);
+      return;
+    }
+    std::sort(idx.begin(), idx.end(), [this](std::size_t a, std::size_t b) {
+      return runs_[a].sequence < runs_[b].sequence;
+    });
+    const std::size_t group_size =
+        std::min<std::size_t>(idx.size(), gpulsmopt_detail::kCompactGroup);
+    std::vector<std::size_t> group(idx.begin(), idx.begin() + group_size);
+    std::uint64_t group_seq = 0;
+    std::size_t total = 0;
+    for (const std::size_t r : group) {
+      group_seq = std::max(group_seq, runs_[r].sequence);
+      total += runs_[r].count;
+    }
+    if (total == 0) {
+      fold_into_base(stream);
+      return;
+    }
+    if (total > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::runtime_error("temporal compaction exceeds CUB limits");
+
+    resolve_keys_.resize_discard(total);
+    resolve_payload_.resize_discard(total);
+    resolve_alt_keys_.resize_discard(total);
+    resolve_alt_payload_.resize_discard(total);
+    resolve_flags_.resize_discard(total);
+    resolve_count_.resize_discard(1);
+    compaction_counts_.resize_discard(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    compaction_offsets_.resize_discard(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+
+    constexpr int block = 256;
+    constexpr int quotient_rows = gpulsmopt_detail::kEpochQuotients + 1;
+    constexpr int count_grid = (quotient_rows + block - 1) / block;
+    gpulsmopt_detail::assignment_group_count_kernel<<<
+        count_grid, block, 0, stream>>>(
+        assignment_views_.data(), static_cast<int>(group_size),
+        compaction_counts_.data());
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(
+        compaction_counts_.data(), compaction_offsets_.data(),
+        gpulsmopt_detail::kEpochQuotients + 1u, stream);
+    gpulsmopt_detail::assignment_group_gather_kernel<<<
+        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
+        assignment_views_.data(), static_cast<int>(group_size),
+        compaction_offsets_.data(), resolve_keys_.data(),
+        resolve_payload_.data());
+    CUDA_CHECK(cudaGetLastError());
+
+    if (total > compaction_sort_count_) {
+      compaction_sort_temp_bytes_ = 0u;
+      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+          nullptr, compaction_sort_temp_bytes_, resolve_keys_.data(),
+          resolve_alt_keys_.data(), resolve_payload_.data(),
+          resolve_alt_payload_.data(), static_cast<int>(total),
+          gpulsmopt_detail::kEpochQuotients,
+          compaction_offsets_.data(), compaction_offsets_.data() + 1u,
+          0, 16, stream));
+      compaction_sort_count_ = total;
+    }
+    std::size_t sort_bytes = compaction_sort_temp_bytes_;
+    ensure_sort_temp(sort_bytes);
+    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+        sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
+        resolve_alt_keys_.data(), resolve_payload_.data(),
+        resolve_alt_payload_.data(), static_cast<int>(total),
+        gpulsmopt_detail::kEpochQuotients,
+        compaction_offsets_.data(), compaction_offsets_.data() + 1u,
+        0, 16, stream));
+
+    const std::uint32_t compact_count =
+        static_cast<std::uint32_t>(total);
+    acquire_compaction_slot();
+    RunStorage &merged = runs_.back();
+    merged.assignment = true;
+    merged.mixed = true;
+    merged.operation = gpulsmopt_detail::RunOperation::Insert;
+    merged.sequence = group_seq;
+    merged.count = compact_count;
+    merged.keys.resize_discard(compact_count);
+    merged.values.resize_discard(compact_count);
+    merged.op_words.resize_discard(
+        (compact_count + 31u) / 32u + 1u);
+    CUDA_CHECK(cudaMemcpyAsync(
+        merged.keys.data(), resolve_alt_keys_.data(),
+        compact_count * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        merged.op_words.data(), 0,
+        ((compact_count + 31u) / 32u + 1u) *
+            sizeof(std::uint32_t),
+        stream));
+    const int split_grid =
+        static_cast<int>((compact_count + block - 1) / block);
+    gpulsmopt_detail::compact_split_kernel<<<
+        split_grid, block, 0, stream>>>(
+        resolve_alt_payload_.data(), compact_count,
+        merged.values.data(), merged.op_words.data());
+    CUDA_CHECK(cudaGetLastError());
+    build_assignment_offsets(merged, compact_count, stream);
+
+    RunStorage compacted = std::move(runs_.back());
+    runs_.pop_back();
+    std::sort(group.begin(), group.end());
+    for (auto it = group.rbegin(); it != group.rend(); ++it) {
+      if (sorted_run_ready() && sorted_run_index_ > *it)
+        --sorted_run_index_;
+      run_pool_.push_back(std::move(runs_[*it]));
+      runs_.erase(runs_.begin() + static_cast<std::ptrdiff_t>(*it));
+    }
+    runs_.push_back(std::move(compacted));
+    rebuild_chrono_views(stream);
+    invalidate_resolved();
+    succ_built_ = false;
+    ++structure_generation_;
   }
 
   void launch_range_projection(const DeviceRangeOutputBatch &batch,
@@ -4504,11 +4779,32 @@ private:
   std::size_t sorted_run_index_ = std::numeric_limits<std::size_t>::max();
   mutable std::shared_mutex snapshot_mutex_;
 
-  std::uint32_t c0_log_count_ = 0;
-  RunKind c0_kind_ = RunKind::empty;
-  thrust::device_vector<std::uint32_t> c0_log_keys_;
-  thrust::device_vector<std::uint32_t> c0_log_values_;
-  thrust::device_vector<std::uint8_t> c0_log_ops_;
+  // Temporal assignment-run state.
+  std::uint64_t run_sequence_ = 0;
+  RunStorage resolved_;
+  bool resolved_ready_ = false;
+  bool resolved_value_prefix_ready_ = false;
+  bool resolved_count_prefix_ready_ = false;
+  bool succ_built_ = false;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
+      assignment_views_;
+  // Host mirror of the chronological descriptor array (oldest->newest).
+  std::vector<gpulsmopt_detail::AssignmentRunView> chrono_views_;
+  std::size_t delete_sort_count_ = 0;
+  std::size_t delete_sort_temp_bytes_ = 0;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> narrow_overflow_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> resolve_payload_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_alt_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> resolve_alt_payload_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> resolve_flags_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_sel_vdelta_;
+  gpulsmopt_detail::RawDeviceBuffer<std::int8_t> resolve_sel_cdelta_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_count_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_offsets_;
+  std::size_t compaction_sort_count_ = 0;
+  std::size_t compaction_sort_temp_bytes_ = 0;
 
 #ifdef GPULSMOPT_PROFILE_INSERT
   double prof_append_ms_ = 0.0;
@@ -4535,10 +4831,7 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_values_;
   thrust::device_vector<std::uint32_t> sort_key_output_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> sort_payload_input_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> sort_payload_output_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> sort_temp_storage_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> run_merge_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> sorted_value_prefix_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> sorted_count_prefix_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> sorted_range_cdf_;
@@ -4561,13 +4854,14 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_class_list_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> owner_class_count_;
   bool owner_ready_ = false;
-  cudaStream_t last_update_stream_ = nullptr;
+  gpulsmopt_detail::PinnedHostState *host_state_ = nullptr;
+  cudaEvent_t stream_handoff_ = nullptr;
+  cudaStream_t operation_stream_ = nullptr;
+  bool operation_stream_valid_ = false;
   std::size_t direct_sort_count_ = 0;
   std::size_t direct_sort_temp_bytes_ = 0;
   std::size_t run_sort_count_ = 0;
   std::size_t run_sort_temp_bytes_ = 0;
-  std::size_t log_sort_count_ = 0;
-  std::size_t log_sort_temp_bytes_ = 0;
   std::size_t scan_u32_count_ = 0;
   std::size_t scan_u32_temp_bytes_ = 0;
   std::size_t metadata_scan_temp_bytes_ = 0;
@@ -4592,26 +4886,4 @@ private:
   std::uint64_t succ_generation_ = 0;
   std::size_t succ_synced_runs_ = 0;
 
-  // Shard-parallel compaction staging.
-  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::RunView> compact_views_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_combined_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_segoff_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_list_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_count_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_begin_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_heavy_end_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> compact_payload_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_alt_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> compact_alt_payload_;
-  gpulsmopt_detail::RawDeviceBuffer<int> compact_num_runs_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_flags_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_pos_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_group_unique_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_output_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compact_output_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::int8_t> compact_output_counts_;
-  std::size_t compact_output_capacity_ = 0u;
-
-  thrust::device_vector<std::uint8_t> merge_ops_;
 };
