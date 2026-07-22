@@ -45,7 +45,18 @@
 namespace gpulsmopt_adapter_detail {
 
 constexpr size_t batch_capacity() {
-  return static_cast<size_t>(GPULSMOPT_BATCH_CAPACITY);
+  size_t capacity = static_cast<size_t>(GPULSMOPT_BATCH_CAPACITY);
+#ifdef UPDATE_INSERT_BATCH_LOG
+  const size_t insert_capacity =
+      size_t{1} << static_cast<size_t>(UPDATE_INSERT_BATCH_LOG);
+  capacity = capacity < insert_capacity ? insert_capacity : capacity;
+#endif
+#ifdef UPDATE_DELETE_BATCH_LOG
+  const size_t delete_capacity =
+      size_t{1} << static_cast<size_t>(UPDATE_DELETE_BATCH_LOG);
+  capacity = capacity < delete_capacity ? delete_capacity : capacity;
+#endif
+  return capacity;
 }
 
 inline void check_cuda(cudaError_t err) {

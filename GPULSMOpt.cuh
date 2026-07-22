@@ -77,6 +77,7 @@ namespace gpulsmopt_detail {
 constexpr int kRunCapacity = 128;
 // Assignment runs merged per contiguous compaction.
 constexpr int kCompactGroup = 64;
+constexpr std::size_t kCompactionTileRecords = std::size_t{1} << 22;
 #ifdef GPULSMOPT_EPOCH_MAX
 static_assert(GPULSMOPT_EPOCH_MAX == kRunCapacity,
               "GPULSMOPT_EPOCH_MAX must be 128");
@@ -138,9 +139,6 @@ constexpr std::uint32_t kC0LogMaxIndex = 0x00fffffeu;
 
 // Immutable assignment runs replace the owner-transition path.
 enum class RunOperation : std::uint8_t { Insert, Delete };
-// High-water reserve for one update batch.
-constexpr std::size_t kRawRunReserve = std::size_t{1} << 21;
-
 #if GPULSMOPT_SM120_RADIX
 struct Sm120RadixPolicy
     : cub::DeviceRadixSortPolicy<std::uint32_t, std::uint32_t, std::uint32_t> {
@@ -1185,6 +1183,22 @@ sorted_search_bounds(const SortedRunView &sorted, std::uint32_t key,
   *end = sorted.rank23[bin + 1];
 }
 
+__device__ inline bool sorted_find_value(const SortedRunView &sorted,
+                                         std::uint32_t key,
+                                         std::uint32_t *value) {
+  if (sorted.count == 0)
+    return false;
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  sorted_search_bounds(sorted, key, &begin, &end);
+  const std::size_t position =
+      begin + lower_bound_u32(sorted.keys + begin, end - begin, key);
+  if (position >= end || sorted.keys[position] != key)
+    return false;
+  *value = sorted.values[position];
+  return true;
+}
+
 __device__ inline void sorted_range_ranks(const SortedRunView &sorted,
                                           std::uint32_t lo, std::uint32_t hi,
                                           std::size_t *lower,
@@ -2145,12 +2159,77 @@ __global__ void assignment_group_gather_kernel(
   }
 }
 
-// Descriptors are stored oldest->newest; scan newest first so the
-// backward quotient scan finds the latest duplicate. The base owner
-// answers keys no run touched.
+__global__ void assignment_group_gather_range_kernel(
+    const AssignmentRunView *runs, int run_count,
+    std::uint32_t first_quotient, const std::uint32_t *tile_offsets,
+    std::uint32_t *out_keys, std::uint64_t *out_payload) {
+  const std::uint32_t local_q = blockIdx.x;
+  const std::uint32_t q = first_quotient + local_q;
+  std::uint32_t cursor = tile_offsets[local_q];
+  for (int r = 0; r < run_count; ++r) {
+    const AssignmentRunView run = runs[r];
+    const std::uint32_t begin = run.offsets[q];
+    const std::uint32_t count = run.offsets[q + 1u] - begin;
+    for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+      const std::uint32_t p = begin + i;
+      const int op =
+          assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
+      const std::uint32_t value = op != 0 ? run.values[p] : 0u;
+      out_keys[cursor + i] = run.keys[p];
+      out_payload[cursor + i] =
+          (static_cast<std::uint64_t>(value) << 32) |
+          static_cast<std::uint64_t>(op != 0);
+    }
+    cursor += count;
+  }
+}
+
+__global__ void compaction_unique_count_kernel(
+    const std::uint32_t *keys, std::size_t count,
+    std::uint32_t *quotient_counts) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const std::uint32_t key = keys[i];
+  if (i + 1u < count && keys[i + 1u] == key)
+    return;
+  atomicAdd(quotient_counts + (key >> kEpochQuotientBits), 1u);
+}
+
+__global__ void compaction_tile_offsets_kernel(
+    const std::uint32_t *global_offsets, std::uint32_t first,
+    std::uint32_t segments, std::uint32_t *tile_offsets) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i > segments)
+    return;
+  tile_offsets[i] = global_offsets[first + i] - global_offsets[first];
+}
+
+__global__ void compaction_unique_scatter_kernel(
+    const std::uint32_t *keys, const std::uint64_t *payload,
+    std::size_t count, std::uint32_t *quotient_cursors,
+    std::uint32_t *out_keys, std::uint32_t *out_values,
+    std::uint32_t *out_op_words) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const std::uint32_t key = keys[i];
+  if (i + 1u < count && keys[i + 1u] == key)
+    return;
+  const std::uint32_t q = key >> kEpochQuotientBits;
+  const std::uint32_t out = atomicAdd(quotient_cursors + q, 1u);
+  const std::uint64_t packed = payload[i];
+  out_keys[out] = key;
+  out_values[out] = static_cast<std::uint32_t>(packed >> 32);
+  if (packed & 1u)
+    atomicOr(out_op_words + (out >> 5), 1u << (out & 31u));
+}
+
+// Scan newest first, then fall through to BaseRun.
 __global__ void temporal_lookup_kernel(const AssignmentRunView *runs,
-                                       int run_count, OwnerView base,
-                                       int base_ready,
+                                       int run_count, SortedRunView base,
                                        const std::uint32_t *queries,
                                        std::size_t n,
                                        std::uint32_t *out_values,
@@ -2176,15 +2255,12 @@ __global__ void temporal_lookup_kernel(const AssignmentRunView *runs,
       }
     }
   }
-  if (base_ready) {
-    std::uint64_t packed = 0u;
-    if (owner_find(base, key, &packed) &&
-        owner_state(packed) == kOwnerLive) {
-      out_values[i] = owner_value(packed);
-      if (out_found)
-        out_found[i] = 1u;
-      return;
-    }
+  std::uint32_t value = 0u;
+  if (sorted_find_value(base, key, &value)) {
+    out_values[i] = value;
+    if (out_found)
+      out_found[i] = 1u;
+    return;
   }
   out_values[i] = kEmptyKey;
   if (out_found)
@@ -2433,8 +2509,8 @@ __global__ void resolved_range_kernel(
 
 // One block maps its lanes directly to chronological runs.
 __global__ void temporal_lookup_run_parallel_kernel(
-    const AssignmentRunView *runs, int run_count, OwnerView base,
-    int base_ready, const std::uint32_t *queries, std::size_t n,
+    const AssignmentRunView *runs, int run_count, SortedRunView base,
+    const std::uint32_t *queries, std::size_t n,
     std::uint32_t *out_values, std::uint8_t *out_found) {
   const std::size_t query = blockIdx.x;
   if (query >= n)
@@ -2483,14 +2559,9 @@ __global__ void temporal_lookup_run_parallel_kernel(
   }
   std::uint32_t value = kEmptyKey;
   std::uint8_t found = 0u;
-  if (base_ready) {
-    std::uint64_t packed = 0u;
-    if (owner_find(base, key, &packed) &&
-        owner_state(packed) == kOwnerLive) {
-      value = owner_value(packed);
-      found = 1u;
-    }
-  }
+  found = sorted_find_value(base, key, &value) ? 1u : 0u;
+  if (!found)
+    value = kEmptyKey;
   out_values[query] = value;
   if (out_found)
     out_found[query] = found;
@@ -2521,8 +2592,8 @@ __global__ void narrow_range_kernel(
     const std::uint32_t *lo, const std::uint32_t *hi,
     std::uint32_t *out_sums, std::uint32_t *out_counts,
     std::size_t query_count, const AssignmentRunView *runs,
-    int run_count, OwnerView base, int base_ready,
-    SortedRunView base_view, SortedRunRangeView base_range,
+    int run_count, SortedRunView base_view,
+    SortedRunRangeView base_range,
     const std::uint32_t *base_value_prefix,
     const std::uint32_t *base_count_prefix,
     std::uint32_t *overflow) {
@@ -2598,15 +2669,7 @@ __global__ void narrow_range_kernel(
     const int op =
         assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
     std::uint32_t base_value = 0u;
-    bool base_live = false;
-    if (base_ready) {
-      std::uint64_t packed = 0u;
-      if (owner_find(base, key, &packed) &&
-          owner_state(packed) == kOwnerLive) {
-        base_live = true;
-        base_value = owner_value(packed);
-      }
-    }
+    const bool base_live = sorted_find_value(base_view, key, &base_value);
     if (op != 0) {
       const std::uint32_t value = run.values[p];
       correction += base_live ? value - base_value : value;
@@ -2666,20 +2729,6 @@ __global__ void base_only_range_kernel(
         sorted_range_count(base, base_count_prefix, l, h);
 }
 
-// Split resolved latest payloads into absolute values plus a
-// packed op bitset for a mixed (compacted) assignment run.
-__global__ void compact_split_kernel(const std::uint64_t *payload,
-                                     std::size_t m, std::uint32_t *out_values,
-                                     std::uint32_t *op_words) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= m)
-    return;
-  out_values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
-  if (payload[i] & 1u)
-    atomicOr(op_words + (i >> 5), 1u << (i & 31u));
-}
-
 } // namespace gpulsmopt_detail
 
 class GPULSMOpt {
@@ -2724,7 +2773,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     order_stream_locked(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     clear_run_state();
-    clear_owner_state(stream);
     live_count_ = 0;
     run_sequence_ = 0;
     chrono_views_.clear();
@@ -2798,6 +2846,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
+    ensure_sorted_run_cache(stream);
     const int run_count = static_cast<int>(chrono_views_.size());
     const bool run_parallel =
         batch.count <=
@@ -2809,15 +2858,15 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       const int grid = static_cast<int>(batch.count);
       gpulsmopt_detail::temporal_lookup_run_parallel_kernel<<<
           grid, block, 0, stream>>>(
-          assignment_views_.data(), run_count, make_owner_view(),
-          owner_ready_ ? 1 : 0, batch.queries, batch.count,
+          assignment_views_.data(), run_count, make_sorted_view(),
+          batch.queries, batch.count,
           batch.out_values, batch.out_found);
     } else {
       const int block = 256;
       const int grid = static_cast<int>((batch.count + block - 1) / block);
       gpulsmopt_detail::temporal_lookup_kernel<<<grid, block, 0, stream>>>(
-          assignment_views_.data(), run_count, make_owner_view(),
-          owner_ready_ ? 1 : 0, batch.queries, batch.count,
+          assignment_views_.data(), run_count, make_sorted_view(),
+          batch.queries, batch.count,
           batch.out_values, batch.out_found);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -2881,8 +2930,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       gpulsmopt_detail::narrow_range_kernel<<<grid, block, 0, stream>>>(
           batch.lo, batch.hi, batch.out_sums, batch.out_counts,
           batch.query_count, assignment_views_.data(), run_count,
-          make_owner_view(), owner_ready_ ? 1 : 0, make_sorted_view(),
-          make_sorted_range_view(), sorted_value_prefix_.data(),
+          make_sorted_view(), make_sorted_range_view(),
+          sorted_value_prefix_.data(),
           sorted_count_prefix_.data(), narrow_overflow_.data());
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaMemcpyAsync(&host_state_->narrow_overflow,
@@ -2943,7 +2992,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     ++base_generation_;
     succ_bits_.release();
     if (n == 0) {
-      clear_owner_state(stream);
       prepare_for_insert(stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
       return;
@@ -2967,7 +3015,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.values.resize_discard(run.count);
     build_assignment_offsets(run, static_cast<std::uint32_t>(run.count), stream);
     build_sorted_run_cache(0u, stream);
-    build_owner_index(stream);
     live_count_ = run.count;
     prepare_for_insert(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2978,20 +3025,18 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(self->snapshot_mutex_);
     const cudaStream_t stream = self->operation_stream_;
     self->ensure_resolved(stream);
-    std::size_t live = 0;
+    std::int64_t live = self->sorted_run_ready()
+                            ? static_cast<std::int64_t>(
+                                  self->sorted_run().count)
+                            : 0;
     auto policy = thrust::cuda::par.on(stream);
-    if (self->owner_ready_)
-      live = thrust::reduce(
-          policy, self->owner_quotient_live_.data(),
-          self->owner_quotient_live_.data() + gpulsmopt_detail::kEpochQuotients,
-          std::size_t{0}, thrust::plus<std::size_t>());
     if (self->resolved_.count > 0)
-      live += static_cast<std::size_t>(thrust::reduce(
+      live += thrust::reduce(
           policy, self->resolved_.count_delta.data(),
           self->resolved_.count_delta.data() + self->resolved_.count,
-          std::int64_t{0}, thrust::plus<std::int64_t>()));
+          std::int64_t{0}, thrust::plus<std::int64_t>());
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    self->live_count_ = live;
+    self->live_count_ = static_cast<std::size_t>(std::max<std::int64_t>(0, live));
     return self->live_count_;
   }
 
@@ -3006,7 +3051,9 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         normalize_views_, norm_keys_, norm_pay_,
         cache_pay_, merge_out_keys_, merge_out_pay_, merge_flags_,
         merge_sel_keys_, merge_sel_pay_, compaction_counts_,
-        compaction_offsets_, narrow_overflow_, assignment_views_,
+        compaction_offsets_, compaction_tile_offsets_,
+        compaction_unique_counts_, compaction_unique_offsets_,
+        compaction_unique_cursors_, narrow_overflow_, assignment_views_,
         direct_sort_keys_,
         direct_sort_values_, sort_key_output_, sort_temp_storage_,
         sorted_value_prefix_, sorted_count_prefix_, base_rank23_,
@@ -4070,6 +4117,16 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
     compaction_offsets_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
+    compaction_tile_offsets_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    compaction_unique_counts_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    compaction_unique_offsets_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    compaction_unique_cursors_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    host_compaction_offsets_.resize(
+        gpulsmopt_detail::kEpochQuotients + 1u);
     if (run_capacity == 0u || max_elements_ == 0u || run_pool_.empty())
       return;
     const std::size_t run_limit =
@@ -4087,10 +4144,12 @@ private:
     if (capacity == 0u)
       return;
 
-    resolve_keys_.resize_discard_exact(capacity);
-    resolve_payload_.resize_discard_exact(capacity);
-    resolve_alt_keys_.resize_discard_exact(capacity);
-    resolve_alt_payload_.resize_discard_exact(capacity);
+    const std::size_t tile_capacity =
+        std::min(capacity, gpulsmopt_detail::kCompactionTileRecords);
+    resolve_keys_.resize_discard_exact(tile_capacity);
+    resolve_payload_.resize_discard_exact(tile_capacity);
+    resolve_alt_keys_.resize_discard_exact(tile_capacity);
+    resolve_alt_payload_.resize_discard_exact(tile_capacity);
     RunStorage &destination = run_pool_.front();
     destination.keys.resize_discard_exact(capacity);
     destination.values.resize_discard_exact(capacity);
@@ -4101,11 +4160,13 @@ private:
     CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
         nullptr, sort_bytes, resolve_keys_.data(),
         resolve_alt_keys_.data(), resolve_payload_.data(),
-        resolve_alt_payload_.data(), static_cast<int>(capacity),
+        resolve_alt_payload_.data(), static_cast<int>(tile_capacity),
         gpulsmopt_detail::kEpochQuotients,
-        compaction_offsets_.data(), compaction_offsets_.data() + 1u,
+        compaction_tile_offsets_.data(),
+        compaction_tile_offsets_.data() + 1u,
         0, 16, stream));
-    compaction_sort_count_ = capacity;
+    compaction_sort_count_ = tile_capacity;
+    compaction_sort_segments_ = gpulsmopt_detail::kEpochQuotients;
     compaction_sort_temp_bytes_ = sort_bytes;
     ensure_sort_temp(sort_bytes);
   }
@@ -4114,8 +4175,7 @@ private:
   void prepare_for_insert(cudaStream_t stream) {
     const std::size_t direct_count =
         std::min(max_elements_,
-                 std::max<std::size_t>(gpulsmopt_detail::kRawRunReserve,
-                                       batch_capacity_));
+                 std::max<std::size_t>(1, batch_capacity_));
     reserve_leaf_storage(direct_count);
     assignment_views_.resize_discard_exact(gpulsmopt_detail::kRunCapacity);
     chrono_views_.reserve(gpulsmopt_detail::kRunCapacity);
@@ -4796,7 +4856,6 @@ private:
     base.values.resize_discard(kept);
     build_assignment_offsets(base, kept, stream);
     build_sorted_run_cache(0u, stream);
-    build_owner_index(stream);
     prebind_run_views(stream);
     run_sequence_ = 0;
     chrono_views_.clear();
@@ -4853,58 +4912,142 @@ private:
     if (total > static_cast<std::size_t>(std::numeric_limits<int>::max()))
       throw std::runtime_error("temporal compaction exceeds CUB limits");
 
-    resolve_keys_.resize_discard(total);
-    resolve_payload_.resize_discard(total);
-    resolve_alt_keys_.resize_discard(total);
-    resolve_alt_payload_.resize_discard(total);
-    resolve_flags_.resize_discard(total);
-    resolve_count_.resize_discard(1);
-    compaction_counts_.resize_discard(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    compaction_offsets_.resize_discard(
-        gpulsmopt_detail::kEpochQuotients + 1u);
+    normalize_views_.resize_discard(group_size);
+    for (std::size_t slot = 0; slot < group_size; ++slot) {
+      RunStorage &run = runs_[group[slot]];
+      const bool insert =
+          run.operation == gpulsmopt_detail::RunOperation::Insert;
+      host_state_->views[slot] = {
+          run.keys.data(), insert ? run.values.data() : nullptr,
+          run.quotient_off.data(), run.mixed ? run.op_words.data() : nullptr,
+          static_cast<std::uint8_t>(insert ? 1u : 0u),
+          static_cast<std::uint8_t>(run.mixed ? 1u : 0u)};
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        normalize_views_.data(), host_state_->views,
+        group_size * sizeof(gpulsmopt_detail::AssignmentRunView),
+        cudaMemcpyHostToDevice, stream));
 
     constexpr int block = 256;
     constexpr int quotient_rows = gpulsmopt_detail::kEpochQuotients + 1;
     constexpr int count_grid = (quotient_rows + block - 1) / block;
     gpulsmopt_detail::assignment_group_count_kernel<<<
         count_grid, block, 0, stream>>>(
-        assignment_views_.data(), static_cast<int>(group_size),
+        normalize_views_.data(), static_cast<int>(group_size),
         compaction_counts_.data());
     CUDA_CHECK(cudaGetLastError());
     exclusive_scan_u32(
         compaction_counts_.data(), compaction_offsets_.data(),
         gpulsmopt_detail::kEpochQuotients + 1u, stream);
-    gpulsmopt_detail::assignment_group_gather_kernel<<<
-        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
-        assignment_views_.data(), static_cast<int>(group_size),
-        compaction_offsets_.data(), resolve_keys_.data(),
-        resolve_payload_.data());
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(
+        host_compaction_offsets_.data(), compaction_offsets_.data(),
+        (gpulsmopt_detail::kEpochQuotients + 1u) * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (host_compaction_offsets_.back() != total)
+      throw std::runtime_error("temporal compaction count mismatch");
 
-    if (total > compaction_sort_count_) {
-      compaction_sort_temp_bytes_ = 0u;
-      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-          nullptr, compaction_sort_temp_bytes_, resolve_keys_.data(),
-          resolve_alt_keys_.data(), resolve_payload_.data(),
-          resolve_alt_payload_.data(), static_cast<int>(total),
-          gpulsmopt_detail::kEpochQuotients,
-          compaction_offsets_.data(), compaction_offsets_.data() + 1u,
-          0, 16, stream));
-      compaction_sort_count_ = total;
+    using QuotientTile = std::pair<std::uint32_t, std::uint32_t>;
+    std::vector<QuotientTile> tiles;
+    std::uint32_t first = 0u;
+    while (first < gpulsmopt_detail::kEpochQuotients) {
+      std::uint32_t last = first;
+      while (last < gpulsmopt_detail::kEpochQuotients) {
+        const std::size_t candidate =
+            host_compaction_offsets_[last + 1u] -
+            host_compaction_offsets_[first];
+        if (candidate > gpulsmopt_detail::kCompactionTileRecords &&
+            last > first)
+          break;
+        ++last;
+        if (candidate >= gpulsmopt_detail::kCompactionTileRecords)
+          break;
+      }
+      tiles.emplace_back(first, last);
+      first = last;
     }
-    std::size_t sort_bytes = compaction_sort_temp_bytes_;
-    ensure_sort_temp(sort_bytes);
-    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-        sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
-        resolve_alt_keys_.data(), resolve_payload_.data(),
-        resolve_alt_payload_.data(), static_cast<int>(total),
-        gpulsmopt_detail::kEpochQuotients,
-        compaction_offsets_.data(), compaction_offsets_.data() + 1u,
-        0, 16, stream));
 
-    const std::uint32_t compact_count =
-        static_cast<std::uint32_t>(total);
+    auto stage_tile = [&](const QuotientTile &tile) -> std::size_t {
+      const std::uint32_t tile_first = tile.first;
+      const std::uint32_t segments = tile.second - tile.first;
+      const std::size_t tile_count =
+          host_compaction_offsets_[tile.second] -
+          host_compaction_offsets_[tile.first];
+      if (tile_count == 0u)
+        return 0u;
+      resolve_keys_.resize_discard(tile_count);
+      resolve_payload_.resize_discard(tile_count);
+      resolve_alt_keys_.resize_discard(tile_count);
+      resolve_alt_payload_.resize_discard(tile_count);
+      const int offset_grid = static_cast<int>((segments + 1u + block - 1u) /
+                                               block);
+      gpulsmopt_detail::compaction_tile_offsets_kernel<<<
+          offset_grid, block, 0, stream>>>(
+          compaction_offsets_.data(), tile_first, segments,
+          compaction_tile_offsets_.data());
+      CUDA_CHECK(cudaGetLastError());
+      gpulsmopt_detail::assignment_group_gather_range_kernel<<<
+          segments, block, 0, stream>>>(
+          normalize_views_.data(), static_cast<int>(group_size), tile_first,
+          compaction_tile_offsets_.data(), resolve_keys_.data(),
+          resolve_payload_.data());
+      CUDA_CHECK(cudaGetLastError());
+      if (tile_count > compaction_sort_count_ ||
+          segments > compaction_sort_segments_) {
+        std::size_t required = 0u;
+        CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+            nullptr, required, resolve_keys_.data(),
+            resolve_alt_keys_.data(), resolve_payload_.data(),
+            resolve_alt_payload_.data(), static_cast<int>(tile_count),
+            static_cast<int>(segments), compaction_tile_offsets_.data(),
+            compaction_tile_offsets_.data() + 1u, 0, 16, stream));
+        compaction_sort_count_ =
+            std::max(compaction_sort_count_, tile_count);
+        compaction_sort_segments_ =
+            std::max(compaction_sort_segments_,
+                     static_cast<std::size_t>(segments));
+        compaction_sort_temp_bytes_ =
+            std::max(compaction_sort_temp_bytes_, required);
+      }
+      std::size_t sort_bytes = compaction_sort_temp_bytes_;
+      ensure_sort_temp(sort_bytes);
+      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+          sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
+          resolve_alt_keys_.data(), resolve_payload_.data(),
+          resolve_alt_payload_.data(), static_cast<int>(tile_count),
+          static_cast<int>(segments), compaction_tile_offsets_.data(),
+          compaction_tile_offsets_.data() + 1u, 0, 16, stream));
+      return tile_count;
+    };
+
+    CUDA_CHECK(cudaMemsetAsync(
+        compaction_unique_counts_.data(), 0,
+        (gpulsmopt_detail::kEpochQuotients + 1u) * sizeof(std::uint32_t),
+        stream));
+    for (const QuotientTile &tile : tiles) {
+      const std::size_t tile_count = stage_tile(tile);
+      if (tile_count == 0u)
+        continue;
+      const int grid =
+          static_cast<int>((tile_count + block - 1u) / block);
+      gpulsmopt_detail::compaction_unique_count_kernel<<<
+          grid, block, 0, stream>>>(
+          resolve_alt_keys_.data(), tile_count,
+          compaction_unique_counts_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    exclusive_scan_u32(
+        compaction_unique_counts_.data(),
+        compaction_unique_offsets_.data(),
+        gpulsmopt_detail::kEpochQuotients + 1u, stream);
+    std::uint32_t compact_count = 0u;
+    CUDA_CHECK(cudaMemcpyAsync(
+        &compact_count,
+        compaction_unique_offsets_.data() +
+            gpulsmopt_detail::kEpochQuotients,
+        sizeof(compact_count), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
     acquire_compaction_slot();
     RunStorage &merged = runs_.back();
     merged.assignment = true;
@@ -4912,27 +5055,42 @@ private:
     merged.operation = gpulsmopt_detail::RunOperation::Insert;
     merged.sequence = group_seq;
     merged.count = compact_count;
+    merged.unique_keys = true;
+    merged.fully_sorted = false;
+    merged.unit_counts = false;
     merged.keys.resize_discard(compact_count);
     merged.values.resize_discard(compact_count);
+    merged.quotient_off.resize_discard(
+        gpulsmopt_detail::kEpochQuotients + 1u);
     merged.op_words.resize_discard(
         (compact_count + 31u) / 32u + 1u);
-    CUDA_CHECK(cudaMemcpyAsync(
-        merged.keys.data(), resolve_alt_keys_.data(),
-        compact_count * sizeof(std::uint32_t),
-        cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemsetAsync(
         merged.op_words.data(), 0,
         ((compact_count + 31u) / 32u + 1u) *
             sizeof(std::uint32_t),
         stream));
-    const int split_grid =
-        static_cast<int>((compact_count + block - 1) / block);
-    gpulsmopt_detail::compact_split_kernel<<<
-        split_grid, block, 0, stream>>>(
-        resolve_alt_payload_.data(), compact_count,
-        merged.values.data(), merged.op_words.data());
-    CUDA_CHECK(cudaGetLastError());
-    build_assignment_offsets(merged, compact_count, stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        merged.quotient_off.data(), compaction_unique_offsets_.data(),
+        (gpulsmopt_detail::kEpochQuotients + 1u) * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        compaction_unique_cursors_.data(),
+        compaction_unique_offsets_.data(),
+        gpulsmopt_detail::kEpochQuotients * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToDevice, stream));
+    for (const QuotientTile &tile : tiles) {
+      const std::size_t tile_count = stage_tile(tile);
+      if (tile_count == 0u)
+        continue;
+      const int grid =
+          static_cast<int>((tile_count + block - 1u) / block);
+      gpulsmopt_detail::compaction_unique_scatter_kernel<<<
+          grid, block, 0, stream>>>(
+          resolve_alt_keys_.data(), resolve_alt_payload_.data(), tile_count,
+          compaction_unique_cursors_.data(), merged.keys.data(),
+          merged.values.data(), merged.op_words.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
 
     RunStorage compacted = std::move(runs_.back());
     runs_.pop_back();
@@ -5015,7 +5173,13 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_count_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_counts_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_offsets_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_tile_offsets_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_unique_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_unique_offsets_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_unique_cursors_;
+  std::vector<std::uint32_t> host_compaction_offsets_;
   std::size_t compaction_sort_count_ = 0;
+  std::size_t compaction_sort_segments_ = 0;
   std::size_t compaction_sort_temp_bytes_ = 0;
 
 #ifdef GPULSMOPT_PROFILE_INSERT
