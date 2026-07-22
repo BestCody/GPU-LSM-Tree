@@ -160,6 +160,8 @@ public:
          std::to_string(static_cast<size_t>(GPULSMOPT_SCATTER_MIN_BATCH))},
         {"run_capacity",
          std::to_string(static_cast<size_t>(gpulsmopt_detail::kRunCapacity))},
+        {"prewarm_leaves",
+         std::to_string(static_cast<size_t>(GPULSMOPT_PREWARM_LEAVES))},
     };
   }
 
@@ -204,6 +206,7 @@ public:
         reinterpret_cast<const std::uint32_t *>(keys),
         reinterpret_cast<const std::uint32_t *>(build_values_buffer_.ptr()),
         size, 0);
+    build_values_buffer_.free();
     timer.stop();
 
     if (build_bytes)

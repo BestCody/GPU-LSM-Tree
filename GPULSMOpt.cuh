@@ -74,6 +74,9 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_NARROW_RANGE_MAX_QUERIES
 #define GPULSMOPT_NARROW_RANGE_MAX_QUERIES 4096
 #endif
+#ifndef GPULSMOPT_PREWARM_LEAVES
+#define GPULSMOPT_PREWARM_LEAVES 16
+#endif
 constexpr int kRunCapacity = 128;
 // Assignment runs merged per contiguous compaction.
 constexpr int kCompactGroup = 64;
@@ -1877,6 +1880,87 @@ __global__ void succ_query_kernel(const std::uint32_t *queries,
   out_keys[i] = best == kEmptyKey ? 0u : best;
 }
 
+__global__ void succ_live_count_kernel(
+    const std::uint32_t *base_keys, const std::uint32_t *base_offsets,
+    const std::uint32_t *correction_keys,
+    const std::int8_t *correction_counts,
+    const std::uint32_t *correction_offsets, std::uint32_t *counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kEpochQuotients)
+    return;
+  if (q == kEpochQuotients) {
+    counts[q] = 0u;
+    return;
+  }
+  std::uint32_t bi = base_offsets ? base_offsets[q] : 0u;
+  const std::uint32_t be = base_offsets ? base_offsets[q + 1u] : 0u;
+  std::uint32_t ci = correction_offsets ? correction_offsets[q] : 0u;
+  const std::uint32_t ce =
+      correction_offsets ? correction_offsets[q + 1u] : 0u;
+  std::uint32_t live = 0u;
+  while (bi < be || ci < ce) {
+    if (ci == ce || (bi < be && base_keys[bi] < correction_keys[ci])) {
+      ++bi;
+      ++live;
+      continue;
+    }
+    if (bi == be || correction_keys[ci] < base_keys[bi]) {
+      live += correction_counts[ci] > 0 ? 1u : 0u;
+      ++ci;
+      continue;
+    }
+    live += correction_counts[ci] >= 0 ? 1u : 0u;
+    ++bi;
+    ++ci;
+  }
+  counts[q] = live;
+}
+
+__global__ void succ_live_write_kernel(
+    const std::uint32_t *base_keys, const std::uint32_t *base_offsets,
+    const std::uint32_t *correction_keys,
+    const std::int8_t *correction_counts,
+    const std::uint32_t *correction_offsets,
+    const std::uint32_t *output_offsets, std::uint32_t *output) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  std::uint32_t bi = base_offsets ? base_offsets[q] : 0u;
+  const std::uint32_t be = base_offsets ? base_offsets[q + 1u] : 0u;
+  std::uint32_t ci = correction_offsets ? correction_offsets[q] : 0u;
+  const std::uint32_t ce =
+      correction_offsets ? correction_offsets[q + 1u] : 0u;
+  std::uint32_t out = output_offsets[q];
+  while (bi < be || ci < ce) {
+    if (ci == ce || (bi < be && base_keys[bi] < correction_keys[ci])) {
+      output[out++] = base_keys[bi++];
+      continue;
+    }
+    if (bi == be || correction_keys[ci] < base_keys[bi]) {
+      if (correction_counts[ci] > 0)
+        output[out++] = correction_keys[ci];
+      ++ci;
+      continue;
+    }
+    if (correction_counts[ci] >= 0)
+      output[out++] = base_keys[bi];
+    ++bi;
+    ++ci;
+  }
+}
+
+__global__ void succ_sorted_query_kernel(
+    const std::uint32_t *queries, std::size_t count,
+    std::uint32_t *out_keys, const std::uint32_t *live_keys,
+    std::size_t live_count) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const std::size_t position =
+      lower_bound_u32(live_keys, live_count, queries[i]);
+  out_keys[i] = position < live_count ? live_keys[position] : 0u;
+}
+
 // 8 runs x 32 quotients tiles: both sides coalesce.
 constexpr int kTransposeRuns = 8;
 constexpr int kTransposeQuots = 32;
@@ -2105,6 +2189,7 @@ struct AssignmentRunView {
   const std::uint32_t *keys;
   const std::uint32_t *values;
   const std::uint32_t *offsets;
+  const std::uint64_t *fingerprints;
   const std::uint32_t *op_words; // null for homogeneous leaves
   std::uint8_t constant_op;      // 1 insert, 0 delete
   std::uint8_t mixed;            // 1 if op_words is used
@@ -2240,8 +2325,12 @@ __global__ void temporal_lookup_kernel(const AssignmentRunView *runs,
     return;
   const std::uint32_t key = queries[i];
   const std::uint32_t q = key >> kEpochQuotientBits;
+  const std::uint64_t bit =
+      std::uint64_t{1} << spill_slot(key, 63u);
   for (int r = run_count - 1; r >= 0; --r) {
     const AssignmentRunView run = runs[r];
+    if (run.fingerprints && !(run.fingerprints[q] & bit))
+      continue;
     const std::uint32_t b = run.offsets[q];
     std::uint32_t p = run.offsets[q + 1u];
     while (p-- > b) {
@@ -2302,6 +2391,24 @@ __global__ void assignment_boundary_kernel(const std::uint32_t *keys,
   const std::uint32_t prev = i == 0u ? q : keys[i - 1u] >> kEpochQuotientBits;
   if (i == 0u || q != prev)
     offsets[q] = i;
+}
+
+__global__ void assignment_fingerprint_kernel(
+    const std::uint32_t *keys, const std::uint32_t *offsets,
+    std::uint64_t *fingerprints) {
+  const std::uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t q = thread >> 5;
+  if (q >= kEpochQuotients)
+    return;
+  const int lane = threadIdx.x & 31;
+  std::uint64_t mask = 0u;
+  for (std::uint32_t i = offsets[q] + lane;
+       i < offsets[q + 1u]; i += 32u)
+    mask |= std::uint64_t{1} << spill_slot(keys[i], 63u);
+  for (int delta = 16; delta > 0; delta >>= 1)
+    mask |= __shfl_down_sync(0xffffffffu, mask, delta);
+  if (lane == 0)
+    fingerprints[q] = mask;
 }
 
 // Flat directory boundary: rank23[key>>9] = first position.
@@ -2518,22 +2625,26 @@ __global__ void temporal_lookup_run_parallel_kernel(
   __shared__ unsigned long long candidates[kRunCapacity];
   const int run_index = threadIdx.x;
   const std::uint32_t key = queries[query];
+  const std::uint32_t q = key >> kEpochQuotientBits;
+  const std::uint64_t bit =
+      std::uint64_t{1} << spill_slot(key, 63u);
   unsigned long long candidate = 0u;
   if (run_index < run_count) {
     const AssignmentRunView run = runs[run_index];
-    const std::uint32_t q = key >> kEpochQuotientBits;
-    const std::uint32_t begin = run.offsets[q];
-    std::uint32_t position = run.offsets[q + 1u];
-    while (position-- > begin) {
-      if (run.keys[position] != key)
-        continue;
-      const int op = assignment_op_at(
-          run.op_words, run.constant_op, run.mixed, position);
-      const std::uint32_t value = op != 0 ? run.values[position] : kEmptyKey;
-      candidate =
-          (static_cast<unsigned long long>(run_index + 1) << 33) |
-          (static_cast<unsigned long long>(op != 0) << 32) | value;
-      break;
+    if (!run.fingerprints || (run.fingerprints[q] & bit)) {
+      const std::uint32_t begin = run.offsets[q];
+      std::uint32_t position = run.offsets[q + 1u];
+      while (position-- > begin) {
+        if (run.keys[position] != key)
+          continue;
+        const int op = assignment_op_at(
+            run.op_words, run.constant_op, run.mixed, position);
+        const std::uint32_t value = op != 0 ? run.values[position] : kEmptyKey;
+        candidate =
+            (static_cast<unsigned long long>(run_index + 1) << 33) |
+            (static_cast<unsigned long long>(op != 0) << 32) | value;
+        break;
+      }
     }
   }
   candidates[run_index] = candidate;
@@ -2726,7 +2837,7 @@ __global__ void base_only_range_kernel(
       sorted_range_sum(base, base_range, base_value_prefix, l, h);
   if constexpr (WithCounts)
     out_counts[i] =
-        sorted_range_count(base, base_count_prefix, l, h);
+      sorted_range_count(base, base_count_prefix, l, h);
 }
 
 } // namespace gpulsmopt_detail
@@ -2777,9 +2888,9 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run_sequence_ = 0;
     chrono_views_.clear();
     invalidate_resolved();
-    succ_built_ = false;
+    succ_live_ready_ = false;
     ++base_generation_;
-    succ_bits_.release();
+    succ_live_keys_.release();
   }
 
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
@@ -2847,6 +2958,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
+    ensure_assignment_fingerprints(stream);
     const int run_count = static_cast<int>(chrono_views_.size());
     const bool run_parallel =
         batch.count <=
@@ -2877,11 +2989,12 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
-    ensure_successor_bitmap(stream);
+    ensure_successor_index(stream);
     const int block = 256;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
-    gpulsmopt_detail::succ_query_kernel<<<grid, block, 0, stream>>>(
-        batch.queries, batch.count, batch.out_keys, succ_bits_.data());
+    gpulsmopt_detail::succ_sorted_query_kernel<<<grid, block, 0, stream>>>(
+        batch.queries, batch.count, batch.out_keys,
+        succ_live_keys_.data(), succ_live_count_);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -2988,9 +3101,9 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run_sequence_ = 0;
     chrono_views_.clear();
     invalidate_resolved();
-    succ_built_ = false;
+    succ_live_ready_ = false;
     ++base_generation_;
-    succ_bits_.release();
+    succ_live_keys_.release();
     if (n == 0) {
       prepare_for_insert(stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -3003,6 +3116,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.fully_sorted = true;
     run.unit_counts = true;
     run.unique_keys = true;
+    run.fingerprint_ready = false;
     run.keys.resize_discard(n);
     run.values.resize_discard(n);
     auto policy = thrust::cuda::par.on(stream);
@@ -3061,9 +3175,10 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         owner_spill_values_, owner_spill_count_, owner_quotient_live_,
         meta_pending_list_, meta_pending_count_, owner_class_list_,
         owner_class_count_, logical_run_views_, run_off_t_, run_vp_t_,
-        run_cp_t_, succ_bits_);
+        run_cp_t_, succ_live_keys_);
     total += device_bytes_all(
         resolved_.keys, resolved_.values, resolved_.count_delta,
+        resolved_.quotient_fingerprint,
         resolved_value_prefix_, resolved_count_prefix_,
         resolved_.quotient_count_sum, resolved_.quotient_off,
         resolved_.subgroup_masks, resolved_.quotient_live,
@@ -3074,6 +3189,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     for (const auto &epoch : runs_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta,
+          epoch.quotient_fingerprint,
           epoch.quotient_count_sum, epoch.quotient_off,
           epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
@@ -3082,6 +3198,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     for (const auto &epoch : run_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta,
+          epoch.quotient_fingerprint,
           epoch.quotient_count_sum, epoch.quotient_off,
           epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
@@ -3095,6 +3212,7 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> quotient_fingerprint;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
   };
 
@@ -3124,6 +3242,7 @@ private:
     bool fully_sorted = false;
     bool unit_counts = false;
     bool unique_keys = false;
+    bool fingerprint_ready = false;
   };
 
   void order_stream_locked(cudaStream_t stream) {
@@ -3909,6 +4028,7 @@ private:
     run.fully_sorted = false;
     run.unit_counts = false;
     run.unique_keys = false;
+    run.fingerprint_ready = false;
     run.keys.resize_discard(count);
     {
       GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
@@ -3937,8 +4057,9 @@ private:
   // Offsets-only leaf metadata; richer metadata is built only for
   // resolved delta runs and the BaseRun.
   void build_assignment_offsets(RunStorage &run, std::uint32_t count,
-                                cudaStream_t stream) {
-    run.quotient_off.resize_discard(gpulsmopt_detail::kEpochQuotients + 1);
+                                 cudaStream_t stream) {
+    run.quotient_off.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1);
     std::uint32_t *offsets = run.quotient_off.data();
     if (count == 0u) {
       CUDA_CHECK(cudaMemsetAsync(offsets, 0,
@@ -3967,6 +4088,7 @@ private:
             ? run.values.data()
             : nullptr,
         run.quotient_off.data(),
+        run.fingerprint_ready ? run.quotient_fingerprint.data() : nullptr,
         run.mixed ? run.op_words.data() : nullptr,
         static_cast<std::uint8_t>(
             run.operation == gpulsmopt_detail::RunOperation::Insert ? 1u : 0u),
@@ -3981,6 +4103,28 @@ private:
     CUDA_CHECK(cudaMemcpyAsync(assignment_views_.data() + slot,
                                host_state_->views + slot, sizeof(view),
                                cudaMemcpyHostToDevice, stream));
+  }
+
+  void ensure_assignment_fingerprints(cudaStream_t stream) {
+    bool changed = false;
+    constexpr int block = 256;
+    constexpr int grid =
+        (gpulsmopt_detail::kEpochQuotients * 32 + block - 1) / block;
+    for (RunStorage &run : runs_) {
+      if (!run.assignment || run.fingerprint_ready)
+        continue;
+      run.quotient_fingerprint.resize_discard_exact(
+          gpulsmopt_detail::kEpochQuotients);
+      gpulsmopt_detail::assignment_fingerprint_kernel<<<
+          grid, block, 0, stream>>>(
+          run.keys.data(), run.quotient_off.data(),
+          run.quotient_fingerprint.data());
+      CUDA_CHECK(cudaGetLastError());
+      run.fingerprint_ready = true;
+      changed = true;
+    }
+    if (changed)
+      rebuild_chrono_views(stream);
   }
   void acquire_run_slot() {
     if (run_pool_.empty()) {
@@ -4010,10 +4154,34 @@ private:
            static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity)) {
       run_pool_.emplace_back();
     }
-    for (auto &leaf : run_pool_) {
+    const std::size_t warm = std::min(
+        run_pool_.size(),
+        static_cast<std::size_t>(GPULSMOPT_PREWARM_LEAVES));
+    const std::size_t first_warm = run_pool_.size() - warm;
+    for (std::size_t i = 0; i < run_pool_.size(); ++i) {
+      RunStorage &leaf = run_pool_[i];
+      if (i < first_warm) {
+        leaf.keys.release();
+        leaf.values.release();
+        leaf.quotient_off.release();
+        leaf.quotient_fingerprint.release();
+        leaf.op_words.release();
+        leaf.count_delta.release();
+        leaf.subgroup_masks.release();
+        leaf.quotient_live.release();
+        leaf.quotient_count_sum.release();
+        leaf.quotient_value_sum.release();
+        leaf.quotient_count_prefix.release();
+        leaf.quotient_value_prefix.release();
+        leaf.subgroup_value_prefix.release();
+        leaf.heavy_list.release();
+        leaf.heavy_count.release();
+        leaf.fingerprint_ready = false;
+        continue;
+      }
       leaf.keys.resize_discard(count);
       leaf.values.resize_discard(count);
-      leaf.quotient_off.resize_discard(
+      leaf.quotient_off.resize_discard_exact(
           gpulsmopt_detail::kEpochQuotients + 1);
     }
   }
@@ -4113,6 +4281,8 @@ private:
 
   void reserve_temporal_compaction_storage(
       std::size_t run_capacity, cudaStream_t stream) {
+    (void)run_capacity;
+    (void)stream;
     compaction_counts_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
     compaction_offsets_.resize_discard_exact(
@@ -4127,48 +4297,6 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
     host_compaction_offsets_.resize(
         gpulsmopt_detail::kEpochQuotients + 1u);
-    if (run_capacity == 0u || max_elements_ == 0u || run_pool_.empty())
-      return;
-    const std::size_t run_limit =
-        run_capacity > std::numeric_limits<std::size_t>::max() /
-                           gpulsmopt_detail::kCompactGroup
-            ? std::numeric_limits<std::size_t>::max()
-            : run_capacity * gpulsmopt_detail::kCompactGroup;
-    const std::size_t live_limit =
-        max_elements_ > std::numeric_limits<std::size_t>::max() / 2u
-            ? std::numeric_limits<std::size_t>::max()
-            : max_elements_ * 2u;
-    const std::size_t capacity = std::min(
-        {run_limit, live_limit,
-         static_cast<std::size_t>(std::numeric_limits<int>::max())});
-    if (capacity == 0u)
-      return;
-
-    const std::size_t tile_capacity =
-        std::min(capacity, gpulsmopt_detail::kCompactionTileRecords);
-    resolve_keys_.resize_discard_exact(tile_capacity);
-    resolve_payload_.resize_discard_exact(tile_capacity);
-    resolve_alt_keys_.resize_discard_exact(tile_capacity);
-    resolve_alt_payload_.resize_discard_exact(tile_capacity);
-    RunStorage &destination = run_pool_.front();
-    destination.keys.resize_discard_exact(capacity);
-    destination.values.resize_discard_exact(capacity);
-    destination.op_words.resize_discard_exact(
-        (capacity + 31u) / 32u + 1u);
-
-    std::size_t sort_bytes = 0u;
-    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-        nullptr, sort_bytes, resolve_keys_.data(),
-        resolve_alt_keys_.data(), resolve_payload_.data(),
-        resolve_alt_payload_.data(), static_cast<int>(tile_capacity),
-        gpulsmopt_detail::kEpochQuotients,
-        compaction_tile_offsets_.data(),
-        compaction_tile_offsets_.data() + 1u,
-        0, 16, stream));
-    compaction_sort_count_ = tile_capacity;
-    compaction_sort_segments_ = gpulsmopt_detail::kEpochQuotients;
-    compaction_sort_temp_bytes_ = sort_bytes;
-    ensure_sort_temp(sort_bytes);
   }
 
   // Reserve direct-path buffers before timed updates.
@@ -4190,6 +4318,14 @@ private:
     }
     prepare_sort_storage(direct_count, stream);
     reserve_temporal_compaction_storage(direct_count, stream);
+    if (direct_count > 0 && !run_pool_.empty()) {
+      RunStorage &sample = run_pool_.back();
+      sort_run_batch(
+          direct_sort_keys_.data(), direct_sort_values_.data(),
+          direct_count, sample.keys.data(), sample.values.data(), stream);
+      sort_delete_batch(
+          direct_sort_keys_.data(), direct_count, sample.keys.data(), stream);
+    }
     prebind_run_views(stream);
   }
 
@@ -4326,85 +4462,51 @@ private:
     CUDA_CHECK(cudaGetLastError());
   }
 
-  // Successor bitmap = base live keys + resolved corrections.
-  // Persistent bitmap: built once from the BaseRun, then advanced
-  // incrementally by assignment runs past the applied watermark.
-  void ensure_successor_bitmap(cudaStream_t stream) {
-    if (succ_bits_.size() == 0)
-      succ_bits_.resize_discard_exact(gpulsmopt_detail::kSuccTotalWords);
+  void ensure_successor_index(cudaStream_t stream) {
+    if (succ_live_ready_ && succ_live_base_generation_ == base_generation_ &&
+        succ_live_sequence_ == run_sequence_)
+      return;
+    ensure_sorted_run_cache(stream);
+    ensure_resolved(stream);
     constexpr int block = 256;
-    const bool rebuild =
-        !succ_built_ || succ_base_generation_ != base_generation_;
-    if (rebuild) {
-      // Clear L0 and seed live keys from the sorted BaseRun only.
-      CUDA_CHECK(cudaMemsetAsync(
-          succ_bits_.data(), 0,
-          static_cast<std::size_t>(gpulsmopt_detail::succ_level_words(0)) *
-              sizeof(std::uint32_t),
-          stream));
-      if (sorted_run_ready() && sorted_run().count > 0) {
-        const RunStorage &base = sorted_run();
-        const int grid = static_cast<int>((base.count + block - 1) / block);
-        gpulsmopt_detail::succ_seed_base_kernel<<<grid, block, 0, stream>>>(
-            base.keys.data(), base.count, succ_bits_.data());
-        CUDA_CHECK(cudaGetLastError());
-      }
-      for (int level = 1; level < 6; ++level) {
-        const std::uint32_t upper_words =
-            gpulsmopt_detail::succ_level_words(level);
-        const int grid = static_cast<int>((upper_words + block - 1) / block);
-        gpulsmopt_detail::succ_build_level_kernel<<<grid, block, 0, stream>>>(
-            succ_bits_.data() + gpulsmopt_detail::succ_level_off(level - 1),
-            succ_bits_.data() + gpulsmopt_detail::succ_level_off(level),
-            upper_words);
-        CUDA_CHECK(cudaGetLastError());
-      }
-      succ_applied_sequence_ = 0;
-      succ_base_generation_ = base_generation_;
-      succ_built_ = true;
-    }
-    // Apply assignment runs past the watermark, oldest first.
-    std::vector<std::size_t> pending;
-    for (std::size_t r = 0; r < runs_.size(); ++r)
-      if (runs_[r].assignment && runs_[r].sequence > succ_applied_sequence_)
-        pending.push_back(r);
-    std::sort(pending.begin(), pending.end(),
-              [this](std::size_t a, std::size_t b) {
-                return runs_[a].sequence < runs_[b].sequence;
-              });
-    for (const std::size_t r : pending) {
-      RunStorage &run = runs_[r];
-      if (run.count == 0)
-        continue;
-      const int grid =
-          static_cast<int>((run.count + block - 1) / block);
-      if (!run.mixed) {
-        const bool insert =
-            run.operation == gpulsmopt_detail::RunOperation::Insert;
-        gpulsmopt_detail::succ_apply_homogeneous_kernel<<<
-            grid, block, 0, stream>>>(
-            run.keys.data(), run.count, insert, succ_bits_.data());
-        CUDA_CHECK(cudaGetLastError());
-        continue;
-      }
-      gpulsmopt_detail::succ_apply_mixed_kernel<<<
-          grid, block, 0, stream>>>(
-          run.keys.data(), run.op_words.data(), run.count,
-          succ_bits_.data());
+    constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
+    constexpr int grid = (rows + block - 1) / block;
+    const RunStorage *base = sorted_run_ready() ? &sorted_run() : nullptr;
+    const std::uint32_t *base_keys = base ? base->keys.data() : nullptr;
+    const std::uint32_t *base_offsets =
+        base ? base->quotient_off.data() : nullptr;
+    const std::uint32_t *correction_keys =
+        resolved_.count ? resolved_.keys.data() : nullptr;
+    const std::int8_t *correction_counts =
+        resolved_.count ? resolved_.count_delta.data() : nullptr;
+    const std::uint32_t *correction_offsets =
+        resolved_.count ? resolved_.quotient_off.data() : nullptr;
+    gpulsmopt_detail::succ_live_count_kernel<<<grid, block, 0, stream>>>(
+        base_keys, base_offsets, correction_keys, correction_counts,
+        correction_offsets, compaction_counts_.data());
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(
+        compaction_counts_.data(), compaction_offsets_.data(), rows, stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        &host_state_->resolved_count,
+        compaction_offsets_.data() + gpulsmopt_detail::kEpochQuotients,
+        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    succ_live_count_ = host_state_->resolved_count;
+    succ_live_keys_.resize_discard_exact(succ_live_count_);
+    if (succ_live_count_ > 0u) {
+      constexpr int write_grid =
+          (gpulsmopt_detail::kEpochQuotients + block - 1) / block;
+      gpulsmopt_detail::succ_live_write_kernel<<<
+          write_grid, block, 0, stream>>>(
+          base_keys, base_offsets, correction_keys, correction_counts,
+          correction_offsets, compaction_offsets_.data(),
+          succ_live_keys_.data());
       CUDA_CHECK(cudaGetLastError());
-      for (int level = 1; level < 6; ++level) {
-        gpulsmopt_detail::succ_update_level_kernel<<<
-            grid, block, 0, stream>>>(
-            run.keys.data(), run.count,
-            succ_bits_.data() +
-                gpulsmopt_detail::succ_level_off(level - 1),
-            succ_bits_.data() +
-                gpulsmopt_detail::succ_level_off(level),
-            5 * level);
-        CUDA_CHECK(cudaGetLastError());
-      }
     }
-    succ_applied_sequence_ = run_sequence_;
+    succ_live_base_generation_ = base_generation_;
+    succ_live_sequence_ = run_sequence_;
+    succ_live_ready_ = true;
   }
 
   void invalidate_resolved() {
@@ -4430,6 +4532,7 @@ private:
           run.keys.data(),
           insert ? run.values.data() : nullptr,
           run.quotient_off.data(),
+          run.fingerprint_ready ? run.quotient_fingerprint.data() : nullptr,
           run.mixed ? run.op_words.data() : nullptr,
           static_cast<std::uint8_t>(insert ? 1u : 0u),
           static_cast<std::uint8_t>(run.mixed ? 1u : 0u)};
@@ -4829,6 +4932,7 @@ private:
     base.fully_sorted = true;
     base.unit_counts = true;
     base.unique_keys = true;
+    base.fingerprint_ready = false;
     base.keys.resize_discard(latest);
     base.values.resize_discard(latest);
     std::uint32_t kept = 0u;
@@ -4860,7 +4964,8 @@ private:
     run_sequence_ = 0;
     chrono_views_.clear();
     invalidate_resolved();
-    succ_built_ = false;
+    succ_live_ready_ = false;
+    succ_live_keys_.release();
     ++base_generation_;
     ++structure_generation_;
   }
@@ -4919,7 +5024,9 @@ private:
           run.operation == gpulsmopt_detail::RunOperation::Insert;
       host_state_->views[slot] = {
           run.keys.data(), insert ? run.values.data() : nullptr,
-          run.quotient_off.data(), run.mixed ? run.op_words.data() : nullptr,
+          run.quotient_off.data(),
+          run.fingerprint_ready ? run.quotient_fingerprint.data() : nullptr,
+          run.mixed ? run.op_words.data() : nullptr,
           static_cast<std::uint8_t>(insert ? 1u : 0u),
           static_cast<std::uint8_t>(run.mixed ? 1u : 0u)};
     }
@@ -5058,6 +5165,7 @@ private:
     merged.unique_keys = true;
     merged.fully_sorted = false;
     merged.unit_counts = false;
+    merged.fingerprint_ready = false;
     merged.keys.resize_discard(compact_count);
     merged.values.resize_discard(compact_count);
     merged.quotient_off.resize_discard(
@@ -5153,9 +5261,10 @@ private:
   std::size_t resolved_sort_temp_bytes_ = 0;
   bool resolved_value_prefix_ready_ = false;
   bool resolved_count_prefix_ready_ = false;
-  bool succ_built_ = false;
-  std::uint64_t succ_applied_sequence_ = 0;
-  std::uint64_t succ_base_generation_ = ~std::uint64_t{0};
+  bool succ_live_ready_ = false;
+  std::size_t succ_live_count_ = 0;
+  std::uint64_t succ_live_sequence_ = 0;
+  std::uint64_t succ_live_base_generation_ = ~std::uint64_t{0};
   std::uint64_t base_generation_ = 0;
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
       assignment_views_;
@@ -5253,7 +5362,7 @@ private:
   bool run_meta_counts_ready_ = false;
 
   // Lazy hierarchical live-key bitmap for successor().
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_bits_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_keys_;
   std::uint64_t structure_generation_ = 0;
   std::uint64_t succ_generation_ = 0;
   std::size_t succ_synced_runs_ = 0;
