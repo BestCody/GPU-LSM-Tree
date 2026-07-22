@@ -2189,7 +2189,6 @@ struct AssignmentRunView {
   const std::uint32_t *keys;
   const std::uint32_t *values;
   const std::uint32_t *offsets;
-  const std::uint64_t *fingerprints;
   const std::uint32_t *op_words; // null for homogeneous leaves
   std::uint8_t constant_op;      // 1 insert, 0 delete
   std::uint8_t mixed;            // 1 if op_words is used
@@ -2325,23 +2324,20 @@ __global__ void temporal_lookup_kernel(const AssignmentRunView *runs,
     return;
   const std::uint32_t key = queries[i];
   const std::uint32_t q = key >> kEpochQuotientBits;
-  const std::uint64_t bit =
-      std::uint64_t{1} << spill_slot(key, 63u);
   for (int r = run_count - 1; r >= 0; --r) {
     const AssignmentRunView run = runs[r];
-    if (run.fingerprints && !(run.fingerprints[q] & bit))
-      continue;
-    const std::uint32_t b = run.offsets[q];
-    std::uint32_t p = run.offsets[q + 1u];
-    while (p-- > b) {
-      if (run.keys[p] == key) {
-        const bool live =
-            assignment_op_at(run.op_words, run.constant_op, run.mixed, p) != 0;
-        out_values[i] = live ? run.values[p] : kEmptyKey;
-        if (out_found)
-          out_found[i] = live ? 1u : 0u;
-        return;
-      }
+    const std::uint32_t begin = run.offsets[q];
+    std::uint32_t position = run.offsets[q + 1u];
+    while (position-- > begin) {
+      if (run.keys[position] != key)
+        continue;
+      const bool live = assignment_op_at(
+                            run.op_words, run.constant_op,
+                            run.mixed, position) != 0;
+      out_values[i] = live ? run.values[position] : kEmptyKey;
+      if (out_found)
+        out_found[i] = live ? 1u : 0u;
+      return;
     }
   }
   std::uint32_t value = 0u;
@@ -2391,24 +2387,6 @@ __global__ void assignment_boundary_kernel(const std::uint32_t *keys,
   const std::uint32_t prev = i == 0u ? q : keys[i - 1u] >> kEpochQuotientBits;
   if (i == 0u || q != prev)
     offsets[q] = i;
-}
-
-__global__ void assignment_fingerprint_kernel(
-    const std::uint32_t *keys, const std::uint32_t *offsets,
-    std::uint64_t *fingerprints) {
-  const std::uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::uint32_t q = thread >> 5;
-  if (q >= kEpochQuotients)
-    return;
-  const int lane = threadIdx.x & 31;
-  std::uint64_t mask = 0u;
-  for (std::uint32_t i = offsets[q] + lane;
-       i < offsets[q + 1u]; i += 32u)
-    mask |= std::uint64_t{1} << spill_slot(keys[i], 63u);
-  for (int delta = 16; delta > 0; delta >>= 1)
-    mask |= __shfl_down_sync(0xffffffffu, mask, delta);
-  if (lane == 0)
-    fingerprints[q] = mask;
 }
 
 // Flat directory boundary: rank23[key>>9] = first position.
@@ -2626,25 +2604,21 @@ __global__ void temporal_lookup_run_parallel_kernel(
   const int run_index = threadIdx.x;
   const std::uint32_t key = queries[query];
   const std::uint32_t q = key >> kEpochQuotientBits;
-  const std::uint64_t bit =
-      std::uint64_t{1} << spill_slot(key, 63u);
   unsigned long long candidate = 0u;
   if (run_index < run_count) {
     const AssignmentRunView run = runs[run_index];
-    if (!run.fingerprints || (run.fingerprints[q] & bit)) {
-      const std::uint32_t begin = run.offsets[q];
-      std::uint32_t position = run.offsets[q + 1u];
-      while (position-- > begin) {
-        if (run.keys[position] != key)
-          continue;
-        const int op = assignment_op_at(
-            run.op_words, run.constant_op, run.mixed, position);
-        const std::uint32_t value = op != 0 ? run.values[position] : kEmptyKey;
-        candidate =
-            (static_cast<unsigned long long>(run_index + 1) << 33) |
-            (static_cast<unsigned long long>(op != 0) << 32) | value;
-        break;
-      }
+    const std::uint32_t begin = run.offsets[q];
+    std::uint32_t position = run.offsets[q + 1u];
+    while (position-- > begin) {
+      if (run.keys[position] != key)
+        continue;
+      const int op = assignment_op_at(
+          run.op_words, run.constant_op, run.mixed, position);
+      const std::uint32_t value = op != 0 ? run.values[position] : kEmptyKey;
+      candidate =
+          (static_cast<unsigned long long>(run_index + 1) << 33) |
+          (static_cast<unsigned long long>(op != 0) << 32) | value;
+      break;
     }
   }
   candidates[run_index] = candidate;
@@ -2958,7 +2932,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
-    ensure_assignment_fingerprints(stream);
     const int run_count = static_cast<int>(chrono_views_.size());
     const bool run_parallel =
         batch.count <=
@@ -3005,7 +2978,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
     const int run_count = static_cast<int>(chrono_views_.size());
-    // No updates: BaseRun-only, no resolve/metadata/count-prefix work.
     if (run_count == 0) {
       const int block = 128;
       const int grid =
@@ -3116,7 +3088,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.fully_sorted = true;
     run.unit_counts = true;
     run.unique_keys = true;
-    run.fingerprint_ready = false;
     run.keys.resize_discard(n);
     run.values.resize_discard(n);
     auto policy = thrust::cuda::par.on(stream);
@@ -3178,7 +3149,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         run_cp_t_, succ_live_keys_);
     total += device_bytes_all(
         resolved_.keys, resolved_.values, resolved_.count_delta,
-        resolved_.quotient_fingerprint,
         resolved_value_prefix_, resolved_count_prefix_,
         resolved_.quotient_count_sum, resolved_.quotient_off,
         resolved_.subgroup_masks, resolved_.quotient_live,
@@ -3189,7 +3159,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     for (const auto &epoch : runs_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta,
-          epoch.quotient_fingerprint,
           epoch.quotient_count_sum, epoch.quotient_off,
           epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
@@ -3198,7 +3167,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     for (const auto &epoch : run_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta,
-          epoch.quotient_fingerprint,
           epoch.quotient_count_sum, epoch.quotient_off,
           epoch.subgroup_masks, epoch.quotient_live,
           epoch.quotient_value_sum, epoch.quotient_count_prefix,
@@ -3212,7 +3180,6 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> quotient_fingerprint;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
   };
 
@@ -3242,7 +3209,6 @@ private:
     bool fully_sorted = false;
     bool unit_counts = false;
     bool unique_keys = false;
-    bool fingerprint_ready = false;
   };
 
   void order_stream_locked(cudaStream_t stream) {
@@ -4028,7 +3994,6 @@ private:
     run.fully_sorted = false;
     run.unit_counts = false;
     run.unique_keys = false;
-    run.fingerprint_ready = false;
     run.keys.resize_discard(count);
     {
       GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
@@ -4088,7 +4053,6 @@ private:
             ? run.values.data()
             : nullptr,
         run.quotient_off.data(),
-        run.fingerprint_ready ? run.quotient_fingerprint.data() : nullptr,
         run.mixed ? run.op_words.data() : nullptr,
         static_cast<std::uint8_t>(
             run.operation == gpulsmopt_detail::RunOperation::Insert ? 1u : 0u),
@@ -4105,27 +4069,6 @@ private:
                                cudaMemcpyHostToDevice, stream));
   }
 
-  void ensure_assignment_fingerprints(cudaStream_t stream) {
-    bool changed = false;
-    constexpr int block = 256;
-    constexpr int grid =
-        (gpulsmopt_detail::kEpochQuotients * 32 + block - 1) / block;
-    for (RunStorage &run : runs_) {
-      if (!run.assignment || run.fingerprint_ready)
-        continue;
-      run.quotient_fingerprint.resize_discard_exact(
-          gpulsmopt_detail::kEpochQuotients);
-      gpulsmopt_detail::assignment_fingerprint_kernel<<<
-          grid, block, 0, stream>>>(
-          run.keys.data(), run.quotient_off.data(),
-          run.quotient_fingerprint.data());
-      CUDA_CHECK(cudaGetLastError());
-      run.fingerprint_ready = true;
-      changed = true;
-    }
-    if (changed)
-      rebuild_chrono_views(stream);
-  }
   void acquire_run_slot() {
     if (run_pool_.empty()) {
       runs_.emplace_back();
@@ -4164,7 +4107,6 @@ private:
         leaf.keys.release();
         leaf.values.release();
         leaf.quotient_off.release();
-        leaf.quotient_fingerprint.release();
         leaf.op_words.release();
         leaf.count_delta.release();
         leaf.subgroup_masks.release();
@@ -4176,7 +4118,6 @@ private:
         leaf.subgroup_value_prefix.release();
         leaf.heavy_list.release();
         leaf.heavy_count.release();
-        leaf.fingerprint_ready = false;
         continue;
       }
       leaf.keys.resize_discard(count);
@@ -4532,7 +4473,6 @@ private:
           run.keys.data(),
           insert ? run.values.data() : nullptr,
           run.quotient_off.data(),
-          run.fingerprint_ready ? run.quotient_fingerprint.data() : nullptr,
           run.mixed ? run.op_words.data() : nullptr,
           static_cast<std::uint8_t>(insert ? 1u : 0u),
           static_cast<std::uint8_t>(run.mixed ? 1u : 0u)};
@@ -4932,7 +4872,6 @@ private:
     base.fully_sorted = true;
     base.unit_counts = true;
     base.unique_keys = true;
-    base.fingerprint_ready = false;
     base.keys.resize_discard(latest);
     base.values.resize_discard(latest);
     std::uint32_t kept = 0u;
@@ -5025,7 +4964,6 @@ private:
       host_state_->views[slot] = {
           run.keys.data(), insert ? run.values.data() : nullptr,
           run.quotient_off.data(),
-          run.fingerprint_ready ? run.quotient_fingerprint.data() : nullptr,
           run.mixed ? run.op_words.data() : nullptr,
           static_cast<std::uint8_t>(insert ? 1u : 0u),
           static_cast<std::uint8_t>(run.mixed ? 1u : 0u)};
@@ -5165,7 +5103,6 @@ private:
     merged.unique_keys = true;
     merged.fully_sorted = false;
     merged.unit_counts = false;
-    merged.fingerprint_ready = false;
     merged.keys.resize_discard(compact_count);
     merged.values.resize_discard(compact_count);
     merged.quotient_off.resize_discard(
