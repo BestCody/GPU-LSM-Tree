@@ -2965,12 +2965,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.count = static_cast<std::size_t>(unique_end.first - run.keys.data());
     run.keys.resize_discard(run.count);
     run.values.resize_discard(run.count);
-    run.count_delta.resize_discard(run.count);
-    CUDA_CHECK(cudaMemsetAsync(run.count_delta.data(), 1,
-                               run.count * sizeof(std::int8_t), stream));
-    commit_run_metadata(run, stream, nullptr,
-                        static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
-                        false);
+    build_assignment_offsets(run, static_cast<std::uint32_t>(run.count), stream);
     build_sorted_run_cache(0u, stream);
     build_owner_index(stream);
     live_count_ = run.count;
@@ -3049,11 +3044,15 @@ explicit GPULSMOpt(const DictionaryConfig &config)
   }
 
 private:
-  struct RunStorage {
+  struct AssignmentLeafStorage {
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
-    gpulsmopt_detail::RawDeviceBuffer<std::int8_t> count_delta;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
+  };
+
+  struct RunStorage : AssignmentLeafStorage {
+    gpulsmopt_detail::RawDeviceBuffer<std::int8_t> count_delta;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> subgroup_masks;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_live;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_count_sum;
@@ -3063,8 +3062,6 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> subgroup_value_prefix;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> heavy_list;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> heavy_count;
-    // Packed op bits for mixed (compacted) assignment runs.
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
     std::size_t count = 0;
     // Temporal identity of an immutable assignment run.
     std::uint64_t sequence = 0;
@@ -3408,21 +3405,21 @@ private:
   std::size_t run_count() const { return runs_.size(); }
 
   gpulsmopt_detail::RunView make_run_view(RunStorage &epoch) {
-    return {epoch.keys.data(),
-            epoch.values.data(),
-            epoch.count_delta.data(),
-            epoch.quotient_off.data(),
-            epoch.subgroup_masks.data(),
-            epoch.quotient_live.data(),
-            epoch.quotient_count_sum.data(),
-            epoch.quotient_value_sum.data(),
-            epoch.quotient_count_prefix.data(),
-            epoch.quotient_value_prefix.data(),
+    return {raw_or_null(epoch.keys),
+            raw_or_null(epoch.values),
+            raw_or_null(epoch.count_delta),
+            raw_or_null(epoch.quotient_off),
+            raw_or_null(epoch.subgroup_masks),
+            raw_or_null(epoch.quotient_live),
+            raw_or_null(epoch.quotient_count_sum),
+            raw_or_null(epoch.quotient_value_sum),
+            raw_or_null(epoch.quotient_count_prefix),
+            raw_or_null(epoch.quotient_value_prefix),
             epoch.subgroup_value_prefix_ready
-                ? epoch.subgroup_value_prefix.data()
+                ? raw_or_null(epoch.subgroup_value_prefix)
                 : nullptr,
-            epoch.heavy_list.data(),
-            epoch.heavy_count.data(),
+            raw_or_null(epoch.heavy_list),
+            raw_or_null(epoch.heavy_count),
             epoch.fully_sorted ? 1u : 0u};
   }
 
@@ -3961,31 +3958,16 @@ private:
     run_pool_.erase(best);
   }
 
-  void reserve_run_storage(std::size_t count) {
+  void reserve_leaf_storage(std::size_t count) {
     while (runs_.size() + run_pool_.size() <
            static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity)) {
       run_pool_.emplace_back();
     }
-    for (auto &epoch : run_pool_) {
-      epoch.keys.resize_discard(count);
-      epoch.values.resize_discard(count);
-      epoch.count_delta.resize_discard(count);
-      epoch.quotient_off.resize_discard(gpulsmopt_detail::kEpochQuotients + 1);
-      epoch.subgroup_masks.resize_discard(
-          gpulsmopt_detail::kEpochQuotients *
-          gpulsmopt_detail::kEpochSubgroupPlanes);
-      epoch.quotient_live.resize_discard(gpulsmopt_detail::kEpochQuotients);
-      epoch.quotient_count_sum.resize_discard(
-          gpulsmopt_detail::kEpochQuotients);
-      epoch.quotient_value_sum.resize_discard(
-          gpulsmopt_detail::kEpochQuotients);
-      epoch.quotient_count_prefix.resize_discard(
+    for (auto &leaf : run_pool_) {
+      leaf.keys.resize_discard(count);
+      leaf.values.resize_discard(count);
+      leaf.quotient_off.resize_discard(
           gpulsmopt_detail::kEpochQuotients + 1);
-      epoch.quotient_value_prefix.resize_discard(
-          gpulsmopt_detail::kEpochQuotients + 1);
-      epoch.subgroup_value_prefix.resize_discard(0);
-      epoch.heavy_list.resize_discard(gpulsmopt_detail::kEpochQuotients);
-      epoch.heavy_count.resize_discard(1);
     }
   }
 
@@ -4134,7 +4116,7 @@ private:
         std::min(max_elements_,
                  std::max<std::size_t>(gpulsmopt_detail::kRawRunReserve,
                                        batch_capacity_));
-    reserve_run_storage(direct_count);
+    reserve_leaf_storage(direct_count);
     assignment_views_.resize_discard_exact(gpulsmopt_detail::kRunCapacity);
     chrono_views_.reserve(gpulsmopt_detail::kRunCapacity);
     if (direct_count > 0) {
@@ -4146,11 +4128,6 @@ private:
       delete_sort_count_ = direct_count;
       ensure_sort_temp(delete_sort_temp_bytes_);
     }
-    owner_class_list_.resize_discard_exact(4u *
-                                           gpulsmopt_detail::kEpochQuotients);
-    owner_class_count_.resize_discard_exact(4u);
-    meta_pending_list_.resize_discard_exact((direct_count + 31u) / 32u + 1u);
-    meta_pending_count_.resize_discard_exact(1u);
     prepare_sort_storage(direct_count, stream);
     reserve_temporal_compaction_storage(direct_count, stream);
     prebind_run_views(stream);
@@ -4817,12 +4794,7 @@ private:
     base.count = kept;
     base.keys.resize_discard(kept);
     base.values.resize_discard(kept);
-    base.count_delta.resize_discard(kept);
-    if (kept > 0)
-      CUDA_CHECK(cudaMemsetAsync(base.count_delta.data(), 1,
-                                 kept * sizeof(std::int8_t), stream));
-    prepare_run_metadata_storage(base);
-    launch_run_metadata_kernels(base, kept, stream, false);
+    build_assignment_offsets(base, kept, stream);
     build_sorted_run_cache(0u, stream);
     build_owner_index(stream);
     prebind_run_views(stream);
