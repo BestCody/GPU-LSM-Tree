@@ -102,7 +102,7 @@ constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
 
-// Immutable assignment runs replace the owner-transition path.
+// Assignment runs avoid eager owner transitions.
 enum class RunOperation : std::uint8_t { Insert, Delete };
 #if GPULSMOPT_SM120_RADIX
 struct Sm120RadixPolicy
@@ -314,7 +314,7 @@ struct RunView {
 struct SortedRunView {
   const std::uint32_t *keys;
   const std::uint32_t *values;
-  const std::uint32_t *rank23; // flat directory, 2^23 + 1 entries
+  const std::uint32_t *rank23;
   std::size_t count;
   std::uint32_t unit_counts;
 };
@@ -437,15 +437,6 @@ __global__ void sorted_range_cdf_scatter_kernel(const std::uint32_t *keys,
   cdf[slot] = values[i];
 }
 
-// Scatter quotient starts; mask warp-contained segments.
-
-// Lengths, live counts, and transition size classes.
-
-// Finish masks for quotients that crossed a warp boundary.
-
-
-
-
 struct TakeLastU32 {
   __host__ __device__ std::uint32_t operator()(std::uint32_t,
                                                std::uint32_t newer) const {
@@ -454,7 +445,6 @@ struct TakeLastU32 {
 };
 
 
-// Rebuild live-key bits by scanning the owner directory.
 // Scalar op for a leaf, or one packed bit for a mixed run.
 __device__ inline int assignment_op_at(const std::uint32_t *op_words,
                                        std::uint8_t constant_op,
@@ -464,107 +454,44 @@ __device__ inline int assignment_op_at(const std::uint32_t *op_words,
   return (op_words[p >> 5] >> (p & 31u)) & 1u;
 }
 
-// Seed L0 from the sorted BaseRun (all keys live).
-__global__ void succ_live_count_kernel(
-    const std::uint32_t *base_keys, const std::uint32_t *base_offsets,
-    const std::uint32_t *correction_keys,
-    const std::int8_t *correction_counts,
-    const std::uint32_t *correction_offsets, std::uint32_t *counts) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
+// Successor over the BaseRun alone: every base key is live.
+__global__ void base_successor_kernel(SortedRunView base,
+                                      const std::uint32_t *queries,
+                                      std::size_t query_count,
+                                      std::uint32_t *results) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= query_count)
     return;
-  if (q == kEpochQuotients) {
-    counts[q] = 0u;
+  if (base.count == 0) {
+    results[i] = 0u;
     return;
   }
-  std::uint32_t bi = base_offsets ? base_offsets[q] : 0u;
-  const std::uint32_t be = base_offsets ? base_offsets[q + 1u] : 0u;
-  std::uint32_t ci = correction_offsets ? correction_offsets[q] : 0u;
-  const std::uint32_t ce =
-      correction_offsets ? correction_offsets[q + 1u] : 0u;
-  std::uint32_t live = 0u;
-  while (bi < be || ci < ce) {
-    if (ci == ce || (bi < be && base_keys[bi] < correction_keys[ci])) {
-      ++bi;
-      ++live;
-      continue;
-    }
-    if (bi == be || correction_keys[ci] < base_keys[bi]) {
-      live += correction_counts[ci] > 0 ? 1u : 0u;
-      ++ci;
-      continue;
-    }
-    live += correction_counts[ci] >= 0 ? 1u : 0u;
-    ++bi;
-    ++ci;
-  }
-  counts[q] = live;
-}
-
-__global__ void succ_live_write_kernel(
-    const std::uint32_t *base_keys, const std::uint32_t *base_offsets,
-    const std::uint32_t *correction_keys,
-    const std::int8_t *correction_counts,
-    const std::uint32_t *correction_offsets,
-    const std::uint32_t *output_offsets, std::uint32_t *output) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kEpochQuotients)
-    return;
-  std::uint32_t bi = base_offsets ? base_offsets[q] : 0u;
-  const std::uint32_t be = base_offsets ? base_offsets[q + 1u] : 0u;
-  std::uint32_t ci = correction_offsets ? correction_offsets[q] : 0u;
-  const std::uint32_t ce =
-      correction_offsets ? correction_offsets[q + 1u] : 0u;
-  std::uint32_t out = output_offsets[q];
-  while (bi < be || ci < ce) {
-    if (ci == ce || (bi < be && base_keys[bi] < correction_keys[ci])) {
-      output[out++] = base_keys[bi++];
-      continue;
-    }
-    if (bi == be || correction_keys[ci] < base_keys[bi]) {
-      if (correction_counts[ci] > 0)
-        output[out++] = correction_keys[ci];
-      ++ci;
-      continue;
-    }
-    if (correction_counts[ci] >= 0)
-      output[out++] = base_keys[bi];
-    ++bi;
-    ++ci;
-  }
-}
-
-__global__ void succ_sorted_query_kernel(
-    const std::uint32_t *queries, std::size_t count,
-    std::uint32_t *out_keys, const std::uint32_t *live_keys,
-    std::size_t live_count) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
+  const std::uint32_t key = queries[i];
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  sorted_search_bounds(base, key, &begin, &end);
+  // Empty bins start at the next nonempty bin.
   const std::size_t position =
-      lower_bound_u32(live_keys, live_count, queries[i]);
-  out_keys[i] = position < live_count ? live_keys[position] : 0u;
+      begin + lower_bound_u32(base.keys + begin, end - begin, key);
+  results[i] = position < base.count ? base.keys[position] : 0u;
 }
-
-
-
-// Pack 32/W queries per warp for small run counts.
 
 // Immutable assignment run seen by device readers.
 struct AssignmentRunView {
   const std::uint32_t *keys;
   const std::uint32_t *values;
   const std::uint32_t *offsets;
-  const std::uint32_t *op_words; // null for homogeneous leaves
+  const std::uint32_t *op_words;
   std::uint8_t constant_op;      // 1 insert, 0 delete
   std::uint8_t mixed;            // 1 if op_words is used
 };
 
-// Scalar op for a leaf, or one packed bit for a mixed run.
 struct PinnedHostState {
   AssignmentRunView views[kRunCapacity];
   std::uint32_t narrow_overflow;
   std::uint32_t resolved_count;
+  std::uint32_t successor_miss_count;
 };
 
 __global__ void assignment_group_count_kernel(
@@ -718,8 +645,302 @@ __global__ void temporal_lookup_kernel(const AssignmentRunView *runs,
     out_found[i] = 0u;
 }
 
-// Pack one run into the resolve staging arrays. Concatenation
-// order (oldest run first, input order within) is the timestamp.
+// Sparse successor state for the base and corrections.
+struct SuccessorSparseView {
+  SortedRunView base;
+  const std::uint32_t *deleted_base_words;
+  const std::uint32_t *base_live_l1;
+  const std::uint32_t *base_live_l2;
+  const std::uint32_t *base_live_l3;
+  const std::uint32_t *correction_keys;
+  const std::uint32_t *correction_offsets;
+  const std::uint32_t *positive_words;
+  const std::uint32_t *positive_l1;
+  const std::uint32_t *positive_l2;
+  const std::uint32_t *positive_l3;
+  std::uint32_t correction_count;
+  std::uint32_t base_l0_words;
+  std::uint32_t base_l3_words;
+  std::uint32_t positive_l0_words;
+  std::uint32_t positive_l3_words;
+};
+
+__device__ inline std::uint32_t succ_ffs0(std::uint32_t bits) {
+  return static_cast<std::uint32_t>(__ffs(static_cast<int>(bits))) - 1u;
+}
+
+// Bits at or above `bit`.
+__device__ inline std::uint32_t succ_mask_from(std::uint32_t bit) {
+  return 0xffffffffu << bit;
+}
+
+// Bits strictly above `bit` (bit 31 leaves nothing).
+__device__ inline std::uint32_t succ_mask_above(std::uint32_t bit) {
+  return bit >= 31u ? 0u : (0xffffffffu << (bit + 1u));
+}
+
+// Finds the next nonempty L0 word.
+__device__ inline std::uint32_t
+successor_next_set_word(const std::uint32_t *l1,
+                        const std::uint32_t *l2,
+                        const std::uint32_t *l3,
+                        std::uint32_t l0_words,
+                        std::uint32_t l3_words,
+                        std::uint32_t w) {
+  if (w >= l0_words)
+    return l0_words;
+  std::uint32_t i1 = w >> 5;
+  std::uint32_t b1 = l1[i1] & succ_mask_from(w & 31u);
+  if (b1)
+    return (i1 << 5) | succ_ffs0(b1);
+  std::uint32_t i2 = i1 >> 5;
+  std::uint32_t b2 = l2[i2] & succ_mask_above(i1 & 31u);
+  if (!b2) {
+    std::uint32_t i3 = i2 >> 5;
+    std::uint32_t b3 = l3[i3] & succ_mask_above(i2 & 31u);
+    while (!b3) {
+      if (++i3 >= l3_words)
+        return l0_words;
+      b3 = l3[i3];
+    }
+    i2 = (i3 << 5) | succ_ffs0(b3);
+    b2 = l2[i2];
+  }
+  i1 = (i2 << 5) | succ_ffs0(b2);
+  b1 = l1[i1];
+  return (i1 << 5) | succ_ffs0(b1);
+}
+
+// Finds the first surviving BaseRun position.
+__device__ inline std::size_t
+successor_first_base_live(const SuccessorSparseView &view,
+                          std::size_t position) {
+  if (position >= view.base.count)
+    return view.base.count;
+  std::uint32_t w = static_cast<std::uint32_t>(position >> 5);
+  std::uint32_t bits = ~view.deleted_base_words[w] &
+                       succ_mask_from(static_cast<std::uint32_t>(position) & 31u);
+  if (!bits) {
+    w = successor_next_set_word(
+        view.base_live_l1, view.base_live_l2, view.base_live_l3,
+        view.base_l0_words, view.base_l3_words, w + 1u);
+    if (w >= view.base_l0_words)
+      return view.base.count;
+    bits = ~view.deleted_base_words[w];
+  }
+  const std::size_t found =
+      (static_cast<std::size_t>(w) << 5) | succ_ffs0(bits);
+  return found < view.base.count ? found : view.base.count;
+}
+
+// Finds the first positive correction position.
+__device__ inline std::size_t
+successor_first_positive(const SuccessorSparseView &view,
+                         std::size_t position) {
+  if (position >= view.correction_count)
+    return view.correction_count;
+  std::uint32_t w = static_cast<std::uint32_t>(position >> 5);
+  std::uint32_t bits =
+      view.positive_words[w] &
+      succ_mask_from(static_cast<std::uint32_t>(position) & 31u);
+  if (!bits) {
+    w = successor_next_set_word(
+        view.positive_l1, view.positive_l2, view.positive_l3,
+        view.positive_l0_words, view.positive_l3_words, w + 1u);
+    if (w >= view.positive_l0_words)
+      return view.correction_count;
+    bits = view.positive_words[w];
+  }
+  const std::size_t found =
+      (static_cast<std::size_t>(w) << 5) | succ_ffs0(bits);
+  return found < view.correction_count ? found
+                                       : view.correction_count;
+}
+
+// Resolves hits and compacts misses once per block.
+__global__ void successor_live_or_miss_kernel(
+    const AssignmentRunView *runs, int run_count, SortedRunView base,
+    const std::uint32_t *queries, std::size_t query_count,
+    std::uint32_t *results, std::uint32_t *miss_indices,
+    std::uint32_t *miss_count) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  bool missing = false;
+  if (i < query_count) {
+    const std::uint32_t key = queries[i];
+    const std::uint32_t q = key >> kEpochQuotientBits;
+    int live = -1;
+    for (int r = run_count - 1; r >= 0 && live < 0; --r) {
+      const AssignmentRunView run = runs[r];
+      const std::uint32_t begin = run.offsets[q];
+      std::uint32_t position = run.offsets[q + 1u];
+      while (position-- > begin) {
+        if (run.keys[position] != key)
+          continue;
+        live = assignment_op_at(run.op_words, run.constant_op, run.mixed,
+                                position) != 0
+                   ? 1
+                   : 0;
+        break;
+      }
+    }
+    if (live < 0) {
+      std::uint32_t value = 0u;
+      live = sorted_find_value(base, key, &value) ? 1 : 0;
+    }
+    if (live > 0)
+      results[i] = key;
+    else
+      missing = true;
+  }
+  constexpr unsigned kWarps = 8u;
+  __shared__ unsigned warp_counts[kWarps];
+  __shared__ unsigned warp_offsets[kWarps];
+  __shared__ unsigned block_slot;
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned warp = threadIdx.x >> 5;
+  const unsigned mask = __ballot_sync(0xffffffffu, missing);
+  const unsigned warp_count = static_cast<unsigned>(__popc(mask));
+  if (lane == 0u)
+    warp_counts[warp] = warp_count;
+  if (!__syncthreads_or(missing))
+    return;
+  if (warp == 0u) {
+    const unsigned value = lane < kWarps ? warp_counts[lane] : 0u;
+    unsigned prefix = value;
+#pragma unroll
+    for (unsigned offset = 1u; offset < kWarps; offset <<= 1u) {
+      const unsigned add =
+          __shfl_up_sync(0xffffffffu, prefix, offset);
+      if (lane >= offset)
+        prefix += add;
+    }
+    if (lane < kWarps)
+      warp_offsets[lane] = prefix - value;
+    if (lane == kWarps - 1u)
+      block_slot = atomicAdd(miss_count, prefix);
+  }
+  __syncthreads();
+  if (missing) {
+    const unsigned rank =
+        static_cast<unsigned>(__popc(mask & ((1u << lane) - 1u)));
+    miss_indices[block_slot + warp_offsets[warp] + rank] =
+        static_cast<std::uint32_t>(i);
+  }
+}
+
+// Classifies resolved corrections into two bitmaps.
+__global__ void successor_classify_kernel(const std::uint32_t *keys,
+                                          const std::int8_t *count_delta,
+                                          std::size_t count, SortedRunView base,
+                                          std::uint32_t *positive_words,
+                                          std::uint32_t *deleted_base_words) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count)
+    return;
+  const int delta = static_cast<int>(count_delta[i]);
+  if (delta > 0) {
+    atomicOr(positive_words + (i >> 5),
+             1u << (static_cast<std::uint32_t>(i) & 31u));
+    return;
+  }
+  if (delta >= 0 || base.count == 0)
+    return;
+  const std::uint32_t key = keys[i];
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  sorted_search_bounds(base, key, &begin, &end);
+  const std::size_t position =
+      begin + lower_bound_u32(base.keys + begin, end - begin, key);
+  if (position >= end || base.keys[position] != key)
+    return;
+  // Shared words require atomic updates.
+  atomicOr(deleted_base_words + (position >> 5),
+           1u << (static_cast<std::uint32_t>(position) & 31u));
+}
+
+// Masks unused BaseRun tail positions.
+__global__ void successor_tail_mask_kernel(std::uint32_t *words,
+                                           std::uint32_t word_count,
+                                           std::uint32_t base_count) {
+  if (word_count == 0u)
+    return;
+  const std::uint32_t used = base_count & 31u;
+  if (used)
+    words[word_count - 1u] |= ~((1u << used) - 1u);
+}
+
+// Marks nonempty lower-level words.
+__global__ void successor_live_level_kernel(const std::uint32_t *lower,
+                                            std::uint32_t lower_words,
+                                            std::uint32_t *upper,
+                                            std::uint32_t upper_words,
+                                            int deleted_bits) {
+  const std::uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= upper_words)
+    return;
+  const std::uint32_t first = j << 5;
+  const std::uint32_t limit =
+      lower_words > first ? min(32u, lower_words - first) : 0u;
+  std::uint32_t bits = 0u;
+  for (std::uint32_t k = 0; k < limit; ++k) {
+    const std::uint32_t word = lower[first + k];
+    const bool live = deleted_bits ? (~word) != 0u : word != 0u;
+    if (live)
+      bits |= 1u << k;
+  }
+  upper[j] = bits;
+}
+
+// Returns the smaller base or positive correction key.
+__global__ void sparse_successor_kernel(SuccessorSparseView view,
+                                        const std::uint32_t *queries,
+                                        const std::uint32_t *indices,
+                                        std::size_t count,
+                                        std::uint32_t *results) {
+  const std::size_t t =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= count)
+    return;
+  const std::size_t i =
+      indices ? static_cast<std::size_t>(indices[t]) : t;
+  const std::uint32_t key = queries[i];
+  std::uint32_t best = 0u;
+  bool found = false;
+  if (view.base.count != 0) {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    sorted_search_bounds(view.base, key, &begin, &end);
+    std::size_t position =
+        begin + lower_bound_u32(view.base.keys + begin, end - begin, key);
+    position = successor_first_base_live(view, position);
+    if (position < view.base.count) {
+      best = view.base.keys[position];
+      found = true;
+    }
+  }
+  if (view.correction_count != 0u) {
+    const std::uint32_t q = key >> kEpochQuotientBits;
+    const std::uint32_t begin = view.correction_offsets[q];
+    const std::uint32_t end = view.correction_offsets[q + 1u];
+    std::size_t position =
+        begin + lower_bound_u32(view.correction_keys + begin,
+                                end - begin, key);
+    position = successor_first_positive(view, position);
+    if (position < view.correction_count) {
+      const std::uint32_t candidate =
+          view.correction_keys[position];
+      if (!found || candidate < best) {
+        best = candidate;
+        found = true;
+      }
+    }
+  }
+  results[i] = found ? best : 0u;
+}
+
+// Packs one run in chronological order.
 __global__ void resolve_pack_run_kernel(const std::uint32_t *keys,
                                         const std::uint32_t *values,
                                         const std::uint32_t *op_words,
@@ -739,8 +960,7 @@ __global__ void resolve_pack_run_kernel(const std::uint32_t *keys,
       (static_cast<std::uint64_t>(v) << 32) | (op != 0 ? 1u : 0u);
 }
 
-// Boundary-only offsets for an assignment leaf: no masks, no
-// pending list, no per-quotient counts.
+// Builds assignment quotient offsets.
 __global__ void assignment_boundary_kernel(const std::uint32_t *keys,
                                            std::uint32_t count,
                                            std::uint32_t *offsets) {
@@ -771,8 +991,7 @@ __global__ void base_rank23_boundary_kernel(const std::uint32_t *keys,
     rank23[bin] = i;
 }
 
-// After a stable full-key sort, the last record of each equal-key
-// group is the newest assignment.
+// Keeps the newest equal-key assignment.
 __global__ void resolve_flag_last_kernel(const std::uint32_t *keys,
                                          std::size_t n,
                                          std::uint8_t *flags) {
@@ -803,7 +1022,7 @@ struct CountDeltaToU32 {
   }
 };
 
-// Convert sorted assignments to timestamped base corrections.
+// Converts assignments to base corrections.
 __global__ void normalize_correction_kernel(
     const std::uint32_t *keys, const std::uint64_t *assignment,
     std::size_t count, SortedRunView base,
@@ -886,8 +1105,7 @@ __global__ void resolve_merge_flag_kernel(const std::uint64_t *tagged_keys,
   flags[i] = (last && payload[i] != 0u) ? 1u : 0u;
 }
 
-// Split latest assignments into absolute value + keep flag.
-// A key whose latest op is delete is dropped from the new base.
+// Splits newest live assignments from deletes.
 __global__ void resolve_base_extract_kernel(const std::uint64_t *payload,
                                             std::size_t m,
                                             std::uint32_t *out_values,
@@ -1022,7 +1240,7 @@ constexpr int kNarrowSeenCap = 128;
 constexpr int kNarrowHashSlots = 2 * kNarrowSeenCap;
 static_assert((kNarrowHashSlots & (kNarrowHashSlots - 1)) == 0);
 
-// Integer mix hash for the narrow-range open-addressing set.
+// Hash for narrow-range sets.
 __host__ __device__ inline std::uint64_t hash_mix_slot(std::uint32_t key,
                                                        std::uint64_t mask) {
   std::uint64_t x = key;
@@ -1234,9 +1452,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run_sequence_ = 0;
     chrono_views_.clear();
     invalidate_resolved();
-    succ_live_ready_ = false;
+    succ_sparse_ready_ = false;
     ++base_generation_;
-    succ_live_keys_.release();
   }
 
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
@@ -1331,12 +1548,44 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       return;
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
-    ensure_successor_index(stream);
-    const int block = 256;
+    ensure_sorted_run_cache(stream);
+    constexpr int block = 256;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
-    gpulsmopt_detail::succ_sorted_query_kernel<<<grid, block, 0, stream>>>(
-        batch.queries, batch.count, batch.out_keys,
-        succ_live_keys_.data(), succ_live_count_);
+    const int run_count = static_cast<int>(chrono_views_.size());
+    if (run_count == 0) {
+      gpulsmopt_detail::base_successor_kernel<<<grid, block, 0, stream>>>(
+          make_sorted_view(), batch.queries, batch.count, batch.out_keys);
+      CUDA_CHECK(cudaGetLastError());
+      return;
+    }
+    if (sparse_view_is_current()) {
+      gpulsmopt_detail::sparse_successor_kernel<<<grid, block, 0, stream>>>(
+          make_sparse_successor_view(), batch.queries, nullptr, batch.count,
+          batch.out_keys);
+      CUDA_CHECK(cudaGetLastError());
+      return;
+    }
+    succ_miss_indices_.resize_discard(batch.count);
+    succ_miss_count_.resize_discard(1);
+    CUDA_CHECK(cudaMemsetAsync(succ_miss_count_.data(), 0,
+                               sizeof(std::uint32_t), stream));
+    gpulsmopt_detail::successor_live_or_miss_kernel<<<grid, block, 0, stream>>>(
+        assignment_views_.data(), run_count, make_sorted_view(), batch.queries,
+        batch.count, batch.out_keys, succ_miss_indices_.data(),
+        succ_miss_count_.data());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(&host_state_->successor_miss_count,
+                               succ_miss_count_.data(), sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint32_t misses = host_state_->successor_miss_count;
+    if (misses == 0u)
+      return;
+    ensure_sparse_successor_view(stream);
+    const int miss_grid = static_cast<int>((misses + block - 1u) / block);
+    gpulsmopt_detail::sparse_successor_kernel<<<miss_grid, block, 0, stream>>>(
+        make_sparse_successor_view(), batch.queries, succ_miss_indices_.data(),
+        misses, batch.out_keys);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -1442,9 +1691,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run_sequence_ = 0;
     chrono_views_.clear();
     invalidate_resolved();
-    succ_live_ready_ = false;
+    succ_sparse_ready_ = false;
     ++base_generation_;
-    succ_live_keys_.release();
     if (n == 0) {
       prepare_for_insert(stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1507,7 +1755,10 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         compaction_unique_cursors_, narrow_overflow_, assignment_views_,
         direct_sort_keys_, direct_sort_values_, sort_temp_storage_,
         sorted_value_prefix_, sorted_count_prefix_, base_rank23_,
-        sorted_range_cdf_, succ_live_keys_);
+        sorted_range_cdf_, succ_miss_indices_, succ_miss_count_,
+        succ_deleted_base_words_, succ_live_word_l1_, succ_live_word_l2_,
+        succ_live_word_l3_, succ_positive_words_, succ_positive_l1_,
+        succ_positive_l2_, succ_positive_l3_);
     total += device_bytes_all(
         resolved_.keys, resolved_.values, resolved_.count_delta,
         resolved_value_prefix_, resolved_count_prefix_, resolved_.quotient_off,
@@ -1610,7 +1861,7 @@ private:
     sorted_range_cdf_ready_ = false;
   }
 
-  // Flat 23-bit rank directory, rebuilt only when the base changes.
+  // Builds the flat rank directory per base.
   void build_base_rank23(RunStorage &base, cudaStream_t stream) {
     base_rank23_.resize_discard(gpulsmopt_detail::kBaseRank23Size + 1);
     std::uint32_t *dir = base_rank23_.data();
@@ -1631,7 +1882,7 @@ private:
     gpulsmopt_detail::base_rank23_boundary_kernel<<<grid, block, 0, stream>>>(
         base.keys.data(), count, dir);
     CUDA_CHECK(cudaGetLastError());
-    // Reverse-min inclusive scan fills empty bins with the next start.
+    // Empty bins inherit the next start.
     constexpr int items = gpulsmopt_detail::kBaseRank23Size + 1;
     auto rev = thrust::make_reverse_iterator(
         thrust::device_pointer_cast(dir + items));
@@ -1649,7 +1900,7 @@ private:
     RunStorage &run = runs_[sorted_run_index_];
     const std::size_t count = run.count;
     build_base_rank23(run, stream);
-    // BaseRun is always unit_counts: only a value prefix is needed.
+    // BaseRun needs only a value prefix.
     sorted_value_prefix_.resize_discard(count + 1u);
     sorted_count_prefix_.resize_discard(0u);
     CUDA_CHECK(cudaMemsetAsync(sorted_value_prefix_.data(), 0,
@@ -1778,8 +2029,7 @@ private:
 
 
 
-  // Immutable assignment run: upper-16 sort + quotient offsets,
-  // NO previous-state resolution. This is the insert/delete path.
+  // Builds an unresolved assignment run.
   void create_assignment_run(bool is_insert, const std::uint32_t *keys,
                              const std::uint32_t *values, std::size_t count,
                              bool keys_sorted, cudaStream_t stream) {
@@ -1800,13 +2050,13 @@ private:
     run.keys.resize_discard(count);
     {
       GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
-      // Stable upper-16 sort keeps each quotient in input order.
+      // Stable sort preserves quotient input order.
       if (is_insert) {
         run.values.resize_discard(count);
         sort_run_batch(keys, values, count, run.keys.data(),
                        run.values.data(), stream);
       } else if (keys_sorted) {
-        // Already key-sorted (superset of upper-16 order): no re-sort.
+        // Fully sorted keys need only a copy.
         run.values.resize_discard(0);
         CUDA_CHECK(cudaMemcpyAsync(run.keys.data(), keys,
                                    count * sizeof(std::uint32_t),
@@ -1819,7 +2069,7 @@ private:
     }
     {
       GPULSMOPT_PROF_PHASE(prof_delta_ingest_ms_);
-      // Leaf metadata is quotient offsets only: no masks, no counts.
+      // Leaf metadata stores quotient offsets only.
       build_assignment_offsets(run, static_cast<std::uint32_t>(count), stream);
     }
     publish_assignment_view(run, stream);
@@ -1850,7 +2100,7 @@ private:
     reverse_min_scan_offsets(offsets, stream);
   }
 
-  // Publish one chronological descriptor so the run is queryable.
+  // Publishes one chronological run descriptor.
   void publish_assignment_view(RunStorage &run, cudaStream_t stream) {
     gpulsmopt_detail::AssignmentRunView view{
         run.keys.data(),
@@ -2024,6 +2274,26 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
   }
 
+  // Reserve successor storage before timed updates.
+  void reserve_successor_storage() {
+    const std::size_t queries = std::max<std::size_t>(1, batch_capacity_);
+    succ_miss_indices_.resize_discard(queries);
+    succ_miss_count_.resize_discard(1);
+    const std::size_t base_capacity = std::max<std::size_t>(max_elements_, 1);
+    const std::size_t l0 = (base_capacity + 31u) >> 5;
+    const std::size_t l1 = (l0 + 31u) >> 5;
+    const std::size_t l2 = (l1 + 31u) >> 5;
+    const std::size_t l3 = (l2 + 31u) >> 5;
+    succ_deleted_base_words_.resize_discard(l0);
+    succ_live_word_l1_.resize_discard(l1);
+    succ_live_word_l2_.resize_discard(l2);
+    succ_live_word_l3_.resize_discard(l3);
+    succ_positive_words_.resize_discard(l0);
+    succ_positive_l1_.resize_discard(l1);
+    succ_positive_l2_.resize_discard(l2);
+    succ_positive_l3_.resize_discard(l3);
+  }
+
   // Reserve direct-path buffers before timed updates.
   void prepare_for_insert(cudaStream_t stream) {
     const std::size_t direct_count =
@@ -2043,6 +2313,7 @@ private:
     }
     prepare_sort_storage(direct_count, stream);
     reserve_temporal_compaction_storage(direct_count, stream);
+    reserve_successor_storage();
     if (direct_count > 0 && !run_pool_.empty()) {
       RunStorage &sample = run_pool_.back();
       sort_run_batch(
@@ -2110,51 +2381,103 @@ private:
 
 
 
-  void ensure_successor_index(cudaStream_t stream) {
-    if (succ_live_ready_ && succ_live_base_generation_ == base_generation_ &&
-        succ_live_sequence_ == run_sequence_)
-      return;
-    ensure_sorted_run_cache(stream);
+  bool sparse_view_is_current() const {
+    return succ_sparse_ready_ &&
+           succ_sparse_base_generation_ == base_generation_ &&
+           succ_sparse_run_sequence_ == run_sequence_;
+  }
+
+  gpulsmopt_detail::SuccessorSparseView make_sparse_successor_view() const {
+    return {make_sorted_view(),
+            succ_deleted_base_words_.data(),
+            succ_live_word_l1_.data(),
+            succ_live_word_l2_.data(),
+            succ_live_word_l3_.data(),
+            resolved_.keys.data(),
+            resolved_.quotient_off.data(),
+            succ_positive_words_.data(),
+            succ_positive_l1_.data(),
+            succ_positive_l2_.data(),
+            succ_positive_l3_.data(),
+            static_cast<std::uint32_t>(resolved_.count),
+            succ_sparse_l0_words_,
+            succ_sparse_l3_words_,
+            succ_sparse_positive_l0_words_,
+            succ_sparse_positive_l3_words_};
+  }
+
+  // Builds sparse state only after a successor miss.
+  void ensure_sparse_successor_view(cudaStream_t stream) {
     ensure_resolved(stream);
     constexpr int block = 256;
-    constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
-    constexpr int grid = (rows + block - 1) / block;
-    const RunStorage *base = sorted_run_ready() ? &sorted_run() : nullptr;
-    const std::uint32_t *base_keys = base ? base->keys.data() : nullptr;
-    const std::uint32_t *base_offsets =
-        base ? base->quotient_off.data() : nullptr;
-    const std::uint32_t *correction_keys =
-        resolved_.count ? resolved_.keys.data() : nullptr;
-    const std::int8_t *correction_counts =
-        resolved_.count ? resolved_.count_delta.data() : nullptr;
-    const std::uint32_t *correction_offsets =
-        resolved_.count ? resolved_.quotient_off.data() : nullptr;
-    gpulsmopt_detail::succ_live_count_kernel<<<grid, block, 0, stream>>>(
-        base_keys, base_offsets, correction_keys, correction_counts,
-        correction_offsets, compaction_counts_.data());
-    CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(
-        compaction_counts_.data(), compaction_offsets_.data(), rows, stream);
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->resolved_count,
-        compaction_offsets_.data() + gpulsmopt_detail::kEpochQuotients,
-        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    succ_live_count_ = host_state_->resolved_count;
-    succ_live_keys_.resize_discard_exact(succ_live_count_);
-    if (succ_live_count_ > 0u) {
-      constexpr int write_grid =
-          (gpulsmopt_detail::kEpochQuotients + block - 1) / block;
-      gpulsmopt_detail::succ_live_write_kernel<<<
-          write_grid, block, 0, stream>>>(
-          base_keys, base_offsets, correction_keys, correction_counts,
-          correction_offsets, compaction_offsets_.data(),
-          succ_live_keys_.data());
+    const std::uint32_t base_count =
+        sorted_run_ready() ? static_cast<std::uint32_t>(sorted_run().count) : 0u;
+    const std::uint32_t l0 = (base_count + 31u) >> 5;
+    const std::uint32_t l1 = (l0 + 31u) >> 5;
+    const std::uint32_t l2 = (l1 + 31u) >> 5;
+    const std::uint32_t l3 = (l2 + 31u) >> 5;
+    const std::size_t corrections = resolved_.count;
+    const std::uint32_t p0 =
+        (static_cast<std::uint32_t>(corrections) + 31u) >> 5;
+    const std::uint32_t p1 = (p0 + 31u) >> 5;
+    const std::uint32_t p2 = (p1 + 31u) >> 5;
+    const std::uint32_t p3 = (p2 + 31u) >> 5;
+    succ_sparse_l0_words_ = l0;
+    succ_sparse_l3_words_ = l3;
+    succ_sparse_positive_l0_words_ = p0;
+    succ_sparse_positive_l3_words_ = p3;
+    succ_deleted_base_words_.resize_discard(std::max<std::uint32_t>(l0, 1u));
+    succ_live_word_l1_.resize_discard(std::max<std::uint32_t>(l1, 1u));
+    succ_live_word_l2_.resize_discard(std::max<std::uint32_t>(l2, 1u));
+    succ_live_word_l3_.resize_discard(std::max<std::uint32_t>(l3, 1u));
+    succ_positive_words_.resize_discard(std::max<std::uint32_t>(p0, 1u));
+    succ_positive_l1_.resize_discard(std::max<std::uint32_t>(p1, 1u));
+    succ_positive_l2_.resize_discard(std::max<std::uint32_t>(p2, 1u));
+    succ_positive_l3_.resize_discard(std::max<std::uint32_t>(p3, 1u));
+    if (l0 != 0u)
+      CUDA_CHECK(cudaMemsetAsync(succ_deleted_base_words_.data(), 0,
+                                 l0 * sizeof(std::uint32_t), stream));
+    if (p0 != 0u)
+      CUDA_CHECK(cudaMemsetAsync(succ_positive_words_.data(), 0,
+                                 p0 * sizeof(std::uint32_t), stream));
+    if (corrections > 0) {
+      const int grid = static_cast<int>((corrections + block - 1u) / block);
+      gpulsmopt_detail::successor_classify_kernel<<<grid, block, 0, stream>>>(
+          resolved_.keys.data(), resolved_.count_delta.data(), corrections,
+          make_sorted_view(), succ_positive_words_.data(),
+          succ_deleted_base_words_.data());
       CUDA_CHECK(cudaGetLastError());
     }
-    succ_live_base_generation_ = base_generation_;
-    succ_live_sequence_ = run_sequence_;
-    succ_live_ready_ = true;
+    if (l0 != 0u) {
+      gpulsmopt_detail::successor_tail_mask_kernel<<<1, 1, 0, stream>>>(
+          succ_deleted_base_words_.data(), l0, base_count);
+      CUDA_CHECK(cudaGetLastError());
+      gpulsmopt_detail::successor_live_level_kernel<<<
+          static_cast<int>((l1 + block - 1u) / block), block, 0, stream>>>(
+          succ_deleted_base_words_.data(), l0, succ_live_word_l1_.data(), l1, 1);
+      gpulsmopt_detail::successor_live_level_kernel<<<
+          static_cast<int>((l2 + block - 1u) / block), block, 0, stream>>>(
+          succ_live_word_l1_.data(), l1, succ_live_word_l2_.data(), l2, 0);
+      gpulsmopt_detail::successor_live_level_kernel<<<
+          static_cast<int>((l3 + block - 1u) / block), block, 0, stream>>>(
+          succ_live_word_l2_.data(), l2, succ_live_word_l3_.data(), l3, 0);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    if (p0 != 0u) {
+      gpulsmopt_detail::successor_live_level_kernel<<<
+          static_cast<int>((p1 + block - 1u) / block), block, 0, stream>>>(
+          succ_positive_words_.data(), p0, succ_positive_l1_.data(), p1, 0);
+      gpulsmopt_detail::successor_live_level_kernel<<<
+          static_cast<int>((p2 + block - 1u) / block), block, 0, stream>>>(
+          succ_positive_l1_.data(), p1, succ_positive_l2_.data(), p2, 0);
+      gpulsmopt_detail::successor_live_level_kernel<<<
+          static_cast<int>((p3 + block - 1u) / block), block, 0, stream>>>(
+          succ_positive_l2_.data(), p2, succ_positive_l3_.data(), p3, 0);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    succ_sparse_base_generation_ = base_generation_;
+    succ_sparse_run_sequence_ = run_sequence_;
+    succ_sparse_ready_ = true;
   }
 
   void invalidate_resolved() {
@@ -2469,8 +2792,7 @@ private:
     resolved_count_prefix_ready_ = true;
   }
 
-  // Fold the base snapshot and every assignment run into one
-  // fresh sorted base via last-wins; drops resolved tombstones.
+  // Folds the base and assignments with last-wins.
   void fold_into_base(cudaStream_t stream) {
     std::vector<std::size_t> idx;
     std::size_t total = 0;
@@ -2504,7 +2826,7 @@ private:
       RunStorage &run = runs_[idx[j]];
       if (run.count == 0)
         continue;
-      // Base run packs as all-insert; assignment leaves use their op.
+      // Packs the base as an insert run.
       const bool is_insert =
           !run.assignment ||
           run.operation == gpulsmopt_detail::RunOperation::Insert;
@@ -2609,13 +2931,11 @@ private:
     run_sequence_ = 0;
     chrono_views_.clear();
     invalidate_resolved();
-    succ_live_ready_ = false;
-    succ_live_keys_.release();
+    succ_sparse_ready_ = false;
     ++base_generation_;
   }
 
-  // Republish the chronological descriptor array after the run set
-  // changes (compaction). Assignment runs, oldest sequence first.
+  // Republishes descriptors after compaction.
   void rebuild_chrono_views(cudaStream_t stream) {
     std::vector<std::size_t> idx;
     for (std::size_t r = 0; r < runs_.size(); ++r)
@@ -2629,10 +2949,7 @@ private:
       publish_assignment_view(runs_[r], stream);
   }
 
-  // Temporally-contiguous last-write-wins compaction. Merges the
-  // oldest group of assignment runs into ONE mixed run, retaining
-  // tombstones (unlike fold_into_base). Falls back to fold when a
-  // group cannot be formed.
+  // Compacts oldest contiguous runs with last-wins.
   void compact_contiguous(cudaStream_t stream) {
     std::vector<std::size_t> idx;
     for (std::size_t r = 0; r < runs_.size(); ++r)
@@ -2868,7 +3185,7 @@ private:
   std::uint64_t run_sequence_ = 0;
   RunStorage resolved_;
   bool resolved_ready_ = false;
-  // Incremental resolved-cache state + linear merge scratch.
+  // Incremental cache and merge scratch.
   std::uint64_t resolved_through_sequence_ = 0;
   std::uint64_t resolved_base_generation_ = ~std::uint64_t{0};
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
@@ -2891,14 +3208,18 @@ private:
   std::size_t resolved_sort_temp_bytes_ = 0;
   bool resolved_value_prefix_ready_ = false;
   bool resolved_count_prefix_ready_ = false;
-  bool succ_live_ready_ = false;
-  std::size_t succ_live_count_ = 0;
-  std::uint64_t succ_live_sequence_ = 0;
-  std::uint64_t succ_live_base_generation_ = ~std::uint64_t{0};
+  // Lazy successor sidecar.
+  bool succ_sparse_ready_ = false;
+  std::uint64_t succ_sparse_base_generation_ = ~std::uint64_t{0};
+  std::uint64_t succ_sparse_run_sequence_ = 0;
+  std::uint32_t succ_sparse_l0_words_ = 0;
+  std::uint32_t succ_sparse_l3_words_ = 0;
+  std::uint32_t succ_sparse_positive_l0_words_ = 0;
+  std::uint32_t succ_sparse_positive_l3_words_ = 0;
   std::uint64_t base_generation_ = 0;
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
       assignment_views_;
-  // Host mirror of the chronological descriptor array (oldest->newest).
+  // Oldest-to-newest descriptor mirror.
   std::vector<gpulsmopt_detail::AssignmentRunView> chrono_views_;
   std::size_t delete_sort_count_ = 0;
   std::size_t delete_sort_temp_bytes_ = 0;
@@ -2954,5 +3275,14 @@ private:
   std::size_t metadata_scan_temp_bytes_ = 0;
   bool sorted_range_cdf_ready_ = false;
 
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_miss_indices_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_miss_count_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_deleted_base_words_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_word_l1_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_word_l2_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_word_l3_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_words_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_l1_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_l2_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_l3_;
 };
