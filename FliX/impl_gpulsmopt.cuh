@@ -152,12 +152,7 @@ public:
     return {
         {"batch_capacity",
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
-        {"c0_log", "1"},
-        {"sorted_runs", "1"},
-        {"c0_flush_budget",
-         std::to_string(static_cast<size_t>(GPULSMOPT_C0_FLUSH_BUDGET))},
-        {"direct_run_min_batch",
-         std::to_string(static_cast<size_t>(GPULSMOPT_SCATTER_MIN_BATCH))},
+        {"structure", "temporal_assignment_runs"},
         {"run_capacity",
          std::to_string(static_cast<size_t>(gpulsmopt_detail::kRunCapacity))},
         {"prewarm_leaves",
