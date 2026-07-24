@@ -1643,7 +1643,7 @@ __global__ void base_only_range_kernel(
 // --- Rank23 canonical fold (sec 13) ---
 constexpr int kFoldQuotientCap = 1280;
 constexpr int kFoldBinCap = 32;
-constexpr int kFoldThreads = 256;
+constexpr int kFoldThreads = 512;
 // Base keys per quotient (~512 uniform); window caps the shared
 // preload of state/override/base-value so apply hits on-chip memory.
 constexpr int kWindowCap = 768;
@@ -1841,7 +1841,15 @@ __global__ void canonical_fold_rank23_kernel(
     }
     return;
   }
-  // Flat gather: each thread locates its run in shared offsets.
+  // Zero histogram + delta accumulators before the fused gather.
+  for (int b = tid; b < 128; b += blockDim.x) {
+    s_bincount[b] = 0;
+    s_rank_dv[b] = 0u;
+    s_rank_dc[b] = 0;
+  }
+  __syncthreads();
+  // Flat gather: locate each record's run and tally its bin in one
+  // pass (no separate re-read of s_rec for the histogram).
   for (int i = tid; i < s_total; i += blockDim.x) {
     int lo = 0, hi = run_count - 1;
     while (lo < hi) {
@@ -1863,6 +1871,7 @@ __global__ void canonical_fold_rank23_kernel(
     rec.value = (op != 0 && run.values) ? run.values[p] : 0u;
     rec.source_position = p;
     s_rec[i] = rec;
+    atomicAdd(&s_bincount[rec.low_key >> 9], 1);
   }
   // Coalesced preload of this quotient's base window into shared so
   // apply reads/writes on-chip instead of scattered global memory.
@@ -1873,14 +1882,6 @@ __global__ void canonical_fold_rank23_kernel(
     s_win_ovr[i] = override_values[gp];
     s_win_state[i] = state[gp];
   }
-  for (int b = tid; b < 128; b += blockDim.x) {
-    s_bincount[b] = 0;
-    s_rank_dv[b] = 0u;
-    s_rank_dc[b] = 0;
-  }
-  __syncthreads();
-  for (int i = tid; i < s_total; i += blockDim.x)
-    atomicAdd(&s_bincount[s_rec[i].low_key >> 9], 1);
   __syncthreads();
   if (tid == 0) {
     int off = 0;
@@ -1915,7 +1916,7 @@ __global__ void canonical_fold_rank23_kernel(
   const int warp = tid >> 5;
   const int lane = tid & 31;
   constexpr unsigned warp_mask = 0xffffffffu;
-  for (int bin = warp; bin < 128; bin += 8) {
+  for (int bin = warp; bin < 128; bin += (blockDim.x >> 5)) {
     const int begin = s_binoff[bin];
     const int end = s_binoff[bin + 1];
     const int count = end - begin;
@@ -1925,32 +1926,35 @@ __global__ void canonical_fold_rank23_kernel(
       continue;
     }
     std::uint16_t record = 0xffffu;
-    unsigned long long order = ~0ull;
+    FoldRecord me{};
+    unsigned long long order = 0ull;
     if (lane < count) {
       record = s_order[begin + lane];
-      order = fold_record_order(s_rec[record]);
+      me = s_rec[record];
+      order = fold_record_order(me);
     }
-    fold_warp_bitonic(order, record, fold_sort_width(count));
-    FoldRecord winner{};
-    if (lane < count) {
-      s_order[begin + lane] = record;
-      winner = s_rec[record];
+    // All-pairs winner: this lane owns its key iff no other lane
+    // holds the same key with a higher order. No sort needed; the
+    // cold path is re-sorted by the downstream merge.
+    bool newest = lane < count;
+    for (int src = 0; src < count; ++src) {
+      const int okey =
+          __shfl_sync(warp_mask, static_cast<int>(me.low_key), src);
+      const unsigned long long oord =
+          __shfl_sync(warp_mask, order, src);
+      if (src != lane && okey == static_cast<int>(me.low_key) &&
+          oord > order)
+        newest = false;
     }
-    const std::uint16_t next_key =
-        __shfl_down_sync(warp_mask, winner.low_key, 1);
-    const bool newest =
-        lane < count &&
-        (lane + 1 == count || winner.low_key != next_key);
     const std::uint32_t base_b = s_base_b[bin];
     const std::uint32_t base_e = s_base_e[bin];
     std::uint32_t dv = 0u;
     std::int32_t dc = 0;
     bool unmatched = false;
-    // Search base.keys (L2-resident, cheap); apply hits the shared
-    // window so state/override reads and writes stay on-chip.
+    // Search base.keys (windowed in shared); apply hits shared.
     if (newest) {
       const std::uint32_t full_key =
-          (q << kEpochQuotientBits) | winner.low_key;
+          (q << kEpochQuotientBits) | me.low_key;
       const std::uint32_t rel_b = base_b - s_wb;
       const std::uint32_t p =
           base_b + static_cast<std::uint32_t>(lower_bound_u32(
@@ -1958,7 +1962,7 @@ __global__ void canonical_fold_rank23_kernel(
       const std::size_t j = p - s_wb;
       if (p < base_e && s_win_key[j] == full_key) {
         canonical_apply_one(s_win_val[j], s_win_state, s_win_ovr, j,
-                            winner.operation, winner.value, &dv, &dc);
+                            me.operation, me.value, &dv, &dc);
       } else {
         unmatched = true;
       }
@@ -2009,7 +2013,7 @@ __global__ void canonical_fold_rank23_kernel(
     s_coldn = off;
   }
   __syncthreads();
-  for (int bin = warp; bin < 128; bin += 8) {
+  for (int bin = warp; bin < 128; bin += (blockDim.x >> 5)) {
     const int begin = s_binoff[bin];
     const int count = s_binoff[bin + 1] - begin;
     const bool keep =
