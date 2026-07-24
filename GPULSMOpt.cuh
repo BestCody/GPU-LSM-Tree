@@ -607,15 +607,6 @@ canonical_range_count(const CanonicalBaseView &v,
          static_cast<std::uint32_t>(canonical_range_count_delta(v, lo, hi));
 }
 
-// Shared fold record; source_rank indexes the 64 chronological views.
-struct FoldRecord {
-  std::uint16_t low_key;
-  std::uint8_t operation;
-  std::uint8_t source_rank;
-  std::uint32_t value;
-  std::uint32_t source_position;
-};
-
 
 
 __global__ void sorted_range_cdf_scatter_kernel(const std::uint32_t *keys,
@@ -1641,8 +1632,6 @@ __global__ void base_only_range_kernel(
 }
 
 // --- Rank23 canonical fold (sec 13) ---
-constexpr int kFoldQuotientCap = 1280;
-constexpr int kFoldBinCap = 32;
 constexpr int kFoldThreads = 512;
 // Base keys per quotient (~512 uniform); window caps the shared
 // preload of state/override/base-value so apply hits on-chip memory.
@@ -1653,13 +1642,11 @@ constexpr int kFoldStatUnmatched = 1;
 constexpr int kFoldStatFallback = 2;
 constexpr int kFoldStatOverflow = 3;
 constexpr int kFoldStatCells = 4;
-static_assert(sizeof(FoldRecord) == 12, "fold record layout");
 static_assert(kWindowCap * (3 * sizeof(std::uint32_t) + 1 +
                             sizeof(unsigned long long)) +
                   8 * 1024 <=
               48 * 1024,
               "fold shared memory exceeds the 48 KiB static limit");
-static_assert(kFoldBinCap <= 32, "fast bins must fit one warp");
 
 // Apply one winner to a matched BaseRun position; the caller
 // accumulates the returned correction change into the bin totals.
@@ -1700,44 +1687,6 @@ canonical_apply_one(std::uint32_t bv, std::uint8_t *state,
     override_values[p] = nv;
   *out_vdelta = new_vc - old_vc;
   *out_cdelta = new_cc - old_cc;
-}
-
-__device__ inline unsigned long long
-fold_record_order(const FoldRecord &record) {
-  return (static_cast<unsigned long long>(record.low_key) << 40) |
-         (static_cast<unsigned long long>(record.source_rank) << 32) |
-         record.source_position;
-}
-
-__device__ inline int fold_sort_width(int count) {
-  int width = 1;
-  while (width < count)
-    width <<= 1;
-  return width;
-}
-
-__device__ inline void
-fold_warp_bitonic(unsigned long long &key, std::uint16_t &record,
-                  int width) {
-  constexpr unsigned mask = 0xffffffffu;
-  const int lane = threadIdx.x & 31;
-  for (int length = 2; length <= width; length <<= 1) {
-    for (int stride = length >> 1; stride > 0; stride >>= 1) {
-      const unsigned long long other_key =
-          __shfl_xor_sync(mask, key, stride, width);
-      const std::uint16_t other_record =
-          __shfl_xor_sync(mask, record, stride, width);
-      const bool ascending = (lane & length) == 0;
-      const bool lower_lane = (lane & stride) == 0;
-      const bool take_min = ascending == lower_lane;
-      const bool take_other =
-          take_min ? other_key < key : other_key > key;
-      if (take_other) {
-        key = other_key;
-        record = other_record;
-      }
-    }
-  }
 }
 
 // One block per quotient; fold 64 raw runs into canonical state
