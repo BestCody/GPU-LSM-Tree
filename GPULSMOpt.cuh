@@ -1641,9 +1641,12 @@ __global__ void base_only_range_kernel(
 }
 
 // --- Rank23 canonical fold (sec 13) ---
-constexpr int kFoldQuotientCap = 2048;
+constexpr int kFoldQuotientCap = 1280;
 constexpr int kFoldBinCap = 32;
 constexpr int kFoldThreads = 256;
+// Base keys per quotient (~512 uniform); window caps the shared
+// preload of state/override/base-value so apply hits on-chip memory.
+constexpr int kWindowCap = 768;
 // Device fold stat cells (sec 28).
 constexpr int kFoldStatMatched = 0;
 constexpr int kFoldStatUnmatched = 1;
@@ -1653,6 +1656,7 @@ constexpr int kFoldStatCells = 4;
 static_assert(sizeof(FoldRecord) == 12, "fold record layout");
 static_assert(kFoldQuotientCap *
                       (sizeof(FoldRecord) + 2 * sizeof(std::uint16_t) + 1) +
+                  kWindowCap * (3 * sizeof(std::uint32_t) + 1) +
                   12 * 1024 <=
               48 * 1024,
               "fold shared memory exceeds the 48 KiB static limit");
@@ -1760,11 +1764,19 @@ __global__ void canonical_fold_rank23_kernel(
   __shared__ AssignmentRunView s_views[kRawFoldWidth];
   __shared__ std::uint32_t s_base_b[128];
   __shared__ std::uint32_t s_base_e[128];
+  __shared__ std::uint32_t s_win_key[kWindowCap];
+  __shared__ std::uint32_t s_win_val[kWindowCap];
+  __shared__ std::uint32_t s_win_ovr[kWindowCap];
+  __shared__ std::uint8_t s_win_state[kWindowCap];
+  __shared__ std::uint32_t s_wb;
+  __shared__ int s_wlen;
   __shared__ int s_bincount[128];
   __shared__ int s_binoff[129];
   __shared__ int s_bincur[128];
   __shared__ int s_coldcount[128];
   __shared__ int s_coldoff[129];
+  __shared__ std::uint32_t s_rank_dv[128];
+  __shared__ std::int32_t s_rank_dc[128];
   __shared__ int s_total;
   __shared__ int s_overflow;
   __shared__ int s_coldn;
@@ -1802,6 +1814,11 @@ __global__ void canonical_fold_rank23_kernel(
     s_runoff[run_count] = c;
     s_total = static_cast<int>(c);
     if (c > static_cast<std::uint32_t>(kFoldQuotientCap))
+      s_overflow = 1;
+    // Contiguous base window this block will touch (all 128 bins).
+    s_wb = s_base_b[0];
+    s_wlen = static_cast<int>(s_base_e[127] - s_base_b[0]);
+    if (s_wlen > kWindowCap)
       s_overflow = 1;
   }
   __syncthreads();
@@ -1847,8 +1864,20 @@ __global__ void canonical_fold_rank23_kernel(
     rec.source_position = p;
     s_rec[i] = rec;
   }
-  for (int b = tid; b < 128; b += blockDim.x)
+  // Coalesced preload of this quotient's base window into shared so
+  // apply reads/writes on-chip instead of scattered global memory.
+  for (int i = tid; i < s_wlen; i += blockDim.x) {
+    const std::uint32_t gp = s_wb + static_cast<std::uint32_t>(i);
+    s_win_key[i] = base.keys[gp];
+    s_win_val[i] = base.values[gp];
+    s_win_ovr[i] = override_values[gp];
+    s_win_state[i] = state[gp];
+  }
+  for (int b = tid; b < 128; b += blockDim.x) {
     s_bincount[b] = 0;
+    s_rank_dv[b] = 0u;
+    s_rank_dc[b] = 0;
+  }
   __syncthreads();
   for (int i = tid; i < s_total; i += blockDim.x)
     atomicAdd(&s_bincount[s_rec[i].low_key >> 9], 1);
@@ -1912,24 +1941,23 @@ __global__ void canonical_fold_rank23_kernel(
     const bool newest =
         lane < count &&
         (lane + 1 == count || winner.low_key != next_key);
-    const std::uint32_t gbin =
-        (q << (kBaseRank23Bits - kEpochQuotientBits)) |
-        static_cast<std::uint32_t>(bin);
     const std::uint32_t base_b = s_base_b[bin];
     const std::uint32_t base_e = s_base_e[bin];
     std::uint32_t dv = 0u;
     std::int32_t dc = 0;
     bool unmatched = false;
-    // Measured faster than the register merge here: the base
-    // arrays are L2-resident, so the tiny search is cheap.
+    // Search base.keys (L2-resident, cheap); apply hits the shared
+    // window so state/override reads and writes stay on-chip.
     if (newest) {
       const std::uint32_t full_key =
           (q << kEpochQuotientBits) | winner.low_key;
+      const std::uint32_t rel_b = base_b - s_wb;
       const std::uint32_t p =
           base_b + static_cast<std::uint32_t>(lower_bound_u32(
-                       base.keys + base_b, base_e - base_b, full_key));
-      if (p < base_e && base.keys[p] == full_key) {
-        canonical_apply_one(base.values[p], state, override_values, p,
+                       s_win_key + rel_b, base_e - base_b, full_key));
+      const std::size_t j = p - s_wb;
+      if (p < base_e && s_win_key[j] == full_key) {
+        canonical_apply_one(s_win_val[j], s_win_state, s_win_ovr, j,
                             winner.operation, winner.value, &dv, &dc);
       } else {
         unmatched = true;
@@ -1940,10 +1968,8 @@ __global__ void canonical_fold_rank23_kernel(
       dc += __shfl_down_sync(warp_mask, dc, offset);
     }
     if (lane == 0) {
-      if (dv != 0u)
-        rank23_value_delta[gbin] += dv;
-      if (dc != 0)
-        rank23_count_delta[gbin] += dc;
+      s_rank_dv[bin] = dv;
+      s_rank_dc[bin] = dc;
     }
     if (lane < count)
       s_coldflag[begin + lane] =
@@ -1958,6 +1984,21 @@ __global__ void canonical_fold_rank23_kernel(
     }
   }
   __syncthreads();
+  // Coalesced write-back of the modified base window.
+  for (int i = tid; i < s_wlen; i += blockDim.x) {
+    const std::uint32_t gp = s_wb + static_cast<std::uint32_t>(i);
+    state[gp] = s_win_state[i];
+    override_values[gp] = s_win_ovr[i];
+  }
+  // Coalesced write-back of this quotient's 128 rank23 deltas.
+  const std::uint32_t rank_base =
+      q << (kBaseRank23Bits - kEpochQuotientBits);
+  for (int b = tid; b < 128; b += blockDim.x) {
+    if (s_rank_dv[b] != 0u)
+      rank23_value_delta[rank_base + b] += s_rank_dv[b];
+    if (s_rank_dc[b] != 0)
+      rank23_count_delta[rank_base + b] += s_rank_dc[b];
+  }
   if (tid == 0) {
     int off = 0;
     for (int bin = 0; bin < 128; ++bin) {
@@ -4238,7 +4279,15 @@ private:
 
     {
       GPULSMOPT_FOLD_PHASE(prof_fold_fallback_ms_);
-      run_fold_fallback(group_size, cold, stream);
+      // Skip the fallback kernel entirely when nothing overflowed
+      // (the common case): a one-word D2H beats a flat empty scan.
+      std::uint32_t fallback_n = 0;
+      CUDA_CHECK(cudaMemcpyAsync(&fallback_n, fold_fallback_count_.data(),
+                                 sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (fallback_n > 0)
+        run_fold_fallback(group_size, cold, stream);
     }
 
     {
