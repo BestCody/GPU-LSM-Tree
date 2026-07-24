@@ -145,6 +145,14 @@ public:
   static constexpr operation_support can_delete = operation_support::async;
   static constexpr operation_support can_update = operation_support::async;
   static constexpr operation_support can_successor = operation_support::async;
+  static constexpr size_t prewarm_leaves =
+      static_cast<size_t>(GPULSMOPT_PREWARM_LEAVES);
+  static constexpr bool sustained_tracks_compaction = true;
+  static constexpr bool sustained_value_validation = true;
+
+  static size_t sustained_max_size(size_t build_size, size_t, size_t) {
+    return build_size;
+  }
 
   static std::string short_description() { return "gpulsmopt"; }
 
@@ -280,6 +288,19 @@ public:
     batch.count = size;
     batch.out_keys = reinterpret_cast<std::uint32_t *>(result);
     dictionary_->successor(batch, stream);
+  }
+
+  // Forward the maintenance counters for sustained benchmarks.
+  using maintenance_stats_type = GPULSMOpt::MaintenanceStats;
+  maintenance_stats_type maintenance_stats() const {
+    ensure_built();
+    return dictionary_->maintenance_stats();
+  }
+
+  // Explicit final drain for sustained accounting (plan sec 32).
+  void final_drain(cudaStream_t stream) {
+    ensure_built();
+    dictionary_->consolidate(stream);
   }
 
 private:

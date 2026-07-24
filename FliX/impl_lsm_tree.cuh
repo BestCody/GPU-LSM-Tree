@@ -14,6 +14,7 @@
 #include "memory_layout.cuh"
 
 #include <cmath>
+#include <stdexcept>
 
 #include <cub/cub.cuh>
 
@@ -755,6 +756,38 @@ public:
     static constexpr operation_support can_delete = operation_support::async;
     static constexpr operation_support can_update = operation_support::async;
     static constexpr operation_support can_successor = operation_support::async;
+    static constexpr size_t prewarm_leaves = 0;
+    static constexpr bool sustained_tracks_compaction = false;
+    static constexpr bool sustained_value_validation = false;
+
+    static size_t sustained_max_size(
+        size_t build_size, size_t batch_size, size_t rounds)
+    {
+        const size_t limit = std::numeric_limits<size_t>::max();
+        if (rounds != 0 && batch_size > (limit - build_size) / rounds)
+            throw std::overflow_error("sustained LSMu capacity overflow");
+        return build_size + batch_size * rounds;
+    }
+
+    struct MaintenanceStats
+    {
+        std::uint64_t compaction_count = 0;
+        std::uint64_t compacted_input_records = 0;
+        std::uint64_t compacted_output_records = 0;
+        std::size_t physical_runs = 0;
+        std::size_t assignment_runs = 0;
+    };
+
+    MaintenanceStats maintenance_stats() const
+    {
+        MaintenanceStats stats;
+        stats.physical_runs = staged_insert_size != 0 ? 1 : 0;
+        for (size_t level = 0; level < level_count; ++level)
+            if ((inserted_chunk_counter & (size_t{1} << level)) != 0)
+                ++stats.physical_runs;
+        stats.assignment_runs = stats.physical_runs;
+        return stats;
+    }
 
     static std::string short_description()
     {

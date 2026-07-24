@@ -187,10 +187,18 @@ rc::result_collector rc;
         benchmark_updates<tree_awad<key32, true>>(rc, runs);
     #elif defined(LSM_TREE)
     #pragma message "LSM_TREE=YES"
+#ifdef SUSTAINED_INSERT_BENCHMARK
+        benchmark_sustained_overwrites<
+            lsm_tree_ashkiani<key32, lsm_chunk_size_log>>(rc, runs);
+#else
         benchmark_updates<lsm_tree_ashkiani<key32, lsm_chunk_size_log>>(rc, runs);
+#endif
     #elif defined(GPULSMOPT)
         #pragma message "GPULSMOPT=YES"
         benchmark_updates<gpulsmopt<key32>>(rc, runs);
+#ifdef SUSTAINED_INSERT_BENCHMARK
+        benchmark_sustained_overwrites<gpulsmopt<key32>>(rc, runs);
+#endif
     #else
         printf("No Baselines Selected \n");
     #endif

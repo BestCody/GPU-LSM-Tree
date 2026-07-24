@@ -2491,6 +2491,332 @@ void benchmark_updates(
     }
 }
 
+#ifdef SUSTAINED_INSERT_BENCHMARK
+#ifndef UPDATE_INSERT_BATCH_LOG
+#error "Sustained overwrite requires UPDATE_INSERT_BATCH_LOG"
+#endif
+#ifndef SUSTAINED_INSERT_ROUNDS
+#define SUSTAINED_INSERT_ROUNDS 190
+#endif
+template <typename index_type>
+void benchmark_sustained_overwrite_once(
+    rc::result_collector &rc, size_t run)
+{
+    CUCHECK(cudaSetDevice(0));
+    CUCHECK(cudaFree(0));
+
+    using key_type = typename index_type::key_type;
+
+    const size_t build_size = size_t{1} << init_build_size_log;
+    const size_t batch_size = size_t{1} << UPDATE_INSERT_BATCH_LOG;
+    const size_t total_rounds = SUSTAINED_INSERT_ROUNDS;
+    const size_t index_mask = build_size - 1;
+    const uint64_t odd_multiplier = 2654435761ull;
+    const uint64_t perm_seed =
+        0x9e3779b1ull + run * 0x85ebca6bull;
+    const uint64_t max_value =
+        static_cast<uint64_t>(total_rounds) * batch_size;
+    const size_t max_size = index_type::sustained_max_size(
+        build_size, batch_size, total_rounds);
+
+    rti_assert(batch_size <= build_size,
+               "overwrite batch exceeds the base");
+    rti_assert(max_value <=
+                   static_cast<uint64_t>(
+                       std::numeric_limits<smallsize>::max()) + 1u,
+               "sustained overwrite value overflow");
+
+    const std::string workload = "fixed_base_reassignment";
+    const std::string index_name = index_type::short_description();
+    const std::string index_parameters =
+        parameters_to_string(index_type::parameters());
+    const std::string index_id =
+        index_name + "__" + parameters_to_name(index_type::parameters());
+
+    std::vector<key_type> build_keys;
+    generate_keys_file(build_size, min_usable_key<key_type>(),
+                       max_usable_key<key_type>(), build_keys, "keys_cache.txt");
+
+    std::vector<smallsize> expected;
+    if constexpr (index_type::sustained_value_validation)
+    {
+        expected.resize(build_size);
+        for (size_t p = 0; p < build_size; ++p)
+            expected[p] = static_cast<smallsize>(p);
+    }
+
+    index_type index;
+    double build_time_ms = 0.0;
+    size_t build_bytes = 0;
+    {
+        cuda_buffer<key_type> build_keys_buffer;
+        build_keys_buffer.alloc(build_size);
+        build_keys_buffer.upload(build_keys.data(), build_size);
+        index.build(build_keys_buffer.ptr(), build_size, max_size,
+                    std::numeric_limits<size_t>::max(), &build_time_ms,
+                    &build_bytes);
+    }
+    rc::auto_commit_result(rc)
+        .add_parameter("experiment",
+                       std::string("sustained_overwrite_build"))
+        .add_parameter("workload", workload)
+        .add_parameter("index_type", index_name)
+        .add_parameter("index_parameters", index_parameters)
+        .add_parameter("index_id", index_id)
+        .add_parameter("run", run)
+        .add_parameter("key_bits", sizeof(key_type) * 8)
+        .add_parameter("build_size_log", init_build_size_log)
+        .add_parameter("batch_size_log", UPDATE_INSERT_BATCH_LOG)
+        .add_parameter("rounds", total_rounds)
+        .add_parameter("permutation_seed", perm_seed)
+        .add_parameter("build_size", build_size)
+        .add_parameter("max_size", max_size)
+        .add_parameter("batch_size", batch_size)
+        .add_measurement("build_time_ms", build_time_ms)
+        .add_measurement("build_bytes", build_bytes);
+
+    cuda_buffer<key_type> batch_keys_buffer;
+    cuda_buffer<smallsize> batch_values_buffer;
+    batch_keys_buffer.alloc(batch_size);
+    batch_values_buffer.alloc(batch_size);
+    std::vector<key_type> host_keys(batch_size);
+    std::vector<smallsize> host_values(batch_size);
+
+    std::vector<double> round_times(total_rounds, 0.0);
+    std::vector<char> round_compacted(total_rounds, 0);
+    size_t observed_compactions = 0;
+
+    for (size_t round = 0; round < total_rounds; ++round)
+    {
+        // deterministic permutation batch, distinct within the batch
+        const uint64_t base = static_cast<uint64_t>(round) * batch_size;
+        for (size_t i = 0; i < batch_size; ++i)
+        {
+            const uint64_t linear = base + i;
+            const size_t idx = static_cast<size_t>(
+                (linear * odd_multiplier + perm_seed) & index_mask);
+            const smallsize value = static_cast<smallsize>(linear);
+            host_keys[i] = build_keys[idx];
+            host_values[i] = value;
+            if constexpr (index_type::sustained_value_validation)
+                expected[idx] = value;
+        }
+        batch_keys_buffer.upload(host_keys.data(), batch_size);
+        batch_values_buffer.upload(host_values.data(), batch_size);
+
+        // memory + compaction inspection stays outside the timed region
+        const size_t before_bytes = index.gpu_resident_bytes();
+        const auto stats_before = index.maintenance_stats();
+
+        cuda_timer timer(0);
+        timer.start();
+        index.insert(batch_keys_buffer.ptr(), batch_values_buffer.ptr(),
+                     batch_size, 0);
+        timer.stop();
+        const double insert_time_ms = timer.time_ms();
+        CUCHECK(cudaDeviceSynchronize());
+
+        const size_t after_bytes = index.gpu_resident_bytes();
+        const auto stats_after = index.maintenance_stats();
+        const uint64_t compaction_delta =
+            stats_after.compaction_count - stats_before.compaction_count;
+        const bool compaction_triggered =
+            compaction_delta != 0;
+        observed_compactions +=
+            static_cast<size_t>(compaction_delta);
+
+        const size_t step = round + 1;
+        const bool prewarmed_region =
+            step <= index_type::prewarm_leaves;
+        round_times[round] = insert_time_ms;
+        round_compacted[round] = compaction_triggered ? 1 : 0;
+
+        rc::auto_commit_result(rc)
+            .add_parameter("experiment",
+                           std::string("sustained_overwrite"))
+            .add_parameter("workload", workload)
+            .add_parameter("index_type", index_name)
+            .add_parameter("index_parameters", index_parameters)
+            .add_parameter("index_id", index_id)
+            .add_parameter("run", run)
+            .add_parameter("key_bits", sizeof(key_type) * 8)
+            .add_parameter("build_size_log", init_build_size_log)
+            .add_parameter("batch_size_log", UPDATE_INSERT_BATCH_LOG)
+            .add_parameter("build_size", build_size)
+            .add_parameter("max_size", max_size)
+            .add_parameter("rounds", total_rounds)
+            .add_parameter("permutation_seed", perm_seed)
+            .add_parameter("step", step)
+            .add_parameter("batch_size", batch_size)
+            .add_parameter("prewarmed_region", prewarmed_region ? 1 : 0)
+            .add_parameter("compaction_triggered", compaction_triggered ? 1 : 0)
+            .add_measurement("insert_time_ms", insert_time_ms)
+            .add_measurement("resident_bytes_before", before_bytes)
+            .add_measurement("resident_bytes_after", after_bytes)
+            .add_measurement("physical_runs", stats_after.physical_runs)
+            .add_measurement("assignment_runs", stats_after.assignment_runs)
+            .add_measurement("compaction_count", stats_after.compaction_count)
+            .add_measurement("compacted_input_records",
+                             stats_after.compacted_input_records)
+            .add_measurement("compacted_output_records",
+                             stats_after.compacted_output_records);
+
+        std::cerr << " -> overwrite step " << step << "/" << total_rounds
+                  << " insert=" << insert_time_ms << " ms"
+                  << " runs=" << stats_after.physical_runs
+                  << (compaction_triggered ? " [compaction]" : "") << std::endl;
+    }
+
+    // aggregate the 190 per-round measurements
+    auto mean_of = [&](size_t lo, size_t hi, bool skip_compaction) {
+        double sum = 0.0;
+        size_t n = 0;
+        for (size_t r = lo; r < hi && r < total_rounds; ++r)
+        {
+            if (skip_compaction && round_compacted[r])
+                continue;
+            sum += round_times[r];
+            ++n;
+        }
+        return n ? sum / n : 0.0;
+    };
+    std::vector<double> sorted_times(round_times);
+    std::sort(sorted_times.begin(), sorted_times.end());
+    auto percentile = [&](double p) {
+        if (sorted_times.empty())
+            return 0.0;
+        const double rank = std::ceil(p * sorted_times.size());
+        const size_t index = std::min(
+            sorted_times.size() - 1,
+            static_cast<size_t>(std::max(1.0, rank) - 1.0));
+        return sorted_times[index];
+    };
+    double total_time = 0.0;
+    for (double t : round_times)
+        total_time += t;
+
+    const double short_foreground = mean_of(0, 5, false);
+    const double prewarmed =
+        mean_of(0, index_type::prewarm_leaves, true);
+    const double post_prewarm =
+        mean_of(index_type::prewarm_leaves, total_rounds, true);
+    const double amortized = total_rounds ? total_time / total_rounds : 0.0;
+
+    auto commit_summary = [&](const char *metric, double value,
+                              size_t step) {
+        rc::auto_commit_result(rc)
+            .add_parameter("experiment",
+                           std::string("sustained_overwrite_summary"))
+            .add_parameter("workload", workload)
+            .add_parameter("index_type", index_name)
+            .add_parameter("index_parameters", index_parameters)
+            .add_parameter("index_id", index_id)
+            .add_parameter("run", run)
+            .add_parameter("key_bits", sizeof(key_type) * 8)
+            .add_parameter("build_size_log", init_build_size_log)
+            .add_parameter("batch_size_log", UPDATE_INSERT_BATCH_LOG)
+            .add_parameter("build_size", build_size)
+            .add_parameter("max_size", max_size)
+            .add_parameter("batch_size", batch_size)
+            .add_parameter("rounds", total_rounds)
+            .add_parameter("permutation_seed", perm_seed)
+            .add_parameter("step", step)
+            .add_parameter("metric", std::string(metric))
+            .add_measurement("value_ms", value);
+    };
+    commit_summary("short_foreground_mean", short_foreground, 0);
+    commit_summary("prewarmed_mean", prewarmed, 0);
+    commit_summary("post_prewarm_mean", post_prewarm, 0);
+    commit_summary("p50", percentile(0.50), 0);
+    commit_summary("p95", percentile(0.95), 0);
+    commit_summary("p99", percentile(0.99), 0);
+    commit_summary("max", sorted_times.empty() ? 0.0 : sorted_times.back(), 0);
+    commit_summary("amortized", amortized, 0);
+    for (size_t r = 0; r < total_rounds; ++r)
+        if (round_compacted[r])
+            commit_summary("compaction_latency", round_times[r], r + 1);
+
+    size_t mismatches = 0;
+    if constexpr (index_type::sustained_value_validation)
+    {
+        const size_t sample_count =
+            std::min<size_t>(build_size, size_t{1} << 20);
+        const size_t stride = build_size / sample_count;
+        std::vector<key_type> sample_keys(sample_count);
+        std::vector<smallsize> sample_expected(sample_count);
+        for (size_t s = 0; s < sample_count; ++s)
+        {
+            const size_t pos = s * stride;
+            sample_keys[s] = build_keys[pos];
+            sample_expected[s] = expected[pos];
+        }
+        cuda_buffer<key_type> sample_keys_buffer;
+        cuda_buffer<smallsize> sample_result_buffer;
+        sample_keys_buffer.alloc(sample_count);
+        sample_result_buffer.alloc(sample_count);
+        sample_keys_buffer.upload(sample_keys.data(), sample_count);
+        index.lookup(sample_keys_buffer.ptr(), sample_result_buffer.ptr(),
+                     sample_count, 0);
+        CUCHECK(cudaDeviceSynchronize());
+        std::vector<smallsize> sample_result =
+            sample_result_buffer.download(sample_count);
+        for (size_t s = 0; s < sample_count; ++s)
+            if (sample_result[s] != sample_expected[s])
+                ++mismatches;
+    }
+
+    std::cerr << "sustained overwrite: run=" << run
+              << " rounds=" << total_rounds
+              << " compactions=" << observed_compactions
+              << " amortized=" << amortized << " ms"
+              << " mismatches=" << mismatches << std::endl;
+    if (index_type::sustained_tracks_compaction &&
+        observed_compactions < 2)
+        std::cerr << "WARNING: fewer than two compactions observed"
+                  << std::endl;
+    if (index_type::sustained_value_validation && mismatches != 0)
+        std::cerr << "WARNING: sustained overwrite mismatch"
+                  << std::endl;
+    rti_assert((!index_type::sustained_tracks_compaction ||
+                observed_compactions >= 2) &&
+                   (!index_type::sustained_value_validation ||
+                    mismatches == 0),
+               "sustained overwrite validation failed");
+
+    rc::auto_commit_result(rc)
+        .add_parameter("experiment",
+                       std::string("sustained_overwrite_validation"))
+        .add_parameter("workload", workload)
+        .add_parameter("index_type", index_name)
+        .add_parameter("index_parameters", index_parameters)
+        .add_parameter("index_id", index_id)
+        .add_parameter("run", run)
+        .add_parameter("key_bits", sizeof(key_type) * 8)
+        .add_parameter("build_size_log", init_build_size_log)
+        .add_parameter("batch_size_log", UPDATE_INSERT_BATCH_LOG)
+        .add_parameter("build_size", build_size)
+        .add_parameter("batch_size", batch_size)
+        .add_parameter("rounds", total_rounds)
+        .add_parameter("permutation_seed", perm_seed)
+        .add_parameter("max_size", max_size)
+        .add_parameter("tracks_compaction",
+                       index_type::sustained_tracks_compaction ? 1 : 0)
+        .add_parameter("value_validation",
+                       index_type::sustained_value_validation ? 1 : 0)
+        .add_measurement("observed_compactions", observed_compactions)
+        .add_measurement("validation_mismatches", mismatches);
+}
+
+template <typename index_type>
+void benchmark_sustained_overwrites(rc::result_collector &rc,
+                                    size_t runs)
+{
+    rti_assert(runs > 0, "sustained overwrite needs a run");
+    for (size_t run = 0; run < runs; ++run)
+        benchmark_sustained_overwrite_once<index_type>(rc, run);
+}
+#endif
+
 #endif
 
 /*
