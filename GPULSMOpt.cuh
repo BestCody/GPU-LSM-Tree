@@ -1654,10 +1654,9 @@ constexpr int kFoldStatFallback = 2;
 constexpr int kFoldStatOverflow = 3;
 constexpr int kFoldStatCells = 4;
 static_assert(sizeof(FoldRecord) == 12, "fold record layout");
-static_assert(kFoldQuotientCap *
-                      (sizeof(FoldRecord) + 2 * sizeof(std::uint16_t) + 1) +
-                  kWindowCap * (3 * sizeof(std::uint32_t) + 1) +
-                  12 * 1024 <=
+static_assert(kWindowCap * (3 * sizeof(std::uint32_t) + 1 +
+                            sizeof(unsigned long long)) +
+                  8 * 1024 <=
               48 * 1024,
               "fold shared memory exceeds the 48 KiB static limit");
 static_assert(kFoldBinCap <= 32, "fast bins must fit one warp");
@@ -1755,10 +1754,6 @@ __global__ void canonical_fold_rank23_kernel(
     std::uint32_t *fallback_count, std::uint32_t *fold_stats) {
   const std::uint32_t q = blockIdx.x;
   const int tid = threadIdx.x;
-  __shared__ FoldRecord s_rec[kFoldQuotientCap];
-  __shared__ std::uint16_t s_order[kFoldQuotientCap];
-  __shared__ std::uint16_t s_cold[kFoldQuotientCap];
-  __shared__ std::uint8_t s_coldflag[kFoldQuotientCap];
   __shared__ std::uint32_t s_runoff[kRawFoldWidth + 1];
   __shared__ std::uint32_t s_runbegin[kRawFoldWidth];
   __shared__ AssignmentRunView s_views[kRawFoldWidth];
@@ -1768,24 +1763,19 @@ __global__ void canonical_fold_rank23_kernel(
   __shared__ std::uint32_t s_win_val[kWindowCap];
   __shared__ std::uint32_t s_win_ovr[kWindowCap];
   __shared__ std::uint8_t s_win_state[kWindowCap];
-  __shared__ std::uint32_t s_wb;
-  __shared__ int s_wlen;
-  __shared__ int s_bincount[128];
-  __shared__ int s_binoff[129];
-  __shared__ int s_bincur[128];
-  __shared__ int s_coldcount[128];
-  __shared__ int s_coldoff[129];
+  __shared__ unsigned long long s_winner[kWindowCap];
   __shared__ std::uint32_t s_rank_dv[128];
   __shared__ std::int32_t s_rank_dc[128];
+  __shared__ std::uint32_t s_wb;
+  __shared__ int s_wlen;
   __shared__ int s_total;
   __shared__ int s_overflow;
-  __shared__ int s_coldn;
+  __shared__ int s_has_cold;
   __shared__ int s_matched;
-  __shared__ std::uint32_t s_page;
 
   if (tid == 0) {
     s_overflow = 0;
-    s_coldn = 0;
+    s_has_cold = 0;
     s_matched = 0;
   }
   for (int r = tid; r < run_count; r += blockDim.x) {
@@ -1813,8 +1803,6 @@ __global__ void canonical_fold_rank23_kernel(
     }
     s_runoff[run_count] = c;
     s_total = static_cast<int>(c);
-    if (c > static_cast<std::uint32_t>(kFoldQuotientCap))
-      s_overflow = 1;
     // Contiguous base window this block will touch (all 128 bins).
     s_wb = s_base_b[0];
     s_wlen = static_cast<int>(s_base_e[127] - s_base_b[0]);
@@ -1841,15 +1829,25 @@ __global__ void canonical_fold_rank23_kernel(
     }
     return;
   }
-  // Zero histogram + delta accumulators before the fused gather.
+  // Preload the base window; init per-slot winners + rank deltas.
+  for (int i = tid; i < s_wlen; i += blockDim.x) {
+    const std::uint32_t gp = s_wb + static_cast<std::uint32_t>(i);
+    s_win_key[i] = base.keys[gp];
+    s_win_val[i] = base.values[gp];
+    s_win_ovr[i] = override_values[gp];
+    s_win_state[i] = state[gp];
+    s_winner[i] = 0ull;
+  }
   for (int b = tid; b < 128; b += blockDim.x) {
-    s_bincount[b] = 0;
     s_rank_dv[b] = 0u;
     s_rank_dc[b] = 0;
   }
   __syncthreads();
-  // Flat gather: locate each record's run and tally its bin in one
-  // pass (no separate re-read of s_rec for the histogram).
+  // Fused gather + scatter: stream each pending record, locate its
+  // base slot (narrowed by its rank23 bin), and keep the newest run
+  // per slot via one 64-bit atomicMax that packs rank/op/value. No
+  // binning, no sort, no record buffer. A base miss routes the whole
+  // quotient to the fallback (cold is empty in the overwrite regime).
   for (int i = tid; i < s_total; i += blockDim.x) {
     int lo = 0, hi = run_count - 1;
     while (lo < hi) {
@@ -1862,39 +1860,28 @@ __global__ void canonical_fold_rank23_kernel(
     const AssignmentRunView &run = s_views[lo];
     const std::uint32_t p =
         s_runbegin[lo] + (static_cast<std::uint32_t>(i) - s_runoff[lo]);
-    const int op =
-        assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
-    FoldRecord rec;
-    rec.low_key = static_cast<std::uint16_t>(run.keys[p] & 0xffffu);
-    rec.operation = static_cast<std::uint8_t>(op != 0);
-    rec.source_rank = static_cast<std::uint8_t>(lo);
-    rec.value = (op != 0 && run.values) ? run.values[p] : 0u;
-    rec.source_position = p;
-    s_rec[i] = rec;
-    atomicAdd(&s_bincount[rec.low_key >> 9], 1);
-  }
-  // Coalesced preload of this quotient's base window into shared so
-  // apply reads/writes on-chip instead of scattered global memory.
-  for (int i = tid; i < s_wlen; i += blockDim.x) {
-    const std::uint32_t gp = s_wb + static_cast<std::uint32_t>(i);
-    s_win_key[i] = base.keys[gp];
-    s_win_val[i] = base.values[gp];
-    s_win_ovr[i] = override_values[gp];
-    s_win_state[i] = state[gp];
-  }
-  __syncthreads();
-  if (tid == 0) {
-    int off = 0;
-    for (int b = 0; b < 128; ++b) {
-      s_binoff[b] = off;
-      if (s_bincount[b] > kFoldBinCap)
-        s_overflow = 1;
-      off += s_bincount[b];
+    const std::uint32_t full_key = run.keys[p];
+    const int lbin = static_cast<int>((full_key >> 9) & 0x7fu);
+    const std::uint32_t rb = s_base_b[lbin] - s_wb;
+    const std::uint32_t bn = s_base_e[lbin] - s_base_b[lbin];
+    const std::uint32_t off = static_cast<std::uint32_t>(
+        lower_bound_u32(s_win_key + rb, bn, full_key));
+    if (off < bn && s_win_key[rb + off] == full_key) {
+      const int op =
+          assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
+      const std::uint32_t val =
+          (op != 0 && run.values) ? run.values[p] : 0u;
+      const unsigned long long packed =
+          (static_cast<unsigned long long>(lo + 1) << 40) |
+          (op != 0 ? (1ull << 39) : 0ull) |
+          static_cast<unsigned long long>(val);
+      atomicMax(&s_winner[rb + off], packed);
+    } else {
+      s_has_cold = 1;
     }
-    s_binoff[128] = off;
   }
   __syncthreads();
-  if (s_overflow) {
+  if (s_has_cold) {
     if (tid == 0) {
       const std::uint32_t s = atomicAdd(fallback_count, 1u);
       fallback_quotients[s] = q;
@@ -1905,88 +1892,28 @@ __global__ void canonical_fold_rank23_kernel(
     }
     return;
   }
-  for (int b = tid; b < 128; b += blockDim.x)
-    s_bincur[b] = s_binoff[b];
-  __syncthreads();
-  for (int i = tid; i < s_total; i += blockDim.x) {
-    const int lb = s_rec[i].low_key >> 9;
-    s_order[atomicAdd(&s_bincur[lb], 1)] = static_cast<std::uint16_t>(i);
-  }
-  __syncthreads();
-  const int warp = tid >> 5;
-  const int lane = tid & 31;
-  constexpr unsigned warp_mask = 0xffffffffu;
-  for (int bin = warp; bin < 128; bin += (blockDim.x >> 5)) {
-    const int begin = s_binoff[bin];
-    const int end = s_binoff[bin + 1];
-    const int count = end - begin;
-    if (count == 0) {
-      if (lane == 0)
-        s_coldcount[bin] = 0;
+  // Apply the newest update at each touched slot; the slot's key
+  // gives its rank23 bin, so deltas accumulate with light contention.
+  int applied = 0;
+  for (int j = tid; j < s_wlen; j += blockDim.x) {
+    const unsigned long long w = s_winner[j];
+    if (w == 0ull)
       continue;
-    }
-    std::uint16_t record = 0xffffu;
-    FoldRecord me{};
-    unsigned long long order = 0ull;
-    if (lane < count) {
-      record = s_order[begin + lane];
-      me = s_rec[record];
-      order = fold_record_order(me);
-    }
-    // All-pairs winner: this lane owns its key iff no other lane
-    // holds the same key with a higher order. No sort needed; the
-    // cold path is re-sorted by the downstream merge.
-    bool newest = lane < count;
-    for (int src = 0; src < count; ++src) {
-      const int okey =
-          __shfl_sync(warp_mask, static_cast<int>(me.low_key), src);
-      const unsigned long long oord =
-          __shfl_sync(warp_mask, order, src);
-      if (src != lane && okey == static_cast<int>(me.low_key) &&
-          oord > order)
-        newest = false;
-    }
-    const std::uint32_t base_b = s_base_b[bin];
-    const std::uint32_t base_e = s_base_e[bin];
+    const int op = static_cast<int>((w >> 39) & 1ull);
+    const std::uint32_t val = static_cast<std::uint32_t>(w & 0xffffffffu);
     std::uint32_t dv = 0u;
     std::int32_t dc = 0;
-    bool unmatched = false;
-    // Search base.keys (windowed in shared); apply hits shared.
-    if (newest) {
-      const std::uint32_t full_key =
-          (q << kEpochQuotientBits) | me.low_key;
-      const std::uint32_t rel_b = base_b - s_wb;
-      const std::uint32_t p =
-          base_b + static_cast<std::uint32_t>(lower_bound_u32(
-                       s_win_key + rel_b, base_e - base_b, full_key));
-      const std::size_t j = p - s_wb;
-      if (p < base_e && s_win_key[j] == full_key) {
-        canonical_apply_one(s_win_val[j], s_win_state, s_win_ovr, j,
-                            me.operation, me.value, &dv, &dc);
-      } else {
-        unmatched = true;
-      }
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      dv += __shfl_down_sync(warp_mask, dv, offset);
-      dc += __shfl_down_sync(warp_mask, dc, offset);
-    }
-    if (lane == 0) {
-      s_rank_dv[bin] = dv;
-      s_rank_dc[bin] = dc;
-    }
-    if (lane < count)
-      s_coldflag[begin + lane] =
-          static_cast<std::uint8_t>(unmatched);
-    const unsigned cold = __ballot_sync(warp_mask, unmatched);
-    const unsigned applied =
-        __ballot_sync(warp_mask, newest && !unmatched);
-    if (lane == 0) {
-      s_coldcount[bin] = __popc(cold);
-      if (applied)
-        atomicAdd(&s_matched, __popc(applied));
-    }
+    canonical_apply_one(s_win_val[j], s_win_state, s_win_ovr,
+                        static_cast<std::size_t>(j), op, val, &dv, &dc);
+    const int lbin = static_cast<int>((s_win_key[j] >> 9) & 0x7fu);
+    if (dv != 0u)
+      atomicAdd(&s_rank_dv[lbin], dv);
+    if (dc != 0)
+      atomicAdd(&s_rank_dc[lbin], dc);
+    ++applied;
   }
+  if (applied)
+    atomicAdd(&s_matched, applied);
   __syncthreads();
   // Coalesced write-back of the modified base window.
   for (int i = tid; i < s_wlen; i += blockDim.x) {
@@ -2004,74 +1931,12 @@ __global__ void canonical_fold_rank23_kernel(
       rank23_count_delta[rank_base + b] += s_rank_dc[b];
   }
   if (tid == 0) {
-    int off = 0;
-    for (int bin = 0; bin < 128; ++bin) {
-      s_coldoff[bin] = off;
-      off += s_coldcount[bin];
-    }
-    s_coldoff[128] = off;
-    s_coldn = off;
-  }
-  __syncthreads();
-  for (int bin = warp; bin < 128; bin += (blockDim.x >> 5)) {
-    const int begin = s_binoff[bin];
-    const int count = s_binoff[bin + 1] - begin;
-    const bool keep =
-        lane < count && s_coldflag[begin + lane] != 0;
-    const unsigned kept = __ballot_sync(warp_mask, keep);
-    if (keep) {
-      const unsigned before =
-          lane == 0 ? 0u : kept & ((1u << lane) - 1u);
-      s_cold[s_coldoff[bin] + __popc(before)] =
-          s_order[begin + lane];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-    const int n = s_coldn;
-    cold_page_count[q] = static_cast<std::uint32_t>(n);
-    if (n > 0) {
-      const std::uint32_t cap =
-          static_cast<std::uint32_t>((n + 31) & ~31);
-      const std::uint32_t begin = atomicAdd(cold_arena_tail, cap);
-      s_page = (begin + cap <= arena_capacity) ? begin : 0xffffffffu;
-      cold_page_begin[q] = (s_page == 0xffffffffu) ? 0u : begin;
-      cold_page_capacity[q] =
-          (s_page == 0xffffffffu) ? 0u : cap;
-      if (s_page == 0xffffffffu) {
-        cold_page_count[q] = 0u;
-        atomicAdd(fold_stats + kFoldStatOverflow,
-                  static_cast<std::uint32_t>(n));
-      } else {
-        atomicAdd(fold_stats + kFoldStatUnmatched,
-                  static_cast<std::uint32_t>(n));
-      }
-    } else {
-      cold_page_begin[q] = 0u;
-      cold_page_capacity[q] = 0u;
-      s_page = 0xffffffffu;
-    }
+    cold_page_begin[q] = 0;
+    cold_page_count[q] = 0;
+    cold_page_capacity[q] = 0;
     if (s_matched)
       atomicAdd(fold_stats + kFoldStatMatched,
                 static_cast<std::uint32_t>(s_matched));
-  }
-  __syncthreads();
-  if (s_page != 0xffffffffu) {
-    const std::uint32_t words = cold_page_capacity[q] >> 5;
-    for (std::uint32_t word = tid; word < words;
-         word += blockDim.x)
-      cold_ops[(s_page >> 5) + word] = 0u;
-  }
-  __syncthreads();
-  if (s_page != 0xffffffffu) {
-    for (int i = tid; i < s_coldn; i += blockDim.x) {
-      const FoldRecord r = s_rec[s_cold[i]];
-      const std::uint32_t dst = s_page + static_cast<std::uint32_t>(i);
-      cold_keys[dst] = (q << kEpochQuotientBits) | r.low_key;
-      cold_values[dst] = r.operation ? r.value : 0u;
-      if (r.operation)
-        atomicOr(&cold_ops[dst >> 5], 1u << (dst & 31u));
-    }
   }
 }
 
