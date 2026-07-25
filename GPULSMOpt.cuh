@@ -2266,6 +2266,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
+    flush_pending_views(stream);
     const int run_count = static_cast<int>(chrono_views_.size());
     const bool run_parallel =
         batch.count <=
@@ -2297,6 +2298,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
+    flush_pending_views(stream);
     constexpr int block = 256;
     const int grid = static_cast<int>((batch.count + block - 1) / block);
     const int run_count = static_cast<int>(chrono_views_.size());
@@ -2344,6 +2346,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
+    flush_pending_views(stream);
     ensure_canonical_value_prefix(stream);
     if (batch.out_counts)
       ensure_canonical_count_prefix(stream);
@@ -3018,6 +3021,7 @@ private:
 
   // Publishes one chronological run descriptor.
   void publish_assignment_view(RunStorage &run, cudaStream_t stream) {
+    (void)stream;
     gpulsmopt_detail::AssignmentRunView view =
         make_assignment_view(run);
     const std::size_t slot = chrono_views_.size();
@@ -3027,9 +3031,28 @@ private:
     host_state_->views[slot] = view;
     if (assignment_views_.size() < chrono_views_.size())
       assignment_views_.resize_discard(gpulsmopt_detail::kRunCapacity);
-    CUDA_CHECK(cudaMemcpyAsync(assignment_views_.data() + slot,
-                               host_state_->views + slot, sizeof(view),
-                               cudaMemcpyHostToDevice, stream));
+    // Device descriptors are materialized lazily in one batched copy right
+    // before a read consumes them (flush_pending_views). Inserts never read
+    // the device array, so this drops an H2D copy + stream op from every
+    // insert; the fold uses its own fold_source_views_ buffer.
+    views_dirty_ = true;
+  }
+
+  // Sync the device descriptor array with the host run views. Only the read
+  // paths (lookup/successor/range) consume it, and they call this after
+  // ensure_sorted_run_cache. host_state_->views[0..chrono_views_) always
+  // mirrors the live runs (publish writes both in lockstep; clears zero the
+  // count), so one batched copy of the current run count is exact.
+  void flush_pending_views(cudaStream_t stream) {
+    if (!views_dirty_)
+      return;
+    const std::size_t n = chrono_views_.size();
+    if (n != 0)
+      CUDA_CHECK(cudaMemcpyAsync(
+          assignment_views_.data(), host_state_->views,
+          n * sizeof(gpulsmopt_detail::AssignmentRunView),
+          cudaMemcpyHostToDevice, stream));
+    views_dirty_ = false;
   }
 
   void acquire_run_slot() {
@@ -4599,6 +4622,9 @@ private:
       assignment_views_;
   // Oldest-to-newest descriptor mirror.
   std::vector<gpulsmopt_detail::AssignmentRunView> chrono_views_;
+  // Set when a run is published; cleared when the device descriptor array is
+  // batch-synced before a read (flush_pending_views).
+  bool views_dirty_ = false;
   std::size_t delete_sort_count_ = 0;
   std::size_t delete_sort_temp_bytes_ = 0;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> narrow_overflow_;
