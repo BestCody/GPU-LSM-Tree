@@ -2915,9 +2915,14 @@ private:
       }
       {
         GPULSMOPT_PROF_PHASE(prof_delta_ingest_ms_);
-        // Leaf metadata stores quotient offsets only.
-        build_assignment_offsets(run, static_cast<std::uint32_t>(count),
-                                 stream);
+        // Quotient offsets via the single-kernel path (same as inserts): the
+        // radix sort / pre-sorted copy leaves keys quotient-ascending, so no
+        // boundary kernel, reverse-min scan, or sentinel memset is needed.
+        run.quotient_off.resize_discard_exact(
+            gpulsmopt_detail::kEpochQuotients + 1);
+        build_quotient_offsets(run.keys.data(),
+                               static_cast<std::uint32_t>(count),
+                               run.quotient_off.data(), stream);
       }
     }
     publish_assignment_view(run, stream);
@@ -2936,6 +2941,25 @@ private:
     return n;
   }
 
+  // Dense quotient offsets over quotient-ascending sorted keys in one kernel:
+  // offsets[q] = lower_bound(keys, q<<16). Shared by insert and delete raw
+  // leaves; replaces the boundary + reverse-min-scan + sentinel-memset path.
+  void build_quotient_offsets(const std::uint32_t *sorted_keys,
+                              std::uint32_t count, std::uint32_t *out_off,
+                              cudaStream_t stream) {
+    constexpr std::uint32_t Q = gpulsmopt_detail::kEpochQuotients;
+    if (count == 0u) {
+      CUDA_CHECK(cudaMemsetAsync(out_off, 0,
+                                 (Q + 1u) * sizeof(std::uint32_t), stream));
+      return;
+    }
+    constexpr int block = 256;
+    const int grid = static_cast<int>((Q + 1u + block - 1) / block);
+    gpulsmopt_detail::quotient_lower_bound_kernel<<<grid, block, 0, stream>>>(
+        sorted_keys, count, out_off);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
   // One fused operation for an ordinary insert raw run: stable
   // upper-16 sort + dense quotient offsets, no boundary kernel, no
   // reverse-min repair, no sentinel memset, no per-insert allocation.
@@ -2945,20 +2969,15 @@ private:
                                 std::uint32_t *out_values,
                                 std::uint32_t *out_quotient_off,
                                 cudaStream_t stream) {
-    constexpr std::uint32_t Q = gpulsmopt_detail::kEpochQuotients;
     if (count == 0u) {
-      CUDA_CHECK(cudaMemsetAsync(out_quotient_off, 0,
-                                 (Q + 1u) * sizeof(std::uint32_t), stream));
+      build_quotient_offsets(out_keys, 0u, out_quotient_off, stream);
       return;
     }
     // Stable sort preserves same-quotient input order (last-wins).
     sort_run_batch(keys, values, count, out_keys, out_values, stream);
     // Dense offsets in a single kernel over the sorted keys.
-    constexpr int block = 256;
-    const int grid = static_cast<int>((Q + 1u + block - 1) / block);
-    gpulsmopt_detail::quotient_lower_bound_kernel<<<grid, block, 0, stream>>>(
-        out_keys, static_cast<std::uint32_t>(count), out_quotient_off);
-    CUDA_CHECK(cudaGetLastError());
+    build_quotient_offsets(out_keys, static_cast<std::uint32_t>(count),
+                           out_quotient_off, stream);
   }
 
   void build_assignment_offsets(RunStorage &run, std::uint32_t count,
