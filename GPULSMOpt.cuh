@@ -45,9 +45,6 @@
 #endif
 
 namespace gpulsmopt_detail {
-#ifndef GPULSMOPT_SM120_RADIX
-#define GPULSMOPT_SM120_RADIX 1
-#endif
 #ifndef GPULSMOPT_RADIX_THREADS
 #define GPULSMOPT_RADIX_THREADS 256
 #endif
@@ -120,7 +117,6 @@ enum class AssignmentClass : std::uint8_t { Raw, ColdStable };
 constexpr std::uint8_t kCanonBase = 0;     // immutable BaseRun value
 constexpr std::uint8_t kCanonOverride = 1; // override value
 constexpr std::uint8_t kCanonDead = 2;     // deleted
-#if GPULSMOPT_SM120_RADIX
 struct Sm120RadixPolicy
     : cub::DeviceRadixSortPolicy<std::uint32_t, std::uint32_t, std::uint32_t> {
   using Base =
@@ -170,18 +166,6 @@ epoch_radix_sort_pairs(void *temp_storage, std::size_t &temp_bytes,
       Sm120RadixPolicy>::Dispatch(temp_storage, temp_bytes, keys, values, count,
                                   begin_bit, end_bit, false, stream);
 }
-#else
-inline cudaError_t
-epoch_radix_sort_pairs(void *temp_storage, std::size_t &temp_bytes,
-                       const std::uint32_t *keys_in, std::uint32_t *keys_out,
-                       const std::uint32_t *values_in,
-                       std::uint32_t *values_out, std::uint32_t count,
-                       int begin_bit, int end_bit, cudaStream_t stream) {
-  return cub::DeviceRadixSort::SortPairs(temp_storage, temp_bytes, keys_in,
-                                         keys_out, values_in, values_out, count,
-                                         begin_bit, end_bit, stream);
-}
-#endif
 
 #if defined(GPULSMOPT_PROFILE_INSERT) || defined(GPULSMOPT_PROFILE_FOLD)
 struct ScopedInsertPhaseTimer {
@@ -2307,7 +2291,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
 #endif
       insert_records(batch.keys, batch.values,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
-                     batch.count, false, stream);
+                     batch.count, stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       CUDA_CHECK(cudaStreamSynchronize(stream));
       const auto prof_t1 = std::chrono::high_resolution_clock::now();
@@ -2331,6 +2315,9 @@ explicit GPULSMOpt(const DictionaryConfig &config)
   void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
+    if (!batch.sorted)
+      throw std::invalid_argument(
+          "GPULSMOpt deletion requires sorted keys");
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
       order_stream_locked(stream);
@@ -2340,7 +2327,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
 #endif
       insert_records(batch.keys, batch.keys,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
-                     batch.count, batch.sorted, stream);
+                     batch.count, stream);
 #ifdef GPULSMOPT_PROFILE_INSERT
       CUDA_CHECK(cudaStreamSynchronize(stream));
       const auto prof_t1 = std::chrono::high_resolution_clock::now();
@@ -2975,7 +2962,7 @@ private:
   // Builds an unresolved assignment run.
   void create_assignment_run(bool is_insert, const std::uint32_t *keys,
                              const std::uint32_t *values, std::size_t count,
-                             bool keys_sorted, cudaStream_t stream) {
+                             cudaStream_t stream) {
     acquire_run_slot();
     RunStorage &run = runs_.back();
     run.count = count;
@@ -3005,23 +2992,14 @@ private:
     } else {
       {
         GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
-        if (keys_sorted) {
-          // Fully sorted keys need only a copy.
-          run.values.resize_discard(0);
-          CUDA_CHECK(cudaMemcpyAsync(run.keys.data(), keys,
-                                     count * sizeof(std::uint32_t),
-                                     cudaMemcpyDeviceToDevice, stream));
-        } else {
-          // Deletion leaves are key-only: no value traffic.
-          run.values.resize_discard(0);
-          sort_delete_batch(keys, count, run.keys.data(), stream);
-        }
+        run.values.resize_discard(0);
+        CUDA_CHECK(cudaMemcpyAsync(run.keys.data(), keys,
+                                   count * sizeof(std::uint32_t),
+                                   cudaMemcpyDeviceToDevice, stream));
       }
       {
         GPULSMOPT_PROF_PHASE(prof_delta_ingest_ms_);
-        // Quotient offsets via the single-kernel path (same as inserts): the
-        // radix sort / pre-sorted copy leaves keys quotient-ascending, so no
-        // boundary kernel, reverse-min scan, or sentinel memset is needed.
+        // Build quotient offsets from sorted deletion keys.
         run.quotient_off.resize_discard_exact(
             gpulsmopt_detail::kEpochQuotients + 1);
         build_quotient_offsets(run.keys.data(),
@@ -3241,14 +3219,13 @@ private:
 
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
-                      std::size_t count, bool keys_sorted,
-                      cudaStream_t stream) {
+                      std::size_t count, cudaStream_t stream) {
     if (count == 0)
       return;
     const bool is_insert =
         op == static_cast<std::uint8_t>(gpulsmopt_detail::kInsert);
     create_assignment_run(is_insert, keys_in, is_insert ? values_in : nullptr,
-                          count, keys_sorted, stream);
+                          count, stream);
   }
 
   void ensure_sort_temp(std::size_t bytes) {
@@ -3408,15 +3385,6 @@ private:
     reserve_leaf_storage(direct_count);
     assignment_views_.resize_discard_exact(gpulsmopt_detail::kRunCapacity);
     chrono_views_.reserve(gpulsmopt_detail::kRunCapacity);
-    if (direct_count > 0) {
-      delete_sort_temp_bytes_ = 0;
-      CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-          nullptr, delete_sort_temp_bytes_, direct_sort_keys_.data(),
-          direct_sort_keys_.data(), static_cast<int>(direct_count), 16, 32,
-          stream));
-      delete_sort_count_ = direct_count;
-      ensure_sort_temp(delete_sort_temp_bytes_);
-    }
     prepare_sort_storage(direct_count, stream);
     reserve_temporal_compaction_storage(direct_count, stream);
     reserve_successor_storage();
@@ -3427,8 +3395,6 @@ private:
       sort_run_batch(
           direct_sort_keys_.data(), direct_sort_values_.data(),
           direct_count, sample.keys.data(), sample.values.data(), stream);
-      sort_delete_batch(
-          direct_sort_keys_.data(), direct_count, sample.keys.data(), stream);
     }
   }
 
@@ -3450,24 +3416,6 @@ private:
         values, direct_sort_values_.data(), n, 0, 32, stream));
   }
 
-  // Key-only upper-16 sort for deletion leaves.
-  void sort_delete_batch(const std::uint32_t *keys, std::size_t n,
-                         std::uint32_t *out_keys, cudaStream_t stream) {
-    if (n > delete_sort_count_) {
-      delete_sort_temp_bytes_ = 0;
-      CUDA_CHECK(cub::DeviceRadixSort::SortKeys(nullptr, delete_sort_temp_bytes_,
-                                                keys, out_keys,
-                                                static_cast<int>(n), 16, 32,
-                                                stream));
-      delete_sort_count_ = n;
-    }
-    std::size_t temp_bytes = delete_sort_temp_bytes_;
-    ensure_sort_temp(temp_bytes);
-    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(sort_temp_storage_.data(),
-                                              temp_bytes, keys, out_keys,
-                                              static_cast<int>(n), 16, 32,
-                                              stream));
-  }
 
   void sort_run_batch(const std::uint32_t *keys, const std::uint32_t *values,
                       std::size_t n, std::uint32_t *out_keys,
@@ -4749,8 +4697,6 @@ private:
   // Set when a run is published; cleared when the device descriptor array is
   // batch-synced before a read (flush_pending_views).
   bool views_dirty_ = false;
-  std::size_t delete_sort_count_ = 0;
-  std::size_t delete_sort_temp_bytes_ = 0;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> narrow_overflow_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> resolve_payload_;
