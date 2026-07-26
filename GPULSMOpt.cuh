@@ -2494,8 +2494,9 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     CUDA_CHECK(cudaMemsetAsync(
         rank23_count_delta_.data(), 0,
         gpulsmopt_detail::kBaseRank23Size * sizeof(std::int32_t), stream));
-    rank23_value_prefix_.resize_discard(gpulsmopt_detail::kBaseRank23Size + 1u);
-    rank23_count_prefix_.resize_discard(gpulsmopt_detail::kBaseRank23Size + 1u);
+    // Range-only prefixes (2 x Rank23) are allocated lazily by
+    // ensure_canonical_*_prefix on the first range query; lookup/successor-only
+    // workloads never pay for them.
     rank23_value_prefix_ready_ = false;
     rank23_count_prefix_ready_ = false;
     canonical_overlay_active_ = false;
