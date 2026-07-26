@@ -85,7 +85,6 @@ constexpr int kEpochSubgroupPlanes = kEpochSubgroupBits;
 constexpr int kEpochSubgroupPrefixStride = kEpochSubgroups;
 constexpr int kEpochHeavySortCap = 128;
 constexpr int kRunStride = kRunCapacity;
-constexpr int kGpuResidentWarps = 9024;
 // Flat BaseRun rank directory.
 constexpr int kBaseRank23Bits = 23;
 constexpr int kBaseRank23Shift = 32 - kBaseRank23Bits;
@@ -688,10 +687,14 @@ __device__ inline void assignment_bounds(const AssignmentRunView &run,
 
 struct PinnedHostState {
   AssignmentRunView views[kRunCapacity];
+  AssignmentRunView scratch_views[kRunCapacity];
   std::uint32_t narrow_overflow;
   std::uint32_t resolved_count;
   std::uint32_t successor_miss_count;
   std::uint32_t gathered_count;
+  std::uint32_t fold_fallback_count;
+  std::uint32_t fold_cold_count;
+  std::uint32_t fold_matched_count;
 };
 
 __global__ void assignment_group_count_kernel(
@@ -766,17 +769,23 @@ __global__ void assignment_group_gather_range_kernel(
   }
 }
 
-__global__ void compaction_unique_count_kernel(
-    const std::uint32_t *keys, std::size_t count,
-    std::uint32_t *quotient_counts) {
+__global__ void compaction_stage_unique_kernel(
+    const std::uint32_t *keys, const std::uint64_t *payload,
+    std::size_t count, std::size_t output_begin,
+    std::uint32_t *staged_keys, std::uint64_t *staged_payload,
+    std::uint32_t *keep_flags) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count)
     return;
   const std::uint32_t key = keys[i];
-  if (i + 1u < count && keys[i + 1u] == key)
+  const bool keep = i + 1u == count || keys[i + 1u] != key;
+  const std::size_t output = output_begin + i;
+  keep_flags[output] = keep ? 1u : 0u;
+  if (!keep)
     return;
-  atomicAdd(quotient_counts + (key >> kEpochQuotientBits), 1u);
+  staged_keys[output] = key;
+  staged_payload[output] = payload[i];
 }
 
 __global__ void compaction_tile_offsets_kernel(
@@ -788,25 +797,50 @@ __global__ void compaction_tile_offsets_kernel(
   tile_offsets[i] = global_offsets[first + i] - global_offsets[first];
 }
 
+__global__ void compaction_output_offsets_kernel(
+    const std::uint32_t *input_offsets,
+    const std::uint32_t *positions,
+    const std::uint32_t *keep_flags, std::uint32_t count,
+    std::uint32_t *output_offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kEpochQuotients)
+    return;
+  const std::uint32_t compact_count =
+      positions[count - 1u] + keep_flags[count - 1u];
+  const std::uint32_t input = input_offsets[q];
+  output_offsets[q] = input < count ? positions[input] : compact_count;
+}
+
 __global__ void compaction_unique_scatter_kernel(
     const std::uint32_t *keys, const std::uint64_t *payload,
-    std::size_t count, std::uint32_t *quotient_cursors,
+    const std::uint32_t *keep_flags,
+    const std::uint32_t *positions, std::size_t count,
     std::uint32_t *out_keys, std::uint32_t *out_values,
-    std::uint32_t *out_op_words) {
+    std::uint8_t *out_ops) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= count)
+  if (i >= count || keep_flags[i] == 0u)
     return;
-  const std::uint32_t key = keys[i];
-  if (i + 1u < count && keys[i + 1u] == key)
-    return;
-  const std::uint32_t q = key >> kEpochQuotientBits;
-  const std::uint32_t out = atomicAdd(quotient_cursors + q, 1u);
+  const std::uint32_t out = positions[i];
   const std::uint64_t packed = payload[i];
-  out_keys[out] = key;
+  out_keys[out] = keys[i];
   out_values[out] = static_cast<std::uint32_t>(packed >> 32);
-  if (packed & 1u)
-    atomicOr(out_op_words + (out >> 5), 1u << (out & 31u));
+  out_ops[out] = static_cast<std::uint8_t>(packed & 1u);
+}
+
+__global__ void compaction_pack_ops_kernel(
+    const std::uint8_t *ops, std::size_t count,
+    std::uint32_t *out_op_words) {
+  const std::size_t word =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t begin = word << 5;
+  if (begin >= count)
+    return;
+  std::uint32_t packed = 0u;
+  const std::size_t end = begin + 32u < count ? begin + 32u : count;
+  for (std::size_t i = begin; i < end; ++i)
+    packed |= static_cast<std::uint32_t>(ops[i] != 0u) << (i - begin);
+  out_op_words[word] = packed;
 }
 
 // Scan newest first, then fall through to the canonical base.
@@ -1176,6 +1210,21 @@ __global__ void resolve_pack_run_kernel(const std::uint32_t *keys,
       (static_cast<std::uint64_t>(v) << 32) | (op != 0 ? 1u : 0u);
 }
 
+// Packs the visible canonical BaseRun.
+__global__ void resolve_pack_canonical_base_kernel(
+    CanonicalBaseView base, std::uint32_t *out_keys,
+    std::uint64_t *out_payload) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= base.base.count)
+    return;
+  const bool live = canonical_live_at(base, i);
+  const std::uint32_t value = live ? canonical_value_at(base, i) : 0u;
+  out_keys[i] = base.base.keys[i];
+  out_payload[i] =
+      (static_cast<std::uint64_t>(value) << 32) | (live ? 1u : 0u);
+}
+
 // Builds assignment quotient offsets.
 __global__ void assignment_boundary_kernel(const std::uint32_t *keys,
                                            std::uint32_t count,
@@ -1233,15 +1282,18 @@ __global__ void base_rank23_boundary_kernel(const std::uint32_t *keys,
     rank23[bin] = i;
 }
 
-// Keeps the newest equal-key assignment.
-__global__ void resolve_flag_last_kernel(const std::uint32_t *keys,
-                                         std::size_t n,
-                                         std::uint8_t *flags) {
+// Keeps only the newest live record for each key.
+__global__ void resolve_live_last_kernel(
+    const std::uint32_t *keys, const std::uint64_t *payload,
+    std::size_t n, std::uint32_t *out_values,
+    std::uint8_t *flags) {
   const std::size_t i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
-  flags[i] = (i + 1u == n || keys[i] != keys[i + 1u]) ? 1u : 0u;
+  const bool last = i + 1u == n || keys[i] != keys[i + 1u];
+  out_values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
+  flags[i] = last && (payload[i] & 1u) != 0u ? 1u : 0u;
 }
 
 // Corrections use modulo-32-bit value arithmetic.
@@ -1338,18 +1390,6 @@ __global__ void resolve_merge_flag_kernel(const std::uint64_t *tagged_keys,
   flags[i] = (last && payload[i] != 0u) ? 1u : 0u;
 }
 
-// Splits newest live assignments from deletes.
-__global__ void resolve_base_extract_kernel(const std::uint64_t *payload,
-                                            std::size_t m,
-                                            std::uint32_t *out_values,
-                                            std::uint8_t *out_keep) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= m)
-    return;
-  out_values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
-  out_keep[i] = (payload[i] & 1u) != 0u ? 1u : 0u;
-}
 
 __device__ inline void resolved_range_ranks(
     const RunView &resolved, std::uint32_t lo, std::uint32_t hi,
@@ -1722,13 +1762,15 @@ __global__ void canonical_fold_rank23_kernel(
     std::uint8_t *state, std::uint32_t *override_values,
     std::uint32_t *rank23_value_delta, std::int32_t *rank23_count_delta,
     std::uint32_t *cold_page_begin, std::uint32_t *cold_page_count,
-    std::uint32_t *cold_page_capacity,
     std::uint32_t *cold_arena_tail, std::uint32_t arena_capacity,
     std::uint32_t *cold_keys, std::uint32_t *cold_values,
     std::uint32_t *cold_ops, std::uint32_t *fallback_quotients,
-    std::uint32_t *fallback_count, std::uint32_t *fold_stats) {
+    std::uint32_t *fallback_count, std::uint32_t *cold_output_count,
+    std::uint32_t *matched_output_count, std::uint32_t *fold_stats) {
   const std::uint32_t q = blockIdx.x;
   const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
   __shared__ std::uint32_t s_runoff[kRawFoldWidth + 1];
   __shared__ std::uint32_t s_runbegin[kRawFoldWidth];
   __shared__ AssignmentRunView s_views[kRawFoldWidth];
@@ -1741,17 +1783,22 @@ __global__ void canonical_fold_rank23_kernel(
   __shared__ unsigned long long s_winner[kWindowCap];
   __shared__ std::uint32_t s_rank_dv[128];
   __shared__ std::int32_t s_rank_dc[128];
+  __shared__ std::uint32_t s_warp_count[16];
+  __shared__ std::uint32_t s_warp_offset[16];
   __shared__ std::uint32_t s_wb;
+  __shared__ std::uint32_t s_page;
+  __shared__ std::uint32_t s_emit_cursor;
+  __shared__ std::uint32_t s_chunk_base;
   __shared__ int s_wlen;
   __shared__ int s_total;
   __shared__ int s_overflow;
-  __shared__ int s_has_cold;
   __shared__ int s_matched;
+  __shared__ int s_coldn;
 
   if (tid == 0) {
     s_overflow = 0;
-    s_has_cold = 0;
     s_matched = 0;
+    s_coldn = 0;
   }
   for (int r = tid; r < run_count; r += blockDim.x) {
     s_views[r] = runs[r];
@@ -1760,25 +1807,28 @@ __global__ void canonical_fold_rank23_kernel(
     s_runbegin[r] = b;
     s_runoff[r] = e - b;
   }
-  // One parallel pass caches every base bin boundary.
   if (tid < 128) {
-    const std::uint32_t gbin =
-        (q << (kBaseRank23Bits - kEpochQuotientBits)) |
-        static_cast<std::uint32_t>(tid);
-    s_base_b[tid] = base.rank23[gbin];
-    s_base_e[tid] = base.rank23[gbin + 1u];
+    if (base.count == 0u) {
+      s_base_b[tid] = 0u;
+      s_base_e[tid] = 0u;
+    } else {
+      const std::uint32_t gbin =
+          (q << (kBaseRank23Bits - kEpochQuotientBits)) |
+          static_cast<std::uint32_t>(tid);
+      s_base_b[tid] = base.rank23[gbin];
+      s_base_e[tid] = base.rank23[gbin + 1u];
+    }
   }
   __syncthreads();
   if (tid == 0) {
-    std::uint32_t c = 0;
+    std::uint32_t count = 0;
     for (int r = 0; r < run_count; ++r) {
-      const std::uint32_t cc = s_runoff[r];
-      s_runoff[r] = c;
-      c += cc;
+      const std::uint32_t records = s_runoff[r];
+      s_runoff[r] = count;
+      count += records;
     }
-    s_runoff[run_count] = c;
-    s_total = static_cast<int>(c);
-    // Contiguous base window this block will touch (all 128 bins).
+    s_runoff[run_count] = count;
+    s_total = static_cast<int>(count);
     s_wb = s_base_b[0];
     s_wlen = static_cast<int>(s_base_e[127] - s_base_b[0]);
     if (s_wlen > kWindowCap)
@@ -1789,28 +1839,23 @@ __global__ void canonical_fold_rank23_kernel(
     if (tid == 0) {
       cold_page_begin[q] = 0;
       cold_page_count[q] = 0;
-      cold_page_capacity[q] = 0;
     }
     return;
   }
   if (s_overflow) {
     if (tid == 0) {
-      const std::uint32_t s = atomicAdd(fallback_count, 1u);
-      fallback_quotients[s] = q;
+      const std::uint32_t slot = atomicAdd(fallback_count, 1u);
+      fallback_quotients[slot] = q;
       cold_page_begin[q] = 0;
       cold_page_count[q] = 0;
-      cold_page_capacity[q] = 0;
       atomicAdd(fold_stats + kFoldStatFallback, 1u);
     }
     return;
   }
-  // Preload the base window; init per-slot winners + rank deltas.
+
   for (int i = tid; i < s_wlen; i += blockDim.x) {
-    const std::uint32_t gp = s_wb + static_cast<std::uint32_t>(i);
-    s_win_key[i] = base.keys[gp];
-    s_win_val[i] = base.values[gp];
-    s_win_ovr[i] = override_values[gp];
-    s_win_state[i] = state[gp];
+    const std::uint32_t p = s_wb + static_cast<std::uint32_t>(i);
+    s_win_key[i] = base.keys[p];
     s_winner[i] = 0ull;
   }
   for (int b = tid; b < 128; b += blockDim.x) {
@@ -1818,85 +1863,104 @@ __global__ void canonical_fold_rank23_kernel(
     s_rank_dc[b] = 0;
   }
   __syncthreads();
-  // Fused gather + scatter: stream each pending record, locate its
-  // base slot (narrowed by its rank23 bin), and keep the newest run
-  // per slot via one 64-bit atomicMax that packs rank/op/value. No
-  // binning, no sort, no record buffer. A base miss routes the whole
-  // quotient to the fallback (cold is empty in the overwrite regime).
-  for (int i = tid; i < s_total; i += blockDim.x) {
-    int lo = 0, hi = run_count - 1;
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (s_runoff[mid] <= static_cast<std::uint32_t>(i))
-        lo = mid;
-      else
-        hi = mid - 1;
+
+  for (int chunk = 0; chunk < s_total; chunk += blockDim.x) {
+    const int i = chunk + tid;
+    bool miss = false;
+    if (i < s_total) {
+      int lo = 0;
+      int hi = run_count - 1;
+      while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (s_runoff[mid] <= static_cast<std::uint32_t>(i))
+          lo = mid;
+        else
+          hi = mid - 1;
+      }
+      const AssignmentRunView run = s_views[lo];
+      const std::uint32_t p =
+          s_runbegin[lo] +
+          (static_cast<std::uint32_t>(i) - s_runoff[lo]);
+      const std::uint32_t key = run.keys[p];
+      const int lbin = static_cast<int>((key >> 9) & 0x7fu);
+      const std::uint32_t rb = s_base_b[lbin] - s_wb;
+      const std::uint32_t bn = s_base_e[lbin] - s_base_b[lbin];
+      const std::uint32_t off = static_cast<std::uint32_t>(
+          lower_bound_u32(s_win_key + rb, bn, key));
+      if (off < bn && s_win_key[rb + off] == key) {
+        const unsigned long long priority =
+            (static_cast<unsigned long long>(lo + 1) << 32) | p;
+        atomicMax(&s_winner[rb + off], priority);
+      } else {
+        miss = true;
+      }
     }
-    const AssignmentRunView &run = s_views[lo];
-    const std::uint32_t p =
-        s_runbegin[lo] + (static_cast<std::uint32_t>(i) - s_runoff[lo]);
-    const std::uint32_t full_key = run.keys[p];
-    const int lbin = static_cast<int>((full_key >> 9) & 0x7fu);
-    const std::uint32_t rb = s_base_b[lbin] - s_wb;
-    const std::uint32_t bn = s_base_e[lbin] - s_base_b[lbin];
-    const std::uint32_t off = static_cast<std::uint32_t>(
-        lower_bound_u32(s_win_key + rb, bn, full_key));
-    if (off < bn && s_win_key[rb + off] == full_key) {
-      const int op =
-          assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
-      const std::uint32_t val =
-          (op != 0 && run.values) ? run.values[p] : 0u;
-      const unsigned long long packed =
-          (static_cast<unsigned long long>(lo + 1) << 40) |
-          (op != 0 ? (1ull << 39) : 0ull) |
-          static_cast<unsigned long long>(val);
-      atomicMax(&s_winner[rb + off], packed);
-    } else {
-      s_has_cold = 1;
-    }
-  }
-  __syncthreads();
-  if (s_has_cold) {
+    const unsigned mask = __ballot_sync(0xffffffffu, miss);
+    if (lane == 0)
+      s_warp_count[warp] = static_cast<std::uint32_t>(__popc(mask));
+    __syncthreads();
     if (tid == 0) {
-      const std::uint32_t s = atomicAdd(fallback_count, 1u);
-      fallback_quotients[s] = q;
-      cold_page_begin[q] = 0;
-      cold_page_count[q] = 0;
-      cold_page_capacity[q] = 0;
-      atomicAdd(fold_stats + kFoldStatFallback, 1u);
+      for (int w = 0; w < 16; ++w)
+        s_coldn += static_cast<int>(s_warp_count[w]);
     }
-    return;
+    __syncthreads();
   }
-  // Apply the newest update at each touched slot; the slot's key
-  // gives its rank23 bin, so deltas accumulate with light contention.
-  int applied = 0;
+
+  int local_matched = 0;
+  for (int j = tid; j < s_wlen; j += blockDim.x)
+    local_matched += s_winner[j] != 0ull ? 1 : 0;
+  if (local_matched)
+    atomicAdd(&s_matched, local_matched);
+  __syncthreads();
+
+  const bool dense_apply = s_wlen > 0 && s_matched * 2 >= s_wlen;
+  if (dense_apply) {
+    for (int i = tid; i < s_wlen; i += blockDim.x) {
+      const std::uint32_t p = s_wb + static_cast<std::uint32_t>(i);
+      s_win_val[i] = base.values[p];
+      s_win_ovr[i] = override_values[p];
+      s_win_state[i] = state[p];
+    }
+    __syncthreads();
+  }
+
   for (int j = tid; j < s_wlen; j += blockDim.x) {
-    const unsigned long long w = s_winner[j];
-    if (w == 0ull)
+    const unsigned long long winner = s_winner[j];
+    if (winner == 0ull)
       continue;
-    const int op = static_cast<int>((w >> 39) & 1ull);
-    const std::uint32_t val = static_cast<std::uint32_t>(w & 0xffffffffu);
+    const int run_index = static_cast<int>(winner >> 32) - 1;
+    const std::uint32_t p = static_cast<std::uint32_t>(winner);
+    const AssignmentRunView run = s_views[run_index];
+    const int op =
+        assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
+    const std::uint32_t value =
+        op != 0 && run.values ? run.values[p] : 0u;
+    const std::uint32_t global_p = s_wb + static_cast<std::uint32_t>(j);
     std::uint32_t dv = 0u;
     std::int32_t dc = 0;
-    canonical_apply_one(s_win_val[j], s_win_state, s_win_ovr,
-                        static_cast<std::size_t>(j), op, val, &dv, &dc);
+    if (dense_apply) {
+      canonical_apply_one(s_win_val[j], s_win_state, s_win_ovr,
+                          static_cast<std::size_t>(j), op, value, &dv, &dc);
+    } else {
+      canonical_apply_one(base.values[global_p], state, override_values,
+                          global_p, op, value, &dv, &dc);
+    }
     const int lbin = static_cast<int>((s_win_key[j] >> 9) & 0x7fu);
     if (dv != 0u)
       atomicAdd(&s_rank_dv[lbin], dv);
     if (dc != 0)
       atomicAdd(&s_rank_dc[lbin], dc);
-    ++applied;
   }
-  if (applied)
-    atomicAdd(&s_matched, applied);
   __syncthreads();
-  // Coalesced write-back of the modified base window.
-  for (int i = tid; i < s_wlen; i += blockDim.x) {
-    const std::uint32_t gp = s_wb + static_cast<std::uint32_t>(i);
-    state[gp] = s_win_state[i];
-    override_values[gp] = s_win_ovr[i];
+
+  if (dense_apply) {
+    for (int i = tid; i < s_wlen; i += blockDim.x) {
+      const std::uint32_t p = s_wb + static_cast<std::uint32_t>(i);
+      state[p] = s_win_state[i];
+      override_values[p] = s_win_ovr[i];
+    }
   }
-  // Coalesced write-back of this quotient's 128 rank23 deltas.
+
   const std::uint32_t rank_base =
       q << (kBaseRank23Bits - kEpochQuotientBits);
   for (int b = tid; b < 128; b += blockDim.x) {
@@ -1905,13 +1969,107 @@ __global__ void canonical_fold_rank23_kernel(
     if (s_rank_dc[b] != 0)
       rank23_count_delta[rank_base + b] += s_rank_dc[b];
   }
-  if (tid == 0) {
-    cold_page_begin[q] = 0;
-    cold_page_count[q] = 0;
-    cold_page_capacity[q] = 0;
-    if (s_matched)
-      atomicAdd(fold_stats + kFoldStatMatched,
-                static_cast<std::uint32_t>(s_matched));
+
+  if (s_coldn == 0) {
+    if (tid == 0) {
+      cold_page_begin[q] = 0u;
+      cold_page_count[q] = 0u;
+    }
+  } else {
+    if (tid == 0) {
+      const std::uint32_t cap =
+          (static_cast<std::uint32_t>(s_coldn) + 31u) & ~31u;
+      const std::uint32_t page = atomicAdd(cold_arena_tail, cap);
+      if (page > arena_capacity || cap > arena_capacity - page)
+        asm("trap;");
+      s_page = page;
+      s_emit_cursor = 0u;
+      cold_page_begin[q] = page;
+      cold_page_count[q] = static_cast<std::uint32_t>(s_coldn);
+      atomicAdd(cold_output_count, static_cast<std::uint32_t>(s_coldn));
+      atomicAdd(fold_stats + kFoldStatUnmatched,
+                static_cast<std::uint32_t>(s_coldn));
+    }
+    __syncthreads();
+    const std::uint32_t words =
+        (static_cast<std::uint32_t>(s_coldn) + 31u) >> 5;
+    for (std::uint32_t word = tid; word < words; word += blockDim.x)
+      cold_ops[(s_page >> 5) + word] = 0u;
+    __syncthreads();
+
+    const bool all_miss = s_coldn == s_total;
+    for (int chunk = 0; chunk < s_total; chunk += blockDim.x) {
+      const int i = chunk + tid;
+      bool miss = false;
+      std::uint32_t key = 0u;
+      std::uint32_t value = 0u;
+      int op = 0;
+      if (i < s_total) {
+        int lo = 0;
+        int hi = run_count - 1;
+        while (lo < hi) {
+          const int mid = (lo + hi + 1) >> 1;
+          if (s_runoff[mid] <= static_cast<std::uint32_t>(i))
+            lo = mid;
+          else
+            hi = mid - 1;
+        }
+        const AssignmentRunView run = s_views[lo];
+        const std::uint32_t p =
+            s_runbegin[lo] +
+            (static_cast<std::uint32_t>(i) - s_runoff[lo]);
+        key = run.keys[p];
+        if (all_miss) {
+          miss = true;
+        } else {
+          const int lbin = static_cast<int>((key >> 9) & 0x7fu);
+          const std::uint32_t rb = s_base_b[lbin] - s_wb;
+          const std::uint32_t bn = s_base_e[lbin] - s_base_b[lbin];
+          const std::uint32_t off = static_cast<std::uint32_t>(
+              lower_bound_u32(s_win_key + rb, bn, key));
+          miss = off >= bn || s_win_key[rb + off] != key;
+        }
+        if (miss) {
+          op = assignment_op_at(run.op_words, run.constant_op,
+                                run.mixed, p);
+          value = op != 0 && run.values ? run.values[p] : 0u;
+        }
+      }
+      const unsigned mask = __ballot_sync(0xffffffffu, miss);
+      if (lane == 0)
+        s_warp_count[warp] = static_cast<std::uint32_t>(__popc(mask));
+      __syncthreads();
+      if (tid == 0) {
+        std::uint32_t count = 0u;
+        for (int w = 0; w < 16; ++w) {
+          s_warp_offset[w] = count;
+          count += s_warp_count[w];
+        }
+        s_chunk_base = s_emit_cursor;
+        s_emit_cursor += count;
+      }
+      __syncthreads();
+      if (miss) {
+        const unsigned before =
+            lane == 0 ? 0u : mask & ((1u << lane) - 1u);
+        const std::uint32_t rank =
+            static_cast<std::uint32_t>(__popc(before));
+        const std::uint32_t out =
+            s_page + s_chunk_base + s_warp_offset[warp] + rank;
+        cold_keys[out] = key;
+        cold_values[out] = value;
+        if (op != 0)
+          atomicOr(cold_ops + (out >> 5), 1u << (out & 31u));
+      }
+      __syncthreads();
+    }
+  }
+
+  if (tid == 0 && s_matched != 0) {
+    atomicAdd(matched_output_count,
+              static_cast<std::uint32_t>(s_matched));
+    atomicAdd(fold_stats + kFoldStatMatched,
+              static_cast<std::uint32_t>(s_matched));
   }
 }
 
@@ -1922,30 +2080,27 @@ __global__ void canonical_fold_fallback_kernel(
     const AssignmentRunView *runs, int run_count,
     const std::uint32_t *quotient_list,
     const std::uint32_t *quotient_count,
-    std::uint32_t *work_head, SortedRunView base,
-    std::uint8_t *state, std::uint32_t *override_values,
-    std::uint32_t *rank23_value_delta,
-    std::int32_t *rank23_count_delta,
+    std::uint32_t *work_head,
     std::uint32_t *cold_page_begin,
     std::uint32_t *cold_page_count,
-    std::uint32_t *cold_page_capacity,
     std::uint32_t *cold_arena_tail,
     std::uint32_t arena_capacity,
     std::uint32_t *cold_keys,
     std::uint32_t *cold_values,
     std::uint32_t *cold_ops,
+    std::uint32_t *cold_output_count,
     std::uint32_t *fold_stats) {
   const int tid = threadIdx.x;
-  __shared__ std::uint32_t s_pos[kRawFoldWidth];
-  __shared__ std::uint32_t s_end[kRawFoldWidth];
-  __shared__ std::uint32_t s_last[kRawFoldWidth];
-  __shared__ std::uint32_t s_reduce[kRawFoldWidth];
-  __shared__ int s_rank[kRawFoldWidth];
+  __shared__ std::uint32_t s_begin[kRawFoldWidth];
+  __shared__ std::uint32_t s_count[kRawFoldWidth];
+  __shared__ std::uint32_t s_offset[kRawFoldWidth + 1];
   __shared__ std::uint32_t s_work;
   __shared__ std::uint32_t s_q;
   __shared__ std::uint32_t s_page;
-  __shared__ std::uint32_t s_coldn;
-  __shared__ std::uint32_t s_matchn;
+  __shared__ std::uint32_t s_total;
+
+  if (*quotient_count == 0u)
+    return;
 
   while (true) {
     if (tid == 0)
@@ -1956,124 +2111,60 @@ __global__ void canonical_fold_fallback_kernel(
     if (tid == 0)
       s_q = quotient_list[s_work];
     __syncthreads();
+
     const std::uint32_t q = s_q;
-    std::uint32_t begin = 0u;
-    std::uint32_t end = 0u;
-    if (tid < run_count)
+    if (tid < run_count) {
+      std::uint32_t begin = 0u;
+      std::uint32_t end = 0u;
       assignment_bounds(runs[tid], q, &begin, &end);
-    s_pos[tid] = begin;
-    s_end[tid] = end;
-    s_reduce[tid] = end - begin;
-    __syncthreads();
-    for (int stride = kRawFoldWidth / 2; stride > 0;
-         stride >>= 1) {
-      if (tid < stride)
-        s_reduce[tid] += s_reduce[tid + stride];
-      __syncthreads();
+      s_begin[tid] = begin;
+      s_count[tid] = end - begin;
+    } else {
+      s_begin[tid] = 0u;
+      s_count[tid] = 0u;
     }
+    __syncthreads();
     if (tid == 0) {
-      const std::uint32_t total = s_reduce[0];
+      std::uint32_t total = 0u;
+      for (int r = 0; r < run_count; ++r) {
+        s_offset[r] = total;
+        total += s_count[r];
+      }
+      s_offset[run_count] = total;
+      s_total = total;
       const std::uint32_t cap = (total + 31u) & ~31u;
-      const std::uint32_t page =
-          atomicAdd(cold_arena_tail, cap);
-      if (page > arena_capacity ||
-          cap > arena_capacity - page)
+      const std::uint32_t page = atomicAdd(cold_arena_tail, cap);
+      if (page > arena_capacity || cap > arena_capacity - page)
         asm("trap;");
       s_page = page;
-      s_coldn = 0u;
-      s_matchn = 0u;
       cold_page_begin[q] = page;
-      cold_page_count[q] = 0u;
-      cold_page_capacity[q] = cap;
+      cold_page_count[q] = total;
+      atomicAdd(cold_output_count, total);
+      atomicAdd(fold_stats + kFoldStatUnmatched, total);
     }
     __syncthreads();
-    const std::uint32_t words =
-        cold_page_capacity[q] >> 5;
+
+    const std::uint32_t words = (s_total + 31u) >> 5;
     for (std::uint32_t word = tid; word < words;
          word += blockDim.x)
       cold_ops[(s_page >> 5) + word] = 0u;
     __syncthreads();
 
-    while (true) {
-      const std::uint32_t pos = s_pos[tid];
-      const bool active = pos < s_end[tid];
-      s_reduce[tid] = active ? runs[tid].keys[pos]
-                             : 0xffffffffu;
-      if (__syncthreads_count(active) == 0)
-        break;
-      for (int stride = kRawFoldWidth / 2; stride > 0;
-           stride >>= 1) {
-        if (tid < stride)
-          s_reduce[tid] =
-              min(s_reduce[tid], s_reduce[tid + stride]);
-        __syncthreads();
-      }
-      const std::uint32_t key = s_reduce[0];
-
-      int rank = -1;
-      if (tid < run_count) {
-        std::uint32_t p = s_pos[tid];
-        if (p < s_end[tid] && runs[tid].keys[p] == key) {
-          do {
-            s_last[tid] = p;
-            ++p;
-          } while (p < s_end[tid] &&
-                   runs[tid].keys[p] == key);
-          s_pos[tid] = p;
-          rank = tid;
-        }
-      }
-      s_rank[tid] = rank;
-      __syncthreads();
-      for (int stride = kRawFoldWidth / 2; stride > 0;
-           stride >>= 1) {
-        if (tid < stride)
-          s_rank[tid] = max(s_rank[tid],
-                            s_rank[tid + stride]);
-        __syncthreads();
-      }
-      const int winner = s_rank[0];
-      if (tid == winner) {
-        const AssignmentRunView run = runs[winner];
-        const std::uint32_t p = s_last[winner];
+    for (int r = 0; r < run_count; ++r) {
+      const AssignmentRunView run = runs[r];
+      const std::uint32_t begin = s_begin[r];
+      const std::uint32_t count = s_count[r];
+      const std::uint32_t out_begin = s_page + s_offset[r];
+      for (std::uint32_t i = tid; i < count; i += blockDim.x) {
+        const std::uint32_t p = begin + i;
+        const std::uint32_t out = out_begin + i;
         const int op = assignment_op_at(
             run.op_words, run.constant_op, run.mixed, p);
-        const std::uint32_t value =
-            op != 0 && run.values ? run.values[p] : 0u;
-        const std::uint32_t gbin =
-            key >> kBaseRank23Shift;
-        const std::uint32_t base_b = base.rank23[gbin];
-        const std::uint32_t base_e = base.rank23[gbin + 1u];
-        const std::uint32_t bp =
-            base_b + static_cast<std::uint32_t>(
-                         lower_bound_u32(base.keys + base_b,
-                                         base_e - base_b, key));
-        if (bp < base_e && base.keys[bp] == key) {
-          std::uint32_t dv;
-          std::int32_t dc;
-          canonical_apply_one(base.values[bp], state,
-                              override_values, bp, op,
-                              value, &dv, &dc);
-          rank23_value_delta[gbin] += dv;
-          rank23_count_delta[gbin] += dc;
-          ++s_matchn;
-        } else {
-          const std::uint32_t slot = s_page + s_coldn++;
-          cold_keys[slot] = key;
-          cold_values[slot] = op != 0 ? value : 0u;
-          if (op != 0)
-            atomicOr(&cold_ops[slot >> 5],
-                     1u << (slot & 31u));
-        }
+        cold_keys[out] = run.keys[p];
+        cold_values[out] = op != 0 && run.values ? run.values[p] : 0u;
+        if (op != 0)
+          atomicOr(cold_ops + (out >> 5), 1u << (out & 31u));
       }
-      __syncthreads();
-    }
-    if (tid == 0) {
-      cold_page_count[q] = s_coldn;
-      if (s_matchn)
-        atomicAdd(fold_stats + kFoldStatMatched, s_matchn);
-      if (s_coldn)
-        atomicAdd(fold_stats + kFoldStatUnmatched, s_coldn);
     }
     __syncthreads();
   }
@@ -2457,6 +2548,16 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     sort_direct_batch(keys, values, n, stream);
     acquire_run_slot();
     RunStorage &run = runs_.back();
+    run.sequence = 0;
+    run.sequence_begin = 0;
+    run.sequence_end = 0;
+    run.stable_level = -1;
+    run.operation = gpulsmopt_detail::RunOperation::Insert;
+    run.assignment_class = gpulsmopt_detail::AssignmentClass::Raw;
+    run.mixed = false;
+    run.assignment = false;
+    run.paged = false;
+    run.cold_arena_slot = -1;
     run.count = n;
     run.fully_sorted = true;
     run.unit_counts = true;
@@ -2471,7 +2572,10 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.count = static_cast<std::size_t>(unique_end.first - run.keys.data());
     run.keys.resize_discard(run.count);
     run.values.resize_discard(run.count);
-    build_assignment_offsets(run, static_cast<std::uint32_t>(run.count), stream);
+    run.quotient_off.release();
+    run.op_words.release();
+    run.count_delta.release();
+    run.page_counts.release();
     build_sorted_run_cache(0u, stream);
     live_count_ = run.count;
     allocate_canonical_overlay(run.count, stream);
@@ -2501,7 +2605,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     rank23_count_prefix_ready_ = false;
     canonical_overlay_active_ = false;
     ++canonical_generation_;
-    canonical_through_sequence_ = 0;
   }
 
   // Reset the overlay to identity without freeing capacity (sec 25).
@@ -2523,7 +2626,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     rank23_count_prefix_ready_ = false;
     canonical_overlay_active_ = false;
     ++canonical_generation_;
-    canonical_through_sequence_ = 0;
   }
 
   std::size_t live_count() const {
@@ -2562,8 +2664,10 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         cache_pay_, merge_out_keys_, merge_out_pay_, merge_flags_,
         merge_sel_keys_, merge_sel_pay_, compaction_counts_,
         compaction_offsets_, compaction_tile_offsets_,
-        compaction_unique_counts_, compaction_unique_offsets_,
-        compaction_unique_cursors_, narrow_overflow_, assignment_views_,
+        compaction_stage_keys_, compaction_stage_payload_,
+        compaction_keep_flags_, compaction_positions_,
+        compaction_unique_offsets_, compaction_output_ops_,
+        narrow_overflow_, assignment_views_,
         direct_sort_keys_, direct_sort_values_, sort_temp_storage_,
         sorted_value_prefix_, sorted_count_prefix_, base_rank23_,
         sorted_range_cdf_, succ_miss_indices_, succ_miss_count_,
@@ -2579,17 +2683,18 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         base_override_state_, base_override_values_, rank23_value_delta_,
         rank23_count_delta_, rank23_value_prefix_, rank23_count_prefix_,
         fold_source_views_, fold_fallback_quotients_,
-        fold_fallback_count_, fold_fallback_head_, fold_stats_,
+        fold_fallback_count_, fold_fallback_head_, fold_cold_count_,
+        fold_matched_count_, fold_stats_,
         cold_arena_keys_, cold_arena_values_, cold_arena_ops_,
         cold_arena_tail_);
     for (const auto &epoch : runs_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.page_counts, epoch.page_capacity);
+          epoch.op_words, epoch.page_counts);
     for (const auto &epoch : run_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.page_counts, epoch.page_capacity);
+          epoch.op_words, epoch.page_counts);
     return total;
   }
 
@@ -2601,7 +2706,6 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
     // Paged cold-run metadata (empty for packed runs).
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> page_counts;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> page_capacity;
   };
 
   struct RunStorage : AssignmentLeafStorage {
@@ -3119,7 +3223,6 @@ private:
         leaf.op_words.release();
         leaf.count_delta.release();
         leaf.page_counts.release();
-        leaf.page_capacity.release();
         continue;
       }
       leaf.keys.resize_discard(count);
@@ -3212,7 +3315,6 @@ private:
 
   void reserve_temporal_compaction_storage(
       std::size_t run_capacity, cudaStream_t stream) {
-    (void)run_capacity;
     (void)stream;
     compaction_counts_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
@@ -3220,12 +3322,13 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
     compaction_tile_offsets_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
-    compaction_unique_counts_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
     compaction_unique_offsets_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
-    compaction_unique_cursors_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
+    compaction_stage_keys_.resize_discard(run_capacity);
+    compaction_stage_payload_.resize_discard(run_capacity);
+    compaction_keep_flags_.resize_discard(run_capacity);
+    compaction_positions_.resize_discard(run_capacity);
+    compaction_output_ops_.resize_discard(run_capacity);
     host_compaction_offsets_.resize(
         gpulsmopt_detail::kEpochQuotients + 1u);
   }
@@ -3256,6 +3359,8 @@ private:
         gpulsmopt_detail::kEpochQuotients);
     fold_fallback_count_.resize_discard(1);
     fold_fallback_head_.resize_discard(1);
+    fold_cold_count_.resize_discard(1);
+    fold_matched_count_.resize_discard(1);
     // Build-time reset matches the host-side stats reset.
     fold_stats_.resize_discard(gpulsmopt_detail::kFoldStatCells);
     CUDA_CHECK(cudaMemset(fold_stats_.data(), 0,
@@ -3505,9 +3610,10 @@ private:
     normalize_views_.resize_discard(
         gpulsmopt_detail::kRunCapacity);
     for (std::size_t slot = 0; slot < idx.size(); ++slot)
-      host_state_->views[slot] = make_assignment_view(runs_[idx[slot]]);
+      host_state_->scratch_views[slot] =
+          make_assignment_view(runs_[idx[slot]]);
     CUDA_CHECK(cudaMemcpyAsync(
-        normalize_views_.data(), host_state_->views,
+        normalize_views_.data(), host_state_->scratch_views,
         idx.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
         cudaMemcpyHostToDevice, stream));
 
@@ -3898,72 +4004,86 @@ private:
     base.count = kept;
     base.keys.resize_discard(kept);
     base.values.resize_discard(kept);
-    build_assignment_offsets(base, kept, stream);
+    base.quotient_off.release();
     build_sorted_run_cache(sorted_run_index_, stream);
     reset_canonical_overlay(stream);
   }
 
   // Folds the base and assignments with last-wins.
   void fold_into_base(cudaStream_t stream) {
-    // Materialize the overlay and collapse paged/cold runs first.
-    bake_overlay_into_base(stream);
-    std::vector<std::size_t> to_merge;
-    bool any_paged = false;
-    for (std::size_t r = 0; r < runs_.size(); ++r)
-      if (runs_[r].assignment) {
-        to_merge.push_back(r);
-        any_paged = any_paged || runs_[r].paged;
-      }
-    // Paged counts are upper bounds; merging packs them exactly.
-    if (to_merge.size() > 1 || (to_merge.size() == 1 && any_paged))
-      merge_run_group(to_merge, gpulsmopt_detail::AssignmentClass::ColdStable,
-                      0, stream);
-    std::vector<std::size_t> idx;
-    std::size_t total = 0;
-    if (sorted_run_ready()) {
-      idx.push_back(sorted_run_index_);
-      total += runs_[sorted_run_index_].count;
-    }
     std::vector<std::size_t> updates;
-    for (std::size_t r = 0; r < runs_.size(); ++r)
-      if (runs_[r].assignment) {
-        updates.push_back(r);
-        total += runs_[r].count;
-      }
-    std::sort(updates.begin(), updates.end(),
-              [this](std::size_t a, std::size_t b) {
-                return runs_[a].sequence < runs_[b].sequence;
-              });
-    for (const std::size_t r : updates)
-      idx.push_back(r);
+    std::size_t assignment_total = 0;
+    for (std::size_t r = 0; r < runs_.size(); ++r) {
+      if (!runs_[r].assignment)
+        continue;
+      updates.push_back(r);
+      assignment_total += runs_[r].count;
+    }
+    if (updates.empty()) {
+      bake_overlay_into_base(stream);
+      return;
+    }
+    std::stable_sort(updates.begin(), updates.end(),
+                     [this](std::size_t a, std::size_t b) {
+                       if (runs_[a].sequence_begin !=
+                           runs_[b].sequence_begin)
+                         return runs_[a].sequence_begin <
+                                runs_[b].sequence_begin;
+                       return runs_[a].sequence_end < runs_[b].sequence_end;
+                     });
+
+    const std::size_t base_count =
+        sorted_run_ready() ? sorted_run().count : 0u;
+    const std::size_t total = base_count + assignment_total;
     if (total == 0)
       return;
+    if (total > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::runtime_error("full consolidation exceeds CUB limits");
+
     resolve_keys_.resize_discard(total);
     resolve_payload_.resize_discard(total);
     resolve_alt_keys_.resize_discard(total);
     resolve_alt_payload_.resize_discard(total);
     resolve_flags_.resize_discard(total);
+    resolve_sel_vdelta_.resize_discard(total);
     resolve_count_.resize_discard(1);
     constexpr int block = 256;
-    std::size_t off = 0;
-    for (std::size_t j = 0; j < idx.size(); ++j) {
-      RunStorage &run = runs_[idx[j]];
-      if (run.count == 0)
-        continue;
-      // Packs the base as an insert run.
-      const bool is_insert =
-          !run.assignment ||
-          run.operation == gpulsmopt_detail::RunOperation::Insert;
-      const int grid = static_cast<int>((run.count + block - 1) / block);
-      gpulsmopt_detail::resolve_pack_run_kernel<<<grid, block, 0, stream>>>(
-          run.keys.data(), is_insert ? run.values.data() : nullptr,
-          run.mixed ? run.op_words.data() : nullptr,
-          static_cast<std::uint8_t>(is_insert ? 1u : 0u),
-          static_cast<std::uint8_t>(run.mixed ? 1u : 0u), run.count,
-          resolve_keys_.data() + off, resolve_payload_.data() + off);
+
+    if (base_count > 0) {
+      const int base_grid =
+          static_cast<int>((base_count + block - 1u) / block);
+      gpulsmopt_detail::resolve_pack_canonical_base_kernel<<<
+          base_grid, block, 0, stream>>>(
+          make_canonical_base_view(), resolve_keys_.data(),
+          resolve_payload_.data());
       CUDA_CHECK(cudaGetLastError());
-      off += run.count;
     }
+
+    normalize_views_.resize_discard(updates.size());
+    for (std::size_t slot = 0; slot < updates.size(); ++slot)
+      host_state_->scratch_views[slot] =
+          make_assignment_view(runs_[updates[slot]]);
+    CUDA_CHECK(cudaMemcpyAsync(
+        normalize_views_.data(), host_state_->scratch_views,
+        updates.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
+        cudaMemcpyHostToDevice, stream));
+    constexpr int quotient_rows = gpulsmopt_detail::kEpochQuotients + 1;
+    constexpr int count_grid = (quotient_rows + block - 1) / block;
+    gpulsmopt_detail::assignment_group_count_kernel<<<
+        count_grid, block, 0, stream>>>(
+        normalize_views_.data(), static_cast<int>(updates.size()),
+        compaction_counts_.data());
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(
+        compaction_counts_.data(), compaction_offsets_.data(),
+        gpulsmopt_detail::kEpochQuotients + 1u, stream);
+    gpulsmopt_detail::assignment_group_gather_kernel<<<
+        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
+        normalize_views_.data(), static_cast<int>(updates.size()),
+        compaction_offsets_.data(), resolve_keys_.data() + base_count,
+        resolve_payload_.data() + base_count);
+    CUDA_CHECK(cudaGetLastError());
+
     std::size_t sort_bytes = 0;
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, sort_bytes, resolve_keys_.data(), resolve_alt_keys_.data(),
@@ -3974,86 +4094,64 @@ private:
         sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
         resolve_alt_keys_.data(), resolve_payload_.data(),
         resolve_alt_payload_.data(), static_cast<int>(total), 0, 32, stream));
-    const int grid = static_cast<int>((total + block - 1) / block);
-    gpulsmopt_detail::resolve_flag_last_kernel<<<grid, block, 0, stream>>>(
-        resolve_alt_keys_.data(), total, resolve_flags_.data());
+    const int grid = static_cast<int>((total + block - 1u) / block);
+    gpulsmopt_detail::resolve_live_last_kernel<<<grid, block, 0, stream>>>(
+        resolve_alt_keys_.data(), resolve_alt_payload_.data(), total,
+        resolve_sel_vdelta_.data(), resolve_flags_.data());
     CUDA_CHECK(cudaGetLastError());
-    std::size_t key_sel_bytes = 0;
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, key_sel_bytes, resolve_alt_keys_.data(),
-        resolve_flags_.data(),
-        resolve_keys_.data(), resolve_count_.data(), static_cast<int>(total),
-        stream));
-    std::size_t payload_sel_bytes = 0;
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, payload_sel_bytes, resolve_alt_payload_.data(),
-        resolve_flags_.data(), resolve_payload_.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    std::size_t sel_bytes =
-        std::max(key_sel_bytes, payload_sel_bytes);
-    ensure_sort_temp(sel_bytes);
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), sel_bytes, resolve_alt_keys_.data(),
-        resolve_flags_.data(), resolve_keys_.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), sel_bytes, resolve_alt_payload_.data(),
-        resolve_flags_.data(), resolve_payload_.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    std::uint32_t latest = 0u;
-    CUDA_CHECK(cudaMemcpyAsync(&latest, resolve_count_.data(), sizeof(latest),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    resolve_sel_vdelta_.resize_discard(latest);
-    resolve_flags_.resize_discard(latest);
-    if (latest > 0) {
-      const int egrid = static_cast<int>((latest + block - 1) / block);
-      gpulsmopt_detail::resolve_base_extract_kernel<<<egrid, block, 0,
-                                                      stream>>>(
-          resolve_payload_.data(), latest, resolve_sel_vdelta_.data(),
-          resolve_flags_.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
+
     clear_sorted_state();
     for (auto &run : runs_)
       run_pool_.push_back(std::move(run));
     runs_.clear();
-    acquire_run_slot();
+    acquire_compaction_slot();
     RunStorage &base = runs_.back();
-    base.assignment = false;
+    base.count = 0;
     base.sequence = 0;
+    base.sequence_begin = 0;
+    base.sequence_end = 0;
+    base.stable_level = -1;
+    base.operation = gpulsmopt_detail::RunOperation::Insert;
+    base.assignment_class = gpulsmopt_detail::AssignmentClass::Raw;
+    base.mixed = false;
+    base.assignment = false;
     base.fully_sorted = true;
     base.unit_counts = true;
     base.unique_keys = true;
-    base.keys.resize_discard(latest);
-    base.values.resize_discard(latest);
+    base.paged = false;
+    base.cold_arena_slot = -1;
+    base.keys.resize_discard(total);
+    base.values.resize_discard(total);
+
+    std::size_t select_bytes = 0;
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        nullptr, select_bytes, resolve_alt_keys_.data(),
+        resolve_flags_.data(), base.keys.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    ensure_sort_temp(select_bytes);
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        sort_temp_storage_.data(), select_bytes, resolve_alt_keys_.data(),
+        resolve_flags_.data(), base.keys.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        sort_temp_storage_.data(), select_bytes, resolve_sel_vdelta_.data(),
+        resolve_flags_.data(), base.values.data(), resolve_count_.data(),
+        static_cast<int>(total), stream));
     std::uint32_t kept = 0u;
-    if (latest > 0) {
-      std::size_t b_bytes = 0;
-      CUDA_CHECK(cub::DeviceSelect::Flagged(
-          nullptr, b_bytes, resolve_keys_.data(), resolve_flags_.data(),
-          base.keys.data(), resolve_count_.data(), static_cast<int>(latest),
-          stream));
-      ensure_sort_temp(b_bytes);
-      CUDA_CHECK(cub::DeviceSelect::Flagged(
-          sort_temp_storage_.data(), b_bytes, resolve_keys_.data(),
-          resolve_flags_.data(), base.keys.data(), resolve_count_.data(),
-          static_cast<int>(latest), stream));
-      CUDA_CHECK(cub::DeviceSelect::Flagged(
-          sort_temp_storage_.data(), b_bytes, resolve_sel_vdelta_.data(),
-          resolve_flags_.data(), base.values.data(), resolve_count_.data(),
-          static_cast<int>(latest), stream));
-      CUDA_CHECK(cudaMemcpyAsync(&kept, resolve_count_.data(), sizeof(kept),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
+    CUDA_CHECK(cudaMemcpyAsync(&kept, resolve_count_.data(), sizeof(kept),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    base.quotient_off.release();
+    base.op_words.release();
+    base.count_delta.release();
+    base.page_counts.release();
     base.count = kept;
     base.keys.resize_discard(kept);
     base.values.resize_discard(kept);
-    build_assignment_offsets(base, kept, stream);
     build_sorted_run_cache(0u, stream);
     run_sequence_ = 0;
     chrono_views_.clear();
+    views_dirty_ = false;
     invalidate_resolved();
     succ_sparse_ready_ = false;
     allocate_canonical_overlay(kept, stream);
@@ -4100,7 +4198,7 @@ private:
     cold.cold_arena_slot = slot;
     cold.mixed = true;
     cold.operation = gpulsmopt_detail::RunOperation::Insert;
-    cold.unique_keys = true;
+    cold.unique_keys = false;
     cold.fully_sorted = false;
     cold.unit_counts = false;
     cold.count = 0;
@@ -4111,20 +4209,10 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u;
     cold.quotient_off.resize_discard(rows);
     cold.page_counts.resize_discard(rows);
-    cold.page_capacity.resize_discard(rows);
-    CUDA_CHECK(cudaMemsetAsync(
-        cold.quotient_off.data(), 0,
-        rows * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        cold.page_counts.data(), 0,
-        rows * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        cold.page_capacity.data(), 0,
-        rows * sizeof(std::uint32_t), stream));
     return idx;
   }
 
-  // Fold the 64 oldest raw runs into the canonical overlay (sec 10-13).
+  // Fold the 64 oldest raw runs.
   void canonical_fold(cudaStream_t stream) {
     std::vector<std::size_t> raw;
     for (std::size_t r = 0; r < runs_.size(); ++r)
@@ -4139,7 +4227,8 @@ private:
     if (group_size == 0)
       return;
     std::vector<std::size_t> group(raw.begin(), raw.begin() + group_size);
-    std::uint64_t seq_end = 0, seq_begin = ~std::uint64_t{0};
+    std::uint64_t seq_end = 0;
+    std::uint64_t seq_begin = ~std::uint64_t{0};
     std::size_t input_records = 0;
     std::size_t cold_idx = 0;
     {
@@ -4149,20 +4238,23 @@ private:
         seq_end = std::max(seq_end, runs_[r].sequence_end);
         seq_begin = std::min(seq_begin, runs_[r].sequence_begin);
         input_records += runs_[r].count;
-        host_state_->views[slot] = make_assignment_view(runs_[r]);
+        host_state_->scratch_views[slot] =
+            make_assignment_view(runs_[r]);
       }
       fold_source_views_.resize_discard(group_size);
       CUDA_CHECK(cudaMemcpyAsync(
-          fold_source_views_.data(), host_state_->views,
+          fold_source_views_.data(), host_state_->scratch_views,
           group_size * sizeof(gpulsmopt_detail::AssignmentRunView),
           cudaMemcpyHostToDevice, stream));
 
       cold_idx = acquire_cold_run(stream);
-      // Overlay becomes active; readers consult canonical state.
-      canonical_overlay_active_ = true;
       CUDA_CHECK(cudaMemsetAsync(fold_fallback_count_.data(), 0,
                                  sizeof(std::uint32_t), stream));
       CUDA_CHECK(cudaMemsetAsync(fold_fallback_head_.data(), 0,
+                                 sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(fold_cold_count_.data(), 0,
+                                 sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(fold_matched_count_.data(), 0,
                                  sizeof(std::uint32_t), stream));
     }
 
@@ -4170,16 +4262,12 @@ private:
     const std::size_t arena_slot =
         static_cast<std::size_t>(cold.cold_arena_slot);
     std::uint32_t *arena_keys =
-        cold_arena_keys_.data() +
-        arena_slot * cold_arena_slot_capacity_;
+        cold_arena_keys_.data() + arena_slot * cold_arena_slot_capacity_;
     std::uint32_t *arena_values =
-        cold_arena_values_.data() +
-        arena_slot * cold_arena_slot_capacity_;
+        cold_arena_values_.data() + arena_slot * cold_arena_slot_capacity_;
     std::uint32_t *arena_ops =
-        cold_arena_ops_.data() +
-        arena_slot * cold_arena_slot_words_;
-    std::uint32_t *arena_tail =
-        cold_arena_tail_.data() + arena_slot;
+        cold_arena_ops_.data() + arena_slot * cold_arena_slot_words_;
+    std::uint32_t *arena_tail = cold_arena_tail_.data() + arena_slot;
     {
       GPULSMOPT_FOLD_PHASE(prof_fold_fast_ms_);
       gpulsmopt_detail::canonical_fold_rank23_kernel<<<
@@ -4189,56 +4277,75 @@ private:
           make_sorted_view(), base_override_state_.data(),
           base_override_values_.data(), rank23_value_delta_.data(),
           rank23_count_delta_.data(), cold.quotient_off.data(),
-          cold.page_counts.data(), cold.page_capacity.data(),
-          arena_tail, cold_arena_slot_capacity_, arena_keys,
-          arena_values, arena_ops, fold_fallback_quotients_.data(),
-          fold_fallback_count_.data(), fold_stats_.data());
+          cold.page_counts.data(), arena_tail, cold_arena_slot_capacity_,
+          arena_keys, arena_values, arena_ops,
+          fold_fallback_quotients_.data(), fold_fallback_count_.data(),
+          fold_cold_count_.data(), fold_matched_count_.data(),
+          fold_stats_.data());
       CUDA_CHECK(cudaGetLastError());
     }
 
     {
       GPULSMOPT_FOLD_PHASE(prof_fold_fallback_ms_);
-      // Skip the fallback kernel entirely when nothing overflowed
-      // (the common case): a one-word D2H beats a flat empty scan.
-      std::uint32_t fallback_n = 0;
-      CUDA_CHECK(cudaMemcpyAsync(&fallback_n, fold_fallback_count_.data(),
-                                 sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
+      run_fold_fallback(group_size, cold, stream);
+      CUDA_CHECK(cudaMemcpyAsync(
+          &host_state_->fold_fallback_count,
+          fold_fallback_count_.data(), sizeof(std::uint32_t),
+          cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          &host_state_->fold_cold_count,
+          fold_cold_count_.data(), sizeof(std::uint32_t),
+          cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          &host_state_->fold_matched_count,
+          fold_matched_count_.data(), sizeof(std::uint32_t),
+          cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      if (fallback_n > 0)
-        run_fold_fallback(group_size, cold, stream);
     }
 
     {
       GPULSMOPT_FOLD_PHASE(prof_fold_book_ms_);
-      cold.count = input_records;
+      const std::size_t cold_records = host_state_->fold_cold_count;
+      const std::size_t matched_records = host_state_->fold_matched_count;
+      cold.count = cold_records;
       cold.sequence = seq_end;
       cold.sequence_begin = seq_begin;
       cold.sequence_end = seq_end;
       cold.stable_level = 0;
 
-      // Retire the folded raw runs (cold run stays in runs_).
       RunStorage cold_moved = std::move(runs_[cold_idx]);
       runs_.erase(runs_.begin() + static_cast<std::ptrdiff_t>(cold_idx));
       retire_run_group(group, stream);
-      runs_.push_back(std::move(cold_moved));
+      if (cold_records == 0) {
+        const int slot = cold_moved.cold_arena_slot;
+        if (slot >= 0 && slot < gpulsmopt_detail::kColdArenaSlots)
+          cold_arena_slot_used_[slot] = false;
+        cold_moved.paged = false;
+        cold_moved.cold_arena_slot = -1;
+        run_pool_.push_back(std::move(cold_moved));
+      } else {
+        runs_.push_back(std::move(cold_moved));
+      }
 
-      ++canonical_generation_;
-      canonical_through_sequence_ = seq_end;
-      rank23_value_prefix_ready_ = false;
-      rank23_count_prefix_ready_ = false;
+      if (matched_records != 0) {
+        canonical_overlay_active_ = true;
+        ++canonical_generation_;
+        rank23_value_prefix_ready_ = false;
+        rank23_count_prefix_ready_ = false;
+      }
       invalidate_resolved();
       succ_sparse_ready_ = false;
       ++maintenance_stats_.canonical_fold_count;
       maintenance_stats_.canonical_input_records += input_records;
-      // The fold is the compaction event the harness observes.
       ++maintenance_stats_.compaction_count;
       maintenance_stats_.compacted_input_records += input_records;
+      maintenance_stats_.compacted_output_records += cold_records;
     }
 
     {
       GPULSMOPT_FOLD_PHASE(prof_fold_carry_ms_);
-      carry_cold_run(runs_.size() - 1u, stream);
+      if (host_state_->fold_cold_count != 0)
+        carry_cold_run(runs_.size() - 1u, stream);
       rebuild_chrono_views(stream);
     }
 #ifdef GPULSMOPT_PROFILE_FOLD
@@ -4263,21 +4370,14 @@ private:
         gpulsmopt_detail::kFoldFallbackBlocks,
         gpulsmopt_detail::kFoldFallbackThreads, 0, stream>>>(
         fold_source_views_.data(), static_cast<int>(group_size),
-        fold_fallback_quotients_.data(),
-        fold_fallback_count_.data(), fold_fallback_head_.data(),
-        make_sorted_view(), base_override_state_.data(),
-        base_override_values_.data(), rank23_value_delta_.data(),
-        rank23_count_delta_.data(), cold.quotient_off.data(),
-        cold.page_counts.data(), cold.page_capacity.data(),
-        cold_arena_tail_.data() + slot,
+        fold_fallback_quotients_.data(), fold_fallback_count_.data(),
+        fold_fallback_head_.data(), cold.quotient_off.data(),
+        cold.page_counts.data(), cold_arena_tail_.data() + slot,
         cold_arena_slot_capacity_,
-        cold_arena_keys_.data() +
-            slot * cold_arena_slot_capacity_,
-        cold_arena_values_.data() +
-            slot * cold_arena_slot_capacity_,
-        cold_arena_ops_.data() +
-            slot * cold_arena_slot_words_,
-        fold_stats_.data());
+        cold_arena_keys_.data() + slot * cold_arena_slot_capacity_,
+        cold_arena_values_.data() + slot * cold_arena_slot_capacity_,
+        cold_arena_ops_.data() + slot * cold_arena_slot_words_,
+        fold_cold_count_.data(), fold_stats_.data());
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -4329,6 +4429,14 @@ private:
   std::size_t merge_run_group(std::vector<std::size_t> group,
                               gpulsmopt_detail::AssignmentClass out_class,
                               int out_level, cudaStream_t stream) {
+    std::stable_sort(group.begin(), group.end(),
+                     [this](std::size_t a, std::size_t b) {
+                       if (runs_[a].sequence_begin !=
+                           runs_[b].sequence_begin)
+                         return runs_[a].sequence_begin <
+                                runs_[b].sequence_begin;
+                       return runs_[a].sequence_end < runs_[b].sequence_end;
+                     });
     const std::size_t group_size = group.size();
     std::uint64_t group_seq = 0;
     std::uint64_t seq_begin = ~std::uint64_t{0};
@@ -4336,10 +4444,9 @@ private:
     for (const std::size_t r : group) {
       group_seq = std::max(group_seq, runs_[r].sequence_end);
       seq_begin = std::min(seq_begin, runs_[r].sequence_begin);
-      total += runs_[r].count; // exact for packed and paged cold runs
+      total += runs_[r].count;
     }
     if (total == 0) {
-      // Nothing to merge; drop the empty sources.
       retire_run_group(group, stream);
       rebuild_chrono_views(stream);
       invalidate_resolved();
@@ -4350,9 +4457,10 @@ private:
 
     normalize_views_.resize_discard(group_size);
     for (std::size_t slot = 0; slot < group_size; ++slot)
-      host_state_->views[slot] = make_assignment_view(runs_[group[slot]]);
+      host_state_->scratch_views[slot] =
+          make_assignment_view(runs_[group[slot]]);
     CUDA_CHECK(cudaMemcpyAsync(
-        normalize_views_.data(), host_state_->views,
+        normalize_views_.data(), host_state_->scratch_views,
         group_size * sizeof(gpulsmopt_detail::AssignmentRunView),
         cudaMemcpyHostToDevice, stream));
 
@@ -4372,7 +4480,6 @@ private:
         (gpulsmopt_detail::kEpochQuotients + 1u) * sizeof(std::uint32_t),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    // Paged sources carry upper-bound counts; actual may be less.
     const std::size_t actual = host_compaction_offsets_.back();
     if (actual > total)
       throw std::runtime_error("temporal compaction count mismatch");
@@ -4382,6 +4489,11 @@ private:
       invalidate_resolved();
       return runs_.size();
     }
+
+    compaction_stage_keys_.resize_discard(actual);
+    compaction_stage_payload_.resize_discard(actual);
+    compaction_keep_flags_.resize_discard(actual);
+    compaction_positions_.resize_discard(actual);
 
     using QuotientTile = std::pair<std::uint32_t, std::uint32_t>;
     std::vector<QuotientTile> tiles;
@@ -4403,20 +4515,21 @@ private:
       first = last;
     }
 
-    auto stage_tile = [&](const QuotientTile &tile) -> std::size_t {
+    for (const QuotientTile &tile : tiles) {
       const std::uint32_t tile_first = tile.first;
       const std::uint32_t segments = tile.second - tile.first;
-      const std::size_t tile_count =
-          host_compaction_offsets_[tile.second] -
+      const std::size_t tile_begin =
           host_compaction_offsets_[tile.first];
+      const std::size_t tile_count =
+          host_compaction_offsets_[tile.second] - tile_begin;
       if (tile_count == 0u)
-        return 0u;
+        continue;
       resolve_keys_.resize_discard(tile_count);
       resolve_payload_.resize_discard(tile_count);
       resolve_alt_keys_.resize_discard(tile_count);
       resolve_alt_payload_.resize_discard(tile_count);
-      const int offset_grid = static_cast<int>((segments + 1u + block - 1u) /
-                                               block);
+      const int offset_grid = static_cast<int>(
+          (segments + 1u + block - 1u) / block);
       gpulsmopt_detail::compaction_tile_offsets_kernel<<<
           offset_grid, block, 0, stream>>>(
           compaction_offsets_.data(), tile_first, segments,
@@ -4453,29 +4566,26 @@ private:
           resolve_alt_payload_.data(), static_cast<int>(tile_count),
           static_cast<int>(segments), compaction_tile_offsets_.data(),
           compaction_tile_offsets_.data() + 1u, 0, 16, stream));
-      return tile_count;
-    };
-
-    CUDA_CHECK(cudaMemsetAsync(
-        compaction_unique_counts_.data(), 0,
-        (gpulsmopt_detail::kEpochQuotients + 1u) * sizeof(std::uint32_t),
-        stream));
-    for (const QuotientTile &tile : tiles) {
-      const std::size_t tile_count = stage_tile(tile);
-      if (tile_count == 0u)
-        continue;
       const int grid =
           static_cast<int>((tile_count + block - 1u) / block);
-      gpulsmopt_detail::compaction_unique_count_kernel<<<
+      gpulsmopt_detail::compaction_stage_unique_kernel<<<
           grid, block, 0, stream>>>(
-          resolve_alt_keys_.data(), tile_count,
-          compaction_unique_counts_.data());
+          resolve_alt_keys_.data(), resolve_alt_payload_.data(), tile_count,
+          tile_begin, compaction_stage_keys_.data(),
+          compaction_stage_payload_.data(),
+          compaction_keep_flags_.data());
       CUDA_CHECK(cudaGetLastError());
     }
+
     exclusive_scan_u32(
-        compaction_unique_counts_.data(),
-        compaction_unique_offsets_.data(),
-        gpulsmopt_detail::kEpochQuotients + 1u, stream);
+        compaction_keep_flags_.data(), compaction_positions_.data(),
+        actual, stream);
+    gpulsmopt_detail::compaction_output_offsets_kernel<<<
+        count_grid, block, 0, stream>>>(
+        compaction_offsets_.data(), compaction_positions_.data(),
+        compaction_keep_flags_.data(), static_cast<std::uint32_t>(actual),
+        compaction_unique_offsets_.data());
+    CUDA_CHECK(cudaGetLastError());
     std::uint32_t compact_count = 0u;
     CUDA_CHECK(cudaMemcpyAsync(
         &compact_count,
@@ -4503,35 +4613,29 @@ private:
     merged.values.resize_discard(compact_count);
     merged.quotient_off.resize_discard(
         gpulsmopt_detail::kEpochQuotients + 1u);
-    merged.op_words.resize_discard(
-        (compact_count + 31u) / 32u + 1u);
-    CUDA_CHECK(cudaMemsetAsync(
-        merged.op_words.data(), 0,
-        ((compact_count + 31u) / 32u + 1u) *
-            sizeof(std::uint32_t),
-        stream));
+    const std::size_t op_word_count = (compact_count + 31u) / 32u;
+    merged.op_words.resize_discard(op_word_count);
+    compaction_output_ops_.resize_discard(compact_count);
     CUDA_CHECK(cudaMemcpyAsync(
         merged.quotient_off.data(), compaction_unique_offsets_.data(),
         (gpulsmopt_detail::kEpochQuotients + 1u) * sizeof(std::uint32_t),
         cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        compaction_unique_cursors_.data(),
-        compaction_unique_offsets_.data(),
-        gpulsmopt_detail::kEpochQuotients * sizeof(std::uint32_t),
-        cudaMemcpyDeviceToDevice, stream));
-    for (const QuotientTile &tile : tiles) {
-      const std::size_t tile_count = stage_tile(tile);
-      if (tile_count == 0u)
-        continue;
-      const int grid =
-          static_cast<int>((tile_count + block - 1u) / block);
-      gpulsmopt_detail::compaction_unique_scatter_kernel<<<
-          grid, block, 0, stream>>>(
-          resolve_alt_keys_.data(), resolve_alt_payload_.data(), tile_count,
-          compaction_unique_cursors_.data(), merged.keys.data(),
-          merged.values.data(), merged.op_words.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
+    const int scatter_grid =
+        static_cast<int>((actual + block - 1u) / block);
+    gpulsmopt_detail::compaction_unique_scatter_kernel<<<
+        scatter_grid, block, 0, stream>>>(
+        compaction_stage_keys_.data(), compaction_stage_payload_.data(),
+        compaction_keep_flags_.data(), compaction_positions_.data(), actual,
+        merged.keys.data(), merged.values.data(),
+        compaction_output_ops_.data());
+    CUDA_CHECK(cudaGetLastError());
+    const int word_grid =
+        static_cast<int>((op_word_count + block - 1u) / block);
+    gpulsmopt_detail::compaction_pack_ops_kernel<<<
+        word_grid, block, 0, stream>>>(
+        compaction_output_ops_.data(), compact_count,
+        merged.op_words.data());
+    CUDA_CHECK(cudaGetLastError());
 
     RunStorage compacted = std::move(runs_.back());
     runs_.pop_back();
@@ -4539,7 +4643,6 @@ private:
     runs_.push_back(std::move(compacted));
     rebuild_chrono_views(stream);
     invalidate_resolved();
-    // The successor watermark handles the merge.
     ++maintenance_stats_.cold_tier_compaction_count;
     maintenance_stats_.cold_tier_input_records += actual;
     maintenance_stats_.cold_tier_output_records += compact_count;
@@ -4623,7 +4726,6 @@ private:
   std::size_t cold_arena_slot_words_ = 0;
   bool cold_arena_slot_used_[gpulsmopt_detail::kColdArenaSlots] = {};
   std::uint64_t canonical_generation_ = 0;
-  std::uint64_t canonical_through_sequence_ = 0;
   std::uint64_t resolved_canonical_generation_ = ~std::uint64_t{0};
   std::size_t rank23_value_scan_bytes_ = 0;
   std::size_t rank23_count_scan_bytes_ = 0;
@@ -4634,6 +4736,8 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> fold_stats_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> fold_fallback_count_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> fold_fallback_head_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> fold_cold_count_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> fold_matched_count_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> cold_arena_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> cold_arena_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> cold_arena_ops_;
@@ -4658,9 +4762,12 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_counts_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_offsets_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_tile_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_unique_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_stage_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> compaction_stage_payload_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_keep_flags_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_positions_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_unique_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_unique_cursors_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> compaction_output_ops_;
   std::vector<std::uint32_t> host_compaction_offsets_;
   std::size_t compaction_sort_count_ = 0;
   std::size_t compaction_sort_segments_ = 0;
