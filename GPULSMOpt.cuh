@@ -99,6 +99,14 @@ constexpr std::uint32_t kHashCountMask =
     ~(kHashHeavyFlag | kHashScanFlag);
 constexpr std::size_t kWarmLeafCount =
     GPULSMOPT_PREWARM_LEAVES;
+constexpr std::size_t kLeafSlabRuns = 64;
+constexpr std::size_t kInitialLeafSlabs =
+    (kWarmLeafCount + kLeafSlabRuns - 1u) /
+    kLeafSlabRuns;
+constexpr std::size_t kInitialInsertLeafSlabs =
+    (kInitialLeafSlabs + 1u) / 2u;
+constexpr std::size_t kInitialDeleteLeafSlabs =
+    kInitialLeafSlabs / 2u;
 constexpr int kStableLevels = 16;
 static_assert(kRawFoldWidth == 64, "raw fold width must be 64");
 static_assert(kWarmLeafCount >= kRawFoldWidth,
@@ -226,26 +234,30 @@ public:
   RawDeviceBuffer(const RawDeviceBuffer &) = delete;
   RawDeviceBuffer &operator=(const RawDeviceBuffer &) = delete;
   RawDeviceBuffer(RawDeviceBuffer &&other) noexcept
-      : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+      : data_(other.data_), size_(other.size_), capacity_(other.capacity_),
+        owns_(other.owns_) {
     other.data_ = nullptr;
     other.size_ = 0;
     other.capacity_ = 0;
+    other.owns_ = false;
   }
   RawDeviceBuffer &operator=(RawDeviceBuffer &&other) noexcept {
     if (this == &other)
       return *this;
-    if (data_)
+    if (data_ && owns_)
       cudaFree(data_);
     data_ = other.data_;
     size_ = other.size_;
     capacity_ = other.capacity_;
+    owns_ = other.owns_;
     other.data_ = nullptr;
     other.size_ = 0;
     other.capacity_ = 0;
+    other.owns_ = false;
     return *this;
   }
   ~RawDeviceBuffer() {
-    if (data_)
+    if (data_ && owns_)
       cudaFree(data_);
   }
   void resize_discard(std::size_t count) {
@@ -256,10 +268,11 @@ public:
       T *next = nullptr;
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&next),
                             next_capacity * sizeof(T)));
-      if (data_)
+      if (data_ && owns_)
         CUDA_CHECK(cudaFree(data_));
       data_ = next;
       capacity_ = next_capacity;
+      owns_ = true;
     }
     size_ = count;
   }
@@ -269,31 +282,45 @@ public:
       T *next = nullptr;
       CUDA_CHECK(
           cudaMalloc(reinterpret_cast<void **>(&next), count * sizeof(T)));
-      if (data_)
+      if (data_ && owns_)
         CUDA_CHECK(cudaFree(data_));
       data_ = next;
       capacity_ = count;
+      owns_ = true;
     }
     size_ = count;
   }
 
   void release() {
-    if (data_)
+    if (data_ && owns_)
       CUDA_CHECK(cudaFree(data_));
     data_ = nullptr;
     size_ = 0;
     capacity_ = 0;
+    owns_ = false;
+  }
+
+  void bind_external(T *data, std::size_t capacity) {
+    if (data_ && owns_)
+      CUDA_CHECK(cudaFree(data_));
+    data_ = data;
+    size_ = 0;
+    capacity_ = capacity;
+    owns_ = false;
   }
 
   T *data() { return data_; }
   const T *data() const { return data_; }
   std::size_t size() const { return size_; }
   std::size_t capacity() const { return capacity_; }
+  bool owns() const { return owns_; }
+  bool external() const { return data_ != nullptr && !owns_; }
 
 private:
   T *data_ = nullptr;
   std::size_t size_ = 0;
   std::size_t capacity_ = 0;
+  bool owns_ = false;
 };
 
 __host__ __device__ inline std::size_t
@@ -750,6 +777,7 @@ struct PinnedHostState {
   std::uint32_t successor_miss_count;
   std::uint32_t gathered_count;
   std::uint32_t hash_heavy_count;
+  std::uint32_t hash_capacity;
 };
 
 __global__ void assignment_group_count_kernel(
@@ -2042,8 +2070,18 @@ explicit GPULSMOpt(const DictionaryConfig &config)
           "GPULSMOpt currently supports at most 2^31-1 records");
     }
     runs_.reserve(gpulsmopt_detail::kRunCapacity);
-    run_pool_.reserve(gpulsmopt_detail::kWarmLeafCount +
-                      gpulsmopt_detail::kRunCapacity);
+    run_pool_.reserve(gpulsmopt_detail::kRunCapacity);
+    insert_leaf_pool_.reserve(
+        (gpulsmopt_detail::kInitialInsertLeafSlabs + 1u) *
+        gpulsmopt_detail::kLeafSlabRuns);
+    delete_leaf_pool_.reserve(
+        (gpulsmopt_detail::kInitialDeleteLeafSlabs + 1u) *
+        gpulsmopt_detail::kLeafSlabRuns);
+    hash_storage_pool_.reserve(
+        gpulsmopt_detail::kColdArenaSlots + 1u);
+    leaf_slabs_.reserve(
+        gpulsmopt_detail::kLookupLeafCapacity /
+        gpulsmopt_detail::kLeafSlabRuns + 4u);
     CUDA_CHECK(cudaMallocHost(
         reinterpret_cast<void **>(&host_state_), sizeof(*host_state_)));
     const cudaError_t event_error =
@@ -2072,7 +2110,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     chrono_views_.clear();
     invalidate_resolved();
     succ_sparse_ready_ = false;
-    reset_cold_arena();
+    reset_parent_storage();
     ++base_generation_;
   }
 
@@ -2362,7 +2400,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       return;
     }
     sort_direct_batch(keys, values, n, stream);
-    acquire_run_slot();
+    acquire_compaction_slot();
     RunStorage &run = runs_.back();
     run.sequence_begin = 0;
     run.sequence_end = 0;
@@ -2376,7 +2414,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.nested = false;
     run.lookup_mask_ready = false;
     run.group_child_count = 0;
-    run.cold_arena_slot = -1;
     run.parent_slot = -1;
     run.count = n;
     run.fully_sorted = true;
@@ -2397,6 +2434,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.count_delta.release();
     build_sorted_run_cache(0u, stream);
     live_count_ = run.count;
+    release_build_sort_storage();
     prepare_for_insert(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
@@ -2443,17 +2481,17 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         resolved_.keys, resolved_.values, resolved_.count_delta,
         resolved_value_prefix_, resolved_count_prefix_, resolved_.quotient_off,
         resolved_.op_words);
-    // Hash-fold and arena scratch.
+    // Hash-fold scratch and pointer-only parent storage.
     total += device_bytes_all(
-        cold_arena_keys_, hash_overflow_offsets_arena_,
-        hash_counts_arena_, hash_heavy_capacities_,
-        hash_active_quotients_, hash_heavy_count_,
-        hash_child_views_arena_, hash_child_router_arena_,
-        parent_child_views_arena_);
+        hash_heavy_capacities_, hash_active_quotients_,
+        hash_heavy_count_, parent_child_views_arena_);
     for (const auto &epoch : runs_) {
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask);
+          epoch.op_words, epoch.lookup_mask,
+          epoch.hash_storage.keys, epoch.hash_storage.offsets,
+          epoch.hash_storage.counts, epoch.hash_storage.child_views,
+          epoch.hash_storage.child_router);
       for (const auto &child : epoch.hash_children)
         total += device_bytes_all(
             child.keys, child.values, child.quotient_off,
@@ -2463,6 +2501,22 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
           epoch.op_words, epoch.lookup_mask);
+    for (const auto &epoch : insert_leaf_pool_)
+      total += device_bytes_all(
+          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
+          epoch.op_words, epoch.lookup_mask);
+    for (const auto &epoch : delete_leaf_pool_)
+      total += device_bytes_all(
+          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
+          epoch.op_words, epoch.lookup_mask);
+    for (const auto &storage : hash_storage_pool_)
+      total += device_bytes_all(
+          storage.keys, storage.offsets, storage.counts,
+          storage.child_views, storage.child_router);
+    for (const auto &slab : leaf_slabs_)
+      total += device_bytes_all(
+          slab.keys, slab.values, slab.quotient_off,
+          slab.lookup_mask);
     return total;
   }
 
@@ -2474,6 +2528,24 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
     gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> lookup_mask;
     // Paged cold-run metadata (empty for packed runs).
+  };
+
+  struct HashFoldStorage {
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> offsets;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> counts;
+    gpulsmopt_detail::RawDeviceBuffer<
+        gpulsmopt_detail::AssignmentRunView> child_views;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> child_router;
+  };
+
+  struct LeafSlab {
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> lookup_mask;
+    std::size_t records_per_leaf = 0;
+    bool with_values = false;
   };
 
   struct RetainedLeaf : AssignmentLeafStorage {
@@ -2491,6 +2563,7 @@ private:
 
   struct RunStorage : AssignmentLeafStorage {
     gpulsmopt_detail::RawDeviceBuffer<std::int8_t> count_delta;
+    HashFoldStorage hash_storage;
     std::vector<RetainedLeaf> hash_children;
     std::size_t count = 0;
     // Temporal identity of an immutable assignment run.
@@ -2511,7 +2584,6 @@ private:
     bool nested = false;
     bool lookup_mask_ready = false;
     std::uint16_t group_child_count = 0;
-    int cold_arena_slot = -1;
     int parent_slot = -1;
   };
 
@@ -2539,7 +2611,7 @@ private:
   template <class T>
   static std::size_t
   device_bytes(const gpulsmopt_detail::RawDeviceBuffer<T> &v) {
-    return v.capacity() * sizeof(T);
+    return v.owns() ? v.capacity() * sizeof(T) : 0u;
   }
   template <class... Vecs>
   static std::size_t device_bytes_all(const Vecs &...vecs) {
@@ -2583,7 +2655,8 @@ private:
 
   // Builds the flat rank directory per base.
   void build_base_rank23(RunStorage &base, cudaStream_t stream) {
-    base_rank23_.resize_discard(gpulsmopt_detail::kBaseRank23Size + 1);
+    base_rank23_.resize_discard_exact(
+        gpulsmopt_detail::kBaseRank23Size + 1);
     std::uint32_t *dir = base_rank23_.data();
     const std::uint32_t count = static_cast<std::uint32_t>(base.count);
     if (count == 0u) {
@@ -2621,7 +2694,7 @@ private:
     const std::size_t count = run.count;
     build_base_rank23(run, stream);
     // BaseRun needs only a value prefix.
-    sorted_value_prefix_.resize_discard(count + 1u);
+    sorted_value_prefix_.resize_discard_exact(count + 1u);
     sorted_count_prefix_.resize_discard(0u);
     CUDA_CHECK(cudaMemsetAsync(sorted_value_prefix_.data(), 0,
                                sizeof(std::uint32_t), stream));
@@ -2739,7 +2812,7 @@ private:
   void create_assignment_run(bool is_insert, const std::uint32_t *keys,
                              const std::uint32_t *values, std::size_t count,
                              cudaStream_t stream) {
-    acquire_run_slot();
+    acquire_run_slot(is_insert, count);
     RunStorage &run = runs_.back();
     run.count = count;
     run.assignment = true;
@@ -2749,7 +2822,6 @@ private:
     run.nested = false;
     run.lookup_mask_ready = false;
     run.group_child_count = 0;
-    run.cold_arena_slot = -1;
     run.parent_slot = -1;
     run.hash_children.clear();
     run.mixed = false;
@@ -2873,36 +2945,26 @@ private:
     const bool insert =
         run.operation == gpulsmopt_detail::RunOperation::Insert;
     const bool hashed = run.hashed;
-    if (hashed && (run.cold_arena_slot < 0 ||
-                   run.cold_arena_slot >=
-                       gpulsmopt_detail::kColdArenaSlots))
-      throw std::runtime_error("hashed run has no arena slot");
+    if (hashed &&
+        (run.hash_storage.offsets.data() == nullptr ||
+         run.hash_storage.counts.data() == nullptr ||
+         run.hash_storage.child_views.data() == nullptr ||
+         run.hash_storage.child_router.data() == nullptr))
+      throw std::runtime_error("hashed run has no storage");
     if (run.grouped &&
         (run.parent_slot < 0 ||
          run.parent_slot >= gpulsmopt_detail::kParentSlots))
       throw std::runtime_error("grouped run has no parent slot");
-    const std::size_t slot = hashed
-        ? static_cast<std::size_t>(run.cold_arena_slot) : 0u;
     std::uint32_t *keys = hashed
-        ? cold_arena_keys_.data() +
-              slot * cold_arena_slot_capacity_
-        : run.keys.data();
+        ? run.hash_storage.keys.data() : run.keys.data();
     const std::uint32_t *offsets = hashed
-        ? hash_overflow_offsets_arena_.data() +
-              slot * (gpulsmopt_detail::kEpochQuotients + 1u)
-        : run.quotient_off.data();
+        ? run.hash_storage.offsets.data() : run.quotient_off.data();
     const std::uint32_t *quotient_meta = hashed
-        ? hash_counts_arena_.data() +
-              slot * (gpulsmopt_detail::kEpochQuotients + 1u)
-        : nullptr;
+        ? run.hash_storage.counts.data() : nullptr;
     const gpulsmopt_detail::AssignmentRunView *children = hashed
-        ? hash_child_views_arena_.data() +
-              slot * gpulsmopt_detail::kRawFoldWidth
-        : nullptr;
+        ? run.hash_storage.child_views.data() : nullptr;
     const std::uint32_t *child_router = hashed
-        ? hash_child_router_arena_.data() +
-              slot * gpulsmopt_detail::kHashRouteWordsPerParent
-        : nullptr;
+        ? run.hash_storage.child_router.data() : nullptr;
     const gpulsmopt_detail::AssignmentRunView *group_children = run.grouped
         ? parent_child_views_arena_.data() +
               static_cast<std::size_t>(run.parent_slot) *
@@ -3024,11 +3086,8 @@ private:
            child < run.hash_children.size(); ++child)
         host_state_->scratch_views[child] =
             make_retained_leaf_view(run.hash_children[child]);
-      const std::size_t view_base =
-          static_cast<std::size_t>(run.cold_arena_slot) *
-          gpulsmopt_detail::kRawFoldWidth;
       CUDA_CHECK(cudaMemcpyAsync(
-          hash_child_views_arena_.data() + view_base,
+          run.hash_storage.child_views.data(),
           host_state_->scratch_views,
           run.hash_children.size() *
               sizeof(gpulsmopt_detail::AssignmentRunView),
@@ -3125,51 +3184,190 @@ private:
     views_dirty_ = false;
   }
 
-  void acquire_run_slot() {
-    if (run_pool_.empty()) {
-      runs_.emplace_back();
+  static std::size_t checked_product(
+      std::size_t left, std::size_t right) {
+    if (right != 0u &&
+        left > std::numeric_limits<std::size_t>::max() / right)
+      throw std::overflow_error("leaf slab size overflow");
+    return left * right;
+  }
+
+  void grow_leaf_pool(std::size_t count, bool with_values) {
+    count = std::max<std::size_t>(count, 1u);
+    constexpr std::size_t slots =
+        gpulsmopt_detail::kLeafSlabRuns;
+    const std::size_t records = checked_product(slots, count);
+    const std::size_t quotient_entries = checked_product(
+        slots, gpulsmopt_detail::kEpochQuotients + 1u);
+    const std::size_t mask_entries = checked_product(
+        slots, gpulsmopt_detail::kEpochQuotients);
+    LeafSlab slab;
+    slab.records_per_leaf = count;
+    slab.with_values = with_values;
+    slab.keys.resize_discard_exact(records);
+    if (with_values)
+      slab.values.resize_discard_exact(records);
+    slab.quotient_off.resize_discard_exact(quotient_entries);
+    slab.lookup_mask.resize_discard_exact(mask_entries);
+    leaf_slabs_.push_back(std::move(slab));
+    LeafSlab &owner = leaf_slabs_.back();
+    std::uint32_t *keys = owner.keys.data();
+    std::uint32_t *values = owner.values.data();
+    std::uint32_t *offsets = owner.quotient_off.data();
+    std::uint64_t *masks = owner.lookup_mask.data();
+
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+      RunStorage leaf;
+      leaf.keys.bind_external(keys + slot * count, count);
+      if (with_values)
+        leaf.values.bind_external(
+            values + slot * count, count);
+      leaf.quotient_off.bind_external(
+          offsets + slot *
+              (gpulsmopt_detail::kEpochQuotients + 1u),
+          gpulsmopt_detail::kEpochQuotients + 1u);
+      leaf.lookup_mask.bind_external(
+          masks + slot * gpulsmopt_detail::kEpochQuotients,
+          gpulsmopt_detail::kEpochQuotients);
+      auto &pool = with_values
+                       ? insert_leaf_pool_
+                       : delete_leaf_pool_;
+      pool.push_back(std::move(leaf));
+    }
+  }
+
+  static bool leaf_slot_matches(
+      const RunStorage &run, bool with_values,
+      std::size_t count) {
+    if (!run.keys.external() ||
+        run.keys.capacity() < count ||
+        !run.quotient_off.external() ||
+        run.quotient_off.capacity() <
+            gpulsmopt_detail::kEpochQuotients + 1u ||
+        !run.lookup_mask.external())
+      return false;
+    if (with_values)
+      return run.values.external() &&
+             run.values.capacity() >= count;
+    return run.values.data() == nullptr;
+  }
+
+  std::vector<RunStorage> &leaf_pool(bool with_values) {
+    return with_values ? insert_leaf_pool_ : delete_leaf_pool_;
+  }
+
+  const std::vector<RunStorage> &leaf_pool(
+      bool with_values) const {
+    return with_values ? insert_leaf_pool_ : delete_leaf_pool_;
+  }
+
+  std::size_t available_leaf_slots(
+      bool with_values, std::size_t count) const {
+    const auto &pool = leaf_pool(with_values);
+    return static_cast<std::size_t>(std::count_if(
+        pool.begin(), pool.end(),
+        [with_values, count](const RunStorage &run) {
+          return leaf_slot_matches(run, with_values, count);
+        }));
+  }
+
+  RunStorage &available_insert_leaf(std::size_t count) {
+    if (!insert_leaf_pool_.empty() &&
+        leaf_slot_matches(insert_leaf_pool_.back(), true, count))
+      return insert_leaf_pool_.back();
+    auto slot = std::find_if(
+        insert_leaf_pool_.begin(), insert_leaf_pool_.end(),
+        [count](const RunStorage &run) {
+          return leaf_slot_matches(run, true, count);
+        });
+    if (slot == insert_leaf_pool_.end())
+      throw std::runtime_error("no insert leaf slab available");
+    return *slot;
+  }
+
+  void reserve_leaf_storage(std::size_t count) {
+    const std::size_t insert_target =
+        gpulsmopt_detail::kInitialInsertLeafSlabs *
+        gpulsmopt_detail::kLeafSlabRuns;
+    const std::size_t delete_target =
+        gpulsmopt_detail::kInitialDeleteLeafSlabs *
+        gpulsmopt_detail::kLeafSlabRuns;
+    while (available_leaf_slots(true, count) < insert_target)
+      grow_leaf_pool(count, true);
+    while (available_leaf_slots(false, count) < delete_target)
+      grow_leaf_pool(count, false);
+  }
+
+  void ensure_leaf_spares(std::size_t count) {
+    const std::size_t spare =
+        gpulsmopt_detail::kLeafSlabRuns;
+    while (available_leaf_slots(true, count) <= spare)
+      grow_leaf_pool(count, true);
+    while (available_leaf_slots(false, count) <= spare)
+      grow_leaf_pool(count, false);
+  }
+
+  void acquire_run_slot(bool with_values, std::size_t count) {
+    auto &pool = leaf_pool(with_values);
+    if (pool.empty() ||
+        !leaf_slot_matches(pool.back(), with_values, count)) {
+      auto slot = std::find_if(
+          pool.begin(), pool.end(),
+          [with_values, count](const RunStorage &run) {
+            return leaf_slot_matches(run, with_values, count);
+          });
+      if (slot != pool.end())
+        std::iter_swap(slot, pool.end() - 1);
+    }
+    if (pool.empty() ||
+        !leaf_slot_matches(pool.back(), with_values, count))
+      grow_leaf_pool(count, with_values);
+    if (pool.empty() ||
+        !leaf_slot_matches(pool.back(), with_values, count))
+      throw std::runtime_error("leaf slab allocation failed");
+    runs_.push_back(std::move(pool.back()));
+    pool.pop_back();
+  }
+
+  void recycle_run_storage(RunStorage &&run) {
+    if (!run.keys.external()) {
+      run_pool_.push_back(std::move(run));
       return;
     }
-    runs_.push_back(std::move(run_pool_.back()));
-    run_pool_.pop_back();
+    if (run.values.external())
+      insert_leaf_pool_.push_back(std::move(run));
+    else
+      delete_leaf_pool_.push_back(std::move(run));
   }
 
   void acquire_compaction_slot() {
-    if (run_pool_.empty()) {
+    auto best = run_pool_.end();
+    for (auto it = run_pool_.begin();
+         it != run_pool_.end(); ++it) {
+      if (!it->keys.owns())
+        continue;
+      if (best == run_pool_.end() ||
+          it->keys.capacity() > best->keys.capacity())
+        best = it;
+    }
+    if (best == run_pool_.end()) {
       runs_.emplace_back();
       return;
     }
-    auto best = std::max_element(
-        run_pool_.begin(), run_pool_.end(),
-        [](const RunStorage &left, const RunStorage &right) {
-          return left.keys.capacity() < right.keys.capacity();
-        });
     runs_.push_back(std::move(*best));
     run_pool_.erase(best);
   }
 
-  void reserve_leaf_storage(std::size_t count) {
-    while (run_pool_.size() < gpulsmopt_detail::kWarmLeafCount)
-      run_pool_.emplace_back();
-    for (RunStorage &leaf : run_pool_) {
-      leaf.keys.resize_discard(count);
-      leaf.values.resize_discard(count);
-      leaf.quotient_off.resize_discard_exact(
-          gpulsmopt_detail::kEpochQuotients + 1);
-      leaf.lookup_mask.resize_discard_exact(
-          gpulsmopt_detail::kEpochQuotients);
-    }
-  }
-
   void release_hash_children(RunStorage &run) {
     for (RetainedLeaf &child : run.hash_children) {
-      run_pool_.emplace_back();
-      RunStorage &leaf = run_pool_.back();
+      RunStorage leaf;
+      leaf.operation = child.operation;
       leaf.keys = std::move(child.keys);
       leaf.values = std::move(child.values);
       leaf.quotient_off = std::move(child.quotient_off);
       leaf.op_words = std::move(child.op_words);
       leaf.lookup_mask = std::move(child.lookup_mask);
+      recycle_run_storage(std::move(leaf));
     }
     run.hash_children.clear();
   }
@@ -3177,21 +3375,19 @@ private:
   void clear_run_state() {
     clear_sorted_state();
     for (auto &epoch : runs_) {
-      if (epoch.hashed)
+      if (epoch.hashed) {
         release_hash_children(epoch);
+        recycle_hash_storage(epoch);
+      }
       if (epoch.grouped && epoch.parent_slot >= 0 &&
           epoch.parent_slot < gpulsmopt_detail::kParentSlots)
         parent_slot_used_[epoch.parent_slot] = false;
-      if (epoch.cold_arena_slot >= 0 &&
-          epoch.cold_arena_slot < gpulsmopt_detail::kColdArenaSlots)
-        cold_arena_slot_used_[epoch.cold_arena_slot] = false;
       epoch.hashed = false;
       epoch.grouped = false;
       epoch.nested = false;
       epoch.group_child_count = 0;
-      epoch.cold_arena_slot = -1;
       epoch.parent_slot = -1;
-      run_pool_.push_back(std::move(epoch));
+      recycle_run_storage(std::move(epoch));
     }
     runs_.clear();
   }
@@ -3230,10 +3426,23 @@ private:
                                              static_cast<int>(count), stream));
   }
 
+  void release_build_sort_storage() {
+    direct_sort_keys_.release();
+    direct_sort_values_.release();
+    sort_temp_storage_.release();
+    direct_sort_count_ = 0;
+    direct_sort_temp_bytes_ = 0;
+    run_sort_count_ = 0;
+    run_sort_temp_bytes_ = 0;
+    scan_u32_count_ = 0;
+    scan_u32_temp_bytes_ = 0;
+    metadata_scan_temp_bytes_ = 0;
+  }
+
   void prepare_sort_storage(std::size_t direct_count, cudaStream_t stream) {
     direct_sort_keys_.resize_discard(direct_count);
     direct_sort_values_.resize_discard(direct_count);
-    RunStorage &sample = run_pool_.back();
+    RunStorage &sample = available_insert_leaf(direct_count);
     std::size_t direct_bytes = 0;
     if (direct_count > 0) {
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
@@ -3296,51 +3505,66 @@ private:
     succ_positive_l3_.resize_discard(l3);
   }
 
+  void prepare_hash_storage(HashFoldStorage &storage) {
+    storage.offsets.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    storage.counts.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    storage.child_views.resize_discard_exact(
+        gpulsmopt_detail::kRawFoldWidth);
+    storage.child_router.resize_discard_exact(
+        gpulsmopt_detail::kHashRouteWordsPerParent);
+  }
+
+  void reserve_hash_storage() {
+    while (hash_storage_pool_.size() <
+           gpulsmopt_detail::kColdArenaSlots) {
+      hash_storage_pool_.emplace_back();
+      prepare_hash_storage(hash_storage_pool_.back());
+    }
+  }
+
+  HashFoldStorage acquire_hash_storage() {
+    if (hash_storage_pool_.empty())
+      throw std::runtime_error("hash fold capacity exceeded");
+    HashFoldStorage storage =
+        std::move(hash_storage_pool_.back());
+    hash_storage_pool_.pop_back();
+    return storage;
+  }
+
+  void recycle_hash_storage(RunStorage &run) {
+    run.hash_storage.keys.release();
+    if (hash_storage_pool_.size() <
+        gpulsmopt_detail::kColdArenaSlots) {
+      hash_storage_pool_.push_back(
+          std::move(run.hash_storage));
+    } else {
+      run.hash_storage = HashFoldStorage{};
+    }
+  }
+
   void reserve_fold_storage(std::size_t batch_count) {
+    const std::size_t batch =
+        std::max<std::size_t>(batch_count, 1u);
+    if (batch > std::numeric_limits<std::uint32_t>::max() /
+                    gpulsmopt_detail::kRawFoldWidth)
+      throw std::runtime_error("hash fold exceeds 32-bit offsets");
     lookup_host_leaves_.reserve(
         gpulsmopt_detail::kLookupLeafCapacity);
-    const std::size_t batch =
-        std::max<std::size_t>(batch_count, 1);
-    const std::size_t fold_records =
-        batch * gpulsmopt_detail::kRawFoldWidth;
-    const std::size_t page_padding =
-        31u * gpulsmopt_detail::kEpochQuotients;
-    const std::size_t slot =
-        (fold_records + page_padding + 31u) & ~std::size_t{31u};
-    if (slot > std::numeric_limits<std::uint32_t>::max())
-      throw std::runtime_error("cold fold slot exceeds 32-bit offsets");
-    cold_arena_slot_capacity_ =
-        static_cast<std::uint32_t>(slot);
-    const std::size_t arena =
-        slot * gpulsmopt_detail::kColdArenaSlots;
-    cold_arena_keys_.resize_discard(arena);
-    hash_heavy_capacities_.resize_discard(
+    hash_heavy_capacities_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
-    const std::size_t hash_rows =
-        gpulsmopt_detail::kEpochQuotients + 1u;
-    hash_overflow_offsets_arena_.resize_discard(
-        hash_rows * gpulsmopt_detail::kColdArenaSlots);
-    hash_counts_arena_.resize_discard(
-        hash_rows * gpulsmopt_detail::kColdArenaSlots);
-    hash_active_quotients_.resize_discard(
+    hash_active_quotients_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients);
-    hash_heavy_count_.resize_discard(1);
-    hash_child_views_arena_.resize_discard(
-        gpulsmopt_detail::kRawFoldWidth *
-        gpulsmopt_detail::kColdArenaSlots);
-    hash_child_router_arena_.resize_discard(
-        gpulsmopt_detail::kHashRouteWordsPerParent *
-        gpulsmopt_detail::kColdArenaSlots);
-    lookup_publication_.resize_discard(1);
-    parent_child_views_arena_.resize_discard(
+    hash_heavy_count_.resize_discard_exact(1u);
+    reserve_hash_storage();
+    lookup_publication_.resize_discard_exact(1u);
+    parent_child_views_arena_.resize_discard_exact(
         gpulsmopt_detail::kStableFanout *
         gpulsmopt_detail::kParentSlots);
   }
 
-  void reset_cold_arena() {
-    for (int slot = 0; slot < gpulsmopt_detail::kColdArenaSlots;
-         ++slot)
-      cold_arena_slot_used_[slot] = false;
+  void reset_parent_storage() {
     for (int slot = 0; slot < gpulsmopt_detail::kParentSlots;
          ++slot)
       parent_slot_used_[slot] = false;
@@ -3357,7 +3581,7 @@ private:
     reserve_assignment_gather_storage();
     reserve_successor_storage();
     reserve_fold_storage(direct_count);
-    reset_cold_arena();
+    reset_parent_storage();
     constexpr int lookup_block = 256;
     const auto base = make_base_view();
     gpulsmopt_detail::temporal_lookup_leaf_block_kernel<<<
@@ -3369,8 +3593,8 @@ private:
         lookup_publication_.data(), 0, base, nullptr, 0,
         nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
-    if (direct_count > 0 && !run_pool_.empty()) {
-      RunStorage &sample = run_pool_.back();
+    if (direct_count > 0) {
+      RunStorage &sample = available_insert_leaf(direct_count);
       sort_run_batch(
           direct_sort_keys_.data(), direct_sort_values_.data(),
           direct_count, sample.keys.data(), sample.values.data(), stream);
@@ -3914,8 +4138,16 @@ private:
     CUDA_CHECK(cudaGetLastError());
 
     clear_sorted_state();
-    for (auto &run : runs_)
-      run_pool_.push_back(std::move(run));
+    for (auto &run : runs_) {
+      if (run.hashed) {
+        release_hash_children(run);
+        recycle_hash_storage(run);
+      }
+      if (run.grouped && run.parent_slot >= 0 &&
+          run.parent_slot < gpulsmopt_detail::kParentSlots)
+        parent_slot_used_[run.parent_slot] = false;
+      recycle_run_storage(std::move(run));
+    }
     runs_.clear();
     acquire_compaction_slot();
     RunStorage &base = runs_.back();
@@ -3934,7 +4166,6 @@ private:
     base.grouped = false;
     base.nested = false;
     base.group_child_count = 0;
-    base.cold_arena_slot = -1;
     base.parent_slot = -1;
     base.keys.resize_discard(total);
     base.values.resize_discard(total);
@@ -3969,7 +4200,7 @@ private:
     views_dirty_ = false;
     invalidate_resolved();
     succ_sparse_ready_ = false;
-    reset_cold_arena();
+    reset_parent_storage();
     ++base_generation_;
   }
 
@@ -4009,17 +4240,7 @@ private:
       return;
     raw.resize(gpulsmopt_detail::kRawFoldWidth);
 
-    int arena_slot = -1;
-    for (int slot = 0; slot < gpulsmopt_detail::kColdArenaSlots; ++slot) {
-      if (!cold_arena_slot_used_[slot]) {
-        arena_slot = slot;
-        break;
-      }
-    }
-    if (arena_slot < 0)
-      throw std::runtime_error("no free hash-fold arena slot");
-    cold_arena_slot_used_[arena_slot] = true;
-
+    HashFoldStorage hash_storage = acquire_hash_storage();
     std::uint64_t sequence_begin = ~std::uint64_t{0};
     std::uint64_t sequence_end = 0u;
     std::size_t input_records = 0u;
@@ -4032,10 +4253,7 @@ private:
           make_assignment_view(run);
     }
 
-    const std::size_t view_base =
-        static_cast<std::size_t>(arena_slot) *
-        gpulsmopt_detail::kRawFoldWidth;
-    auto *child_views = hash_child_views_arena_.data() + view_base;
+    auto *child_views = hash_storage.child_views.data();
     {
       GPULSMOPT_FOLD_PHASE(prof_hash_publish_ms);
       CUDA_CHECK(cudaMemcpyAsync(
@@ -4043,15 +4261,8 @@ private:
           raw.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
           cudaMemcpyHostToDevice, stream));
     }
-    const std::size_t arena_base =
-        static_cast<std::size_t>(arena_slot) *
-        cold_arena_slot_capacity_;
-    const std::size_t row_base =
-        static_cast<std::size_t>(arena_slot) *
-        (gpulsmopt_detail::kEpochQuotients + 1u);
-    std::uint32_t *counts = hash_counts_arena_.data() + row_base;
-    std::uint32_t *heavy_offsets =
-        hash_overflow_offsets_arena_.data() + row_base;
+    std::uint32_t *counts = hash_storage.counts.data();
+    std::uint32_t *heavy_offsets = hash_storage.offsets.data();
     constexpr int block = 256;
     constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
     constexpr int grid = (rows + block - 1) / block;
@@ -4067,22 +4278,27 @@ private:
           hash_active_quotients_.data(),
           hash_heavy_count_.data());
       CUDA_CHECK(cudaGetLastError());
+    }
+    {
+      GPULSMOPT_FOLD_PHASE(prof_hash_scan_ms);
+      exclusive_scan_u32(
+          hash_heavy_capacities_.data(), heavy_offsets,
+          gpulsmopt_detail::kEpochQuotients + 1u, stream);
       CUDA_CHECK(cudaMemcpyAsync(
           &host_state_->hash_heavy_count,
           hash_heavy_count_.data(), sizeof(std::uint32_t),
           cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          &host_state_->hash_capacity,
+          heavy_offsets + gpulsmopt_detail::kEpochQuotients,
+          sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     const std::uint32_t heavy_count =
         host_state_->hash_heavy_count;
-    {
-      GPULSMOPT_FOLD_PHASE(prof_hash_scan_ms);
-      if (heavy_count != 0u) {
-        exclusive_scan_u32(
-            hash_heavy_capacities_.data(), heavy_offsets,
-            gpulsmopt_detail::kEpochQuotients + 1u, stream);
-      }
-    }
+    const std::uint32_t hash_capacity =
+        host_state_->hash_capacity;
+    hash_storage.keys.resize_discard_exact(hash_capacity);
     {
       GPULSMOPT_FOLD_PHASE(prof_hash_build_ms);
       if (heavy_count != 0u) {
@@ -4090,18 +4306,13 @@ private:
             heavy_count, block, 0, stream>>>(
             child_views, static_cast<int>(raw.size()),
             hash_active_quotients_.data(), heavy_offsets,
-            counts, cold_arena_slot_capacity_,
-            cold_arena_keys_.data() + arena_base);
+            counts, hash_capacity, hash_storage.keys.data());
         CUDA_CHECK(cudaGetLastError());
       }
-      std::uint32_t *child_router =
-          hash_child_router_arena_.data() +
-          static_cast<std::size_t>(arena_slot) *
-              gpulsmopt_detail::kHashRouteWordsPerParent;
       gpulsmopt_detail::temporal_hash_route_kernel<<<
           gpulsmopt_detail::kEpochQuotients, 128, 0, stream>>>(
           child_views, static_cast<int>(raw.size()), counts,
-          child_router);
+          hash_storage.child_router.data());
       CUDA_CHECK(cudaGetLastError());
     }
 #ifdef GPULSMOPT_PROFILE_FOLD
@@ -4120,7 +4331,6 @@ private:
     folded.hashed = true;
     folded.grouped = false;
     folded.nested = false;
-    folded.cold_arena_slot = arena_slot;
     folded.mixed = true;
     folded.operation = gpulsmopt_detail::RunOperation::Insert;
     folded.sequence_begin = sequence_begin;
@@ -4129,6 +4339,7 @@ private:
     folded.unique_keys = false;
     folded.fully_sorted = false;
     folded.unit_counts = false;
+    folded.hash_storage = std::move(hash_storage);
     folded.hash_children.reserve(raw.size());
     for (const std::size_t index : raw) {
       RunStorage &source = runs_[index];
@@ -4151,6 +4362,8 @@ private:
       runs_.erase(runs_.begin() + static_cast<std::ptrdiff_t>(*it));
     }
     runs_.push_back(std::move(folded));
+    ensure_leaf_spares(
+        std::max<std::size_t>(batch_capacity_, 1u));
     invalidate_resolved();
     succ_sparse_ready_ = false;
     ++maintenance_stats_.hash_fold_count;
@@ -4290,23 +4503,13 @@ private:
   std::uint32_t succ_sparse_positive_l0_words_ = 0;
   std::uint32_t succ_sparse_positive_l3_words_ = 0;
   std::uint64_t base_generation_ = 0;
-  // Hash-fold arena state.
-  std::uint32_t cold_arena_slot_capacity_ = 0;
-  bool cold_arena_slot_used_[gpulsmopt_detail::kColdArenaSlots] = {};
-  // Hash-fold scratch.
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> cold_arena_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      hash_overflow_offsets_arena_;
+  // Hash-fold scratch and one ready spare.
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
       hash_heavy_capacities_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hash_counts_arena_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
       hash_active_quotients_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hash_heavy_count_;
-  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
-      hash_child_views_arena_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      hash_child_router_arena_;
+  std::vector<HashFoldStorage> hash_storage_pool_;
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
       parent_child_views_arena_;
   bool parent_slot_used_[gpulsmopt_detail::kParentSlots] = {};
@@ -4342,6 +4545,9 @@ private:
 #endif
   std::vector<RunStorage> runs_;
   std::vector<RunStorage> run_pool_;
+  std::vector<RunStorage> insert_leaf_pool_;
+  std::vector<RunStorage> delete_leaf_pool_;
+  std::vector<LeafSlab> leaf_slabs_;
 
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_values_;
