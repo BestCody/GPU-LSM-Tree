@@ -2,6 +2,7 @@
 #include "gpu_dictionary_adapter.cuh"
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_merge.cuh>
 #include <cub/iterator/transform_input_iterator.cuh>
 #include <cub/device/device_radix_sort.cuh>
@@ -87,6 +88,10 @@ constexpr int kHashFoldMaxRecords = 1280;
 constexpr int kHashRouteBits = 6;
 constexpr int kHashRouteBins = 1 << kHashRouteBits;
 constexpr int kHashRouteWordsPerBin = 2;
+constexpr int kHashRouteMaskBuildMax = 4;
+constexpr int kResolveSmallMax = 128;
+constexpr int kResolveMediumMax = 512;
+constexpr int kResolveLocalMax = 2048;
 constexpr std::size_t kHashRouteWordsPerParent =
     static_cast<std::size_t>(kEpochQuotients) *
     kHashRouteBins * kHashRouteWordsPerBin;
@@ -562,6 +567,7 @@ struct FlatAssignmentLeafView {
   const std::uint32_t *values;
   const std::uint32_t *offsets;
   std::uint32_t count;
+  std::uint32_t rank_base;
   std::uint8_t constant_op;
 };
 
@@ -841,11 +847,14 @@ struct LookupPublication {
 struct PinnedHostState {
   AssignmentRunView views[kRunCapacity];
   AssignmentRunView scratch_views[kRunCapacity];
+  const std::uint64_t *route_masks[kRawFoldWidth];
   LookupPublication lookup;
   std::uint32_t narrow_overflow;
   std::uint32_t resolved_count;
   std::uint32_t successor_miss_count;
   std::uint32_t gathered_count;
+  std::uint32_t resolve_class_counts[4];
+  std::uint32_t fused_winner_count;
   std::uint32_t hash_heavy_count;
   std::uint32_t hash_capacity;
 };
@@ -1337,6 +1346,241 @@ __global__ void normalize_correction_kernel(
   const std::uint64_t rank = static_cast<std::uint32_t>(i + 1u);
   tagged_keys[i] = (static_cast<std::uint64_t>(key) << 32) | rank;
   corrections[i] = corr_pack(value_delta, count_delta);
+}
+
+__global__ void resolve_classify_kernel(
+    const std::uint32_t *counts, std::uint32_t *lists,
+    std::uint32_t *class_counts,
+    std::uint32_t *winner_counts) {
+  const std::uint32_t q =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kEpochQuotients)
+    return;
+  winner_counts[q] = 0u;
+  if (q == kEpochQuotients || counts[q] == 0u)
+    return;
+  const std::uint32_t count = counts[q];
+  const int cls = count <= kResolveSmallMax
+                      ? 0
+                      : count <= kResolveMediumMax
+                            ? 1
+                            : count <= kResolveLocalMax ? 2 : 3;
+  const std::uint32_t slot =
+      atomicAdd(class_counts + cls, 1u);
+  lists[static_cast<std::size_t>(cls) *
+            kEpochQuotients +
+        slot] = q;
+}
+
+template <int Capacity> struct ResolveRecordStorage {
+  std::uint32_t keys[Capacity];
+  std::uint64_t payload[Capacity];
+};
+
+template <int Threads, int Items, bool KeepZero>
+__global__ __launch_bounds__(Threads)
+void quotient_local_resolve_kernel(
+    const FlatAssignmentLeafView *leaves, int leaf_count,
+    const std::uint32_t *quotient_list,
+    const std::uint32_t *input_counts,
+    const std::uint32_t *input_offsets, BaseRunView base,
+    std::uint64_t *out_keys, std::uint64_t *out_payload,
+    std::uint32_t *winner_counts) {
+  constexpr int capacity = Threads * Items;
+  constexpr int warps = Threads / 32;
+  using Sort = cub::BlockRadixSort<
+      std::uint32_t, Threads, Items, std::uint64_t>;
+  using Scan = cub::BlockScan<std::uint32_t, Threads>;
+  union SharedStorage {
+    typename Sort::TempStorage sort;
+    typename Scan::TempStorage scan;
+    ResolveRecordStorage<capacity> records;
+  };
+  __shared__ SharedStorage shared;
+  __shared__ std::uint32_t leaf_bases[kLookupLeafCapacity + 1];
+
+  const std::uint32_t q = quotient_list[blockIdx.x];
+  const std::uint32_t count = input_counts[q];
+  if (threadIdx.x == 0) {
+    std::uint32_t cursor = 0u;
+    for (int leaf = 0; leaf < leaf_count; ++leaf) {
+      leaf_bases[leaf] = cursor;
+      cursor += leaves[leaf].offsets[q + 1u] -
+                leaves[leaf].offsets[q];
+    }
+    leaf_bases[leaf_count] = cursor;
+  }
+  __syncthreads();
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  for (int leaf = warp; leaf < leaf_count; leaf += warps) {
+    const FlatAssignmentLeafView view = leaves[leaf];
+    const std::uint32_t begin = view.offsets[q];
+    const std::uint32_t end = view.offsets[q + 1u];
+    const std::uint32_t output = leaf_bases[leaf];
+    for (std::uint32_t i = lane; i < end - begin; i += 32u) {
+      const std::uint32_t position = begin + i;
+      const std::uint32_t key = view.keys[position];
+      const std::uint32_t value =
+          view.constant_op != 0u ? view.values[position] : 0u;
+      const std::uint32_t rank =
+          view.rank_base + position + 1u;
+      shared.records.keys[output + i] = key & 0xffffu;
+      shared.records.payload[output + i] =
+          (static_cast<std::uint64_t>(view.constant_op != 0u)
+           << 63) |
+          (static_cast<std::uint64_t>(rank) << 32) |
+          value;
+    }
+  }
+  __syncthreads();
+
+  std::uint32_t keys[Items];
+  std::uint64_t payload[Items];
+  bool keep[Items];
+#pragma unroll
+  for (int item = 0; item < Items; ++item) {
+    const int local = threadIdx.x * Items + item;
+    if (local < static_cast<int>(count)) {
+      keys[item] = shared.records.keys[local];
+      payload[item] = shared.records.payload[local];
+    } else {
+      keys[item] = 0xffffffffu;
+      payload[item] = 0u;
+    }
+    keep[item] = false;
+  }
+  __syncthreads();
+  Sort(shared.sort).Sort(keys, payload, 0, 16);
+  __syncthreads();
+#pragma unroll
+  for (int item = 0; item < Items; ++item) {
+    const int local = threadIdx.x * Items + item;
+    shared.records.keys[local] = keys[item];
+    shared.records.payload[local] = payload[item];
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int item = 0; item < Items; ++item) {
+    const int local = threadIdx.x * Items + item;
+    if (local >= static_cast<int>(count))
+      continue;
+    const std::uint32_t low = shared.records.keys[local];
+    if (local != 0 &&
+        shared.records.keys[local - 1] == low)
+      continue;
+    std::uint64_t newest = shared.records.payload[local];
+    std::uint32_t newest_rank =
+        static_cast<std::uint32_t>((newest >> 32) & 0x7fffffffu);
+    int next = local + 1;
+    while (next < static_cast<int>(count) &&
+           shared.records.keys[next] == low) {
+      const std::uint64_t candidate =
+          shared.records.payload[next];
+      const std::uint32_t rank = static_cast<std::uint32_t>(
+          (candidate >> 32) & 0x7fffffffu);
+      if (rank > newest_rank) {
+        newest = candidate;
+        newest_rank = rank;
+      }
+      ++next;
+    }
+
+    const std::uint32_t key =
+        (q << kEpochQuotientBits) | low;
+    const bool insert = (newest >> 63) != 0u;
+    const std::uint32_t value =
+        static_cast<std::uint32_t>(newest);
+    std::uint32_t base_value = 0u;
+    const bool base_live =
+        base.base.count != 0u &&
+        base_find_value(base, key, &base_value);
+    std::uint32_t value_delta = 0u;
+    std::int8_t count_delta = 0;
+    if (insert) {
+      value_delta = base_live ? value - base_value : value;
+      count_delta = base_live ? 0 : 1;
+    } else if (base_live) {
+      value_delta = 0u - base_value;
+      count_delta = -1;
+    }
+    const std::uint64_t correction =
+        corr_pack(value_delta, count_delta);
+    keep[item] = KeepZero || correction != 0u;
+    keys[item] = key;
+    payload[item] = correction;
+  }
+  __syncthreads();
+
+  std::uint32_t thread_count = 0u;
+#pragma unroll
+  for (int item = 0; item < Items; ++item)
+    thread_count += keep[item] ? 1u : 0u;
+  std::uint32_t thread_offset = 0u;
+  std::uint32_t block_total = 0u;
+  Scan(shared.scan).ExclusiveSum(
+      thread_count, thread_offset, block_total);
+  std::uint32_t local_offset = 0u;
+  const std::uint32_t output_base = input_offsets[q];
+#pragma unroll
+  for (int item = 0; item < Items; ++item) {
+    if (!keep[item])
+      continue;
+    const std::uint32_t output =
+        output_base + thread_offset + local_offset++;
+    out_keys[output] =
+        (static_cast<std::uint64_t>(keys[item]) << 32) | 1u;
+    out_payload[output] = payload[item];
+  }
+  if (threadIdx.x == 0)
+    winner_counts[q] = block_total;
+}
+
+__global__ void fused_resolve_pack_kernel(
+    const std::uint32_t *input_offsets,
+    const std::uint32_t *winner_counts,
+    const std::uint32_t *winner_offsets,
+    const std::uint64_t *input_keys,
+    const std::uint64_t *input_payload,
+    std::uint64_t *output_keys,
+    std::uint64_t *output_payload) {
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t count = winner_counts[q];
+  const std::uint32_t input = input_offsets[q];
+  const std::uint32_t output = winner_offsets[q];
+  for (std::uint32_t i = threadIdx.x; i < count;
+       i += blockDim.x) {
+    output_keys[output + i] = input_keys[input + i];
+    output_payload[output + i] = input_payload[input + i];
+  }
+}
+
+__global__ void fused_resolve_unpack_kernel(
+    const std::uint32_t *input_offsets,
+    const std::uint32_t *winner_counts,
+    const std::uint32_t *winner_offsets,
+    const std::uint64_t *input_keys,
+    const std::uint64_t *input_payload,
+    std::uint32_t *output_keys,
+    std::uint32_t *output_values,
+    std::int8_t *output_counts) {
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t count = winner_counts[q];
+  const std::uint32_t input = input_offsets[q];
+  const std::uint32_t output = winner_offsets[q];
+  for (std::uint32_t i = threadIdx.x; i < count;
+       i += blockDim.x) {
+    const std::uint64_t key = input_keys[input + i];
+    const std::uint64_t payload = input_payload[input + i];
+    output_keys[output + i] =
+        static_cast<std::uint32_t>(key >> 32);
+    output_values[output + i] =
+        static_cast<std::uint32_t>(payload >> 32);
+    output_counts[output + i] = static_cast<std::int8_t>(
+        static_cast<std::uint32_t>(payload));
+  }
 }
 
 __global__ void corr_pack_kernel(const std::uint32_t *value_delta,
@@ -1853,10 +2097,12 @@ __global__ void base_only_range_kernel(
       base_range_count(base, base_count_prefix, l, h);
 }
 
-__global__ void raw_quotient_mask_kernel(
+template <bool WithLookup>
+__global__ void raw_quotient_masks_kernel(
     const std::uint32_t *keys,
     const std::uint32_t *offsets,
-    std::uint64_t *masks) {
+    std::uint64_t *lookup_masks,
+    std::uint64_t *route_masks) {
   const std::uint32_t warp = threadIdx.x >> 5;
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t q =
@@ -1867,22 +2113,34 @@ __global__ void raw_quotient_mask_kernel(
   const std::uint32_t end = offsets[q + 1u];
   std::uint32_t low_mask = 0u;
   std::uint32_t high_mask = 0u;
+  std::uint64_t route_mask = 0u;
   for (std::uint32_t position = begin + lane;
        position < end; position += 32u) {
-    const std::uint64_t bits =
-        raw_quotient_mask_bits(keys[position] & 0xffffu);
-    low_mask |= static_cast<std::uint32_t>(bits);
-    high_mask |= static_cast<std::uint32_t>(bits >> 32);
+    const std::uint32_t low = keys[position] & 0xffffu;
+    if constexpr (WithLookup) {
+      const std::uint64_t bits = raw_quotient_mask_bits(low);
+      low_mask |= static_cast<std::uint32_t>(bits);
+      high_mask |= static_cast<std::uint32_t>(bits >> 32);
+    }
+    route_mask |= std::uint64_t{1}
+                  << (low >> (kEpochQuotientBits - kHashRouteBits));
   }
   for (int delta = 16; delta != 0; delta >>= 1) {
-    low_mask |= __shfl_down_sync(
-        0xffffffffu, low_mask, delta);
-    high_mask |= __shfl_down_sync(
-        0xffffffffu, high_mask, delta);
+    if constexpr (WithLookup) {
+      low_mask |= __shfl_down_sync(
+          0xffffffffu, low_mask, delta);
+      high_mask |= __shfl_down_sync(
+          0xffffffffu, high_mask, delta);
+    }
+    route_mask |= __shfl_down_sync(
+        0xffffffffu, route_mask, delta);
   }
-  if (lane == 0u)
-    masks[q] = (static_cast<std::uint64_t>(high_mask) << 32) |
-               low_mask;
+  if (lane == 0u) {
+    if constexpr (WithLookup)
+      lookup_masks[q] =
+          (static_cast<std::uint64_t>(high_mask) << 32) | low_mask;
+    route_masks[q] = route_mask;
+  }
 }
 
 // Plans pointer scans and indexes only heavy quotients.
@@ -2082,6 +2340,39 @@ void temporal_hash_route_kernel(
     child_router[base + tid] = route_masks[tid];
 }
 
+__global__ __launch_bounds__(64)
+void temporal_hash_route_mask_kernel(
+    const std::uint64_t *const *route_masks, int run_count,
+    const std::uint32_t *quotient_counts,
+    std::uint32_t *child_router) {
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t child = threadIdx.x;
+  const std::uint32_t lane = child & 31u;
+  const std::uint32_t word = child >> 5;
+  const std::size_t base =
+      static_cast<std::size_t>(q) * kHashRouteBins *
+      kHashRouteWordsPerBin;
+  if ((quotient_counts[q] & kHashScanFlag) == 0u) {
+    if (child < kHashRouteBins) {
+      child_router[base + child * kHashRouteWordsPerBin] = 0u;
+      child_router[base + child * kHashRouteWordsPerBin + 1u] = 0u;
+    }
+    return;
+  }
+  const std::uint64_t mask =
+      child < static_cast<std::uint32_t>(run_count)
+          ? route_masks[child][q]
+          : 0u;
+  for (int route = 0; route < kHashRouteBins; ++route) {
+    const std::uint32_t candidates = __ballot_sync(
+        0xffffffffu,
+        (mask & (std::uint64_t{1} << route)) != 0u);
+    if (lane == 0u)
+      child_router[base + route * kHashRouteWordsPerBin + word] =
+          candidates;
+  }
+}
+
 } // namespace gpulsmopt_detail
 
 class GPULSMOpt {
@@ -2149,6 +2440,14 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         gpulsmopt_detail::kLeafSlabRuns);
     hash_storage_pool_.reserve(
         gpulsmopt_detail::kColdArenaSlots + 1u);
+    hash_child_pool_.reserve(
+        gpulsmopt_detail::kColdArenaSlots + 1u);
+    for (int slot = 0;
+         slot < gpulsmopt_detail::kColdArenaSlots + 1; ++slot) {
+      hash_child_pool_.emplace_back();
+      hash_child_pool_.back().resize(
+          gpulsmopt_detail::kRawFoldWidth);
+    }
     leaf_slabs_.reserve(
         gpulsmopt_detail::kLookupLeafCapacity /
         gpulsmopt_detail::kLeafSlabRuns + 4u);
@@ -2483,6 +2782,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.grouped = false;
     run.nested = false;
     run.lookup_mask_ready = false;
+    run.route_mask_ready = false;
     run.group_child_count = 0;
     run.parent_slot = -1;
     run.count = n;
@@ -2535,6 +2835,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::size_t total = device_bytes_all(
         resolve_keys_, resolve_payload_, resolve_alt_keys_, resolve_alt_payload_,
         resolve_flags_, resolve_sel_vdelta_, resolve_count_,
+        resolve_quotient_lists_, resolve_class_counts_,
+        resolve_winner_counts_, resolve_winner_offsets_,
         normalize_views_, flat_normalize_views_,
         flat_normalize_bases_, norm_keys_, norm_pay_,
         cache_pay_, merge_out_keys_, merge_out_pay_, merge_flags_,
@@ -2542,6 +2844,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         compaction_offsets_,
         narrow_overflow_, assignment_views_,
         lookup_publication_,
+        hash_route_mask_views_,
         direct_sort_keys_, direct_sort_values_, sort_temp_storage_,
         sorted_value_prefix_, sorted_count_prefix_, base_rank23_,
         sorted_range_cdf_, succ_miss_indices_, succ_miss_count_,
@@ -2559,27 +2862,27 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     for (const auto &epoch : runs_) {
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask,
+          epoch.op_words, epoch.lookup_mask, epoch.route_mask,
           epoch.hash_storage.keys, epoch.hash_storage.offsets,
           epoch.hash_storage.counts, epoch.hash_storage.child_views,
           epoch.hash_storage.child_router);
       for (const auto &child : epoch.hash_children)
         total += device_bytes_all(
             child.keys, child.values, child.quotient_off,
-            child.op_words, child.lookup_mask);
+            child.op_words, child.lookup_mask, child.route_mask);
     }
     for (const auto &epoch : run_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask);
+          epoch.op_words, epoch.lookup_mask, epoch.route_mask);
     for (const auto &epoch : insert_leaf_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask);
+          epoch.op_words, epoch.lookup_mask, epoch.route_mask);
     for (const auto &epoch : delete_leaf_pool_)
       total += device_bytes_all(
           epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask);
+          epoch.op_words, epoch.lookup_mask, epoch.route_mask);
     for (const auto &storage : hash_storage_pool_)
       total += device_bytes_all(
           storage.keys, storage.offsets, storage.counts,
@@ -2587,7 +2890,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     for (const auto &slab : leaf_slabs_)
       total += device_bytes_all(
           slab.keys, slab.values, slab.quotient_off,
-          slab.lookup_mask);
+          slab.lookup_mask, slab.route_mask);
     return total;
   }
 
@@ -2598,6 +2901,7 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
     gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> lookup_mask;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> route_mask;
     // Paged cold-run metadata (empty for packed runs).
   };
 
@@ -2615,6 +2919,7 @@ private:
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
     gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
     gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> lookup_mask;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> route_mask;
     std::size_t records_per_leaf = 0;
     bool with_values = false;
   };
@@ -2625,6 +2930,7 @@ private:
     gpulsmopt_detail::RunOperation operation =
         gpulsmopt_detail::RunOperation::Insert;
     bool lookup_mask_ready = false;
+    bool route_mask_ready = false;
   };
 
   struct HostLookupLeaf {
@@ -2654,6 +2960,7 @@ private:
     bool grouped = false;
     bool nested = false;
     bool lookup_mask_ready = false;
+    bool route_mask_ready = false;
     std::uint16_t group_child_count = 0;
     int parent_slot = -1;
   };
@@ -2892,6 +3199,7 @@ private:
     run.grouped = false;
     run.nested = false;
     run.lookup_mask_ready = false;
+    run.route_mask_ready = false;
     run.group_child_count = 0;
     run.parent_slot = -1;
     run.hash_children.clear();
@@ -3124,30 +3432,36 @@ private:
         continue;
       if (run.assignment_class ==
               gpulsmopt_detail::AssignmentClass::Raw &&
-          !run.lookup_mask_ready) {
+          (!run.lookup_mask_ready || !run.route_mask_ready)) {
         run.lookup_mask.resize_discard_exact(
             gpulsmopt_detail::kEpochQuotients);
-        gpulsmopt_detail::raw_quotient_mask_kernel<<<
+        run.route_mask.resize_discard_exact(
+            gpulsmopt_detail::kEpochQuotients);
+        gpulsmopt_detail::raw_quotient_masks_kernel<true><<<
             grid, block, 0, stream>>>(
             run.keys.data(), run.quotient_off.data(),
-            run.lookup_mask.data());
+            run.lookup_mask.data(), run.route_mask.data());
         CUDA_CHECK(cudaGetLastError());
         run.lookup_mask_ready = true;
+        run.route_mask_ready = true;
         changed = true;
       }
       if (!run.hashed || run.hash_children.empty())
         continue;
       bool refresh = false;
       for (RetainedLeaf &child : run.hash_children) {
-        if (!child.lookup_mask_ready) {
+        if (!child.lookup_mask_ready || !child.route_mask_ready) {
           child.lookup_mask.resize_discard_exact(
               gpulsmopt_detail::kEpochQuotients);
-          gpulsmopt_detail::raw_quotient_mask_kernel<<<
+          child.route_mask.resize_discard_exact(
+              gpulsmopt_detail::kEpochQuotients);
+          gpulsmopt_detail::raw_quotient_masks_kernel<true><<<
               grid, block, 0, stream>>>(
               child.keys.data(), child.quotient_off.data(),
-              child.lookup_mask.data());
+              child.lookup_mask.data(), child.route_mask.data());
           CUDA_CHECK(cudaGetLastError());
           child.lookup_mask_ready = true;
+          child.route_mask_ready = true;
           refresh = true;
         }
       }
@@ -3280,12 +3594,14 @@ private:
       slab.values.resize_discard_exact(records);
     slab.quotient_off.resize_discard_exact(quotient_entries);
     slab.lookup_mask.resize_discard_exact(mask_entries);
+    slab.route_mask.resize_discard_exact(mask_entries);
     leaf_slabs_.push_back(std::move(slab));
     LeafSlab &owner = leaf_slabs_.back();
     std::uint32_t *keys = owner.keys.data();
     std::uint32_t *values = owner.values.data();
     std::uint32_t *offsets = owner.quotient_off.data();
     std::uint64_t *masks = owner.lookup_mask.data();
+    std::uint64_t *route_masks = owner.route_mask.data();
 
     for (std::size_t slot = 0; slot < slots; ++slot) {
       RunStorage leaf;
@@ -3299,6 +3615,9 @@ private:
           gpulsmopt_detail::kEpochQuotients + 1u);
       leaf.lookup_mask.bind_external(
           masks + slot * gpulsmopt_detail::kEpochQuotients,
+          gpulsmopt_detail::kEpochQuotients);
+      leaf.route_mask.bind_external(
+          route_masks + slot * gpulsmopt_detail::kEpochQuotients,
           gpulsmopt_detail::kEpochQuotients);
       auto &pool = with_values
                        ? insert_leaf_pool_
@@ -3315,7 +3634,8 @@ private:
         !run.quotient_off.external() ||
         run.quotient_off.capacity() <
             gpulsmopt_detail::kEpochQuotients + 1u ||
-        !run.lookup_mask.external())
+        !run.lookup_mask.external() ||
+        !run.route_mask.external())
       return false;
     if (with_values)
       return run.values.external() &&
@@ -3438,9 +3758,20 @@ private:
       leaf.quotient_off = std::move(child.quotient_off);
       leaf.op_words = std::move(child.op_words);
       leaf.lookup_mask = std::move(child.lookup_mask);
+      leaf.route_mask = std::move(child.route_mask);
       recycle_run_storage(std::move(leaf));
     }
-    run.hash_children.clear();
+    hash_child_pool_.push_back(
+        std::move(run.hash_children));
+  }
+
+  std::vector<RetainedLeaf> acquire_hash_children() {
+    if (hash_child_pool_.empty())
+      throw std::runtime_error("no free hash-child container");
+    std::vector<RetainedLeaf> children =
+        std::move(hash_child_pool_.back());
+    hash_child_pool_.pop_back();
+    return children;
   }
 
   void clear_run_state() {
@@ -3554,6 +3885,13 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
     compaction_offsets_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
+    resolve_quotient_lists_.resize_discard_exact(
+        4u * gpulsmopt_detail::kEpochQuotients);
+    resolve_class_counts_.resize_discard_exact(4u);
+    resolve_winner_counts_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
+    resolve_winner_offsets_.resize_discard_exact(
+        gpulsmopt_detail::kEpochQuotients + 1u);
   }
 
   // Reserve successor storage before timed updates.
@@ -3628,6 +3966,8 @@ private:
     hash_active_quotients_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients);
     hash_heavy_count_.resize_discard_exact(1u);
+    hash_route_mask_views_.resize_discard_exact(
+        gpulsmopt_detail::kRawFoldWidth);
     reserve_hash_storage();
     lookup_publication_.resize_discard_exact(1u);
     parent_child_views_arena_.resize_discard_exact(
@@ -3820,6 +4160,7 @@ private:
       std::uint32_t *max_count, cudaStream_t stream) {
     flat_normalize_host_.clear();
     *max_count = 0u;
+    std::uint32_t rank_base = 0u;
     for (const std::size_t index : idx) {
       RunStorage &run = runs_[index];
       if (run.grouped)
@@ -3839,7 +4180,9 @@ private:
                insert ? leaf.values.data() : nullptr,
                leaf.quotient_off.data(),
                static_cast<std::uint32_t>(leaf.count),
+               rank_base,
                static_cast<std::uint8_t>(insert ? 1u : 0u)});
+          rank_base += static_cast<std::uint32_t>(leaf.count);
           *max_count = std::max(
               *max_count,
               static_cast<std::uint32_t>(leaf.count));
@@ -3855,7 +4198,9 @@ private:
           {run.keys.data(), insert ? run.values.data() : nullptr,
            run.quotient_off.data(),
            static_cast<std::uint32_t>(run.count),
+           rank_base,
            static_cast<std::uint8_t>(insert ? 1u : 0u)});
+      rank_base += static_cast<std::uint32_t>(run.count);
       *max_count = std::max(
           *max_count, static_cast<std::uint32_t>(run.count));
     }
@@ -3876,8 +4221,9 @@ private:
   }
 
   // Gather by quotient and sort only unseen low bits.
-  std::size_t normalize_runs(const std::vector<std::size_t> &idx,
-                             cudaStream_t stream) {
+  std::size_t normalize_runs_legacy(
+      const std::vector<std::size_t> &idx,
+      cudaStream_t stream) {
     constexpr int block = 256;
     std::uint32_t flat_max_count = 0u;
     const bool use_flat = prepare_flat_normalize_leaves(
@@ -3992,6 +4338,163 @@ private:
     return total;
   }
 
+  std::size_t normalize_runs(
+      const std::vector<std::size_t> &idx,
+      cudaStream_t stream) {
+    constexpr int block = 256;
+    last_normalize_fused_ = false;
+    std::uint32_t max_leaf_count = 0u;
+    const bool flat = prepare_flat_normalize_leaves(
+        idx, &max_leaf_count, stream);
+    const std::size_t leaf_count =
+        flat_normalize_host_.size();
+    if (!flat || leaf_count > static_cast<std::size_t>(
+                                  gpulsmopt_detail::kLookupLeafCapacity))
+      return normalize_runs_legacy(idx, stream);
+
+    std::size_t total = 0u;
+    for (const auto &leaf : flat_normalize_host_)
+      total += leaf.count;
+    if (total == 0u)
+      return 0u;
+    if (total > static_cast<std::size_t>(
+                    std::numeric_limits<int>::max()))
+      throw std::runtime_error("resolved cache exceeds local limits");
+
+    constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
+    constexpr int count_grid = (rows + block - 1) / block;
+    compaction_counts_.resize_discard(rows);
+    compaction_offsets_.resize_discard(rows);
+    gpulsmopt_detail::flat_assignment_count_kernel<<<
+        count_grid, block, 0, stream>>>(
+        flat_normalize_views_.data(),
+        static_cast<int>(leaf_count),
+        compaction_counts_.data());
+    CUDA_CHECK(cudaGetLastError());
+    exclusive_scan_u32(
+        compaction_counts_.data(), compaction_offsets_.data(),
+        rows, stream);
+
+    CUDA_CHECK(cudaMemsetAsync(
+        resolve_class_counts_.data(), 0,
+        4u * sizeof(std::uint32_t), stream));
+    gpulsmopt_detail::resolve_classify_kernel<<<
+        count_grid, block, 0, stream>>>(
+        compaction_counts_.data(),
+        resolve_quotient_lists_.data(),
+        resolve_class_counts_.data(),
+        resolve_winner_counts_.data());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(
+        host_state_->resolve_class_counts,
+        resolve_class_counts_.data(),
+        4u * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (host_state_->resolve_class_counts[3] != 0u)
+      return normalize_runs_legacy(idx, stream);
+
+    merge_out_keys_.resize_discard(total);
+    merge_out_pay_.resize_discard(total);
+    const bool keep_zero = resolved_.count != 0u;
+    auto *lists = resolve_quotient_lists_.data();
+    const std::uint32_t small =
+        host_state_->resolve_class_counts[0];
+    const std::uint32_t medium =
+        host_state_->resolve_class_counts[1];
+    const std::uint32_t large =
+        host_state_->resolve_class_counts[2];
+    if (keep_zero) {
+      if (small != 0u)
+        gpulsmopt_detail::quotient_local_resolve_kernel<
+            32, 4, true><<<small, 32, 0, stream>>>(
+            flat_normalize_views_.data(),
+            static_cast<int>(leaf_count), lists,
+            compaction_counts_.data(),
+            compaction_offsets_.data(), make_base_view(),
+            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_counts_.data());
+      if (medium != 0u)
+        gpulsmopt_detail::quotient_local_resolve_kernel<
+            128, 4, true><<<medium, 128, 0, stream>>>(
+            flat_normalize_views_.data(),
+            static_cast<int>(leaf_count),
+            lists + gpulsmopt_detail::kEpochQuotients,
+            compaction_counts_.data(),
+            compaction_offsets_.data(), make_base_view(),
+            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_counts_.data());
+      if (large != 0u)
+        gpulsmopt_detail::quotient_local_resolve_kernel<
+            256, 8, true><<<large, 256, 0, stream>>>(
+            flat_normalize_views_.data(),
+            static_cast<int>(leaf_count),
+            lists + 2u * gpulsmopt_detail::kEpochQuotients,
+            compaction_counts_.data(),
+            compaction_offsets_.data(), make_base_view(),
+            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_counts_.data());
+    } else {
+      if (small != 0u)
+        gpulsmopt_detail::quotient_local_resolve_kernel<
+            32, 4, false><<<small, 32, 0, stream>>>(
+            flat_normalize_views_.data(),
+            static_cast<int>(leaf_count), lists,
+            compaction_counts_.data(),
+            compaction_offsets_.data(), make_base_view(),
+            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_counts_.data());
+      if (medium != 0u)
+        gpulsmopt_detail::quotient_local_resolve_kernel<
+            128, 4, false><<<medium, 128, 0, stream>>>(
+            flat_normalize_views_.data(),
+            static_cast<int>(leaf_count),
+            lists + gpulsmopt_detail::kEpochQuotients,
+            compaction_counts_.data(),
+            compaction_offsets_.data(), make_base_view(),
+            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_counts_.data());
+      if (large != 0u)
+        gpulsmopt_detail::quotient_local_resolve_kernel<
+            256, 8, false><<<large, 256, 0, stream>>>(
+            flat_normalize_views_.data(),
+            static_cast<int>(leaf_count),
+            lists + 2u * gpulsmopt_detail::kEpochQuotients,
+            compaction_counts_.data(),
+            compaction_offsets_.data(), make_base_view(),
+            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_counts_.data());
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    exclusive_scan_u32(
+        resolve_winner_counts_.data(),
+        resolve_winner_offsets_.data(), rows, stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        &host_state_->fused_winner_count,
+        resolve_winner_offsets_.data() +
+            gpulsmopt_detail::kEpochQuotients,
+        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint32_t winners =
+        host_state_->fused_winner_count;
+    last_normalize_fused_ = true;
+    if (resolved_.count != 0u && winners != 0u) {
+      norm_keys_.resize_discard(winners);
+      norm_pay_.resize_discard(winners);
+      gpulsmopt_detail::fused_resolve_pack_kernel<<<
+          gpulsmopt_detail::kEpochQuotients,
+          block, 0, stream>>>(
+          compaction_offsets_.data(),
+          resolve_winner_counts_.data(),
+          resolve_winner_offsets_.data(),
+          merge_out_keys_.data(), merge_out_pay_.data(),
+          norm_keys_.data(), norm_pay_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    return winners;
+  }
+
   std::uint32_t select_resolved(const std::uint64_t *keys,
                                 const std::uint64_t *pay,
                                 std::size_t total,
@@ -4095,6 +4598,37 @@ private:
         resolved_count_prefix_ready_ = false;
         resolved_ready_ = true;
       }
+      return;
+    }
+    if (last_normalize_fused_ && resolved_.count == 0u) {
+      const std::uint32_t changed =
+          static_cast<std::uint32_t>(total);
+      resolved_.count = changed;
+      resolved_.keys.resize_discard(changed);
+      resolved_.values.resize_discard(changed);
+      resolved_.count_delta.resize_discard(changed);
+      resolved_.quotient_off.resize_discard_exact(
+          gpulsmopt_detail::kEpochQuotients + 1u);
+      gpulsmopt_detail::fused_resolve_unpack_kernel<<<
+          gpulsmopt_detail::kEpochQuotients,
+          256, 0, stream>>>(
+          compaction_offsets_.data(),
+          resolve_winner_counts_.data(),
+          resolve_winner_offsets_.data(),
+          merge_out_keys_.data(), merge_out_pay_.data(),
+          resolved_.keys.data(), resolved_.values.data(),
+          resolved_.count_delta.data());
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaMemcpyAsync(
+          resolved_.quotient_off.data(),
+          resolve_winner_offsets_.data(),
+          (gpulsmopt_detail::kEpochQuotients + 1u) *
+              sizeof(std::uint32_t),
+          cudaMemcpyDeviceToDevice, stream));
+      resolved_value_prefix_ready_ = false;
+      resolved_count_prefix_ready_ = false;
+      resolved_ready_ = true;
+      resolved_through_sequence_ = run_sequence_;
       return;
     }
     const std::uint64_t *candidate_keys = norm_keys_.data();
@@ -4407,6 +4941,7 @@ private:
     std::uint64_t sequence_begin = ~std::uint64_t{0};
     std::uint64_t sequence_end = 0u;
     std::size_t input_records = 0u;
+    int missing_route_masks = 0;
     for (std::size_t child = 0; child < raw.size(); ++child) {
       RunStorage &run = runs_[raw[child]];
       sequence_begin = std::min(sequence_begin, run.sequence_begin);
@@ -4414,6 +4949,18 @@ private:
       input_records += run.count;
       host_state_->scratch_views[child] =
           make_assignment_view(run);
+      missing_route_masks += run.route_mask_ready ? 0 : 1;
+    }
+    const bool use_route_masks =
+        missing_route_masks <=
+        gpulsmopt_detail::kHashRouteMaskBuildMax;
+    if (use_route_masks) {
+      for (std::size_t child = 0; child < raw.size(); ++child) {
+        RunStorage &run = runs_[raw[child]];
+        run.route_mask.resize_discard_exact(
+            gpulsmopt_detail::kEpochQuotients);
+        host_state_->route_masks[child] = run.route_mask.data();
+      }
     }
 
     auto *child_views = hash_storage.child_views.data();
@@ -4423,6 +4970,12 @@ private:
           child_views, host_state_->scratch_views,
           raw.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
           cudaMemcpyHostToDevice, stream));
+      if (use_route_masks) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            hash_route_mask_views_.data(), host_state_->route_masks,
+            raw.size() * sizeof(std::uint64_t *),
+            cudaMemcpyHostToDevice, stream));
+      }
     }
     std::uint32_t *counts = hash_storage.counts.data();
     std::uint32_t *heavy_offsets = hash_storage.offsets.data();
@@ -4472,10 +5025,35 @@ private:
             counts, hash_capacity, hash_storage.keys.data());
         CUDA_CHECK(cudaGetLastError());
       }
-      gpulsmopt_detail::temporal_hash_route_kernel<<<
-          gpulsmopt_detail::kEpochQuotients, 128, 0, stream>>>(
-          child_views, static_cast<int>(raw.size()), counts,
-          hash_storage.child_router.data());
+      if (use_route_masks) {
+        constexpr int mask_block = 256;
+        constexpr int mask_warps = mask_block / 32;
+        constexpr int mask_grid =
+            (gpulsmopt_detail::kEpochQuotients +
+             mask_warps - 1) /
+            mask_warps;
+        for (const std::size_t index : raw) {
+          RunStorage &run = runs_[index];
+          if (run.route_mask_ready)
+            continue;
+          gpulsmopt_detail::raw_quotient_masks_kernel<false><<<
+              mask_grid, mask_block, 0, stream>>>(
+              run.keys.data(), run.quotient_off.data(), nullptr,
+              run.route_mask.data());
+          CUDA_CHECK(cudaGetLastError());
+          run.route_mask_ready = true;
+        }
+        gpulsmopt_detail::temporal_hash_route_mask_kernel<<<
+            gpulsmopt_detail::kEpochQuotients, 64, 0, stream>>>(
+            hash_route_mask_views_.data(),
+            static_cast<int>(raw.size()), counts,
+            hash_storage.child_router.data());
+      } else {
+        gpulsmopt_detail::temporal_hash_route_kernel<<<
+            gpulsmopt_detail::kEpochQuotients, 128, 0, stream>>>(
+            child_views, static_cast<int>(raw.size()), counts,
+            hash_storage.child_router.data());
+      }
       CUDA_CHECK(cudaGetLastError());
     }
 #ifdef GPULSMOPT_PROFILE_FOLD
@@ -4503,20 +5081,24 @@ private:
     folded.fully_sorted = false;
     folded.unit_counts = false;
     folded.hash_storage = std::move(hash_storage);
-    folded.hash_children.reserve(raw.size());
-    for (const std::size_t index : raw) {
+    folded.hash_children = acquire_hash_children();
+    for (std::size_t child_slot = 0;
+         child_slot < raw.size(); ++child_slot) {
+      const std::size_t index = raw[child_slot];
       RunStorage &source = runs_[index];
-      folded.hash_children.emplace_back();
-      RetainedLeaf &child = folded.hash_children.back();
+      RetainedLeaf &child =
+          folded.hash_children[child_slot];
       child.keys = std::move(source.keys);
       child.values = std::move(source.values);
       child.quotient_off = std::move(source.quotient_off);
       child.op_words = std::move(source.op_words);
       child.lookup_mask = std::move(source.lookup_mask);
+      child.route_mask = std::move(source.route_mask);
       child.count = source.count;
       child.sequence = source.sequence_end;
       child.operation = source.operation;
       child.lookup_mask_ready = source.lookup_mask_ready;
+      child.route_mask_ready = source.route_mask_ready;
     }
     std::sort(raw.begin(), raw.end());
     for (auto it = raw.rbegin(); it != raw.rend(); ++it) {
@@ -4634,6 +5216,7 @@ private:
   std::uint64_t run_sequence_ = 0;
   RunStorage resolved_;
   bool resolved_ready_ = false;
+  bool last_normalize_fused_ = false;
   // Incremental cache and merge scratch.
   std::uint64_t resolved_through_sequence_ = 0;
   std::uint64_t resolved_base_generation_ = ~std::uint64_t{0};
@@ -4679,6 +5262,8 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
       hash_active_quotients_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hash_heavy_count_;
+  gpulsmopt_detail::RawDeviceBuffer<const std::uint64_t *>
+      hash_route_mask_views_;
   std::vector<HashFoldStorage> hash_storage_pool_;
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
       parent_child_views_arena_;
@@ -4703,6 +5288,14 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> resolve_flags_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_sel_vdelta_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_count_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      resolve_quotient_lists_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      resolve_class_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      resolve_winner_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      resolve_winner_offsets_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_counts_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_offsets_;
 
@@ -4718,6 +5311,7 @@ private:
   std::vector<RunStorage> insert_leaf_pool_;
   std::vector<RunStorage> delete_leaf_pool_;
   std::vector<LeafSlab> leaf_slabs_;
+  std::vector<std::vector<RetainedLeaf>> hash_child_pool_;
 
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_values_;
