@@ -19,12 +19,14 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -312,6 +314,15 @@ public:
     size_ = 0;
     capacity_ = capacity;
     owns_ = false;
+  }
+
+  void adopt(T *data, std::size_t count) {
+    if (data_ && owns_)
+      CUDA_CHECK(cudaFree(data_));
+    data_ = data;
+    size_ = count;
+    capacity_ = count;
+    owns_ = true;
   }
 
   T *data() { return data_; }
@@ -2460,9 +2471,73 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       host_state_ = nullptr;
       CUDA_CHECK(event_error);
     }
+    const cudaError_t stream_error =
+        cudaStreamCreateWithFlags(&leaf_alloc_stream_,
+                                  cudaStreamNonBlocking);
+    if (stream_error != cudaSuccess) {
+      cudaEventDestroy(stream_handoff_);
+      stream_handoff_ = nullptr;
+      cudaFreeHost(host_state_);
+      host_state_ = nullptr;
+      CUDA_CHECK(stream_error);
+    }
+    const cudaError_t leaf_event_error =
+        cudaEventCreateWithFlags(&leaf_alloc_ready_,
+                                 cudaEventDisableTiming);
+    if (leaf_event_error != cudaSuccess) {
+      cudaStreamDestroy(leaf_alloc_stream_);
+      leaf_alloc_stream_ = nullptr;
+      cudaEventDestroy(stream_handoff_);
+      stream_handoff_ = nullptr;
+      cudaFreeHost(host_state_);
+      host_state_ = nullptr;
+      CUDA_CHECK(leaf_event_error);
+    }
+    const cudaError_t device_error =
+        cudaGetDevice(&leaf_alloc_device_);
+    if (device_error != cudaSuccess) {
+      cudaEventDestroy(leaf_alloc_ready_);
+      leaf_alloc_ready_ = nullptr;
+      cudaStreamDestroy(leaf_alloc_stream_);
+      leaf_alloc_stream_ = nullptr;
+      cudaEventDestroy(stream_handoff_);
+      stream_handoff_ = nullptr;
+      cudaFreeHost(host_state_);
+      host_state_ = nullptr;
+      CUDA_CHECK(device_error);
+    }
+    try {
+      leaf_alloc_worker_ = std::thread(
+          [this] { leaf_alloc_worker_loop(); });
+    } catch (...) {
+      cudaEventDestroy(leaf_alloc_ready_);
+      leaf_alloc_ready_ = nullptr;
+      cudaStreamDestroy(leaf_alloc_stream_);
+      leaf_alloc_stream_ = nullptr;
+      cudaEventDestroy(stream_handoff_);
+      stream_handoff_ = nullptr;
+      cudaFreeHost(host_state_);
+      host_state_ = nullptr;
+      throw;
+    }
   }
 
   ~GPULSMOpt() {
+    {
+      std::lock_guard<std::mutex> guard(leaf_alloc_mutex_);
+      leaf_alloc_stop_ = true;
+    }
+    leaf_alloc_cv_.notify_one();
+    if (leaf_alloc_worker_.joinable())
+      leaf_alloc_worker_.join();
+    if (leaf_alloc_stream_)
+      cudaStreamSynchronize(leaf_alloc_stream_);
+    if (leaf_alloc_result_)
+      cudaFree(leaf_alloc_result_);
+    if (leaf_alloc_ready_)
+      cudaEventDestroy(leaf_alloc_ready_);
+    if (leaf_alloc_stream_)
+      cudaStreamDestroy(leaf_alloc_stream_);
     if (stream_handoff_)
       cudaEventDestroy(stream_handoff_);
     if (host_state_)
@@ -2888,9 +2963,12 @@ explicit GPULSMOpt(const DictionaryConfig &config)
           storage.keys, storage.offsets, storage.counts,
           storage.child_views, storage.child_router);
     for (const auto &slab : leaf_slabs_)
-      total += device_bytes_all(
-          slab.keys, slab.values, slab.quotient_off,
-          slab.lookup_mask, slab.route_mask);
+      total += device_bytes(slab.arena);
+    if (pending_leaf_slab_valid_) {
+      const std::size_t owned =
+          device_bytes(pending_leaf_slab_.arena);
+      total += owned != 0u ? owned : pending_leaf_slab_bytes_;
+    }
     return total;
   }
 
@@ -2915,13 +2993,23 @@ private:
   };
 
   struct LeafSlab {
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> lookup_mask;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> route_mask;
+    gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> arena;
+    std::uint32_t *keys = nullptr;
+    std::uint32_t *values = nullptr;
+    std::uint32_t *quotient_off = nullptr;
+    std::uint64_t *lookup_mask = nullptr;
+    std::uint64_t *route_mask = nullptr;
     std::size_t records_per_leaf = 0;
     bool with_values = false;
+  };
+
+  struct LeafSlabLayout {
+    std::size_t bytes = 0;
+    std::size_t keys_offset = 0;
+    std::size_t values_offset = 0;
+    std::size_t quotient_offset = 0;
+    std::size_t lookup_offset = 0;
+    std::size_t route_offset = 0;
   };
 
   struct RetainedLeaf : AssignmentLeafStorage {
@@ -3190,7 +3278,7 @@ private:
   void create_assignment_run(bool is_insert, const std::uint32_t *keys,
                              const std::uint32_t *values, std::size_t count,
                              cudaStream_t stream) {
-    acquire_run_slot(is_insert, count);
+    acquire_run_slot(is_insert, count, stream);
     RunStorage &run = runs_.back();
     run.count = count;
     run.assignment = true;
@@ -3577,7 +3665,26 @@ private:
     return left * right;
   }
 
-  void grow_leaf_pool(std::size_t count, bool with_values) {
+  static std::size_t checked_sum(
+      std::size_t left, std::size_t right) {
+    if (left > std::numeric_limits<std::size_t>::max() - right)
+      throw std::overflow_error("leaf slab size overflow");
+    return left + right;
+  }
+
+  static std::size_t append_leaf_region(
+      std::size_t &cursor, std::size_t bytes,
+      std::size_t alignment) {
+    const std::size_t remainder = cursor % alignment;
+    if (remainder != 0u)
+      cursor = checked_sum(cursor, alignment - remainder);
+    const std::size_t offset = cursor;
+    cursor = checked_sum(cursor, bytes);
+    return offset;
+  }
+
+  static LeafSlabLayout leaf_slab_layout(
+      std::size_t count, bool with_values) {
     count = std::max<std::size_t>(count, 1u);
     constexpr std::size_t slots =
         gpulsmopt_detail::kLeafSlabRuns;
@@ -3586,44 +3693,205 @@ private:
         slots, gpulsmopt_detail::kEpochQuotients + 1u);
     const std::size_t mask_entries = checked_product(
         slots, gpulsmopt_detail::kEpochQuotients);
+    LeafSlabLayout layout;
+    layout.keys_offset = append_leaf_region(
+        layout.bytes,
+        checked_product(records, sizeof(std::uint32_t)),
+        alignof(std::uint32_t));
+    if (with_values)
+      layout.values_offset = append_leaf_region(
+          layout.bytes,
+          checked_product(records, sizeof(std::uint32_t)),
+          alignof(std::uint32_t));
+    layout.quotient_offset = append_leaf_region(
+        layout.bytes,
+        checked_product(quotient_entries, sizeof(std::uint32_t)),
+        alignof(std::uint32_t));
+    layout.lookup_offset = append_leaf_region(
+        layout.bytes,
+        checked_product(mask_entries, sizeof(std::uint64_t)),
+        alignof(std::uint64_t));
+    layout.route_offset = append_leaf_region(
+        layout.bytes,
+        checked_product(mask_entries, sizeof(std::uint64_t)),
+        alignof(std::uint64_t));
+    return layout;
+  }
+
+  static void bind_leaf_slab(
+      LeafSlab &slab, const LeafSlabLayout &layout) {
+    std::uint8_t *base = slab.arena.data();
+    slab.keys = reinterpret_cast<std::uint32_t *>(
+        base + layout.keys_offset);
+    if (slab.with_values)
+      slab.values = reinterpret_cast<std::uint32_t *>(
+          base + layout.values_offset);
+    slab.quotient_off = reinterpret_cast<std::uint32_t *>(
+        base + layout.quotient_offset);
+    slab.lookup_mask = reinterpret_cast<std::uint64_t *>(
+        base + layout.lookup_offset);
+    slab.route_mask = reinterpret_cast<std::uint64_t *>(
+        base + layout.route_offset);
+  }
+
+  LeafSlab make_leaf_slab(
+      std::size_t count, bool with_values) {
+    count = std::max<std::size_t>(count, 1u);
+    const LeafSlabLayout layout =
+        leaf_slab_layout(count, with_values);
     LeafSlab slab;
     slab.records_per_leaf = count;
     slab.with_values = with_values;
-    slab.keys.resize_discard_exact(records);
-    if (with_values)
-      slab.values.resize_discard_exact(records);
-    slab.quotient_off.resize_discard_exact(quotient_entries);
-    slab.lookup_mask.resize_discard_exact(mask_entries);
-    slab.route_mask.resize_discard_exact(mask_entries);
+    slab.arena.resize_discard_exact(layout.bytes);
+    bind_leaf_slab(slab, layout);
+    return slab;
+  }
+
+  void leaf_alloc_worker_loop() {
+    const cudaError_t device_status =
+        cudaSetDevice(leaf_alloc_device_);
+    for (;;) {
+      std::size_t bytes = 0u;
+      {
+        std::unique_lock<std::mutex> guard(leaf_alloc_mutex_);
+        leaf_alloc_cv_.wait(guard, [this] {
+          return leaf_alloc_stop_ || leaf_alloc_request_;
+        });
+        if (leaf_alloc_stop_ && !leaf_alloc_request_)
+          return;
+        bytes = leaf_alloc_request_bytes_;
+        leaf_alloc_request_ = false;
+      }
+
+      std::uint8_t *arena = nullptr;
+      cudaError_t status = device_status;
+      if (status == cudaSuccess)
+        status = cudaMallocAsync(
+            reinterpret_cast<void **>(&arena), bytes,
+            leaf_alloc_stream_);
+      if (status == cudaSuccess)
+        status = cudaEventRecord(
+            leaf_alloc_ready_, leaf_alloc_stream_);
+
+      {
+        std::lock_guard<std::mutex> guard(leaf_alloc_mutex_);
+        leaf_alloc_result_ = arena;
+        leaf_alloc_status_ = status;
+        leaf_alloc_result_ready_ = true;
+      }
+      leaf_alloc_cv_.notify_all();
+    }
+  }
+
+  void publish_leaf_slab(LeafSlab &&slab) {
     leaf_slabs_.push_back(std::move(slab));
     LeafSlab &owner = leaf_slabs_.back();
-    std::uint32_t *keys = owner.keys.data();
-    std::uint32_t *values = owner.values.data();
-    std::uint32_t *offsets = owner.quotient_off.data();
-    std::uint64_t *masks = owner.lookup_mask.data();
-    std::uint64_t *route_masks = owner.route_mask.data();
+    const std::size_t count = owner.records_per_leaf;
+    const bool with_values = owner.with_values;
+    auto &pool = leaf_pool(with_values);
 
-    for (std::size_t slot = 0; slot < slots; ++slot) {
+    for (std::size_t slot = 0;
+         slot < gpulsmopt_detail::kLeafSlabRuns; ++slot) {
       RunStorage leaf;
-      leaf.keys.bind_external(keys + slot * count, count);
+      leaf.keys.bind_external(owner.keys + slot * count, count);
       if (with_values)
         leaf.values.bind_external(
-            values + slot * count, count);
+            owner.values + slot * count, count);
       leaf.quotient_off.bind_external(
-          offsets + slot *
+          owner.quotient_off + slot *
               (gpulsmopt_detail::kEpochQuotients + 1u),
           gpulsmopt_detail::kEpochQuotients + 1u);
       leaf.lookup_mask.bind_external(
-          masks + slot * gpulsmopt_detail::kEpochQuotients,
+          owner.lookup_mask +
+              slot * gpulsmopt_detail::kEpochQuotients,
           gpulsmopt_detail::kEpochQuotients);
       leaf.route_mask.bind_external(
-          route_masks + slot * gpulsmopt_detail::kEpochQuotients,
+          owner.route_mask +
+              slot * gpulsmopt_detail::kEpochQuotients,
           gpulsmopt_detail::kEpochQuotients);
-      auto &pool = with_values
-                       ? insert_leaf_pool_
-                       : delete_leaf_pool_;
       pool.push_back(std::move(leaf));
     }
+  }
+
+  void grow_leaf_pool(std::size_t count, bool with_values) {
+    publish_leaf_slab(
+        make_leaf_slab(count, with_values));
+  }
+
+  void start_pending_leaf_slab(
+      std::size_t count, bool with_values) {
+    if (pending_leaf_slab_valid_)
+      throw std::runtime_error("leaf slab request already pending");
+    count = std::max<std::size_t>(count, 1u);
+    const LeafSlabLayout layout =
+        leaf_slab_layout(count, with_values);
+    pending_leaf_slab_ = LeafSlab{};
+    pending_leaf_slab_.records_per_leaf = count;
+    pending_leaf_slab_.with_values = with_values;
+    pending_leaf_slab_bytes_ = layout.bytes;
+    {
+      std::lock_guard<std::mutex> guard(leaf_alloc_mutex_);
+      if (leaf_alloc_request_ || leaf_alloc_result_ready_)
+        throw std::runtime_error("leaf allocator is busy");
+      leaf_alloc_request_bytes_ = layout.bytes;
+      leaf_alloc_request_ = true;
+    }
+    pending_leaf_slab_valid_ = true;
+    leaf_alloc_cv_.notify_one();
+  }
+
+  bool promote_pending_leaf_slab(
+      cudaStream_t stream, bool wait) {
+    if (!pending_leaf_slab_valid_)
+      return false;
+    std::uint8_t *arena = nullptr;
+    cudaError_t allocation_status = cudaSuccess;
+    {
+      std::unique_lock<std::mutex> guard(leaf_alloc_mutex_);
+      if (!leaf_alloc_result_ready_) {
+        if (!wait)
+          return false;
+        leaf_alloc_cv_.wait(guard, [this] {
+          return leaf_alloc_result_ready_;
+        });
+      }
+      allocation_status = leaf_alloc_status_;
+      if (allocation_status == cudaSuccess) {
+        const cudaError_t ready =
+            cudaEventQuery(leaf_alloc_ready_);
+        if (ready == cudaErrorNotReady) {
+          if (!wait)
+            return false;
+          CUDA_CHECK(cudaStreamWaitEvent(
+              stream, leaf_alloc_ready_, 0));
+        } else {
+          CUDA_CHECK(ready);
+        }
+      }
+      arena = leaf_alloc_result_;
+      leaf_alloc_result_ = nullptr;
+      leaf_alloc_result_ready_ = false;
+    }
+    if (allocation_status != cudaSuccess) {
+      cudaStreamSynchronize(leaf_alloc_stream_);
+      if (arena)
+        cudaFree(arena);
+      pending_leaf_slab_ = LeafSlab{};
+      pending_leaf_slab_bytes_ = 0u;
+      pending_leaf_slab_valid_ = false;
+      CUDA_CHECK(allocation_status);
+    }
+    const LeafSlabLayout layout = leaf_slab_layout(
+        pending_leaf_slab_.records_per_leaf,
+        pending_leaf_slab_.with_values);
+    pending_leaf_slab_.arena.adopt(arena, layout.bytes);
+    bind_leaf_slab(pending_leaf_slab_, layout);
+    LeafSlab slab = std::move(pending_leaf_slab_);
+    pending_leaf_slab_ = LeafSlab{};
+    pending_leaf_slab_bytes_ = 0u;
+    pending_leaf_slab_valid_ = false;
+    publish_leaf_slab(std::move(slab));
+    return true;
   }
 
   static bool leaf_slot_matches(
@@ -3676,7 +3944,10 @@ private:
     return *slot;
   }
 
-  void reserve_leaf_storage(std::size_t count) {
+  void reserve_leaf_storage(
+      std::size_t count, cudaStream_t stream) {
+    if (pending_leaf_slab_valid_)
+      promote_pending_leaf_slab(stream, true);
     const std::size_t insert_target =
         gpulsmopt_detail::kInitialInsertLeafSlabs *
         gpulsmopt_detail::kLeafSlabRuns;
@@ -3689,16 +3960,45 @@ private:
       grow_leaf_pool(count, false);
   }
 
-  void ensure_leaf_spares(std::size_t count) {
-    const std::size_t spare =
+  void maintain_leaf_spare(
+      std::size_t count, cudaStream_t stream) {
+    count = std::max<std::size_t>(count, 1u);
+    constexpr std::size_t low =
         gpulsmopt_detail::kLeafSlabRuns;
-    while (available_leaf_slots(true, count) <= spare)
-      grow_leaf_pool(count, true);
-    while (available_leaf_slots(false, count) <= spare)
-      grow_leaf_pool(count, false);
+    std::size_t insert_free = available_leaf_slots(true, count);
+    std::size_t delete_free = available_leaf_slots(false, count);
+
+    if (pending_leaf_slab_valid_) {
+      const bool pending_insert =
+          pending_leaf_slab_.with_values;
+      const std::size_t pending_free =
+          pending_insert ? insert_free : delete_free;
+      const std::size_t other_free =
+          pending_insert ? delete_free : insert_free;
+      if (pending_free == 0u || other_free <= low) {
+        promote_pending_leaf_slab(stream, true);
+        insert_free = available_leaf_slots(true, count);
+        delete_free = available_leaf_slots(false, count);
+      }
+    }
+
+    if (!pending_leaf_slab_valid_) {
+      const bool insert_low = insert_free <= low;
+      const bool delete_low = delete_free <= low;
+      if (insert_low || delete_low) {
+        const bool with_values =
+            insert_low && (!delete_low || insert_free <= delete_free);
+        start_pending_leaf_slab(count, with_values);
+        const std::size_t free =
+            with_values ? insert_free : delete_free;
+        if (free == 0u)
+          promote_pending_leaf_slab(stream, true);
+      }
+    }
   }
 
-  void acquire_run_slot(bool with_values, std::size_t count) {
+  void acquire_run_slot(bool with_values, std::size_t count,
+                        cudaStream_t stream) {
     auto &pool = leaf_pool(with_values);
     if (pool.empty() ||
         !leaf_slot_matches(pool.back(), with_values, count)) {
@@ -3711,8 +4011,15 @@ private:
         std::iter_swap(slot, pool.end() - 1);
     }
     if (pool.empty() ||
-        !leaf_slot_matches(pool.back(), with_values, count))
-      grow_leaf_pool(count, with_values);
+        !leaf_slot_matches(pool.back(), with_values, count)) {
+      if (pending_leaf_slab_valid_)
+        promote_pending_leaf_slab(stream, true);
+      if (pool.empty() ||
+          !leaf_slot_matches(pool.back(), with_values, count)) {
+        start_pending_leaf_slab(count, with_values);
+        promote_pending_leaf_slab(stream, true);
+      }
+    }
     if (pool.empty() ||
         !leaf_slot_matches(pool.back(), with_values, count))
       throw std::runtime_error("leaf slab allocation failed");
@@ -3985,7 +4292,7 @@ private:
     const std::size_t direct_count =
         std::min(max_elements_,
                  std::max<std::size_t>(1, batch_capacity_));
-    reserve_leaf_storage(direct_count);
+    reserve_leaf_storage(direct_count, stream);
     assignment_views_.resize_discard_exact(gpulsmopt_detail::kRunCapacity);
     chrono_views_.reserve(gpulsmopt_detail::kRunCapacity);
     prepare_sort_storage(direct_count, stream);
@@ -5107,8 +5414,8 @@ private:
       runs_.erase(runs_.begin() + static_cast<std::ptrdiff_t>(*it));
     }
     runs_.push_back(std::move(folded));
-    ensure_leaf_spares(
-        std::max<std::size_t>(batch_capacity_, 1u));
+    maintain_leaf_spare(
+        std::max<std::size_t>(batch_capacity_, 1u), stream);
     invalidate_resolved();
     succ_sparse_ready_ = false;
     ++maintenance_stats_.hash_fold_count;
@@ -5311,6 +5618,9 @@ private:
   std::vector<RunStorage> insert_leaf_pool_;
   std::vector<RunStorage> delete_leaf_pool_;
   std::vector<LeafSlab> leaf_slabs_;
+  LeafSlab pending_leaf_slab_;
+  std::size_t pending_leaf_slab_bytes_ = 0;
+  bool pending_leaf_slab_valid_ = false;
   std::vector<std::vector<RetainedLeaf>> hash_child_pool_;
 
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
@@ -5324,6 +5634,18 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> base_rank23_;
   gpulsmopt_detail::PinnedHostState *host_state_ = nullptr;
   cudaEvent_t stream_handoff_ = nullptr;
+  cudaEvent_t leaf_alloc_ready_ = nullptr;
+  cudaStream_t leaf_alloc_stream_ = nullptr;
+  std::thread leaf_alloc_worker_;
+  std::mutex leaf_alloc_mutex_;
+  std::condition_variable leaf_alloc_cv_;
+  std::uint8_t *leaf_alloc_result_ = nullptr;
+  std::size_t leaf_alloc_request_bytes_ = 0;
+  cudaError_t leaf_alloc_status_ = cudaSuccess;
+  int leaf_alloc_device_ = 0;
+  bool leaf_alloc_stop_ = false;
+  bool leaf_alloc_request_ = false;
+  bool leaf_alloc_result_ready_ = false;
   cudaStream_t operation_stream_ = nullptr;
   bool operation_stream_valid_ = false;
   std::size_t direct_sort_count_ = 0;
