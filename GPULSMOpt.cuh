@@ -80,6 +80,8 @@ constexpr int kEpochQuotients = 1 << kEpochQuotientBits;
 constexpr int kBaseRank23Bits = 23;
 constexpr int kBaseRank23Shift = 32 - kBaseRank23Bits;
 constexpr std::size_t kBaseRank23Size = std::size_t{1} << kBaseRank23Bits;
+constexpr int kBaseBinsPerQuotient =
+    1 << (kBaseRank23Bits - kEpochQuotientBits);
 constexpr std::size_t kSortedRunMinRecords = 1u << 22;
 // Temporal hash-fold geometry.
 constexpr int kRawFoldWidth = 64;
@@ -1388,14 +1390,16 @@ template <int Capacity> struct ResolveRecordStorage {
   std::uint64_t payload[Capacity];
 };
 
-template <int Threads, int Items, bool KeepZero>
+template <int Threads, int Items, bool KeepZero,
+          bool CacheBaseOffsets>
 __global__ __launch_bounds__(Threads)
 void quotient_local_resolve_kernel(
     const FlatAssignmentLeafView *leaves, int leaf_count,
     const std::uint32_t *quotient_list,
     const std::uint32_t *input_counts,
     const std::uint32_t *input_offsets, BaseRunView base,
-    std::uint64_t *out_keys, std::uint64_t *out_payload,
+    std::uint32_t *out_keys, std::uint32_t *out_values,
+    std::int8_t *out_counts,
     std::uint32_t *winner_counts) {
   constexpr int capacity = Threads * Items;
   constexpr int warps = Threads / 32;
@@ -1409,6 +1413,8 @@ void quotient_local_resolve_kernel(
   };
   __shared__ SharedStorage shared;
   __shared__ std::uint32_t leaf_bases[kLookupLeafCapacity + 1];
+  __shared__ std::uint32_t base_offsets[
+      CacheBaseOffsets ? kBaseBinsPerQuotient + 1 : 1];
 
   const std::uint32_t q = quotient_list[blockIdx.x];
   const std::uint32_t count = input_counts[q];
@@ -1473,6 +1479,21 @@ void quotient_local_resolve_kernel(
   }
   __syncthreads();
 
+  if constexpr (CacheBaseOffsets) {
+    const std::size_t first_bin =
+        static_cast<std::size_t>(q) *
+        kBaseBinsPerQuotient;
+    for (int bin = threadIdx.x;
+         bin <= kBaseBinsPerQuotient;
+         bin += blockDim.x) {
+      base_offsets[bin] =
+          base.base.count == 0u
+              ? 0u
+              : base.base.rank23[first_bin + bin];
+    }
+    __syncthreads();
+  }
+
 #pragma unroll
   for (int item = 0; item < Items; ++item) {
     const int local = threadIdx.x * Items + item;
@@ -1484,14 +1505,16 @@ void quotient_local_resolve_kernel(
       continue;
     std::uint64_t newest = shared.records.payload[local];
     std::uint32_t newest_rank =
-        static_cast<std::uint32_t>((newest >> 32) & 0x7fffffffu);
+        static_cast<std::uint32_t>(
+            (newest >> 32) & 0x7fffffffu);
     int next = local + 1;
     while (next < static_cast<int>(count) &&
            shared.records.keys[next] == low) {
       const std::uint64_t candidate =
           shared.records.payload[next];
-      const std::uint32_t rank = static_cast<std::uint32_t>(
-          (candidate >> 32) & 0x7fffffffu);
+      const std::uint32_t rank =
+          static_cast<std::uint32_t>(
+              (candidate >> 32) & 0x7fffffffu);
       if (rank > newest_rank) {
         newest = candidate;
         newest_rank = rank;
@@ -1505,9 +1528,31 @@ void quotient_local_resolve_kernel(
     const std::uint32_t value =
         static_cast<std::uint32_t>(newest);
     std::uint32_t base_value = 0u;
-    const bool base_live =
-        base.base.count != 0u &&
-        base_find_value(base, key, &base_value);
+    bool base_live = false;
+    if (base.base.count != 0u) {
+      if constexpr (CacheBaseOffsets) {
+        const std::uint32_t base_bin =
+            low >> kBaseRank23Shift;
+        const std::uint32_t base_begin =
+            base_offsets[base_bin];
+        const std::uint32_t base_end =
+            base_offsets[base_bin + 1u];
+        const std::uint32_t base_position =
+            base_begin + static_cast<std::uint32_t>(
+                lower_bound_u32(
+                    base.base.keys + base_begin,
+                    base_end - base_begin, key));
+        base_live =
+            base_position < base_end &&
+            base.base.keys[base_position] == key;
+        if (base_live)
+          base_value = base.base.values[base_position];
+      } else {
+        base_live = base_find_value(
+            base, key, &base_value);
+      }
+    }
+
     std::uint32_t value_delta = 0u;
     std::int8_t count_delta = 0;
     if (insert) {
@@ -1541,20 +1586,22 @@ void quotient_local_resolve_kernel(
       continue;
     const std::uint32_t output =
         output_base + thread_offset + local_offset++;
-    out_keys[output] =
-        (static_cast<std::uint64_t>(keys[item]) << 32) | 1u;
-    out_payload[output] = payload[item];
+    out_keys[output] = keys[item];
+    out_values[output] =
+        static_cast<std::uint32_t>(payload[item] >> 32);
+    out_counts[output] = static_cast<std::int8_t>(
+        static_cast<std::uint32_t>(payload[item]));
   }
   if (threadIdx.x == 0)
     winner_counts[q] = block_total;
 }
-
 __global__ void fused_resolve_pack_kernel(
     const std::uint32_t *input_offsets,
     const std::uint32_t *winner_counts,
     const std::uint32_t *winner_offsets,
-    const std::uint64_t *input_keys,
-    const std::uint64_t *input_payload,
+    const std::uint32_t *input_keys,
+    const std::uint32_t *input_values,
+    const std::int8_t *input_counts,
     std::uint64_t *output_keys,
     std::uint64_t *output_payload) {
   const std::uint32_t q = blockIdx.x;
@@ -1563,8 +1610,11 @@ __global__ void fused_resolve_pack_kernel(
   const std::uint32_t output = winner_offsets[q];
   for (std::uint32_t i = threadIdx.x; i < count;
        i += blockDim.x) {
-    output_keys[output + i] = input_keys[input + i];
-    output_payload[output + i] = input_payload[input + i];
+    output_keys[output + i] =
+        (static_cast<std::uint64_t>(input_keys[input + i]) << 32) |
+        1u;
+    output_payload[output + i] =
+        corr_pack(input_values[input + i], input_counts[input + i]);
   }
 }
 
@@ -1572,25 +1622,27 @@ __global__ void fused_resolve_unpack_kernel(
     const std::uint32_t *input_offsets,
     const std::uint32_t *winner_counts,
     const std::uint32_t *winner_offsets,
-    const std::uint64_t *input_keys,
-    const std::uint64_t *input_payload,
+    const std::uint32_t *input_keys,
+    const std::uint32_t *input_values,
+    const std::int8_t *input_counts,
     std::uint32_t *output_keys,
     std::uint32_t *output_values,
-    std::int8_t *output_counts) {
+    std::int8_t *output_counts,
+    std::uint32_t *output_offsets) {
   const std::uint32_t q = blockIdx.x;
   const std::uint32_t count = winner_counts[q];
   const std::uint32_t input = input_offsets[q];
   const std::uint32_t output = winner_offsets[q];
   for (std::uint32_t i = threadIdx.x; i < count;
        i += blockDim.x) {
-    const std::uint64_t key = input_keys[input + i];
-    const std::uint64_t payload = input_payload[input + i];
-    output_keys[output + i] =
-        static_cast<std::uint32_t>(key >> 32);
-    output_values[output + i] =
-        static_cast<std::uint32_t>(payload >> 32);
-    output_counts[output + i] = static_cast<std::int8_t>(
-        static_cast<std::uint32_t>(payload));
+    output_keys[output + i] = input_keys[input + i];
+    output_values[output + i] = input_values[input + i];
+    output_counts[output + i] = input_counts[input + i];
+  }
+  if (threadIdx.x == 0) {
+    output_offsets[q] = output;
+    if (q + 1u == kEpochQuotients)
+      output_offsets[q + 1u] = winner_offsets[q + 1u];
   }
 }
 
@@ -2914,6 +2966,9 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         resolve_winner_counts_, resolve_winner_offsets_,
         normalize_views_, flat_normalize_views_,
         flat_normalize_bases_, norm_keys_, norm_pay_,
+        resolve_winner_keys_data_, resolve_winner_values_,
+        resolve_winner_deltas_, winner_workspace_arena_,
+        resolved_workspace_arena_,
         cache_pay_, merge_out_keys_, merge_out_pay_, merge_flags_,
         merge_sel_keys_, merge_sel_pay_, compaction_counts_,
         compaction_offsets_,
@@ -4117,6 +4172,72 @@ private:
       sort_temp_storage_.resize_discard(bytes);
   }
 
+  static std::size_t range_arena_records(
+      std::size_t count) {
+    std::size_t capacity = 1u;
+    while (capacity < count) {
+      if (capacity >
+          std::numeric_limits<std::size_t>::max() / 2u)
+        throw std::overflow_error("range arena overflow");
+      capacity *= 2u;
+    }
+    return capacity;
+  }
+
+  static std::size_t range_arena_bytes(
+      std::size_t capacity) {
+    if (capacity >
+        std::numeric_limits<std::size_t>::max() / 9u)
+      throw std::overflow_error("range arena overflow");
+    return capacity * 9u;
+  }
+
+  void reserve_winner_workspace(std::size_t count) {
+    if (count > winner_workspace_capacity_) {
+      winner_workspace_capacity_ = range_arena_records(count);
+      winner_workspace_arena_.resize_discard_exact(
+          range_arena_bytes(winner_workspace_capacity_));
+      std::uint8_t *base = winner_workspace_arena_.data();
+      resolve_winner_keys_data_.bind_external(
+          reinterpret_cast<std::uint32_t *>(base),
+          winner_workspace_capacity_);
+      resolve_winner_values_.bind_external(
+          reinterpret_cast<std::uint32_t *>(
+              base + 4u * winner_workspace_capacity_),
+          winner_workspace_capacity_);
+      resolve_winner_deltas_.bind_external(
+          reinterpret_cast<std::int8_t *>(
+              base + 8u * winner_workspace_capacity_),
+          winner_workspace_capacity_);
+    }
+    resolve_winner_keys_data_.resize_discard(count);
+    resolve_winner_values_.resize_discard(count);
+    resolve_winner_deltas_.resize_discard(count);
+  }
+
+  void reserve_resolved_workspace(std::size_t count) {
+    if (count > resolved_workspace_capacity_) {
+      resolved_workspace_capacity_ = range_arena_records(count);
+      resolved_workspace_arena_.resize_discard_exact(
+          range_arena_bytes(resolved_workspace_capacity_));
+      std::uint8_t *base = resolved_workspace_arena_.data();
+      resolved_.keys.bind_external(
+          reinterpret_cast<std::uint32_t *>(base),
+          resolved_workspace_capacity_);
+      resolved_.values.bind_external(
+          reinterpret_cast<std::uint32_t *>(
+              base + 4u * resolved_workspace_capacity_),
+          resolved_workspace_capacity_);
+      resolved_.count_delta.bind_external(
+          reinterpret_cast<std::int8_t *>(
+              base + 8u * resolved_workspace_capacity_),
+          resolved_workspace_capacity_);
+    }
+    resolved_.keys.resize_discard(count);
+    resolved_.values.resize_discard(count);
+    resolved_.count_delta.resize_discard(count);
+  }
+
   void exclusive_scan_u32(const std::uint32_t *input, std::uint32_t *output,
                           std::size_t count, cudaStream_t stream) {
     if (count == 0)
@@ -4701,8 +4822,7 @@ private:
     if (host_state_->resolve_class_counts[3] != 0u)
       return normalize_runs_legacy(idx, stream);
 
-    merge_out_keys_.resize_discard(total);
-    merge_out_pay_.resize_discard(total);
+    reserve_winner_workspace(total);
     const bool keep_zero = resolved_.count != 0u;
     auto *lists = resolve_quotient_lists_.data();
     const std::uint32_t small =
@@ -4714,62 +4834,74 @@ private:
     if (keep_zero) {
       if (small != 0u)
         gpulsmopt_detail::quotient_local_resolve_kernel<
-            32, 4, true><<<small, 32, 0, stream>>>(
+            32, 4, true, false><<<small, 32, 0, stream>>>(
             flat_normalize_views_.data(),
             static_cast<int>(leaf_count), lists,
             compaction_counts_.data(),
             compaction_offsets_.data(), make_base_view(),
-            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_keys_data_.data(),
+            resolve_winner_values_.data(),
+            resolve_winner_deltas_.data(),
             resolve_winner_counts_.data());
       if (medium != 0u)
         gpulsmopt_detail::quotient_local_resolve_kernel<
-            128, 4, true><<<medium, 128, 0, stream>>>(
+            128, 4, true, true><<<medium, 128, 0, stream>>>(
             flat_normalize_views_.data(),
             static_cast<int>(leaf_count),
             lists + gpulsmopt_detail::kEpochQuotients,
             compaction_counts_.data(),
             compaction_offsets_.data(), make_base_view(),
-            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_keys_data_.data(),
+            resolve_winner_values_.data(),
+            resolve_winner_deltas_.data(),
             resolve_winner_counts_.data());
       if (large != 0u)
         gpulsmopt_detail::quotient_local_resolve_kernel<
-            256, 8, true><<<large, 256, 0, stream>>>(
+            256, 8, true, true><<<large, 256, 0, stream>>>(
             flat_normalize_views_.data(),
             static_cast<int>(leaf_count),
             lists + 2u * gpulsmopt_detail::kEpochQuotients,
             compaction_counts_.data(),
             compaction_offsets_.data(), make_base_view(),
-            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_keys_data_.data(),
+            resolve_winner_values_.data(),
+            resolve_winner_deltas_.data(),
             resolve_winner_counts_.data());
     } else {
       if (small != 0u)
         gpulsmopt_detail::quotient_local_resolve_kernel<
-            32, 4, false><<<small, 32, 0, stream>>>(
+            32, 4, false, false><<<small, 32, 0, stream>>>(
             flat_normalize_views_.data(),
             static_cast<int>(leaf_count), lists,
             compaction_counts_.data(),
             compaction_offsets_.data(), make_base_view(),
-            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_keys_data_.data(),
+            resolve_winner_values_.data(),
+            resolve_winner_deltas_.data(),
             resolve_winner_counts_.data());
       if (medium != 0u)
         gpulsmopt_detail::quotient_local_resolve_kernel<
-            128, 4, false><<<medium, 128, 0, stream>>>(
+            128, 4, false, true><<<medium, 128, 0, stream>>>(
             flat_normalize_views_.data(),
             static_cast<int>(leaf_count),
             lists + gpulsmopt_detail::kEpochQuotients,
             compaction_counts_.data(),
             compaction_offsets_.data(), make_base_view(),
-            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_keys_data_.data(),
+            resolve_winner_values_.data(),
+            resolve_winner_deltas_.data(),
             resolve_winner_counts_.data());
       if (large != 0u)
         gpulsmopt_detail::quotient_local_resolve_kernel<
-            256, 8, false><<<large, 256, 0, stream>>>(
+            256, 8, false, true><<<large, 256, 0, stream>>>(
             flat_normalize_views_.data(),
             static_cast<int>(leaf_count),
             lists + 2u * gpulsmopt_detail::kEpochQuotients,
             compaction_counts_.data(),
             compaction_offsets_.data(), make_base_view(),
-            merge_out_keys_.data(), merge_out_pay_.data(),
+            resolve_winner_keys_data_.data(),
+            resolve_winner_values_.data(),
+            resolve_winner_deltas_.data(),
             resolve_winner_counts_.data());
     }
     CUDA_CHECK(cudaGetLastError());
@@ -4795,7 +4927,9 @@ private:
           compaction_offsets_.data(),
           resolve_winner_counts_.data(),
           resolve_winner_offsets_.data(),
-          merge_out_keys_.data(), merge_out_pay_.data(),
+          resolve_winner_keys_data_.data(),
+          resolve_winner_values_.data(),
+          resolve_winner_deltas_.data(),
           norm_keys_.data(), norm_pay_.data());
       CUDA_CHECK(cudaGetLastError());
     }
@@ -4855,9 +4989,7 @@ private:
                       cudaStream_t stream) {
     constexpr int block = 256;
     resolved_.count = changed;
-    resolved_.keys.resize_discard(changed);
-    resolved_.values.resize_discard(changed);
-    resolved_.count_delta.resize_discard(changed);
+    reserve_resolved_workspace(changed);
     if (changed > 0) {
       const int grid =
           static_cast<int>((changed + block - 1u) / block);
@@ -4911,9 +5043,7 @@ private:
       const std::uint32_t changed =
           static_cast<std::uint32_t>(total);
       resolved_.count = changed;
-      resolved_.keys.resize_discard(changed);
-      resolved_.values.resize_discard(changed);
-      resolved_.count_delta.resize_discard(changed);
+      reserve_resolved_workspace(changed);
       resolved_.quotient_off.resize_discard_exact(
           gpulsmopt_detail::kEpochQuotients + 1u);
       gpulsmopt_detail::fused_resolve_unpack_kernel<<<
@@ -4922,16 +5052,13 @@ private:
           compaction_offsets_.data(),
           resolve_winner_counts_.data(),
           resolve_winner_offsets_.data(),
-          merge_out_keys_.data(), merge_out_pay_.data(),
+          resolve_winner_keys_data_.data(),
+          resolve_winner_values_.data(),
+          resolve_winner_deltas_.data(),
           resolved_.keys.data(), resolved_.values.data(),
-          resolved_.count_delta.data());
+          resolved_.count_delta.data(),
+          resolved_.quotient_off.data());
       CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemcpyAsync(
-          resolved_.quotient_off.data(),
-          resolve_winner_offsets_.data(),
-          (gpulsmopt_detail::kEpochQuotients + 1u) *
-              sizeof(std::uint32_t),
-          cudaMemcpyDeviceToDevice, stream));
       resolved_value_prefix_ready_ = false;
       resolved_count_prefix_ready_ = false;
       resolved_ready_ = true;
@@ -5538,6 +5665,18 @@ private:
       flat_normalize_host_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> norm_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> norm_pay_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      resolve_winner_keys_data_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      resolve_winner_values_;
+  gpulsmopt_detail::RawDeviceBuffer<std::int8_t>
+      resolve_winner_deltas_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t>
+      winner_workspace_arena_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t>
+      resolved_workspace_arena_;
+  std::size_t winner_workspace_capacity_ = 0u;
+  std::size_t resolved_workspace_capacity_ = 0u;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> cache_pay_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_out_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_out_pay_;
