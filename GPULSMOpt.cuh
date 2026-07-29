@@ -557,6 +557,76 @@ struct AssignmentRunView {
   std::uint8_t grouped;
 };
 
+struct FlatAssignmentLeafView {
+  const std::uint32_t *keys;
+  const std::uint32_t *values;
+  const std::uint32_t *offsets;
+  std::uint32_t count;
+  std::uint8_t constant_op;
+};
+
+__global__ void flat_assignment_count_kernel(
+    const FlatAssignmentLeafView *leaves, int leaf_count,
+    std::uint32_t *counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kEpochQuotients)
+    return;
+  if (q == kEpochQuotients) {
+    counts[q] = 0u;
+    return;
+  }
+  std::uint32_t total = 0u;
+  for (int leaf = 0; leaf < leaf_count; ++leaf)
+    total += leaves[leaf].offsets[q + 1u] -
+             leaves[leaf].offsets[q];
+  counts[q] = total;
+}
+
+__global__ void flat_assignment_base_kernel(
+    const FlatAssignmentLeafView *leaves, int leaf_count,
+    const std::uint32_t *quotient_offsets,
+    std::uint32_t *leaf_bases) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  std::uint32_t cursor = quotient_offsets[q];
+  for (int leaf = 0; leaf < leaf_count; ++leaf) {
+    leaf_bases[static_cast<std::size_t>(leaf) *
+                   kEpochQuotients +
+               q] = cursor;
+    cursor += leaves[leaf].offsets[q + 1u] -
+              leaves[leaf].offsets[q];
+  }
+}
+
+__global__ void flat_assignment_gather_kernel(
+    const FlatAssignmentLeafView *leaves, int leaf_count,
+    std::uint32_t max_count, const std::uint32_t *leaf_bases,
+    std::uint32_t *out_keys, std::uint64_t *out_payload) {
+  const std::uint32_t leaf = blockIdx.y;
+  const std::uint32_t position =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (leaf >= static_cast<std::uint32_t>(leaf_count) ||
+      position >= max_count)
+    return;
+  const FlatAssignmentLeafView view = leaves[leaf];
+  if (position >= view.count)
+    return;
+  const std::uint32_t key = view.keys[position];
+  const std::uint32_t q = key >> kEpochQuotientBits;
+  const std::uint32_t output =
+      leaf_bases[static_cast<std::size_t>(leaf) *
+                      kEpochQuotients +
+                  q] +
+      position - view.offsets[q];
+  const std::uint32_t value =
+      view.constant_op != 0u ? view.values[position] : 0u;
+  out_keys[output] = key;
+  out_payload[output] =
+      (static_cast<std::uint64_t>(value) << 32) |
+      static_cast<std::uint64_t>(view.constant_op != 0u);
+}
+
 __device__ inline void assignment_bounds(const AssignmentRunView &run,
                                          std::uint32_t q,
                                          std::uint32_t *begin,
@@ -2465,7 +2535,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::size_t total = device_bytes_all(
         resolve_keys_, resolve_payload_, resolve_alt_keys_, resolve_alt_payload_,
         resolve_flags_, resolve_sel_vdelta_, resolve_count_,
-        normalize_views_, norm_keys_, norm_pay_,
+        normalize_views_, flat_normalize_views_,
+        flat_normalize_bases_, norm_keys_, norm_pay_,
         cache_pay_, merge_out_keys_, merge_out_pay_, merge_flags_,
         merge_sel_keys_, merge_sel_pay_, compaction_counts_,
         compaction_offsets_,
@@ -3744,19 +3815,87 @@ private:
     resolved_count_prefix_ready_ = false;
   }
 
+  bool prepare_flat_normalize_leaves(
+      const std::vector<std::size_t> &idx,
+      std::uint32_t *max_count, cudaStream_t stream) {
+    flat_normalize_host_.clear();
+    *max_count = 0u;
+    for (const std::size_t index : idx) {
+      RunStorage &run = runs_[index];
+      if (run.grouped)
+        return false;
+      if (run.hashed) {
+        if (run.hash_children.empty())
+          return false;
+        for (RetainedLeaf &leaf : run.hash_children) {
+          const bool insert =
+              leaf.operation ==
+              gpulsmopt_detail::RunOperation::Insert;
+          if (leaf.count >
+              std::numeric_limits<std::uint32_t>::max())
+            return false;
+          flat_normalize_host_.push_back(
+              {leaf.keys.data(),
+               insert ? leaf.values.data() : nullptr,
+               leaf.quotient_off.data(),
+               static_cast<std::uint32_t>(leaf.count),
+               static_cast<std::uint8_t>(insert ? 1u : 0u)});
+          *max_count = std::max(
+              *max_count,
+              static_cast<std::uint32_t>(leaf.count));
+        }
+        continue;
+      }
+      if (run.mixed ||
+          run.count > std::numeric_limits<std::uint32_t>::max())
+        return false;
+      const bool insert =
+          run.operation == gpulsmopt_detail::RunOperation::Insert;
+      flat_normalize_host_.push_back(
+          {run.keys.data(), insert ? run.values.data() : nullptr,
+           run.quotient_off.data(),
+           static_cast<std::uint32_t>(run.count),
+           static_cast<std::uint8_t>(insert ? 1u : 0u)});
+      *max_count = std::max(
+          *max_count, static_cast<std::uint32_t>(run.count));
+    }
+    if (flat_normalize_host_.empty() ||
+        flat_normalize_host_.size() > 65535u)
+      return false;
+    flat_normalize_views_.resize_discard(
+        flat_normalize_host_.size());
+    flat_normalize_bases_.resize_discard(
+        flat_normalize_host_.size() *
+        gpulsmopt_detail::kEpochQuotients);
+    CUDA_CHECK(cudaMemcpyAsync(
+        flat_normalize_views_.data(), flat_normalize_host_.data(),
+        flat_normalize_host_.size() *
+            sizeof(gpulsmopt_detail::FlatAssignmentLeafView),
+        cudaMemcpyHostToDevice, stream));
+    return true;
+  }
+
   // Gather by quotient and sort only unseen low bits.
   std::size_t normalize_runs(const std::vector<std::size_t> &idx,
                              cudaStream_t stream) {
     constexpr int block = 256;
-    normalize_views_.resize_discard(
-        gpulsmopt_detail::kRunCapacity);
-    for (std::size_t slot = 0; slot < idx.size(); ++slot)
-      host_state_->scratch_views[slot] =
-          make_assignment_view(runs_[idx[slot]]);
-    CUDA_CHECK(cudaMemcpyAsync(
-        normalize_views_.data(), host_state_->scratch_views,
-        idx.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
-        cudaMemcpyHostToDevice, stream));
+    std::uint32_t flat_max_count = 0u;
+    const bool use_flat = prepare_flat_normalize_leaves(
+        idx, &flat_max_count, stream);
+    const int flat_leaf_count = use_flat
+        ? static_cast<int>(flat_normalize_host_.size())
+        : 0;
+    if (!use_flat) {
+      normalize_views_.resize_discard(
+          gpulsmopt_detail::kRunCapacity);
+      for (std::size_t slot = 0; slot < idx.size(); ++slot)
+        host_state_->scratch_views[slot] =
+            make_assignment_view(runs_[idx[slot]]);
+      CUDA_CHECK(cudaMemcpyAsync(
+          normalize_views_.data(), host_state_->scratch_views,
+          idx.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
+          cudaMemcpyHostToDevice, stream));
+    }
 
     compaction_counts_.resize_discard(
         gpulsmopt_detail::kEpochQuotients + 1u);
@@ -3764,10 +3903,17 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
     constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
     constexpr int count_grid = (rows + block - 1) / block;
-    gpulsmopt_detail::assignment_group_count_kernel<<<
-        count_grid, block, 0, stream>>>(
-        normalize_views_.data(), static_cast<int>(idx.size()),
-        compaction_counts_.data());
+    if (use_flat) {
+      gpulsmopt_detail::flat_assignment_count_kernel<<<
+          count_grid, block, 0, stream>>>(
+          flat_normalize_views_.data(), flat_leaf_count,
+          compaction_counts_.data());
+    } else {
+      gpulsmopt_detail::assignment_group_count_kernel<<<
+          count_grid, block, 0, stream>>>(
+          normalize_views_.data(), static_cast<int>(idx.size()),
+          compaction_counts_.data());
+    }
     CUDA_CHECK(cudaGetLastError());
     exclusive_scan_u32(
         compaction_counts_.data(), compaction_offsets_.data(),
@@ -3788,12 +3934,29 @@ private:
     resolve_payload_.resize_discard(total);
     resolve_alt_keys_.resize_discard(total);
     resolve_alt_payload_.resize_discard(total);
-    gpulsmopt_detail::assignment_group_gather_kernel<<<
-        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
-        normalize_views_.data(), static_cast<int>(idx.size()),
-        compaction_offsets_.data(), resolve_keys_.data(),
-        resolve_payload_.data());
-    CUDA_CHECK(cudaGetLastError());
+    if (use_flat) {
+      gpulsmopt_detail::flat_assignment_base_kernel<<<
+          count_grid, block, 0, stream>>>(
+          flat_normalize_views_.data(), flat_leaf_count,
+          compaction_offsets_.data(), flat_normalize_bases_.data());
+      CUDA_CHECK(cudaGetLastError());
+      const dim3 gather_grid(
+          (flat_max_count + block - 1u) / block,
+          static_cast<unsigned>(flat_leaf_count));
+      gpulsmopt_detail::flat_assignment_gather_kernel<<<
+          gather_grid, block, 0, stream>>>(
+          flat_normalize_views_.data(), flat_leaf_count,
+          flat_max_count, flat_normalize_bases_.data(),
+          resolve_keys_.data(), resolve_payload_.data());
+      CUDA_CHECK(cudaGetLastError());
+    } else {
+      gpulsmopt_detail::assignment_group_gather_kernel<<<
+          gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
+          normalize_views_.data(), static_cast<int>(idx.size()),
+          compaction_offsets_.data(), resolve_keys_.data(),
+          resolve_payload_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
 
     if (total > resolved_sort_count_) {
       resolved_sort_temp_bytes_ = 0u;
@@ -4476,6 +4639,13 @@ private:
   std::uint64_t resolved_base_generation_ = ~std::uint64_t{0};
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
       normalize_views_;
+  gpulsmopt_detail::RawDeviceBuffer<
+      gpulsmopt_detail::FlatAssignmentLeafView>
+      flat_normalize_views_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      flat_normalize_bases_;
+  std::vector<gpulsmopt_detail::FlatAssignmentLeafView>
+      flat_normalize_host_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> norm_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> norm_pay_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> cache_pay_;
