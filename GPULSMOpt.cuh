@@ -4819,18 +4819,18 @@ private:
         4u * sizeof(std::uint32_t),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (host_state_->resolve_class_counts[3] != 0u)
-      return normalize_runs_legacy(idx, stream);
-
-    reserve_winner_workspace(total);
-    const bool keep_zero = resolved_.count != 0u;
-    auto *lists = resolve_quotient_lists_.data();
     const std::uint32_t small =
         host_state_->resolve_class_counts[0];
     const std::uint32_t medium =
         host_state_->resolve_class_counts[1];
     const std::uint32_t large =
         host_state_->resolve_class_counts[2];
+    if (host_state_->resolve_class_counts[3] != 0u)
+      return normalize_runs_legacy(idx, stream);
+
+    reserve_winner_workspace(total);
+    const bool keep_zero = resolved_.count != 0u;
+    auto *lists = resolve_quotient_lists_.data();
     if (keep_zero) {
       if (small != 0u)
         gpulsmopt_detail::quotient_local_resolve_kernel<
