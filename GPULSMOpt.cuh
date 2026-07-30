@@ -102,6 +102,9 @@ constexpr std::size_t kHashRouteWordsPerParent =
 constexpr int kLookupLeafCapacity =
     kColdArenaSlots * kRawFoldWidth + kRawFoldWidth;
 constexpr std::uint16_t kNoLookupParent = 0xffffu;
+constexpr std::uint32_t kNoOwnerLeaf = 0xffffffffu;
+constexpr std::uint32_t kLookupOwnerMaxProbe = 1024u;
+constexpr std::size_t kLookupOwnerMaxSlots = std::size_t{1} << 29;
 constexpr std::uint32_t kHashHeavyFlag = 1u << 31;
 constexpr std::uint32_t kHashScanFlag = 1u << 30;
 constexpr std::uint32_t kHashCountMask =
@@ -857,11 +860,21 @@ struct LookupPublication {
   std::uint32_t parent_ranks[kColdArenaSlots];
 };
 
+struct LookupOwnerLeafView {
+  const std::uint32_t *keys;
+  const std::uint32_t *values;
+  const std::uint32_t *offsets;
+  std::uint64_t *route_mask;
+  std::uint32_t count;
+  std::uint8_t constant_op;
+};
+
 struct PinnedHostState {
   AssignmentRunView views[kRunCapacity];
   AssignmentRunView scratch_views[kRunCapacity];
   const std::uint64_t *route_masks[kRawFoldWidth];
   LookupPublication lookup;
+  LookupOwnerLeafView owner_leaves[kLookupLeafCapacity];
   std::uint32_t narrow_overflow;
   std::uint32_t resolved_count;
   std::uint32_t successor_miss_count;
@@ -871,6 +884,214 @@ struct PinnedHostState {
   std::uint32_t hash_heavy_count;
   std::uint32_t hash_capacity;
 };
+
+__host__ __device__ inline std::uint32_t
+lookup_owner_hash(std::uint32_t key) {
+  key ^= key >> 16;
+  key *= 0x7feb352du;
+  key ^= key >> 15;
+  key *= 0x846ca68bu;
+  return key ^ (key >> 16);
+}
+
+__device__ __forceinline__ std::uint32_t lookup_owner_start(
+    std::uint32_t key, std::uint32_t table_mask) {
+  const std::uint32_t table_bits = 32u - __clz(table_mask);
+  if (table_bits <= 16u)
+    return lookup_owner_hash(key) & table_mask;
+  const std::uint32_t local_bits = table_bits - 16u;
+  const std::uint32_t local_mask = (1u << local_bits) - 1u;
+  std::uint32_t low = key & 0xffffu;
+  low ^= low >> 7;
+  low *= 0x9e3779b1u;
+  low ^= low >> 11;
+  return ((key >> 16) << local_bits) | (low & local_mask);
+}
+
+__device__ __forceinline__ std::uint32_t lookup_owner_next(
+    std::uint32_t slot, std::uint32_t table_mask) {
+  const std::uint32_t table_bits = 32u - __clz(table_mask);
+  if (table_bits <= 16u)
+    return (slot + 1u) & table_mask;
+  const std::uint32_t local_bits = table_bits - 16u;
+  const std::uint32_t local_mask = (1u << local_bits) - 1u;
+  return (slot & ~local_mask) | ((slot + 1u) & local_mask);
+}
+
+
+__device__ __forceinline__ bool lookup_owner_find(
+    const unsigned long long *slots, std::uint32_t table_mask,
+    std::uint32_t key, std::uint32_t *token) {
+  std::uint32_t slot = lookup_owner_start(key, table_mask);
+  for (std::uint32_t probe = 0; probe < kLookupOwnerMaxProbe; ++probe) {
+    const unsigned long long entry = slots[slot];
+    if (entry == 0u) {
+      *token = 0u;
+      return true;
+    }
+    if (static_cast<std::uint32_t>(entry >> 32) == key) {
+      *token = static_cast<std::uint32_t>(entry);
+      return true;
+    }
+    slot = lookup_owner_next(slot, table_mask);
+  }
+  return false;
+}
+
+__device__ __forceinline__ void lookup_owner_legacy(
+    const AssignmentRunView *runs, int run_count, BaseRunView base,
+    std::uint32_t key, std::size_t query, std::uint32_t *out_values,
+    std::uint8_t *out_found) {
+  for (int r = run_count - 1; r >= 0; --r) {
+    std::uint32_t value = 0u;
+    bool live = false;
+    if (!assignment_find(runs[r], key, &value, &live))
+      continue;
+    out_values[query] = live ? value : kEmptyKey;
+    if (out_found)
+      out_found[query] = live ? 1u : 0u;
+    return;
+  }
+  std::uint32_t value = kEmptyKey;
+  const bool found = base_find_value(base, key, &value);
+  out_values[query] = found ? value : kEmptyKey;
+  if (out_found)
+    out_found[query] = found ? 1u : 0u;
+}
+
+// Applies leaves with one cooperative warp per quotient.
+__global__ void lookup_owner_apply_kernel(
+    const LookupOwnerLeafView *leaves, std::uint32_t first_leaf,
+    std::uint32_t leaf_count, std::uint32_t position_bits,
+    unsigned long long *slots, std::uint32_t table_mask,
+    std::uint32_t *overflow) {
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned warp = threadIdx.x >> 5u;
+  const unsigned warps_per_block = blockDim.x >> 5u;
+  const std::uint32_t quotient =
+      blockIdx.x * warps_per_block + warp;
+  if (quotient >= kEpochQuotients || *overflow != 0u)
+    return;
+  const unsigned lane_bit = 1u << lane;
+  for (std::uint32_t offset = 0; offset < leaf_count; ++offset) {
+    const std::uint32_t leaf_id = first_leaf + offset;
+    const LookupOwnerLeafView leaf = leaves[leaf_id];
+    const std::uint32_t begin = leaf.offsets[quotient];
+    const std::uint32_t end = leaf.offsets[quotient + 1u];
+    std::uint64_t route_mask = 0u;
+    for (std::uint32_t base = begin; base < end; base += 32u) {
+      const std::uint32_t position = base + lane;
+      const unsigned full = __activemask();
+      unsigned active = __ballot_sync(full, position < end);
+      std::uint32_t key = 0u;
+      std::uint32_t token = 0u;
+      std::uint32_t slot = 0u;
+      std::uint32_t probes = 0u;
+      if (position < end) {
+        key = leaf.keys[position];
+        token = ((leaf_id + 1u) << position_bits) | position;
+        slot = lookup_owner_start(key, table_mask);
+      }
+      std::uint64_t route_bits =
+          position < end
+              ? std::uint64_t{1}
+                    << ((key & 0xffffu) >>
+                        (kEpochQuotientBits - kHashRouteBits))
+              : 0u;
+      for (int delta = 16; delta != 0; delta >>= 1)
+        route_bits |= __shfl_down_sync(full, route_bits, delta);
+      if (lane == 0u)
+        route_mask |= route_bits;
+      while ((active & lane_bit) != 0u) {
+        const unsigned group = __match_any_sync(active, slot);
+        const int leader = __ffs(group) - 1;
+        unsigned long long entry = 0u;
+        if (static_cast<int>(lane) == leader)
+          entry = slots[slot];
+        entry = __shfl_sync(group, entry, leader);
+        const std::uint32_t entry_key =
+            static_cast<std::uint32_t>(entry >> 32);
+        const std::uint32_t selected_key =
+            __shfl_sync(group, key, leader);
+        const bool claim =
+            entry == 0u ? key == selected_key : entry_key == key;
+        const unsigned claim_mask =
+            __ballot_sync(active, claim) & group;
+        if (claim_mask != 0u) {
+          const int writer = 31 - __clz(claim_mask);
+          if (static_cast<int>(lane) == writer) {
+            slots[slot] =
+                (static_cast<unsigned long long>(key) << 32) | token;
+          }
+        }
+        const bool done = (claim_mask & lane_bit) != 0u;
+        __syncwarp(active);
+        if (!done) {
+          slot = lookup_owner_next(slot, table_mask);
+          ++probes;
+        }
+        const unsigned failed = __ballot_sync(
+            active, !done && probes >= kLookupOwnerMaxProbe);
+        if (failed != 0u) {
+          if (lane == static_cast<unsigned>(__ffs(failed) - 1))
+            atomicExch(overflow, 1u);
+          return;
+        }
+        active = __ballot_sync(active, !done);
+      }
+    }
+    if (lane == 0u)
+      leaf.route_mask[quotient] = route_mask;
+  }
+}
+
+
+__global__ void lookup_owner_kernel(
+    const unsigned long long *slots, std::uint32_t table_mask,
+    const std::uint32_t *overflow, const LookupOwnerLeafView *leaves,
+    std::uint32_t leaf_count, std::uint32_t position_bits,
+    std::uint32_t position_mask, const AssignmentRunView *runs,
+    int run_count, BaseRunView base, const std::uint32_t *queries,
+    std::size_t n, std::uint32_t *out_values,
+    std::uint8_t *out_found) {
+  const std::size_t query =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (query >= n)
+    return;
+  const std::uint32_t key = queries[query];
+  std::uint32_t token = 0u;
+  if (*overflow != 0u ||
+      !lookup_owner_find(slots, table_mask, key, &token)) {
+    lookup_owner_legacy(runs, run_count, base, key, query,
+                        out_values, out_found);
+    return;
+  }
+  if (token != 0u) {
+    const std::uint32_t encoded_leaf = token >> position_bits;
+    const std::uint32_t position = token & position_mask;
+    if (encoded_leaf == 0u || encoded_leaf > leaf_count) {
+      lookup_owner_legacy(runs, run_count, base, key, query,
+                          out_values, out_found);
+      return;
+    }
+    const LookupOwnerLeafView leaf = leaves[encoded_leaf - 1u];
+    if (position >= leaf.count || leaf.keys[position] != key) {
+      lookup_owner_legacy(runs, run_count, base, key, query,
+                          out_values, out_found);
+      return;
+    }
+    const bool live = leaf.constant_op != 0u;
+    out_values[query] = live ? leaf.values[position] : kEmptyKey;
+    if (out_found)
+      out_found[query] = live ? 1u : 0u;
+    return;
+  }
+  std::uint32_t value = kEmptyKey;
+  const bool found = base_find_value(base, key, &value);
+  out_values[query] = found ? value : kEmptyKey;
+  if (out_found)
+    out_found[query] = found ? 1u : 0u;
+}
 
 __global__ void assignment_group_count_kernel(
     const AssignmentRunView *runs, int run_count,
@@ -2607,6 +2828,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     invalidate_resolved();
     succ_sparse_ready_ = false;
     reset_parent_storage();
+    reset_lookup_owner(stream);
     ++base_generation_;
   }
 
@@ -2675,6 +2897,24 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
+    if (should_use_lookup_owner(batch.count)) {
+      flush_pending_views(stream);
+      prepare_lookup_owner(stream);
+      constexpr int block = 256;
+      const int grid = static_cast<int>(
+          (batch.count + block - 1u) / block);
+      const int owner_run_count =
+          static_cast<int>(chrono_views_.size());
+      gpulsmopt_detail::lookup_owner_kernel<<<grid, block, 0, stream>>>(
+          lookup_owner_slots_.data(), lookup_owner_table_mask_,
+          lookup_owner_overflow_.data(), lookup_owner_leaves_.data(),
+          lookup_owner_leaf_count_, lookup_owner_position_bits_,
+          lookup_owner_position_mask_, assignment_views_.data(),
+          owner_run_count, make_base_view(), batch.queries, batch.count,
+          batch.out_values, batch.out_found);
+      CUDA_CHECK(cudaGetLastError());
+      return;
+    }
 #ifdef GPULSMOPT_PROFILE_FOLD
     double prof_masks = 0.0;
     double prof_publish = 0.0;
@@ -2890,6 +3130,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     succ_sparse_ready_ = false;
     ++base_generation_;
     maintenance_stats_ = MaintenanceStats{};
+    reserve_lookup_owner_storage(stream);
     if (n == 0) {
       prepare_for_insert(stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2912,6 +3153,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.route_mask_ready = false;
     run.group_child_count = 0;
     run.parent_slot = -1;
+    run.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
     run.count = n;
     run.fully_sorted = true;
     run.unit_counts = true;
@@ -2973,7 +3215,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         merge_sel_keys_, merge_sel_pay_, compaction_counts_,
         compaction_offsets_,
         narrow_overflow_, assignment_views_,
-        lookup_publication_,
+        lookup_publication_, lookup_owner_slots_,
+        lookup_owner_leaves_, lookup_owner_overflow_,
         hash_route_mask_views_,
         direct_sort_keys_, direct_sort_values_, sort_temp_storage_,
         sorted_value_prefix_, sorted_count_prefix_, base_rank23_,
@@ -3074,6 +3317,7 @@ private:
         gpulsmopt_detail::RunOperation::Insert;
     bool lookup_mask_ready = false;
     bool route_mask_ready = false;
+    std::uint32_t owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
   };
 
   struct HostLookupLeaf {
@@ -3106,6 +3350,7 @@ private:
     bool route_mask_ready = false;
     std::uint16_t group_child_count = 0;
     int parent_slot = -1;
+    std::uint32_t owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
   };
 
   void order_stream_locked(cudaStream_t stream) {
@@ -3383,6 +3628,7 @@ private:
                                run.quotient_off.data(), stream);
       }
     }
+    register_lookup_owner_leaf(run);
     publish_assignment_view(run, stream);
     invalidate_resolved();
     if (count_raw_runs() >= gpulsmopt_detail::kRawFoldWidth)
@@ -3561,6 +3807,85 @@ private:
             0u,
             0u,
             0u};
+  }
+
+  gpulsmopt_detail::LookupOwnerLeafView
+  make_lookup_owner_view(RunStorage &run) {
+    const bool insert =
+        run.operation == gpulsmopt_detail::RunOperation::Insert;
+    return {run.keys.data(), insert ? run.values.data() : nullptr,
+            run.quotient_off.data(), run.route_mask.data(),
+            static_cast<std::uint32_t>(run.count),
+            static_cast<std::uint8_t>(insert ? 1u : 0u)};
+  }
+
+  void register_lookup_owner_leaf(RunStorage &run) {
+    run.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
+    if (!lookup_owner_usable_)
+      return;
+    const std::size_t position_capacity =
+        lookup_owner_position_bits_ == 0u
+            ? 1u
+            : std::size_t{1} << lookup_owner_position_bits_;
+    if (run.count > position_capacity ||
+        lookup_owner_leaf_count_ >=
+            gpulsmopt_detail::kLookupLeafCapacity) {
+      lookup_owner_usable_ = false;
+      return;
+    }
+    const std::uint32_t leaf_id = lookup_owner_leaf_count_++;
+    run.owner_leaf_id = leaf_id;
+    host_state_->owner_leaves[leaf_id] = make_lookup_owner_view(run);
+  }
+
+  void mark_lookup_owner_routes(std::uint32_t first,
+                                std::uint32_t end) {
+    for (RunStorage &run : runs_) {
+      if (run.owner_leaf_id >= first && run.owner_leaf_id < end)
+        run.route_mask_ready = true;
+      for (RetainedLeaf &leaf : run.hash_children) {
+        if (leaf.owner_leaf_id >= first && leaf.owner_leaf_id < end)
+          leaf.route_mask_ready = true;
+      }
+    }
+  }
+
+
+  bool should_use_lookup_owner(std::size_t queries) const {
+    if (!lookup_owner_usable_ || lookup_owner_leaf_count_ == 0u)
+      return false;
+    const std::size_t threshold =
+        std::max<std::size_t>(1u, batch_capacity_ / 4u);
+    return queries >= threshold;
+  }
+
+  void prepare_lookup_owner(cudaStream_t stream) {
+    if (lookup_owner_published_leaf_count_ < lookup_owner_leaf_count_) {
+      const std::uint32_t first = lookup_owner_published_leaf_count_;
+      const std::uint32_t count = lookup_owner_leaf_count_ - first;
+      CUDA_CHECK(cudaMemcpyAsync(
+          lookup_owner_leaves_.data() + first,
+          host_state_->owner_leaves + first,
+          count * sizeof(gpulsmopt_detail::LookupOwnerLeafView),
+          cudaMemcpyHostToDevice, stream));
+      lookup_owner_published_leaf_count_ = lookup_owner_leaf_count_;
+    }
+    if (lookup_owner_applied_leaf_count_ >= lookup_owner_leaf_count_)
+      return;
+    const std::uint32_t first = lookup_owner_applied_leaf_count_;
+    const std::uint32_t pending = lookup_owner_leaf_count_ - first;
+    constexpr int block = 256;
+    constexpr int warps = block / 32;
+    constexpr int grid =
+        (gpulsmopt_detail::kEpochQuotients + warps - 1) / warps;
+    gpulsmopt_detail::lookup_owner_apply_kernel<<<
+        grid, block, 0, stream>>>(
+        lookup_owner_leaves_.data(), first, pending,
+        lookup_owner_position_bits_, lookup_owner_slots_.data(),
+        lookup_owner_table_mask_, lookup_owner_overflow_.data());
+    CUDA_CHECK(cudaGetLastError());
+    mark_lookup_owner_routes(first, first + pending);
+    lookup_owner_applied_leaf_count_ = lookup_owner_leaf_count_;
   }
 
   void ensure_raw_lookup_masks(cudaStream_t stream) {
@@ -4320,6 +4645,83 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
     resolve_winner_offsets_.resize_discard_exact(
         gpulsmopt_detail::kEpochQuotients + 1u);
+  }
+
+  static std::uint32_t lookup_owner_position_bits(std::size_t count) {
+    std::uint32_t bits = 0u;
+    std::size_t capacity = 1u;
+    while (capacity < std::max<std::size_t>(count, 1u)) {
+      capacity <<= 1u;
+      ++bits;
+    }
+    return bits;
+  }
+
+  void reset_lookup_owner(cudaStream_t stream) {
+    lookup_owner_leaf_count_ = 0u;
+    lookup_owner_published_leaf_count_ = 0u;
+    lookup_owner_applied_leaf_count_ = 0u;
+    lookup_owner_usable_ = lookup_owner_enabled_;
+    if (!lookup_owner_enabled_)
+      return;
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_owner_slots_.data(), 0,
+        lookup_owner_slots_.size() * sizeof(unsigned long long), stream));
+    CUDA_CHECK(cudaMemsetAsync(lookup_owner_overflow_.data(), 0,
+                               sizeof(std::uint32_t), stream));
+  }
+
+  void reserve_lookup_owner_storage(cudaStream_t stream) {
+    lookup_owner_position_bits_ =
+        lookup_owner_position_bits(batch_capacity_);
+    if (lookup_owner_position_bits_ > 22u) {
+      lookup_owner_enabled_ = false;
+      lookup_owner_usable_ = false;
+      return;
+    }
+    lookup_owner_position_mask_ =
+        lookup_owner_position_bits_ == 0u
+            ? 0u
+            : (std::uint32_t{1} << lookup_owner_position_bits_) - 1u;
+    if (max_elements_ >
+        std::numeric_limits<std::size_t>::max() / 2u) {
+      lookup_owner_enabled_ = false;
+      lookup_owner_usable_ = false;
+      return;
+    }
+    const std::size_t required =
+        std::max<std::size_t>(2u, max_elements_ * 2u);
+    std::size_t slots = 1u;
+    while (slots < required &&
+           slots < gpulsmopt_detail::kLookupOwnerMaxSlots)
+      slots <<= 1u;
+    if (slots < required ||
+        slots > gpulsmopt_detail::kLookupOwnerMaxSlots) {
+      lookup_owner_enabled_ = false;
+      lookup_owner_usable_ = false;
+      return;
+    }
+    if (lookup_owner_slots_.capacity() < slots) {
+      std::size_t free_bytes = 0u;
+      std::size_t total_bytes = 0u;
+      CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+      (void)total_bytes;
+      const std::size_t bytes =
+          slots * sizeof(unsigned long long);
+      constexpr std::size_t reserve = std::size_t{256} << 20;
+      if (bytes > free_bytes || free_bytes - bytes < reserve) {
+        lookup_owner_enabled_ = false;
+        lookup_owner_usable_ = false;
+        return;
+      }
+    }
+    lookup_owner_slots_.resize_discard_exact(slots);
+    lookup_owner_leaves_.resize_discard_exact(
+        gpulsmopt_detail::kLookupLeafCapacity);
+    lookup_owner_overflow_.resize_discard_exact(1u);
+    lookup_owner_table_mask_ = static_cast<std::uint32_t>(slots - 1u);
+    lookup_owner_enabled_ = true;
+    reset_lookup_owner(stream);
   }
 
   // Reserve successor storage before timed updates.
@@ -5298,6 +5700,7 @@ private:
     base.nested = false;
     base.group_child_count = 0;
     base.parent_slot = -1;
+    base.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
     base.keys.resize_discard(total);
     base.values.resize_discard(total);
 
@@ -5332,6 +5735,7 @@ private:
     invalidate_resolved();
     succ_sparse_ready_ = false;
     reset_parent_storage();
+    reset_lookup_owner(stream);
     ++base_generation_;
   }
 
@@ -5533,6 +5937,7 @@ private:
       child.operation = source.operation;
       child.lookup_mask_ready = source.lookup_mask_ready;
       child.route_mask_ready = source.route_mask_ready;
+      child.owner_leaf_id = source.owner_leaf_id;
     }
     std::sort(raw.begin(), raw.end());
     for (auto it = raw.rbegin(); it != raw.rend(); ++it) {
@@ -5718,6 +6123,21 @@ private:
       assignment_views_;
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::LookupPublication>
       lookup_publication_;
+  gpulsmopt_detail::RawDeviceBuffer<unsigned long long>
+      lookup_owner_slots_;
+  gpulsmopt_detail::RawDeviceBuffer<
+      gpulsmopt_detail::LookupOwnerLeafView>
+      lookup_owner_leaves_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      lookup_owner_overflow_;
+  std::uint32_t lookup_owner_table_mask_ = 0u;
+  std::uint32_t lookup_owner_position_bits_ = 0u;
+  std::uint32_t lookup_owner_position_mask_ = 0u;
+  std::uint32_t lookup_owner_leaf_count_ = 0u;
+  std::uint32_t lookup_owner_published_leaf_count_ = 0u;
+  std::uint32_t lookup_owner_applied_leaf_count_ = 0u;
+  bool lookup_owner_enabled_ = false;
+  bool lookup_owner_usable_ = false;
   // Oldest-to-newest descriptor mirror.
   std::vector<gpulsmopt_detail::AssignmentRunView> chrono_views_;
   std::vector<HostLookupLeaf> lookup_host_leaves_;
