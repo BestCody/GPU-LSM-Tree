@@ -16,6 +16,8 @@
 #include <thrust/iterator/reverse_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/transform.h>
+#include <thrust/unique.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -54,17 +56,11 @@ namespace gpulsmopt_detail {
 #ifndef GPULSMOPT_RADIX_ITEMS
 #define GPULSMOPT_RADIX_ITEMS 22
 #endif
-#ifndef GPULSMOPT_RANGE_CDF_MAX_RATIO
-#define GPULSMOPT_RANGE_CDF_MAX_RATIO 4
-#endif
 #ifndef GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES
 #define GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES (1 << 16)
 #endif
 #ifndef GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS
 #define GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS 8
-#endif
-#ifndef GPULSMOPT_NARROW_RANGE_MAX_QUERIES
-#define GPULSMOPT_NARROW_RANGE_MAX_QUERIES 4096
 #endif
 #ifndef GPULSMOPT_PREWARM_LEAVES
 #define GPULSMOPT_PREWARM_LEAVES 576
@@ -127,11 +123,23 @@ static_assert(kStableFanout == 4, "stable fanout must be 4");
 static_assert(kStableLevels <= 16, "stable levels bounded to 16");
 static_assert(1 + kRawFoldWidth + 3 * kStableLevels + 1 <= kRunCapacity,
               "descriptor occupancy must fit run capacity");
-constexpr std::uint64_t kRangeCdfMaxRatio = GPULSMOPT_RANGE_CDF_MAX_RATIO;
 static_assert(GPULSMOPT_RADIX_THREADS % 32 == 0,
               "radix block size must be warp aligned");
 static_assert(kRunCapacity == 128, "run kernels require 128 physical slots");
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
+
+// QVRF uses immutable, quotient-aligned Base leaves and sparse visible-cell
+// overrides.  This is a hardware/coalescing granularity, not a query-size
+// heuristic.  Each rank23 cell still bounds visibility reconstruction to 512
+// possible keys.
+constexpr std::uint32_t kQvrfBaseLeafRecords = 128u;
+constexpr std::uint32_t kQvrfTopFanout = 16u;
+constexpr std::uint32_t kQvrfTopL1 = kEpochQuotients / kQvrfTopFanout;
+constexpr std::uint32_t kQvrfTopL2 = kQvrfTopL1 / kQvrfTopFanout;
+constexpr std::uint32_t kQvrfTopL3 = kQvrfTopL2 / kQvrfTopFanout;
+constexpr std::uint32_t kQvrfTopL4 = kQvrfTopL3 / kQvrfTopFanout;
+constexpr std::uint32_t kQvrfMaterializationFreeDivisor = 8u;
+static_assert(kQvrfTopL4 == 1u, "QVRF top geometry must reach one root");
 
 constexpr std::uint32_t kInsert = 1;
 constexpr std::uint32_t kTombstone = 0;
@@ -389,18 +397,6 @@ struct SortedRunView {
   std::uint32_t unit_counts;
 };
 
-struct SortedRunRangeView {
-  const std::uint32_t *cdf;
-  std::uint32_t min_key;
-  std::uint64_t span;
-};
-
-
-;
-
-;
-
-
 __device__ inline void
 sorted_search_bounds(const SortedRunView &sorted, std::uint32_t key,
                      std::size_t *begin, std::size_t *end) {
@@ -429,6 +425,11 @@ __device__ inline void sorted_range_ranks(const SortedRunView &sorted,
                                           std::uint32_t lo, std::uint32_t hi,
                                           std::size_t *lower,
                                           std::size_t *upper) {
+  if (sorted.count == 0u) {
+    *lower = 0u;
+    *upper = 0u;
+    return;
+  }
   const std::uint32_t lo_bin = lo >> kBaseRank23Shift;
   const std::uint32_t hi_bin = hi >> kBaseRank23Shift;
   const std::size_t lo_begin = sorted.rank23[lo_bin];
@@ -441,46 +442,6 @@ __device__ inline void sorted_range_ranks(const SortedRunView &sorted,
       hi_begin + upper_bound_u32(sorted.keys + hi_begin, hi_end - hi_begin, hi);
 }
 
-__device__ inline std::uint32_t
-sorted_range_cdf_prefix(const SortedRunRangeView &range, std::uint32_t key,
-                        bool upper) {
-  if (key < range.min_key)
-    return 0u;
-  std::uint64_t index = static_cast<std::uint64_t>(key) - range.min_key +
-                        static_cast<unsigned>(upper);
-  if (index > range.span)
-    index = range.span;
-  return range.cdf[index];
-}
-
-__device__ inline std::uint32_t
-sorted_range_count(const SortedRunView &sorted,
-                   const std::uint32_t *count_prefix, std::uint32_t lo,
-                   std::uint32_t hi) {
-  if (sorted.count == 0)
-    return 0u;
-  std::size_t begin = 0, end = 0;
-  sorted_range_ranks(sorted, lo, hi, &begin, &end);
-  if (sorted.unit_counts)
-    return static_cast<std::uint32_t>(end - begin);
-  return count_prefix[end] - count_prefix[begin];
-}
-
-__device__ inline std::uint32_t
-sorted_range_sum(const SortedRunView &sorted, const SortedRunRangeView &range,
-                 const std::uint32_t *value_prefix, std::uint32_t lo,
-                 std::uint32_t hi) {
-  if (sorted.count == 0)
-    return 0u;
-  if (range.cdf) {
-    return sorted_range_cdf_prefix(range, hi, true) -
-           sorted_range_cdf_prefix(range, lo, false);
-  }
-  std::size_t begin = 0, end = 0;
-  sorted_range_ranks(sorted, lo, hi, &begin, &end);
-  return value_prefix[end] - value_prefix[begin];
-}
-
 struct BaseRunView {
   SortedRunView base;
 };
@@ -491,34 +452,58 @@ __device__ inline bool base_find_value(
   return sorted_find_value(v.base, key, value);
 }
 
-__device__ inline std::uint32_t base_range_sum(
-    const BaseRunView &v,
-    const SortedRunRangeView &range,
-    const std::uint32_t *base_value_prefix,
-    std::uint32_t lo, std::uint32_t hi) {
-  return sorted_range_sum(
-      v.base, range, base_value_prefix, lo, hi);
+struct alignas(16) QvrfSummary {
+  std::uint32_t sum;
+  std::uint32_t count;
+  std::uint32_t minimum;
+  std::uint32_t maximum;
+};
+
+__host__ __device__ inline QvrfSummary qvrf_identity() {
+  return {0u, 0u, std::numeric_limits<std::uint32_t>::max(), 0u};
 }
 
-__device__ inline std::uint32_t base_range_count(
-    const BaseRunView &v,
-    const std::uint32_t *base_count_prefix,
-    std::uint32_t lo, std::uint32_t hi) {
-  return sorted_range_count(
-      v.base, base_count_prefix, lo, hi);
+__host__ __device__ inline QvrfSummary
+qvrf_lift(std::uint32_t key, std::uint32_t value) {
+  (void)key;
+  return {value, 1u, value, value};
 }
 
-__global__ void sorted_range_cdf_scatter_kernel(const std::uint32_t *keys,
-                                                const std::uint32_t *values,
-                                                std::size_t count,
-                                                std::uint32_t min_key,
-                                                std::uint32_t *cdf) {
-  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  const std::uint64_t slot = static_cast<std::uint64_t>(keys[i]) - min_key + 1u;
-  cdf[slot] = values[i];
+// combine is deliberately ordered.  Sum/count/min/max happen to commute, but
+// the forest traversal uses this same left-to-right shape for custom monoids.
+__host__ __device__ inline QvrfSummary
+qvrf_combine(const QvrfSummary &left, const QvrfSummary &right) {
+  if (left.count == 0u)
+    return right;
+  if (right.count == 0u)
+    return left;
+  return {left.sum + right.sum,
+          left.count + right.count,
+          left.minimum < right.minimum ? left.minimum : right.minimum,
+          left.maximum > right.maximum ? left.maximum : right.maximum};
 }
+
+struct QvrfView {
+  SortedRunView base;
+  RunView resolved;
+  const std::uint32_t *resolved_values;
+  const std::int8_t *resolved_counts;
+  const std::uint32_t *base_q_block_offsets;
+  const QvrfSummary *base_block_summaries;
+  const std::uint32_t *cell_ids;
+  const std::uint32_t *cell_offsets;
+  const std::uint32_t *cell_keys;
+  const std::uint32_t *cell_values;
+  const QvrfSummary *cell_summaries;
+  const std::uint32_t *q_cell_offsets;
+  const QvrfSummary *q_summaries;
+  const QvrfSummary *top_l1;
+  const QvrfSummary *top_l2;
+  const QvrfSummary *top_l3;
+  const QvrfSummary *top_l4;
+  std::uint32_t cell_count;
+  std::uint32_t materialized_cells;
+};
 
 struct TakeLastU32 {
   __host__ __device__ std::uint32_t operator()(std::uint32_t,
@@ -875,7 +860,9 @@ struct PinnedHostState {
   const std::uint64_t *route_masks[kRawFoldWidth];
   LookupPublication lookup;
   LookupOwnerLeafView owner_leaves[kLookupLeafCapacity];
-  std::uint32_t narrow_overflow;
+  std::uint32_t qvrf_base_block_count;
+  std::uint32_t qvrf_visible_count;
+  std::uint64_t qvrf_report_count;
   std::uint32_t resolved_count;
   std::uint32_t successor_miss_count;
   std::uint32_t gathered_count;
@@ -1516,6 +1503,605 @@ __global__ void base_rank23_boundary_kernel(const std::uint32_t *keys,
     rank23[bin] = i;
 }
 
+struct QvrfKeyToCell {
+  __host__ __device__ std::uint32_t operator()(std::uint32_t key) const {
+    return key >> kBaseRank23Shift;
+  }
+};
+
+__global__ void qvrf_base_block_count_kernel(const std::uint32_t *rank23,
+                                              std::uint32_t *counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  const std::uint32_t begin = rank23[q * kBaseBinsPerQuotient];
+  const std::uint32_t end = rank23[(q + 1u) * kBaseBinsPerQuotient];
+  counts[q] = (end - begin + kQvrfBaseLeafRecords - 1u) /
+              kQvrfBaseLeafRecords;
+}
+
+__global__ void qvrf_base_block_layout_kernel(
+    const std::uint32_t *rank23, const std::uint32_t *block_offsets,
+    std::uint32_t *block_begins, std::uint16_t *block_counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  const std::uint32_t q_begin = rank23[q * kBaseBinsPerQuotient];
+  const std::uint32_t q_end = rank23[(q + 1u) * kBaseBinsPerQuotient];
+  const std::uint32_t first = block_offsets[q];
+  const std::uint32_t blocks = block_offsets[q + 1u] - first;
+  for (std::uint32_t local = 0; local < blocks; ++local) {
+    const std::uint32_t begin = q_begin + local * kQvrfBaseLeafRecords;
+    const std::uint32_t count =
+        min(kQvrfBaseLeafRecords, q_end - begin);
+    block_begins[first + local] = begin;
+    block_counts[first + local] = static_cast<std::uint16_t>(count);
+  }
+}
+
+__global__ __launch_bounds__(kQvrfBaseLeafRecords)
+void qvrf_base_block_summary_kernel(
+    SortedRunView base, const std::uint32_t *block_begins,
+    const std::uint16_t *block_counts, const std::uint32_t *block_offsets,
+    QvrfSummary *summaries) {
+  const std::uint32_t block_id = blockIdx.x;
+  if (block_id >= block_offsets[kEpochQuotients])
+    return;
+  __shared__ QvrfSummary state[kQvrfBaseLeafRecords];
+  const std::uint32_t begin = block_begins[block_id];
+  const std::uint32_t count = block_counts[block_id];
+  const std::uint32_t lane = threadIdx.x;
+  state[lane] = lane < count
+                    ? qvrf_lift(base.keys[begin + lane],
+                                base.values[begin + lane])
+                             : qvrf_identity();
+  __syncthreads();
+  for (std::uint32_t stride = 1u; stride < kQvrfBaseLeafRecords;
+       stride <<= 1u) {
+    const std::uint32_t left = lane * (stride << 1u);
+    if (left + stride < kQvrfBaseLeafRecords)
+      state[left] = qvrf_combine(state[left], state[left + stride]);
+    __syncthreads();
+  }
+  if (lane == 0u)
+    summaries[block_id] = state[0];
+}
+
+__global__ void qvrf_base_q_summary_kernel(
+    const std::uint32_t *block_offsets,
+    const QvrfSummary *block_summaries, QvrfSummary *q_summaries) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  QvrfSummary state = qvrf_identity();
+  for (std::uint32_t i = block_offsets[q]; i < block_offsets[q + 1u]; ++i)
+    state = qvrf_combine(state, block_summaries[i]);
+  q_summaries[q] = state;
+}
+
+__global__ void qvrf_reduce16_kernel(const QvrfSummary *input,
+                                     QvrfSummary *output,
+                                     std::uint32_t output_count) {
+  const std::uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+  if (item >= output_count)
+    return;
+  QvrfSummary summary = qvrf_identity();
+  const std::uint32_t begin = item * kQvrfTopFanout;
+  for (std::uint32_t i = 0u; i < kQvrfTopFanout; ++i)
+    summary = qvrf_combine(summary, input[begin + i]);
+  output[item] = summary;
+}
+
+__device__ inline QvrfSummary qvrf_base_rank_summary(
+    const QvrfView &view, std::uint32_t q, std::uint32_t begin,
+    std::uint32_t end) {
+  if (begin >= end)
+    return qvrf_identity();
+  const std::uint32_t q_begin =
+      view.base.rank23[q * kBaseBinsPerQuotient];
+  const std::uint32_t first_local =
+      (begin - q_begin) / kQvrfBaseLeafRecords;
+  const std::uint32_t last_local =
+      (end - 1u - q_begin) / kQvrfBaseLeafRecords;
+  QvrfSummary state = qvrf_identity();
+  if (first_local == last_local) {
+    for (std::uint32_t i = begin; i < end; ++i)
+      state = qvrf_combine(
+          state, qvrf_lift(view.base.keys[i], view.base.values[i]));
+    return state;
+  }
+  const std::uint32_t first_end =
+      q_begin + (first_local + 1u) * kQvrfBaseLeafRecords;
+  for (std::uint32_t i = begin; i < first_end; ++i)
+    state = qvrf_combine(
+        state, qvrf_lift(view.base.keys[i], view.base.values[i]));
+  const std::uint32_t q_block = view.base_q_block_offsets[q];
+  for (std::uint32_t local = first_local + 1u; local < last_local; ++local)
+    state = qvrf_combine(state,
+                         view.base_block_summaries[q_block + local]);
+  const std::uint32_t last_begin =
+      q_begin + last_local * kQvrfBaseLeafRecords;
+  for (std::uint32_t i = last_begin; i < end; ++i)
+    state = qvrf_combine(
+        state, qvrf_lift(view.base.keys[i], view.base.values[i]));
+  return state;
+}
+
+__device__ inline void qvrf_resolved_cell_bounds(
+    RunView resolved, std::uint32_t cell, std::uint32_t *begin,
+    std::uint32_t *end) {
+  const std::uint32_t q = cell >>
+      (kBaseRank23Bits - kEpochQuotientBits);
+  const std::uint32_t q_begin = resolved.quotient_off[q];
+  const std::uint32_t q_end = resolved.quotient_off[q + 1u];
+  const std::uint32_t key_begin = cell << kBaseRank23Shift;
+  *begin = q_begin + static_cast<std::uint32_t>(lower_bound_u32(
+      resolved.keys + q_begin, q_end - q_begin, key_begin));
+  if ((cell & (kBaseBinsPerQuotient - 1u)) ==
+      kBaseBinsPerQuotient - 1u) {
+    *end = q_end;
+  } else {
+    const std::uint32_t key_end = (cell + 1u) << kBaseRank23Shift;
+    *end = q_begin + static_cast<std::uint32_t>(lower_bound_u32(
+        resolved.keys + q_begin, q_end - q_begin, key_end));
+  }
+}
+
+__global__ void qvrf_cell_summary_kernel(QvrfView view,
+                                          QvrfSummary *summaries) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= view.cell_count)
+    return;
+  const std::uint32_t cell = view.cell_ids[i];
+  std::uint32_t bi = view.base.rank23[cell];
+  const std::uint32_t be = view.base.rank23[cell + 1u];
+  std::uint32_t ci = 0u, ce = 0u;
+  qvrf_resolved_cell_bounds(view.resolved, cell, &ci, &ce);
+  QvrfSummary summary = qvrf_identity();
+  while (bi < be || ci < ce) {
+    std::uint32_t key = 0u, value = 0u;
+    bool live = false;
+    if (ci < ce &&
+        (bi == be || view.resolved.keys[ci] < view.base.keys[bi])) {
+      key = view.resolved.keys[ci];
+      value = view.resolved_values[ci];
+      live = view.resolved_counts[ci] > 0;
+      ++ci;
+    } else if (bi < be &&
+               (ci == ce || view.base.keys[bi] < view.resolved.keys[ci])) {
+      key = view.base.keys[bi];
+      value = view.base.values[bi];
+      live = true;
+      ++bi;
+    } else {
+      key = view.base.keys[bi];
+      if (view.resolved_counts[ci] >= 0) {
+        value = view.resolved_counts[ci] > 0
+                    ? view.resolved_values[ci]
+                    : view.base.values[bi] + view.resolved_values[ci];
+        live = true;
+      }
+      ++bi;
+      ++ci;
+    }
+    if (live)
+      summary = qvrf_combine(summary, qvrf_lift(key, value));
+  }
+  summaries[i] = summary;
+}
+
+__global__ void qvrf_cell_visible_count_kernel(QvrfView view,
+                                                std::uint32_t *counts) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= view.cell_count)
+    return;
+  const std::uint32_t cell = view.cell_ids[i];
+  std::uint32_t bi = view.base.rank23[cell];
+  const std::uint32_t be = view.base.rank23[cell + 1u];
+  std::uint32_t ci = 0u, ce = 0u;
+  qvrf_resolved_cell_bounds(view.resolved, cell, &ci, &ce);
+  std::uint32_t count = 0u;
+  while (bi < be || ci < ce) {
+    if (ci < ce &&
+        (bi == be || view.resolved.keys[ci] < view.base.keys[bi])) {
+      count += view.resolved_counts[ci] > 0 ? 1u : 0u;
+      ++ci;
+    } else if (bi < be &&
+               (ci == ce || view.base.keys[bi] < view.resolved.keys[ci])) {
+      ++count;
+      ++bi;
+    } else {
+      count += view.resolved_counts[ci] < 0 ? 0u : 1u;
+      ++bi;
+      ++ci;
+    }
+  }
+  counts[i] = count;
+}
+
+__global__ void qvrf_finish_offsets_kernel(const std::uint32_t *counts,
+                                            std::uint32_t *offsets,
+                                            std::uint32_t count) {
+  if (blockIdx.x != 0u || threadIdx.x != 0u)
+    return;
+  offsets[count] = count == 0u ? 0u : offsets[count - 1u] + counts[count - 1u];
+}
+
+__global__ void qvrf_cell_emit_kernel(QvrfView view,
+                                       const std::uint32_t *offsets,
+                                       std::uint32_t *out_keys,
+                                       std::uint32_t *out_values,
+                                       QvrfSummary *summaries) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= view.cell_count)
+    return;
+  const std::uint32_t cell = view.cell_ids[i];
+  std::uint32_t bi = view.base.rank23[cell];
+  const std::uint32_t be = view.base.rank23[cell + 1u];
+  std::uint32_t ci = 0u, ce = 0u;
+  qvrf_resolved_cell_bounds(view.resolved, cell, &ci, &ce);
+  std::uint32_t output = offsets[i];
+  QvrfSummary summary = qvrf_identity();
+  while (bi < be || ci < ce) {
+    std::uint32_t key = 0u, value = 0u;
+    bool live = false;
+    if (ci < ce &&
+        (bi == be || view.resolved.keys[ci] < view.base.keys[bi])) {
+      key = view.resolved.keys[ci];
+      value = view.resolved_values[ci];
+      live = view.resolved_counts[ci] > 0;
+      ++ci;
+    } else if (bi < be &&
+               (ci == ce || view.base.keys[bi] < view.resolved.keys[ci])) {
+      key = view.base.keys[bi];
+      value = view.base.values[bi];
+      live = true;
+      ++bi;
+    } else {
+      key = view.base.keys[bi];
+      if (view.resolved_counts[ci] >= 0) {
+        value = view.resolved_counts[ci] > 0
+                    ? view.resolved_values[ci]
+                    : view.base.values[bi] + view.resolved_values[ci];
+        live = true;
+      }
+      ++bi;
+      ++ci;
+    }
+    if (live) {
+      out_keys[output] = key;
+      out_values[output] = value;
+      summary = qvrf_combine(summary, qvrf_lift(key, value));
+      ++output;
+    }
+  }
+  summaries[i] = summary;
+}
+
+__global__ void qvrf_q_cell_offsets_kernel(const std::uint32_t *cell_ids,
+                                            std::uint32_t cell_count,
+                                            std::uint32_t *offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kEpochQuotients)
+    return;
+  if (cell_count == 0u) {
+    offsets[q] = 0u;
+    return;
+  }
+  const std::uint32_t target = q * kBaseBinsPerQuotient;
+  offsets[q] = static_cast<std::uint32_t>(
+      lower_bound_u32(cell_ids, cell_count, target));
+}
+
+__global__ void qvrf_dirty_q_summary_kernel(QvrfView view,
+                                             QvrfSummary *q_summaries) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kEpochQuotients)
+    return;
+  const std::uint32_t first = view.q_cell_offsets[q];
+  const std::uint32_t last = view.q_cell_offsets[q + 1u];
+  if (first == last)
+    return;
+  std::uint32_t cursor =
+      view.base.rank23[q * kBaseBinsPerQuotient];
+  const std::uint32_t q_end =
+      view.base.rank23[(q + 1u) * kBaseBinsPerQuotient];
+  QvrfSummary summary = qvrf_identity();
+  for (std::uint32_t i = first; i < last; ++i) {
+    const std::uint32_t cell = view.cell_ids[i];
+    const std::uint32_t cell_begin = view.base.rank23[cell];
+    const std::uint32_t cell_end = view.base.rank23[cell + 1u];
+    summary = qvrf_combine(
+        summary, qvrf_base_rank_summary(view, q, cursor, cell_begin));
+    summary = qvrf_combine(summary, view.cell_summaries[i]);
+    cursor = cell_end;
+  }
+  summary = qvrf_combine(
+      summary, qvrf_base_rank_summary(view, q, cursor, q_end));
+  q_summaries[q] = summary;
+}
+
+__device__ inline QvrfSummary qvrf_page_range_summary(
+    const QvrfView &view, std::uint32_t page, std::uint32_t lo,
+    std::uint32_t hi) {
+  const std::uint32_t cell = view.cell_ids[page];
+  const std::uint32_t cell_lo = cell << kBaseRank23Shift;
+  const std::uint32_t cell_hi =
+      cell_lo | ((1u << kBaseRank23Shift) - 1u);
+  if (lo <= cell_lo && hi >= cell_hi)
+    return view.cell_summaries[page];
+  if (view.materialized_cells != 0u) {
+    const std::uint32_t begin = view.cell_offsets[page];
+    const std::uint32_t end = view.cell_offsets[page + 1u];
+    if (begin == end)
+      return qvrf_identity();
+    const std::uint32_t lower = begin + static_cast<std::uint32_t>(
+        lower_bound_u32(view.cell_keys + begin, end - begin, lo));
+    const std::uint32_t upper = begin + static_cast<std::uint32_t>(
+        upper_bound_u32(view.cell_keys + begin, end - begin, hi));
+    QvrfSummary summary = qvrf_identity();
+    for (std::uint32_t i = lower; i < upper; ++i)
+      summary = qvrf_combine(
+          summary, qvrf_lift(view.cell_keys[i], view.cell_values[i]));
+    return summary;
+  }
+
+  std::uint32_t bi = view.base.rank23[cell];
+  const std::uint32_t be = view.base.rank23[cell + 1u];
+  std::uint32_t ci = 0u, ce = 0u;
+  qvrf_resolved_cell_bounds(view.resolved, cell, &ci, &ce);
+  QvrfSummary summary = qvrf_identity();
+  while (bi < be || ci < ce) {
+    std::uint32_t key = 0u, value = 0u;
+    bool live = false;
+    if (ci < ce &&
+        (bi == be || view.resolved.keys[ci] < view.base.keys[bi])) {
+      key = view.resolved.keys[ci];
+      value = view.resolved_values[ci];
+      live = view.resolved_counts[ci] > 0;
+      ++ci;
+    } else if (bi < be &&
+               (ci == ce || view.base.keys[bi] < view.resolved.keys[ci])) {
+      key = view.base.keys[bi];
+      value = view.base.values[bi];
+      live = true;
+      ++bi;
+    } else {
+      key = view.base.keys[bi];
+      if (view.resolved_counts[ci] >= 0) {
+        value = view.resolved_counts[ci] > 0
+                    ? view.resolved_values[ci]
+                    : view.base.values[bi] + view.resolved_values[ci];
+        live = true;
+      }
+      ++bi;
+      ++ci;
+    }
+    if (live && key >= lo && key <= hi)
+      summary = qvrf_combine(summary, qvrf_lift(key, value));
+  }
+  return summary;
+}
+
+__device__ inline QvrfSummary qvrf_q_range_summary(
+    const QvrfView &view, std::uint32_t q, std::uint32_t lo,
+    std::uint32_t hi) {
+  std::size_t lower_size = 0u, upper_size = 0u;
+  sorted_range_ranks(view.base, lo, hi, &lower_size, &upper_size);
+  std::uint32_t cursor = static_cast<std::uint32_t>(lower_size);
+  const std::uint32_t upper = static_cast<std::uint32_t>(upper_size);
+  const std::uint32_t first = view.q_cell_offsets[q];
+  const std::uint32_t last = view.q_cell_offsets[q + 1u];
+  const std::uint32_t lo_cell = lo >> kBaseRank23Shift;
+  const std::uint32_t hi_cell = hi >> kBaseRank23Shift;
+  std::uint32_t page = first;
+  if (first < last)
+    page += static_cast<std::uint32_t>(lower_bound_u32(
+        view.cell_ids + first, last - first, lo_cell));
+  QvrfSummary summary = qvrf_identity();
+  for (; page < last && view.cell_ids[page] <= hi_cell; ++page) {
+    const std::uint32_t cell = view.cell_ids[page];
+    const std::uint32_t base_begin = view.base.rank23[cell];
+    const std::uint32_t base_end = view.base.rank23[cell + 1u];
+    if (cursor < base_begin)
+      summary = qvrf_combine(
+          summary, qvrf_base_rank_summary(view, q, cursor,
+                                           min(base_begin, upper)));
+    summary = qvrf_combine(summary,
+                           qvrf_page_range_summary(view, page, lo, hi));
+    if (base_end > cursor)
+      cursor = base_end;
+  }
+  if (cursor < upper)
+    summary = qvrf_combine(
+        summary, qvrf_base_rank_summary(view, q, cursor, upper));
+  return summary;
+}
+
+__device__ inline QvrfSummary qvrf_top_range_summary(
+    const QvrfView &view, std::uint32_t begin, std::uint32_t end) {
+  QvrfSummary left = qvrf_identity();
+  QvrfSummary right = qvrf_identity();
+  const QvrfSummary *level = view.q_summaries;
+  for (std::uint32_t depth = 0u; depth < 5u && begin < end; ++depth) {
+    while (begin < end && (begin & (kQvrfTopFanout - 1u)) != 0u)
+      left = qvrf_combine(left, level[begin++]);
+    while (begin < end && (end & (kQvrfTopFanout - 1u)) != 0u)
+      right = qvrf_combine(level[--end], right);
+    if (begin == end)
+      break;
+    begin /= kQvrfTopFanout;
+    end /= kQvrfTopFanout;
+    level = depth == 0u ? view.top_l1
+          : depth == 1u ? view.top_l2
+          : depth == 2u ? view.top_l3
+                        : view.top_l4;
+  }
+  return qvrf_combine(left, right);
+}
+
+__device__ inline QvrfSummary qvrf_range_summary(
+    const QvrfView &view, std::uint32_t lower, std::uint32_t upper) {
+  QvrfSummary summary = qvrf_identity();
+  if (lower > upper)
+    return summary;
+  const std::uint32_t qlo = lower >> kEpochQuotientBits;
+  const std::uint32_t qhi = upper >> kEpochQuotientBits;
+  if (qlo == qhi)
+    return qvrf_q_range_summary(view, qlo, lower, upper);
+  const std::uint32_t left_hi =
+      (qlo << kEpochQuotientBits) | 0xffffu;
+  const std::uint32_t right_lo = qhi << kEpochQuotientBits;
+  summary = qvrf_q_range_summary(view, qlo, lower, left_hi);
+  if (qlo + 1u < qhi)
+    summary = qvrf_combine(
+        summary, qvrf_top_range_summary(view, qlo + 1u, qhi));
+  return qvrf_combine(
+      summary, qvrf_q_range_summary(view, qhi, right_lo, upper));
+}
+
+__global__ void qvrf_range_kernel(
+    QvrfView view, const std::uint32_t *lo, const std::uint32_t *hi,
+    std::size_t query_count, std::uint32_t *out_sums,
+    std::uint32_t *out_counts, std::uint32_t *out_mins,
+    std::uint32_t *out_maxs) {
+  const std::size_t query =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (query >= query_count)
+    return;
+  const QvrfSummary summary =
+      qvrf_range_summary(view, lo[query], hi[query]);
+  if (out_sums)
+    out_sums[query] = summary.sum;
+  if (out_counts)
+    out_counts[query] = summary.count;
+  if (out_mins)
+    out_mins[query] = summary.minimum;
+  if (out_maxs)
+    out_maxs[query] = summary.maximum;
+}
+
+__global__ void qvrf_report_count_kernel(
+    QvrfView view, const std::uint32_t *lo, const std::uint32_t *hi,
+    std::size_t query_count, std::uint64_t *counts) {
+  const std::size_t query =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (query < query_count)
+    counts[query] = qvrf_range_summary(view, lo[query], hi[query]).count;
+}
+
+__global__ void qvrf_finish_report_offsets_kernel(
+    const std::uint64_t *counts, std::uint64_t *offsets,
+    std::size_t count) {
+  if (blockIdx.x != 0u || threadIdx.x != 0u)
+    return;
+  offsets[count] = count == 0u ? 0u : offsets[count - 1u] + counts[count - 1u];
+}
+
+__global__ void qvrf_report_kernel(
+    QvrfView view, const std::uint32_t *lo, const std::uint32_t *hi,
+    std::size_t query_count, const std::uint64_t *offsets,
+    std::uint32_t *out_keys, std::uint32_t *out_values) {
+  const std::size_t query =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (query >= query_count || lo[query] > hi[query])
+    return;
+  const std::uint32_t lower_key = lo[query];
+  const std::uint32_t upper_key = hi[query];
+  std::size_t lower_size = 0u, upper_size = 0u;
+  sorted_range_ranks(view.base, lower_key, upper_key,
+                     &lower_size, &upper_size);
+  std::uint32_t cursor = static_cast<std::uint32_t>(lower_size);
+  const std::uint32_t base_upper = static_cast<std::uint32_t>(upper_size);
+  std::uint64_t output = offsets[query];
+
+  const std::uint32_t qlo = lower_key >> kEpochQuotientBits;
+  const std::uint32_t qhi = upper_key >> kEpochQuotientBits;
+  const std::uint32_t lo_cell = lower_key >> kBaseRank23Shift;
+  const std::uint32_t hi_cell = upper_key >> kBaseRank23Shift;
+  const std::uint32_t first = view.q_cell_offsets[qlo];
+  const std::uint32_t last = view.q_cell_offsets[qhi + 1u];
+  std::uint32_t page = first;
+  if (first < last)
+    page += static_cast<std::uint32_t>(lower_bound_u32(
+        view.cell_ids + first, last - first, lo_cell));
+
+  for (; page < last && view.cell_ids[page] <= hi_cell; ++page) {
+    const std::uint32_t cell = view.cell_ids[page];
+    const std::uint32_t cell_begin = view.base.rank23[cell];
+    const std::uint32_t cell_end = view.base.rank23[cell + 1u];
+    const std::uint32_t gap_end = min(cell_begin, base_upper);
+    while (cursor < gap_end) {
+      out_keys[output] = view.base.keys[cursor];
+      out_values[output] = view.base.values[cursor];
+      ++output;
+      ++cursor;
+    }
+
+    if (view.materialized_cells != 0u) {
+      const std::uint32_t begin = view.cell_offsets[page];
+      const std::uint32_t end = view.cell_offsets[page + 1u];
+      if (begin < end) {
+        const std::uint32_t emit_begin = begin +
+            static_cast<std::uint32_t>(lower_bound_u32(
+                view.cell_keys + begin, end - begin, lower_key));
+        const std::uint32_t emit_end = begin +
+            static_cast<std::uint32_t>(upper_bound_u32(
+                view.cell_keys + begin, end - begin, upper_key));
+        for (std::uint32_t i = emit_begin; i < emit_end; ++i) {
+          out_keys[output] = view.cell_keys[i];
+          out_values[output] = view.cell_values[i];
+          ++output;
+        }
+      }
+    } else {
+      std::uint32_t bi = cell_begin;
+      std::uint32_t ci = 0u, ce = 0u;
+      qvrf_resolved_cell_bounds(view.resolved, cell, &ci, &ce);
+      while (bi < cell_end || ci < ce) {
+        std::uint32_t key = 0u, value = 0u;
+        bool live = false;
+        if (ci < ce &&
+            (bi == cell_end || view.resolved.keys[ci] < view.base.keys[bi])) {
+          key = view.resolved.keys[ci];
+          value = view.resolved_values[ci];
+          live = view.resolved_counts[ci] > 0;
+          ++ci;
+        } else if (bi < cell_end &&
+                   (ci == ce || view.base.keys[bi] < view.resolved.keys[ci])) {
+          key = view.base.keys[bi];
+          value = view.base.values[bi];
+          live = true;
+          ++bi;
+        } else {
+          key = view.base.keys[bi];
+          if (view.resolved_counts[ci] >= 0) {
+            value = view.resolved_counts[ci] > 0
+                        ? view.resolved_values[ci]
+                        : view.base.values[bi] + view.resolved_values[ci];
+            live = true;
+          }
+          ++bi;
+          ++ci;
+        }
+        if (live && key >= lower_key && key <= upper_key) {
+          out_keys[output] = key;
+          out_values[output] = value;
+          ++output;
+        }
+      }
+    }
+    if (cell_end > cursor)
+      cursor = cell_end;
+  }
+  while (cursor < base_upper) {
+    out_keys[output] = view.base.keys[cursor];
+    out_values[output] = view.base.values[cursor];
+    ++output;
+    ++cursor;
+  }
+}
+
 // Keeps only the newest live record for each key.
 __global__ void resolve_live_last_kernel(
     const std::uint32_t *keys, const std::uint64_t *payload,
@@ -1540,13 +2126,6 @@ corr_pack(std::uint32_t value_delta, std::int8_t count_delta) {
 struct CacheTaggedKey {
   __host__ __device__ std::uint64_t operator()(std::uint32_t key) const {
     return static_cast<std::uint64_t>(key) << 32;
-  }
-};
-
-struct CountDeltaToU32 {
-  __host__ __device__ std::uint32_t operator()(std::int8_t delta) const {
-    return static_cast<std::uint32_t>(
-        static_cast<std::int32_t>(delta));
   }
 };
 
@@ -1910,65 +2489,6 @@ __global__ void resolve_merge_flag_kernel(const std::uint64_t *tagged_keys,
 }
 
 
-__device__ inline void resolved_range_ranks(
-    const RunView &resolved, std::uint32_t lo, std::uint32_t hi,
-    std::size_t *lower, std::size_t *upper) {
-  const std::uint32_t lo_q = lo >> kEpochQuotientBits;
-  const std::uint32_t hi_q = hi >> kEpochQuotientBits;
-  const std::size_t lo_begin = resolved.quotient_off[lo_q];
-  const std::size_t lo_end = resolved.quotient_off[lo_q + 1u];
-  const std::size_t hi_begin = resolved.quotient_off[hi_q];
-  const std::size_t hi_end = resolved.quotient_off[hi_q + 1u];
-  *lower = lo_begin + lower_bound_u32(
-      resolved.keys + lo_begin, lo_end - lo_begin, lo);
-  *upper = hi_begin + upper_bound_u32(
-      resolved.keys + hi_begin, hi_end - hi_begin, hi);
-}
-
-template <bool WithCounts>
-__global__ void resolved_range_kernel(
-    const std::uint32_t *lo, const std::uint32_t *hi,
-    std::uint32_t *out_sums, std::uint32_t *out_counts,
-    std::size_t query_count, BaseRunView base,
-    SortedRunRangeView base_range,
-    const std::uint32_t *base_value_prefix,
-    const std::uint32_t *base_count_prefix, RunView resolved,
-    const std::uint32_t *resolved_value_prefix,
-    const std::uint32_t *resolved_count_prefix, int resolved_ready) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= query_count)
-    return;
-  const std::uint32_t l = lo[i];
-  const std::uint32_t h = hi[i];
-  if (l > h) {
-    out_sums[i] = 0u;
-    if constexpr (WithCounts)
-      out_counts[i] = 0u;
-    return;
-  }
-  std::size_t delta_lower = 0u;
-  std::size_t delta_upper = 0u;
-  if (resolved_ready)
-    resolved_range_ranks(
-        resolved, l, h, &delta_lower, &delta_upper);
-  // BaseRun sum plus resolved pending assignments.
-  std::uint32_t sum =
-      base_range_sum(base, base_range, base_value_prefix, l, h);
-  if (resolved_ready)
-    sum += resolved_value_prefix[delta_upper] -
-           resolved_value_prefix[delta_lower];
-  out_sums[i] = sum;
-  if constexpr (WithCounts) {
-    std::uint32_t count =
-        base_range_count(base, base_count_prefix, l, h);
-    if (resolved_ready)
-      count += resolved_count_prefix[delta_upper] -
-               resolved_count_prefix[delta_lower];
-    out_counts[i] = count;
-  }
-}
-
 __device__ __forceinline__ bool lookup_raw_leaf(
     const AssignmentRunView &run, std::uint32_t key,
     std::uint32_t *value, bool *live) {
@@ -2191,194 +2711,6 @@ __global__ void temporal_lookup_leaf_thread_kernel(
   }
   write_lookup_candidate(
       best, base, key, query, out_values, out_found);
-}
-
-constexpr int kNarrowSeenCap = 128;
-constexpr int kNarrowHashSlots = 2 * kNarrowSeenCap;
-static_assert((kNarrowHashSlots & (kNarrowHashSlots - 1)) == 0);
-
-// Hash for narrow-range sets.
-__host__ __device__ inline std::uint64_t hash_mix_slot(std::uint32_t key,
-                                                       std::uint64_t mask) {
-  std::uint64_t x = key;
-  x ^= x >> 16;
-  x *= 0x7feb352dU;
-  x ^= x >> 15;
-  x *= 0x846ca68bU;
-  x ^= x >> 16;
-  return x & mask;
-}
-
-__device__ inline void narrow_record_latest(
-    std::uint32_t *keys, unsigned long long *references,
-    std::uint32_t key, unsigned long long reference) {
-  std::uint32_t slot =
-      static_cast<std::uint32_t>(hash_mix_slot(key, kNarrowHashSlots - 1u));
-  for (int probe = 0; probe < kNarrowHashSlots; ++probe) {
-    const std::uint32_t previous =
-        atomicCAS(keys + slot, kEmptyKey, key);
-    if (previous == kEmptyKey || previous == key) {
-      atomicMax(references + slot, reference);
-      return;
-    }
-    slot = (slot + 1u) & (kNarrowHashSlots - 1u);
-  }
-}
-
-// One block resolves one bounded range in shared memory.
-__global__ void narrow_range_kernel(
-    const std::uint32_t *lo, const std::uint32_t *hi,
-    std::uint32_t *out_sums, std::uint32_t *out_counts,
-    std::size_t query_count, const AssignmentRunView *runs,
-    int run_count, BaseRunView base_view,
-    SortedRunRangeView base_range,
-    const std::uint32_t *base_value_prefix,
-    const std::uint32_t *base_count_prefix,
-    std::uint32_t *overflow) {
-  const std::size_t query = blockIdx.x;
-  if (query >= query_count)
-    return;
-  const int lane = threadIdx.x;
-  const std::uint32_t l = lo[query];
-  const std::uint32_t h = hi[query];
-  if (l > h) {
-    if (lane == 0) {
-      out_sums[query] = 0u;
-      if (out_counts)
-        out_counts[query] = 0u;
-    }
-    return;
-  }
-
-  __shared__ std::uint32_t hash_keys[kNarrowHashSlots];
-  __shared__ unsigned long long hash_refs[kNarrowHashSlots];
-  __shared__ std::uint32_t reduce_sum[kNarrowSeenCap];
-  __shared__ std::int32_t reduce_count[kNarrowSeenCap];
-  for (int slot = lane; slot < kNarrowHashSlots; slot += blockDim.x) {
-    hash_keys[slot] = kEmptyKey;
-    hash_refs[slot] = 0u;
-  }
-
-  const std::uint32_t qlo = l >> kEpochQuotientBits;
-  const std::uint32_t qhi = h >> kEpochQuotientBits;
-  // A wide quotient span defers to the whole-batch wide path.
-  if (qhi - qlo > static_cast<std::uint32_t>(kNarrowSeenCap)) {
-    if (lane == 0)
-      atomicExch(overflow, 1u);
-    return;
-  }
-  std::uint32_t candidates = 0u;
-  for (int r = lane; r < run_count; r += blockDim.x) {
-    const AssignmentRunView run = runs[r];
-    if (run.hashed || run.grouped) {
-      candidates += kNarrowSeenCap + 1u;
-      continue;
-    }
-    for (std::uint32_t qq = qlo; qq <= qhi; ++qq)
-      candidates += assignment_record_count(run, qq);
-  }
-  reduce_sum[lane] = candidates;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (lane < stride)
-      reduce_sum[lane] += reduce_sum[lane + stride];
-    __syncthreads();
-  }
-  if (reduce_sum[0] > kNarrowSeenCap) {
-    if (lane == 0)
-      atomicExch(overflow, 1u);
-    return;
-  }
-
-  if (lane < run_count) {
-    const AssignmentRunView run = runs[lane];
-    for (std::uint32_t qq = qlo; qq <= qhi; ++qq) {
-      std::uint32_t begin, end;
-      assignment_bounds(run, qq, &begin, &end);
-      for (std::uint32_t p = begin; p < end; ++p) {
-        const std::uint32_t key = run.keys[p];
-        if (key < l || key > h)
-          continue;
-        const unsigned long long reference =
-            (static_cast<unsigned long long>(lane + 1) << 32) | p;
-        narrow_record_latest(hash_keys, hash_refs, key, reference);
-      }
-    }
-  }
-  __syncthreads();
-
-  std::uint32_t correction = 0u;
-  std::int32_t count_correction = 0;
-  for (int slot = lane; slot < kNarrowHashSlots; slot += blockDim.x) {
-    const std::uint32_t key = hash_keys[slot];
-    if (key == kEmptyKey)
-      continue;
-    const unsigned long long reference = hash_refs[slot];
-    const int r = static_cast<int>(reference >> 32) - 1;
-    const std::uint32_t p = static_cast<std::uint32_t>(reference);
-    const AssignmentRunView run = runs[r];
-    const int op =
-        assignment_op_at(run.op_words, run.constant_op, run.mixed, p);
-    // Baseline is the immutable BaseRun state.
-    std::uint32_t base_value = 0u;
-    const bool base_live = base_find_value(base_view, key, &base_value);
-    if (op != 0) {
-      const std::uint32_t value = run.values[p];
-      correction += base_live ? value - base_value : value;
-      count_correction += base_live ? 0 : 1;
-    } else if (base_live) {
-      correction += 0u - base_value;
-      --count_correction;
-    }
-  }
-  reduce_sum[lane] = correction;
-  reduce_count[lane] = count_correction;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (lane < stride) {
-      reduce_sum[lane] += reduce_sum[lane + stride];
-      reduce_count[lane] += reduce_count[lane + stride];
-    }
-    __syncthreads();
-  }
-  if (lane == 0) {
-    out_sums[query] =
-        base_range_sum(base_view, base_range, base_value_prefix, l, h) +
-        reduce_sum[0];
-    if (out_counts) {
-      const std::uint32_t base_count =
-          base_range_count(base_view, base_count_prefix, l, h);
-      out_counts[query] =
-          base_count + static_cast<std::uint32_t>(reduce_count[0]);
-    }
-  }
-}
-
-template <bool WithCounts>
-__global__ void base_only_range_kernel(
-    const std::uint32_t *lo, const std::uint32_t *hi,
-    std::uint32_t *out_sums, std::uint32_t *out_counts,
-    std::size_t query_count, BaseRunView base,
-    SortedRunRangeView base_range,
-    const std::uint32_t *base_value_prefix,
-    const std::uint32_t *base_count_prefix) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= query_count)
-    return;
-  const std::uint32_t l = lo[i];
-  const std::uint32_t h = hi[i];
-  if (l > h) {
-    out_sums[i] = 0u;
-    if constexpr (WithCounts)
-      out_counts[i] = 0u;
-    return;
-  }
-  out_sums[i] =
-      base_range_sum(base, base_range, base_value_prefix, l, h);
-  if constexpr (WithCounts)
-    out_counts[i] =
-      base_range_count(base, base_count_prefix, l, h);
 }
 
 template <bool WithLookup>
@@ -2830,6 +3162,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     reset_parent_storage();
     reset_lookup_owner(stream);
     ++base_generation_;
+    initialize_empty_base(stream);
   }
 
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
@@ -2868,9 +3201,6 @@ explicit GPULSMOpt(const DictionaryConfig &config)
   void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
     if (batch.count == 0)
       return;
-    if (!batch.sorted)
-      throw std::invalid_argument(
-          "GPULSMOpt deletion requires sorted keys");
     {
       std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
       order_stream_locked(stream);
@@ -2880,7 +3210,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
 #endif
       insert_records(batch.keys, batch.keys,
                      static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
-                     batch.count, stream);
+                     batch.count, stream, batch.sorted);
 #ifdef GPULSMOPT_PROFILE_INSERT
       CUDA_CHECK(cudaStreamSynchronize(stream));
       const auto prof_t1 = std::chrono::high_resolution_clock::now();
@@ -3030,85 +3360,65 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     ensure_sorted_run_cache(stream);
-    flush_pending_views(stream);
-    const int run_count = static_cast<int>(chrono_views_.size());
-    if (run_count == 0) {
-      const int block = 128;
-      const int grid =
-          static_cast<int>((batch.query_count + block - 1) / block);
-      if (batch.out_counts) {
-        gpulsmopt_detail::base_only_range_kernel<true><<<
-            grid, block, 0, stream>>>(
-            batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-            batch.query_count, make_base_view(),
-            make_sorted_range_view(), sorted_value_prefix_.data(),
-            sorted_count_prefix_.data());
-      } else {
-        gpulsmopt_detail::base_only_range_kernel<false><<<
-            grid, block, 0, stream>>>(
-            batch.lo, batch.hi, batch.out_sums, nullptr,
-            batch.query_count, make_base_view(),
-            make_sorted_range_view(), sorted_value_prefix_.data(),
-            nullptr);
-      }
-      CUDA_CHECK(cudaGetLastError());
-      return;
-    }
-    const bool try_narrow =
-        !resolved_ready_ &&
-        batch.query_count <=
-            static_cast<std::size_t>(
-                GPULSMOPT_NARROW_RANGE_MAX_QUERIES) &&
-        run_count > 0;
-    if (try_narrow) {
-      narrow_overflow_.resize_discard(1);
-      CUDA_CHECK(cudaMemsetAsync(narrow_overflow_.data(), 0,
-                                 sizeof(std::uint32_t), stream));
-      constexpr int block = gpulsmopt_detail::kNarrowSeenCap;
-      const int grid = static_cast<int>(batch.query_count);
-      gpulsmopt_detail::narrow_range_kernel<<<grid, block, 0, stream>>>(
-          batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-          batch.query_count, assignment_views_.data(), run_count,
-          make_base_view(), make_sorted_range_view(),
-          sorted_value_prefix_.data(),
-          sorted_count_prefix_.data(), narrow_overflow_.data());
-      CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemcpyAsync(&host_state_->narrow_overflow,
-                                 narrow_overflow_.data(),
-                                 sizeof(std::uint32_t),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      if (host_state_->narrow_overflow == 0u)
-        return;
-    }
-    ensure_resolved(stream);
-    if (batch.out_counts)
-      ensure_resolved_count_prefix(stream);
-    ensure_resolved_value_prefix(stream);
+    ensure_qvrf_visible(stream);
     const int block = 128;
     const int grid =
         static_cast<int>((batch.query_count + block - 1) / block);
-    if (batch.out_counts) {
-      gpulsmopt_detail::resolved_range_kernel<true><<<
-          grid, block, 0, stream>>>(
-          batch.lo, batch.hi, batch.out_sums, batch.out_counts,
-          batch.query_count, make_base_view(),
-          make_sorted_range_view(), sorted_value_prefix_.data(),
-          sorted_count_prefix_.data(), make_run_view(resolved_),
-          resolved_value_prefix_.data(),
-          resolved_count_prefix_.data(),
-          resolved_.count > 0 ? 1 : 0);
-    } else {
-      gpulsmopt_detail::resolved_range_kernel<false><<<
-          grid, block, 0, stream>>>(
-          batch.lo, batch.hi, batch.out_sums, nullptr,
-          batch.query_count, make_base_view(),
-          make_sorted_range_view(), sorted_value_prefix_.data(),
-          nullptr, make_run_view(resolved_),
-          resolved_value_prefix_.data(), nullptr,
-          resolved_.count > 0 ? 1 : 0);
-    }
+    gpulsmopt_detail::qvrf_range_kernel<<<grid, block, 0, stream>>>(
+        make_qvrf_view(), batch.lo, batch.hi, batch.query_count,
+        batch.out_sums, batch.out_counts, batch.out_mins, batch.out_maxs);
     CUDA_CHECK(cudaGetLastError());
+  }
+
+  // Returns the required row count. When both output arrays are present and
+  // output_capacity is sufficient, rows are emitted in sorted-key order per
+  // query. Callers may pass null row arrays for a sizing-only pass.
+  std::size_t range_report(const DeviceRangeReportBatch &batch,
+                           cudaStream_t stream) {
+    if (batch.out_offsets == nullptr)
+      throw std::invalid_argument("range_report requires out_offsets");
+    if (batch.query_count == 0u) {
+      CUDA_CHECK(cudaMemsetAsync(batch.out_offsets, 0,
+                                 sizeof(std::uint64_t), stream));
+      return 0u;
+    }
+    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
+    order_stream_locked(stream);
+    ensure_sorted_run_cache(stream);
+    ensure_qvrf_visible(stream);
+
+    qvrf_report_counts_.resize_discard(batch.query_count);
+    constexpr int block = 128;
+    const int grid = static_cast<int>(
+        (batch.query_count + block - 1u) / block);
+    gpulsmopt_detail::qvrf_report_count_kernel<<<grid, block, 0, stream>>>(
+        make_qvrf_view(), batch.lo, batch.hi, batch.query_count,
+        qvrf_report_counts_.data());
+    CUDA_CHECK(cudaGetLastError());
+    auto policy = thrust::cuda::par.on(stream);
+    thrust::exclusive_scan(policy, qvrf_report_counts_.data(),
+                           qvrf_report_counts_.data() + batch.query_count,
+                           batch.out_offsets);
+    gpulsmopt_detail::qvrf_finish_report_offsets_kernel<<<1, 1, 0, stream>>>(
+        qvrf_report_counts_.data(), batch.out_offsets, batch.query_count);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(
+        &host_state_->qvrf_report_count,
+        batch.out_offsets + batch.query_count,
+        sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint64_t required = host_state_->qvrf_report_count;
+    if (required > std::numeric_limits<std::size_t>::max())
+      throw std::overflow_error("range_report output exceeds size_t");
+    if (required > batch.output_capacity || batch.out_keys == nullptr ||
+        batch.out_values == nullptr)
+      return static_cast<std::size_t>(required);
+
+    gpulsmopt_detail::qvrf_report_kernel<<<grid, block, 0, stream>>>(
+        make_qvrf_view(), batch.lo, batch.hi, batch.query_count,
+        batch.out_offsets, batch.out_keys, batch.out_values);
+    CUDA_CHECK(cudaGetLastError());
+    return static_cast<std::size_t>(required);
   }
 
   void consolidate(cudaStream_t stream) {
@@ -3132,6 +3442,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     maintenance_stats_ = MaintenanceStats{};
     reserve_lookup_owner_storage(stream);
     if (n == 0) {
+      initialize_empty_base(stream);
       prepare_for_insert(stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
       return;
@@ -3214,20 +3525,27 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         cache_pay_, merge_out_keys_, merge_out_pay_, merge_flags_,
         merge_sel_keys_, merge_sel_pay_, compaction_counts_,
         compaction_offsets_,
-        narrow_overflow_, assignment_views_,
+        assignment_views_,
         lookup_publication_, lookup_owner_slots_,
         lookup_owner_leaves_, lookup_owner_overflow_,
         hash_route_mask_views_,
         direct_sort_keys_, direct_sort_values_, sort_temp_storage_,
-        sorted_value_prefix_, sorted_count_prefix_, base_rank23_,
-        sorted_range_cdf_, succ_miss_indices_, succ_miss_count_,
+        base_rank23_, qvrf_base_block_counts_,
+        qvrf_base_q_block_offsets_, qvrf_base_block_begins_,
+        qvrf_base_block_sizes_, qvrf_base_block_summaries_,
+        qvrf_base_q_summaries_, qvrf_current_q_summaries_,
+        qvrf_top_l1_, qvrf_top_l2_, qvrf_top_l3_, qvrf_top_l4_,
+        qvrf_cell_ids_, qvrf_cell_counts_, qvrf_cell_offsets_,
+        qvrf_cell_keys_, qvrf_cell_values_, qvrf_cell_summaries_,
+        qvrf_q_cell_offsets_,
+        qvrf_report_counts_,
+        succ_miss_indices_, succ_miss_count_,
         succ_deleted_base_words_, succ_live_word_l1_, succ_live_word_l2_,
         succ_live_word_l3_, succ_positive_words_, succ_positive_l1_,
         succ_positive_l2_, succ_positive_l3_);
     total += device_bytes_all(
         resolved_.keys, resolved_.values, resolved_.count_delta,
-        resolved_value_prefix_, resolved_count_prefix_, resolved_.quotient_off,
-        resolved_.op_words);
+        resolved_.quotient_off, resolved_.op_words);
     // Hash-fold scratch and pointer-only parent storage.
     total += device_bytes_all(
         hash_heavy_capacities_, hash_active_quotients_,
@@ -3402,21 +3720,60 @@ private:
     return {make_sorted_view()};
   }
 
-  gpulsmopt_detail::SortedRunRangeView make_sorted_range_view() const {
-    return {sorted_range_cdf_ready_ ? sorted_range_cdf_.data() : nullptr,
-            sorted_range_min_key_, sorted_range_span_};
+  gpulsmopt_detail::QvrfView make_qvrf_view() const {
+    return {make_sorted_view(),
+            {raw_or_null(resolved_.keys),
+             raw_or_null(resolved_.quotient_off)},
+            raw_or_null(resolved_.values),
+            raw_or_null(resolved_.count_delta),
+            qvrf_base_q_block_offsets_.data(),
+            qvrf_base_block_summaries_.data(),
+            qvrf_cell_ids_.data(),
+            qvrf_cell_offsets_.data(),
+            qvrf_cell_keys_.data(),
+            qvrf_cell_values_.data(),
+            qvrf_cell_summaries_.data(),
+            qvrf_q_cell_offsets_.data(),
+            qvrf_current_q_summaries_.data(),
+            qvrf_top_l1_.data(),
+            qvrf_top_l2_.data(),
+            qvrf_top_l3_.data(),
+            qvrf_top_l4_.data(),
+            qvrf_cell_count_,
+            qvrf_materialized_cells_ ? 1u : 0u};
   }
 
+  void clear_qvrf_state() {
+    qvrf_base_block_counts_.resize_discard(0);
+    qvrf_base_q_block_offsets_.resize_discard(0);
+    qvrf_base_block_begins_.resize_discard(0);
+    qvrf_base_block_sizes_.resize_discard(0);
+    qvrf_base_block_summaries_.resize_discard(0);
+    qvrf_base_q_summaries_.resize_discard(0);
+    qvrf_current_q_summaries_.resize_discard(0);
+    qvrf_top_l1_.resize_discard(0);
+    qvrf_top_l2_.resize_discard(0);
+    qvrf_top_l3_.resize_discard(0);
+    qvrf_top_l4_.resize_discard(0);
+    qvrf_cell_ids_.resize_discard(0);
+    qvrf_cell_counts_.resize_discard(0);
+    qvrf_cell_offsets_.resize_discard(0);
+    qvrf_cell_keys_.release();
+    qvrf_cell_values_.release();
+    qvrf_cell_summaries_.resize_discard(0);
+    qvrf_q_cell_offsets_.resize_discard(0);
+    qvrf_cell_count_ = 0u;
+    qvrf_materialized_cells_ = false;
+    qvrf_base_ready_ = false;
+    qvrf_ready_ = false;
+    qvrf_base_generation_ = ~std::uint64_t{0};
+    qvrf_run_sequence_ = 0u;
+  }
 
   void clear_sorted_state() {
     sorted_run_index_ = std::numeric_limits<std::size_t>::max();
-    sorted_value_prefix_.resize_discard(0);
-    sorted_count_prefix_.resize_discard(0);
     base_rank23_.resize_discard(0);
-    sorted_range_cdf_.release();
-    sorted_range_min_key_ = 0u;
-    sorted_range_span_ = 0u;
-    sorted_range_cdf_ready_ = false;
+    clear_qvrf_state();
   }
 
   // Builds the flat rank directory per base.
@@ -3455,75 +3812,250 @@ private:
         thrust::minimum<std::uint32_t>(), items, stream));
   }
 
-  void build_sorted_metadata(cudaStream_t stream) {
-    RunStorage &run = runs_[sorted_run_index_];
-    const std::size_t count = run.count;
-    build_base_rank23(run, stream);
-    // BaseRun needs only a value prefix.
-    sorted_value_prefix_.resize_discard_exact(count + 1u);
-    sorted_count_prefix_.resize_discard(0u);
-    CUDA_CHECK(cudaMemsetAsync(sorted_value_prefix_.data(), 0,
-                               sizeof(std::uint32_t), stream));
-    if (count == 0)
-      return;
-    auto policy = thrust::cuda::par.on(stream);
-    thrust::inclusive_scan(policy, run.values.data(), run.values.data() + count,
-                           sorted_value_prefix_.data() + 1u);
+  void build_qvrf_top_tree(cudaStream_t stream) {
+    constexpr int block = 256;
+    gpulsmopt_detail::qvrf_reduce16_kernel<<<
+        (gpulsmopt_detail::kQvrfTopL1 + block - 1u) / block,
+        block, 0, stream>>>(qvrf_current_q_summaries_.data(),
+                            qvrf_top_l1_.data(),
+                            gpulsmopt_detail::kQvrfTopL1);
+    gpulsmopt_detail::qvrf_reduce16_kernel<<<
+        (gpulsmopt_detail::kQvrfTopL2 + block - 1u) / block,
+        block, 0, stream>>>(qvrf_top_l1_.data(), qvrf_top_l2_.data(),
+                            gpulsmopt_detail::kQvrfTopL2);
+    gpulsmopt_detail::qvrf_reduce16_kernel<<<
+        (gpulsmopt_detail::kQvrfTopL3 + block - 1u) / block,
+        block, 0, stream>>>(qvrf_top_l2_.data(), qvrf_top_l3_.data(),
+                            gpulsmopt_detail::kQvrfTopL3);
+    gpulsmopt_detail::qvrf_reduce16_kernel<<<1, block, 0, stream>>>(
+        qvrf_top_l3_.data(), qvrf_top_l4_.data(),
+        gpulsmopt_detail::kQvrfTopL4);
+    CUDA_CHECK(cudaGetLastError());
   }
 
-  void build_sorted_range_cdf(cudaStream_t stream) {
-    RunStorage &run = runs_[sorted_run_index_];
-    sorted_range_cdf_ready_ = false;
-    sorted_range_min_key_ = 0u;
-    sorted_range_span_ = 0u;
-    if (run.count == 0) {
-      sorted_range_cdf_.release();
-      return;
-    }
-    std::uint32_t endpoints[2]{};
-    CUDA_CHECK(cudaMemcpyAsync(endpoints, run.keys.data(),
-                               sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(endpoints + 1, run.keys.data() + run.count - 1u,
-                               sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const std::uint64_t span =
-        static_cast<std::uint64_t>(endpoints[1]) - endpoints[0] + 1u;
-    const std::uint64_t entries = span + 1u;
-    const std::uint64_t bytes = entries * sizeof(std::uint32_t);
-    std::size_t free_bytes = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    (void)total_bytes;
-    const bool dense_enough = span <= static_cast<std::uint64_t>(run.count) *
-                                          gpulsmopt_detail::kRangeCdfMaxRatio;
-    const bool reuses_storage = entries <= sorted_range_cdf_.capacity();
-    const bool memory_ok =
-        reuses_storage || bytes <= static_cast<std::uint64_t>(free_bytes) / 4u;
-    if (!dense_enough || !memory_ok ||
-        entries > std::numeric_limits<std::size_t>::max()) {
-      sorted_range_cdf_.release();
-      return;
-    }
-    const std::size_t count = static_cast<std::size_t>(entries);
-    sorted_range_cdf_.resize_discard_exact(count);
-    CUDA_CHECK(cudaMemsetAsync(sorted_range_cdf_.data(), 0,
-                               count * sizeof(std::uint32_t), stream));
+  void build_qvrf_base_metadata(cudaStream_t stream) {
     constexpr int block = 256;
-    const int grid = static_cast<int>((run.count + block - 1u) / block);
-    gpulsmopt_detail::
-        sorted_range_cdf_scatter_kernel<<<grid, block, 0, stream>>>(
-            run.keys.data(), run.values.data(), run.count, endpoints[0],
-            sorted_range_cdf_.data());
+    constexpr std::uint32_t q_count = gpulsmopt_detail::kEpochQuotients;
+    constexpr int q_grid = (q_count + block - 1) / block;
+    qvrf_base_block_counts_.resize_discard_exact(q_count + 1u);
+    qvrf_base_q_block_offsets_.resize_discard_exact(q_count + 1u);
+    CUDA_CHECK(cudaMemsetAsync(qvrf_base_block_counts_.data(), 0,
+                               (q_count + 1u) * sizeof(std::uint32_t),
+                               stream));
+    gpulsmopt_detail::qvrf_base_block_count_kernel<<<q_grid, block, 0,
+                                                     stream>>>(
+        base_rank23_.data(), qvrf_base_block_counts_.data());
     CUDA_CHECK(cudaGetLastError());
-    auto policy = thrust::cuda::par.on(stream);
-    thrust::inclusive_scan(policy, sorted_range_cdf_.data(),
-                           sorted_range_cdf_.data() + count,
-                           sorted_range_cdf_.data());
-    sorted_range_min_key_ = endpoints[0];
-    sorted_range_span_ = span;
-    sorted_range_cdf_ready_ = true;
+    exclusive_scan_u32(qvrf_base_block_counts_.data(),
+                       qvrf_base_q_block_offsets_.data(), q_count + 1u,
+                       stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        &host_state_->qvrf_base_block_count,
+        qvrf_base_q_block_offsets_.data() + q_count,
+        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::uint32_t block_count =
+        host_state_->qvrf_base_block_count;
+
+    qvrf_base_block_begins_.resize_discard_exact(block_count);
+    qvrf_base_block_sizes_.resize_discard_exact(block_count);
+    qvrf_base_block_summaries_.resize_discard_exact(block_count);
+    qvrf_base_q_summaries_.resize_discard_exact(q_count);
+    qvrf_current_q_summaries_.resize_discard_exact(q_count);
+    qvrf_top_l1_.resize_discard_exact(gpulsmopt_detail::kQvrfTopL1);
+    qvrf_top_l2_.resize_discard_exact(gpulsmopt_detail::kQvrfTopL2);
+    qvrf_top_l3_.resize_discard_exact(gpulsmopt_detail::kQvrfTopL3);
+    qvrf_top_l4_.resize_discard_exact(gpulsmopt_detail::kQvrfTopL4);
+    qvrf_q_cell_offsets_.resize_discard_exact(q_count + 1u);
+    CUDA_CHECK(cudaMemsetAsync(qvrf_q_cell_offsets_.data(), 0,
+                               (q_count + 1u) * sizeof(std::uint32_t),
+                               stream));
+
+    gpulsmopt_detail::qvrf_base_block_layout_kernel<<<q_grid, block, 0,
+                                                      stream>>>(
+        base_rank23_.data(), qvrf_base_q_block_offsets_.data(),
+        qvrf_base_block_begins_.data(), qvrf_base_block_sizes_.data());
+    CUDA_CHECK(cudaGetLastError());
+    if (block_count > 0u) {
+      gpulsmopt_detail::qvrf_base_block_summary_kernel<<<
+          block_count, gpulsmopt_detail::kQvrfBaseLeafRecords, 0, stream>>>(
+          make_sorted_view(), qvrf_base_block_begins_.data(),
+          qvrf_base_block_sizes_.data(),
+          qvrf_base_q_block_offsets_.data(),
+          qvrf_base_block_summaries_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+    gpulsmopt_detail::qvrf_base_q_summary_kernel<<<q_grid, block, 0, stream>>>(
+        qvrf_base_q_block_offsets_.data(),
+        qvrf_base_block_summaries_.data(),
+        qvrf_base_q_summaries_.data());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(
+        qvrf_current_q_summaries_.data(), qvrf_base_q_summaries_.data(),
+        q_count * sizeof(gpulsmopt_detail::QvrfSummary),
+        cudaMemcpyDeviceToDevice, stream));
+    build_qvrf_top_tree(stream);
+
+    qvrf_cell_ids_.resize_discard(0);
+    qvrf_cell_counts_.resize_discard(0);
+    qvrf_cell_offsets_.resize_discard(0);
+    qvrf_cell_keys_.release();
+    qvrf_cell_values_.release();
+    qvrf_cell_summaries_.resize_discard(0);
+    qvrf_cell_count_ = 0u;
+    qvrf_materialized_cells_ = false;
+    qvrf_base_generation_ = base_generation_;
+    qvrf_base_ready_ = true;
+    qvrf_run_sequence_ = run_sequence_;
+    qvrf_ready_ = run_sequence_ == 0u;
+  }
+
+  void ensure_qvrf_visible(cudaStream_t stream) {
+    if (!qvrf_base_ready_ || qvrf_base_generation_ != base_generation_)
+      build_qvrf_base_metadata(stream);
+    if (qvrf_ready_ && qvrf_base_generation_ == base_generation_ &&
+        qvrf_run_sequence_ == run_sequence_)
+      return;
+
+    constexpr int block = 256;
+    constexpr std::uint32_t q_count = gpulsmopt_detail::kEpochQuotients;
+    constexpr int q_grid = (q_count + block - 1) / block;
+
+    // Restore the immutable snapshot before overlaying the current dirty
+    // cells. Rebuilding from the complete resolved cache is what makes a
+    // correction that returns to Base disappear rather than leave stale state.
+    CUDA_CHECK(cudaMemcpyAsync(
+        qvrf_current_q_summaries_.data(), qvrf_base_q_summaries_.data(),
+        q_count * sizeof(gpulsmopt_detail::QvrfSummary),
+        cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemsetAsync(qvrf_q_cell_offsets_.data(), 0,
+                               (q_count + 1u) * sizeof(std::uint32_t),
+                               stream));
+    qvrf_cell_count_ = 0u;
+    qvrf_cell_ids_.resize_discard(0);
+    qvrf_cell_counts_.resize_discard(0);
+    qvrf_cell_offsets_.resize_discard(0);
+    qvrf_cell_keys_.resize_discard(0);
+    qvrf_cell_values_.resize_discard(0);
+    qvrf_cell_summaries_.resize_discard(0);
+    qvrf_materialized_cells_ = false;
+
+    if (run_sequence_ != 0u)
+      ensure_resolved(stream);
+
+    const std::uint32_t correction_count =
+        static_cast<std::uint32_t>(resolved_.count);
+    if (run_sequence_ != 0u && correction_count > 0u) {
+      qvrf_cell_ids_.resize_discard(correction_count);
+      auto policy = thrust::cuda::par.on(stream);
+      thrust::transform(policy, resolved_.keys.data(),
+                        resolved_.keys.data() + correction_count,
+                        qvrf_cell_ids_.data(),
+                        gpulsmopt_detail::QvrfKeyToCell{});
+      auto unique_end = thrust::unique(
+          policy, qvrf_cell_ids_.data(),
+          qvrf_cell_ids_.data() + correction_count);
+      qvrf_cell_count_ = static_cast<std::uint32_t>(
+          unique_end - qvrf_cell_ids_.data());
+      qvrf_cell_ids_.resize_discard(qvrf_cell_count_);
+      qvrf_cell_summaries_.resize_discard(qvrf_cell_count_);
+
+      const int cell_grid = static_cast<int>(
+          (qvrf_cell_count_ + block - 1u) / block);
+      const std::uint64_t row_upper =
+          static_cast<std::uint64_t>(qvrf_cell_count_) *
+              (std::uint64_t{1} << gpulsmopt_detail::kBaseRank23Shift) +
+          correction_count;
+      const std::uint64_t byte_upper =
+          row_upper * 2u * sizeof(std::uint32_t) +
+          static_cast<std::uint64_t>(qvrf_cell_count_) *
+              2u * sizeof(std::uint32_t);
+      std::size_t free_bytes = 0u, total_bytes = 0u;
+      CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+      (void)total_bytes;
+      const bool reuses_rows =
+          row_upper <= qvrf_cell_keys_.capacity() &&
+          row_upper <= qvrf_cell_values_.capacity();
+      bool materialize = reuses_rows ||
+          byte_upper <= static_cast<std::uint64_t>(free_bytes) /
+                            gpulsmopt_detail::
+                                kQvrfMaterializationFreeDivisor;
+#ifdef GPULSMOPT_QVRF_FORCE_VIRTUAL
+      materialize = false;
+#endif
+      if (materialize) {
+        qvrf_cell_counts_.resize_discard(qvrf_cell_count_);
+        qvrf_cell_offsets_.resize_discard(qvrf_cell_count_ + 1u);
+        gpulsmopt_detail::qvrf_cell_visible_count_kernel<<<
+            cell_grid, block, 0, stream>>>(make_qvrf_view(),
+                                          qvrf_cell_counts_.data());
+        CUDA_CHECK(cudaGetLastError());
+        exclusive_scan_u32(qvrf_cell_counts_.data(),
+                           qvrf_cell_offsets_.data(), qvrf_cell_count_,
+                           stream);
+        gpulsmopt_detail::qvrf_finish_offsets_kernel<<<1, 1, 0, stream>>>(
+            qvrf_cell_counts_.data(), qvrf_cell_offsets_.data(),
+            qvrf_cell_count_);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(
+            &host_state_->qvrf_visible_count,
+            qvrf_cell_offsets_.data() + qvrf_cell_count_,
+            sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const std::uint32_t visible_count =
+            host_state_->qvrf_visible_count;
+        qvrf_cell_keys_.resize_discard_exact(visible_count);
+        qvrf_cell_values_.resize_discard_exact(visible_count);
+        qvrf_materialized_cells_ = true;
+        gpulsmopt_detail::qvrf_cell_emit_kernel<<<
+            cell_grid, block, 0, stream>>>(
+            make_qvrf_view(), qvrf_cell_offsets_.data(),
+            qvrf_cell_keys_.data(), qvrf_cell_values_.data(),
+            qvrf_cell_summaries_.data());
+        CUDA_CHECK(cudaGetLastError());
+      } else {
+        qvrf_cell_counts_.resize_discard(0);
+        qvrf_cell_offsets_.resize_discard(0);
+        qvrf_cell_keys_.release();
+        qvrf_cell_values_.release();
+        gpulsmopt_detail::qvrf_cell_summary_kernel<<<
+            cell_grid, block, 0, stream>>>(make_qvrf_view(),
+                                          qvrf_cell_summaries_.data());
+        CUDA_CHECK(cudaGetLastError());
+      }
+      constexpr int q_offset_grid =
+          (gpulsmopt_detail::kEpochQuotients + 1 + block - 1) / block;
+      gpulsmopt_detail::qvrf_q_cell_offsets_kernel<<<
+          q_offset_grid, block, 0, stream>>>(
+          qvrf_cell_ids_.data(), qvrf_cell_count_,
+          qvrf_q_cell_offsets_.data());
+      CUDA_CHECK(cudaGetLastError());
+      gpulsmopt_detail::qvrf_dirty_q_summary_kernel<<<
+          q_grid, block, 0, stream>>>(make_qvrf_view(),
+                                     qvrf_current_q_summaries_.data());
+      CUDA_CHECK(cudaGetLastError());
+    }
+
+    if (qvrf_cell_count_ == 0u) {
+      qvrf_cell_counts_.resize_discard(0);
+      qvrf_cell_offsets_.resize_discard(0);
+      qvrf_cell_keys_.release();
+      qvrf_cell_values_.release();
+    }
+
+    build_qvrf_top_tree(stream);
+    qvrf_base_generation_ = base_generation_;
+    qvrf_run_sequence_ = run_sequence_;
+    qvrf_ready_ = true;
+  }
+
+  void build_sorted_metadata(cudaStream_t stream) {
+    RunStorage &run = runs_[sorted_run_index_];
+    build_base_rank23(run, stream);
+    // The forest is intentionally lazy. Point lookup, successor, and ordinary
+    // updates pay no range-sidecar construction cost.
+    qvrf_base_ready_ = false;
+    qvrf_ready_ = false;
   }
 
   void build_sorted_run_cache(std::size_t index, cudaStream_t stream) {
@@ -3533,7 +4065,6 @@ private:
       return;
     sorted_run_index_ = index;
     build_sorted_metadata(stream);
-    build_sorted_range_cdf(stream);
   }
 
   void ensure_sorted_run_cache(cudaStream_t stream) {
@@ -3577,7 +4108,8 @@ private:
   // Builds an unresolved assignment run.
   void create_assignment_run(bool is_insert, const std::uint32_t *keys,
                              const std::uint32_t *values, std::size_t count,
-                             cudaStream_t stream) {
+                             cudaStream_t stream,
+                             bool input_sorted_by_quotient = false) {
     acquire_run_slot(is_insert, count, stream);
     RunStorage &run = runs_.back();
     run.count = count;
@@ -3611,16 +4143,23 @@ private:
                                run.values.data(), run.quotient_off.data(),
                                stream);
     } else {
-      {
-        GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
-        run.values.resize_discard(0);
+      GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
+      run.values.resize_discard(0);
+      if (input_sorted_by_quotient) {
         CUDA_CHECK(cudaMemcpyAsync(run.keys.data(), keys,
                                    count * sizeof(std::uint32_t),
                                    cudaMemcpyDeviceToDevice, stream));
+      } else {
+        // Deletions have no payload, but the stable quotient sort still needs
+        // a value lane. Reuse the ordinary sort scratch; the dummy values are
+        // never published in the run descriptor.
+        direct_sort_values_.resize_discard(count);
+        sort_run_batch(keys, keys, count, run.keys.data(),
+                       direct_sort_values_.data(), stream);
       }
       {
         GPULSMOPT_PROF_PHASE(prof_delta_ingest_ms_);
-        // Build quotient offsets from sorted deletion keys.
+        // Build quotient offsets from quotient-ascending deletion keys.
         run.quotient_off.resize_discard_exact(
             gpulsmopt_detail::kEpochQuotients + 1);
         build_quotient_offsets(run.keys.data(),
@@ -4461,6 +5000,37 @@ private:
     return children;
   }
 
+  void initialize_empty_base(cudaStream_t stream) {
+    acquire_compaction_slot();
+    RunStorage &base = runs_.back();
+    base.sequence_begin = 0u;
+    base.sequence_end = 0u;
+    base.stable_level = -1;
+    base.operation = gpulsmopt_detail::RunOperation::Insert;
+    base.assignment_class = gpulsmopt_detail::AssignmentClass::Raw;
+    base.mixed = false;
+    base.assignment = false;
+    base.hashed = false;
+    base.grouped = false;
+    base.nested = false;
+    base.lookup_mask_ready = false;
+    base.route_mask_ready = false;
+    base.group_child_count = 0;
+    base.parent_slot = -1;
+    base.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
+    base.count = 0u;
+    base.fully_sorted = true;
+    base.unit_counts = true;
+    base.unique_keys = true;
+    base.hash_children.clear();
+    base.keys.resize_discard(0);
+    base.values.resize_discard(0);
+    base.quotient_off.release();
+    base.op_words.release();
+    base.count_delta.release();
+    build_sorted_run_cache(runs_.size() - 1u, stream);
+  }
+
   void clear_run_state() {
     clear_sorted_state();
     for (auto &epoch : runs_) {
@@ -4483,13 +5053,14 @@ private:
 
   void insert_records(const std::uint32_t *keys_in,
                       const std::uint32_t *values_in, std::uint8_t op,
-                      std::size_t count, cudaStream_t stream) {
+                      std::size_t count, cudaStream_t stream,
+                      bool input_sorted_by_quotient = false) {
     if (count == 0)
       return;
     const bool is_insert =
         op == static_cast<std::uint8_t>(gpulsmopt_detail::kInsert);
     create_assignment_run(is_insert, keys_in, is_insert ? values_in : nullptr,
-                          count, stream);
+                          count, stream, input_sorted_by_quotient);
   }
 
   void ensure_sort_temp(std::size_t bytes) {
@@ -4835,6 +5406,15 @@ private:
         nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
     if (direct_count > 0) {
+      // Warm-up must not feed uninitialized staging records to CUB. The
+      // outputs are discarded, but initcheck correctly treats the reads as
+      // undefined behavior.
+      CUDA_CHECK(cudaMemsetAsync(direct_sort_keys_.data(), 0,
+                                 direct_count * sizeof(std::uint32_t),
+                                 stream));
+      CUDA_CHECK(cudaMemsetAsync(direct_sort_values_.data(), 0,
+                                 direct_count * sizeof(std::uint32_t),
+                                 stream));
       RunStorage &sample = available_insert_leaf(direct_count);
       sort_run_batch(
           direct_sort_keys_.data(), direct_sort_values_.data(),
@@ -4981,8 +5561,7 @@ private:
   void invalidate_resolved() {
     lookup_publication_ready_ = false;
     resolved_ready_ = false;
-    resolved_value_prefix_ready_ = false;
-    resolved_count_prefix_ready_ = false;
+    qvrf_ready_ = false;
   }
 
   bool prepare_flat_normalize_leaves(
@@ -5402,8 +5981,7 @@ private:
       CUDA_CHECK(cudaGetLastError());
     }
     build_assignment_offsets(resolved_, changed, stream);
-    resolved_value_prefix_ready_ = false;
-    resolved_count_prefix_ready_ = false;
+    qvrf_ready_ = false;
     resolved_ready_ = true;
   }
 
@@ -5435,8 +6013,7 @@ private:
       resolved_through_sequence_ = run_sequence_;
       if (!resolved_ready_) {
         build_assignment_offsets(resolved_, resolved_.count, stream);
-        resolved_value_prefix_ready_ = false;
-        resolved_count_prefix_ready_ = false;
+        qvrf_ready_ = false;
         resolved_ready_ = true;
       }
       return;
@@ -5461,8 +6038,7 @@ private:
           resolved_.count_delta.data(),
           resolved_.quotient_off.data());
       CUDA_CHECK(cudaGetLastError());
-      resolved_value_prefix_ready_ = false;
-      resolved_count_prefix_ready_ = false;
+      qvrf_ready_ = false;
       resolved_ready_ = true;
       resolved_through_sequence_ = run_sequence_;
       return;
@@ -5521,66 +6097,6 @@ private:
     resolved_through_sequence_ = run_sequence_;
   }
 
-  void ensure_resolved_value_prefix(cudaStream_t stream) {
-    if (resolved_value_prefix_ready_)
-      return;
-    const std::size_t count = resolved_.count;
-    resolved_value_prefix_.resize_discard(count + 1u);
-    CUDA_CHECK(cudaMemsetAsync(
-        resolved_value_prefix_.data(), 0, sizeof(std::uint32_t), stream));
-    if (count > 0u) {
-      if (count > resolved_value_scan_count_) {
-        resolved_value_scan_temp_bytes_ = 0u;
-        CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-            nullptr, resolved_value_scan_temp_bytes_,
-            resolved_.values.data(),
-            resolved_value_prefix_.data() + 1u,
-            static_cast<int>(count), stream));
-        resolved_value_scan_count_ = count;
-      }
-      std::size_t temp_bytes = resolved_value_scan_temp_bytes_;
-      ensure_sort_temp(temp_bytes);
-      CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-          sort_temp_storage_.data(), temp_bytes,
-          resolved_.values.data(),
-          resolved_value_prefix_.data() + 1u,
-          static_cast<int>(count), stream));
-    }
-    resolved_value_prefix_ready_ = true;
-  }
-
-  void ensure_resolved_count_prefix(cudaStream_t stream) {
-    if (resolved_count_prefix_ready_)
-      return;
-    const std::size_t count = resolved_.count;
-    resolved_count_prefix_.resize_discard(count + 1u);
-    CUDA_CHECK(cudaMemsetAsync(
-        resolved_count_prefix_.data(), 0, sizeof(std::uint32_t), stream));
-    if (count > 0u) {
-      using CountIterator = cub::TransformInputIterator<
-          std::uint32_t, gpulsmopt_detail::CountDeltaToU32,
-          const std::int8_t *>;
-      CountIterator input(
-          resolved_.count_delta.data(),
-          gpulsmopt_detail::CountDeltaToU32{});
-      if (count > resolved_count_scan_count_) {
-        resolved_count_scan_temp_bytes_ = 0u;
-        CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-            nullptr, resolved_count_scan_temp_bytes_, input,
-            resolved_count_prefix_.data() + 1u,
-            static_cast<int>(count), stream));
-        resolved_count_scan_count_ = count;
-      }
-      std::size_t temp_bytes = resolved_count_scan_temp_bytes_;
-      ensure_sort_temp(temp_bytes);
-      CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-          sort_temp_storage_.data(), temp_bytes, input,
-          resolved_count_prefix_.data() + 1u,
-          static_cast<int>(count), stream));
-    }
-    resolved_count_prefix_ready_ = true;
-  }
-
   // Folds the base and assignments with last-wins.
   void fold_into_base(cudaStream_t stream) {
     std::vector<std::size_t> updates;
@@ -5604,18 +6120,19 @@ private:
 
     const std::size_t base_count =
         sorted_run_ready() ? sorted_run().count : 0u;
-    const std::size_t total = base_count + assignment_total;
-    if (total == 0)
+    const std::size_t capacity_total = base_count + assignment_total;
+    if (capacity_total == 0)
       return;
-    if (total > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    if (capacity_total >
+        static_cast<std::size_t>(std::numeric_limits<int>::max()))
       throw std::runtime_error("full consolidation exceeds CUB limits");
 
-    resolve_keys_.resize_discard(total);
-    resolve_payload_.resize_discard(total);
-    resolve_alt_keys_.resize_discard(total);
-    resolve_alt_payload_.resize_discard(total);
-    resolve_flags_.resize_discard(total);
-    resolve_sel_vdelta_.resize_discard(total);
+    resolve_keys_.resize_discard(capacity_total);
+    resolve_payload_.resize_discard(capacity_total);
+    resolve_alt_keys_.resize_discard(capacity_total);
+    resolve_alt_payload_.resize_discard(capacity_total);
+    resolve_flags_.resize_discard(capacity_total);
+    resolve_sel_vdelta_.resize_discard(capacity_total);
     resolve_count_.resize_discard(1);
     constexpr int block = 256;
 
@@ -5647,6 +6164,13 @@ private:
     exclusive_scan_u32(
         compaction_counts_.data(), compaction_offsets_.data(),
         gpulsmopt_detail::kEpochQuotients + 1u, stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        &host_state_->gathered_count,
+        compaction_offsets_.data() + gpulsmopt_detail::kEpochQuotients,
+        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::size_t total =
+        base_count + static_cast<std::size_t>(host_state_->gathered_count);
     gpulsmopt_detail::assignment_group_gather_kernel<<<
         gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
         normalize_views_.data(), static_cast<int>(updates.size()),
@@ -6088,16 +6612,8 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> merge_flags_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_sel_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_sel_pay_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolved_value_prefix_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolved_count_prefix_;
-  std::size_t resolved_value_scan_count_ = 0;
-  std::size_t resolved_value_scan_temp_bytes_ = 0;
-  std::size_t resolved_count_scan_count_ = 0;
-  std::size_t resolved_count_scan_temp_bytes_ = 0;
   std::size_t resolved_sort_count_ = 0;
   std::size_t resolved_sort_temp_bytes_ = 0;
-  bool resolved_value_prefix_ready_ = false;
-  bool resolved_count_prefix_ready_ = false;
   // Lazy successor sidecar.
   bool succ_sparse_ready_ = false;
   std::uint64_t succ_sparse_base_generation_ = ~std::uint64_t{0};
@@ -6146,7 +6662,6 @@ private:
   bool views_dirty_ = false;
   bool lookup_publication_ready_ = false;
   int lookup_leaf_count_ = 0;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> narrow_overflow_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> resolve_payload_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_alt_keys_;
@@ -6185,12 +6700,47 @@ private:
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_values_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> sort_temp_storage_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> sorted_value_prefix_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> sorted_count_prefix_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> sorted_range_cdf_;
-  std::uint32_t sorted_range_min_key_ = 0u;
-  std::uint64_t sorted_range_span_ = 0u;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> base_rank23_;
+  // Lazy Quotient-Visible Range Forest. Base blocks are packed within each
+  // upper-16 quotient; current resolved cells shadow their complete rank23
+  // slices and materialize visible rows only after a range is requested.
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      qvrf_base_block_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      qvrf_base_q_block_offsets_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      qvrf_base_block_begins_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint16_t>
+      qvrf_base_block_sizes_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_base_block_summaries_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_base_q_summaries_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_current_q_summaries_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_top_l1_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_top_l2_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_top_l3_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_top_l4_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> qvrf_cell_ids_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> qvrf_cell_counts_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> qvrf_cell_offsets_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> qvrf_cell_keys_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> qvrf_cell_values_;
+  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::QvrfSummary>
+      qvrf_cell_summaries_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> qvrf_q_cell_offsets_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> qvrf_report_counts_;
+  bool qvrf_base_ready_ = false;
+  bool qvrf_ready_ = false;
+  std::uint64_t qvrf_base_generation_ = ~std::uint64_t{0};
+  std::uint64_t qvrf_run_sequence_ = 0u;
+  std::uint32_t qvrf_cell_count_ = 0u;
+  bool qvrf_materialized_cells_ = false;
   gpulsmopt_detail::PinnedHostState *host_state_ = nullptr;
   cudaEvent_t stream_handoff_ = nullptr;
   cudaEvent_t leaf_alloc_ready_ = nullptr;
@@ -6214,7 +6764,6 @@ private:
   std::size_t scan_u32_count_ = 0;
   std::size_t scan_u32_temp_bytes_ = 0;
   std::size_t metadata_scan_temp_bytes_ = 0;
-  bool sorted_range_cdf_ready_ = false;
 
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_miss_indices_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_miss_count_;
