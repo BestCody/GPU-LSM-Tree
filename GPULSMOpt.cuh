@@ -97,8 +97,7 @@ constexpr int kLookupLeafCapacity =
     kColdArenaSlots * kRawFoldWidth + kRawFoldWidth;
 constexpr std::uint16_t kNoLookupParent = 0xffffu;
 constexpr std::uint32_t kNoOwnerLeaf = 0xffffffffu;
-constexpr std::uint32_t kLookupOwnerMaxProbe = 1024u;
-constexpr std::size_t kLookupOwnerMaxSlots = std::size_t{1} << 29;
+constexpr std::size_t kLookupSectorMaxEntries = std::size_t{1} << 29;
 constexpr std::uint32_t kHashHeavyFlag = 1u << 31;
 constexpr std::uint32_t kHashScanFlag = 1u << 30;
 constexpr std::uint32_t kHashCountMask =
@@ -760,6 +759,291 @@ struct LookupOwnerLeafView {
   std::uint8_t constant_op;
 };
 
+// Lazy Quotient-Visible Sector Fabric (L-QVSF).  One quotient-local lookup
+// transaction reads four exact visible records in one 32-byte GPU sector.
+// The high key half is implicit in the table segment; immutable LSM chronology
+// is consulted only while a quotient is unpublished or its bounded overflow
+// tier saturates.  Explicit empty/live/tombstone state preserves every
+// uint32_t key and value.
+struct alignas(32) LookupSectorBucket {
+  unsigned long long entry[4];
+};
+static_assert(sizeof(LookupSectorBucket) == 32u,
+              "lookup sector bucket must be exactly one memory sector");
+constexpr std::uint32_t kLookupSectorStateShift = 48u;
+constexpr std::uint32_t kLookupSectorStashSlots = 64u;
+constexpr std::uint32_t kLookupRadixStateShift = 32u;
+constexpr std::uint32_t kLookupRadixUnitU64 = 16u;
+constexpr std::uint32_t kLookupRadixRootUnits = 8u;
+constexpr std::uint32_t kLookupRadixDenseUnits =
+    kLookupRadixRootUnits + 256u + 4096u;
+
+__host__ __device__ inline unsigned long long lookup_sector_pack(
+    std::uint32_t low, std::uint32_t value, std::uint32_t state) {
+  return static_cast<unsigned long long>(value) |
+         (static_cast<unsigned long long>(low) << 32u) |
+         (static_cast<unsigned long long>(state) <<
+          kLookupSectorStateShift);
+}
+
+__host__ __device__ inline std::uint32_t lookup_sector_bucket(
+    std::uint32_t low, std::uint32_t bucket_mask) {
+  low ^= low >> 7u;
+  low *= 0x9e3779b1u;
+  low ^= low >> 11u;
+  return low & bucket_mask;
+}
+
+__host__ __device__ inline std::uint32_t lookup_sector_stash_start(
+    std::uint32_t low) {
+  low ^= 0xa511e9b3u;
+  low ^= low >> 16u;
+  low *= 0x7feb352du;
+  low ^= low >> 15u;
+  low *= 0x846ca68bu;
+  low ^= low >> 16u;
+  return low & (kLookupSectorStashSlots - 1u);
+}
+
+__device__ __forceinline__ unsigned long long
+lookup_sector_load_relaxed(const unsigned long long *address);
+
+__device__ __forceinline__ bool lookup_sector_stash_upsert_atomic(
+    unsigned long long *stash, std::uint32_t quotient,
+    std::uint32_t low, unsigned long long packed) {
+  unsigned long long *row = stash +
+      static_cast<std::size_t>(quotient) * kLookupSectorStashSlots;
+  std::uint32_t slot = lookup_sector_stash_start(low);
+  for (std::uint32_t probe = 0; probe < kLookupSectorStashSlots; ++probe) {
+    unsigned long long current = lookup_sector_load_relaxed(row + slot);
+    const std::uint32_t state = static_cast<std::uint32_t>(
+        current >> kLookupSectorStateShift) & 3u;
+    if (state == 0u) {
+      current = atomicCAS(row + slot, 0ull, packed);
+      if (current == 0ull)
+        return true;
+    }
+    if ((static_cast<std::uint32_t>(current >> 32u) & 0xffffu) == low) {
+      atomicExch(row + slot, packed);
+      return true;
+    }
+    slot = (slot + 1u) & (kLookupSectorStashSlots - 1u);
+  }
+  return false;
+}
+
+__device__ __forceinline__ bool lookup_sector_stash_find(
+    const unsigned long long *stash, std::uint32_t quotient,
+    std::uint32_t low, unsigned long long *entry) {
+  const unsigned long long *row = stash +
+      static_cast<std::size_t>(quotient) * kLookupSectorStashSlots;
+  std::uint32_t slot = lookup_sector_stash_start(low);
+  for (std::uint32_t probe = 0; probe < kLookupSectorStashSlots; ++probe) {
+    const unsigned long long current =
+        lookup_sector_load_relaxed(row + slot);
+    const std::uint32_t state = static_cast<std::uint32_t>(
+        current >> kLookupSectorStateShift) & 3u;
+    if (state == 0u)
+      return false;
+    if ((static_cast<std::uint32_t>(current >> 32u) & 0xffffu) == low) {
+      *entry = current;
+      return true;
+    }
+    slot = (slot + 1u) & (kLookupSectorStashSlots - 1u);
+  }
+  return false;
+}
+
+constexpr std::uint32_t kLookupOwnerEmpty = 0u;
+constexpr std::uint32_t kLookupOwnerLive = 1u;
+constexpr std::uint32_t kLookupOwnerTombstone = 2u;
+
+// Publication overlaps result-ready lookups on a maintenance stream.  Scalar
+// relaxed accesses prevent torn entry observations; the per-quotient release
+// watermark makes every completed sector/stash write visible to an acquiring
+// lookup without serializing unrelated quotients.
+__device__ __forceinline__ unsigned long long
+lookup_sector_load_relaxed(const unsigned long long *address) {
+  unsigned long long value;
+#if __CUDA_ARCH__ >= 700
+  asm volatile("ld.relaxed.gpu.u64 %0, [%1];"
+               : "=l"(value) : "l"(address) : "memory");
+#else
+  value = atomicAdd(const_cast<unsigned long long *>(address), 0ull);
+#endif
+  return value;
+}
+
+__device__ __forceinline__ void lookup_sector_store_relaxed(
+    unsigned long long *address, unsigned long long value) {
+#if __CUDA_ARCH__ >= 700
+  asm volatile("st.relaxed.gpu.u64 [%0], %1;"
+               : : "l"(address), "l"(value) : "memory");
+#else
+  atomicExch(address, value);
+#endif
+}
+
+__device__ __forceinline__ std::uint32_t lookup_sector_load_acquire(
+    const std::uint32_t *address) {
+  std::uint32_t value;
+#if __CUDA_ARCH__ >= 700
+  asm volatile("ld.acquire.gpu.u32 %0, [%1];"
+               : "=r"(value) : "l"(address) : "memory");
+#else
+  value = atomicAdd(const_cast<std::uint32_t *>(address), 0u);
+#endif
+  return value;
+}
+
+__device__ __forceinline__ void lookup_sector_store_release(
+    std::uint32_t *address, std::uint32_t value) {
+#if __CUDA_ARCH__ >= 700
+  asm volatile("st.release.gpu.u32 [%0], %1;"
+               : : "l"(address), "r"(value) : "memory");
+#else
+  __threadfence();
+  atomicExch(address, value);
+#endif
+}
+
+__host__ __device__ inline unsigned long long lookup_radix_pack(
+    std::uint32_t value, std::uint32_t state) {
+  return static_cast<unsigned long long>(value) |
+         (static_cast<unsigned long long>(state) <<
+          kLookupRadixStateShift);
+}
+
+__device__ __forceinline__ bool lookup_radix_allocate(
+    unsigned long long *arena, std::uint32_t *cursor,
+    std::uint32_t capacity_units, std::uint32_t units,
+    std::uint32_t *encoded_id) {
+  std::uint32_t first = atomicAdd(cursor, 0u);
+  while (first <= capacity_units &&
+         units <= capacity_units - first) {
+    const std::uint32_t observed =
+        atomicCAS(cursor, first, first + units);
+    if (observed == first) {
+      // Epoch resets rewind the append-only arena instead of clearing its
+      // entire reserved capacity. Zero only the pages that this allocation
+      // actually reuses, before any directory CAS can publish their id.
+      unsigned long long *allocation =
+          arena + static_cast<std::size_t>(first) * kLookupRadixUnitU64;
+      const std::uint32_t entries = units * kLookupRadixUnitU64;
+      for (std::uint32_t entry = 0u; entry < entries; ++entry)
+        allocation[entry] = 0ull;
+      __threadfence();
+      *encoded_id = first + 1u;
+      return true;
+    }
+    first = observed;
+  }
+  return false;
+}
+
+__device__ __forceinline__ unsigned long long *lookup_radix_unit(
+    unsigned long long *arena, std::uint32_t encoded_id) {
+  return arena +
+         static_cast<std::size_t>(encoded_id - 1u) *
+             kLookupRadixUnitU64;
+}
+
+__device__ __forceinline__ const unsigned long long *lookup_radix_unit(
+    const unsigned long long *arena, std::uint32_t encoded_id) {
+  return arena +
+         static_cast<std::size_t>(encoded_id - 1u) *
+             kLookupRadixUnitU64;
+}
+
+// Exact suffix radix: root[high8] -> middle[next4] -> leaf[low4]. Pages are
+// append-only 128-byte arena units, zeroed by the allocator before publication.
+// A directory CAS may leak one losing unit under same-warp contention, but
+// never publishes partial data or compromises exactness; arena exhaustion
+// simply activates legacy fallback.
+__device__ __forceinline__ bool lookup_radix_upsert(
+    unsigned long long *arena, std::uint32_t *cursor,
+    std::uint32_t capacity_units, std::uint32_t root_id,
+    std::uint32_t low, unsigned long long packed) {
+  auto *root = reinterpret_cast<std::uint32_t *>(
+      lookup_radix_unit(arena, root_id));
+  const std::uint32_t high8 = low >> 8u;
+  std::uint32_t middle_id = lookup_sector_load_acquire(root + high8);
+  if (middle_id == 0u) {
+    std::uint32_t candidate = 0u;
+    if (!lookup_radix_allocate(
+            arena, cursor, capacity_units, 1u, &candidate))
+      return false;
+    const std::uint32_t old = atomicCAS(root + high8, 0u, candidate);
+    middle_id = old == 0u ? candidate : old;
+  }
+  auto *middle = reinterpret_cast<std::uint32_t *>(
+      lookup_radix_unit(arena, middle_id));
+  const std::uint32_t middle_index = (low >> 4u) & 0xfu;
+  std::uint32_t leaf_id =
+      lookup_sector_load_acquire(middle + middle_index);
+  if (leaf_id == 0u) {
+    std::uint32_t candidate = 0u;
+    if (!lookup_radix_allocate(
+            arena, cursor, capacity_units, 1u, &candidate))
+      return false;
+    const std::uint32_t old =
+        atomicCAS(middle + middle_index, 0u, candidate);
+    leaf_id = old == 0u ? candidate : old;
+  }
+  unsigned long long *leaf = lookup_radix_unit(arena, leaf_id);
+  lookup_sector_store_relaxed(leaf + (low & 0xfu), packed);
+  return true;
+}
+
+__device__ __noinline__ bool lookup_radix_find(
+    const unsigned long long *arena, std::uint32_t root_id,
+    std::uint32_t low, unsigned long long *entry) {
+  const auto *root = reinterpret_cast<const std::uint32_t *>(
+      lookup_radix_unit(arena, root_id));
+  const std::uint32_t middle_id =
+      lookup_sector_load_acquire(root + (low >> 8u));
+  if (middle_id == 0u)
+    return false;
+  const auto *middle = reinterpret_cast<const std::uint32_t *>(
+      lookup_radix_unit(arena, middle_id));
+  const std::uint32_t leaf_id = lookup_sector_load_acquire(
+      middle + ((low >> 4u) & 0xfu));
+  if (leaf_id == 0u)
+    return false;
+  const unsigned long long value = lookup_sector_load_relaxed(
+      lookup_radix_unit(arena, leaf_id) + (low & 0xfu));
+  const std::uint32_t state = static_cast<std::uint32_t>(
+      value >> kLookupRadixStateShift) & 3u;
+  if (state == kLookupOwnerEmpty)
+    return false;
+  *entry = value;
+  return true;
+}
+
+__device__ __forceinline__ bool lookup_radix_migrate_stash(
+    const unsigned long long *stash, std::uint32_t quotient,
+    unsigned long long *arena, std::uint32_t *cursor,
+    std::uint32_t capacity_units, std::uint32_t root_id) {
+  const unsigned long long *row = stash +
+      static_cast<std::size_t>(quotient) * kLookupSectorStashSlots;
+  for (std::uint32_t slot = 0; slot < kLookupSectorStashSlots; ++slot) {
+    const unsigned long long entry =
+        lookup_sector_load_relaxed(row + slot);
+    const std::uint32_t state = static_cast<std::uint32_t>(
+        entry >> kLookupSectorStateShift) & 3u;
+    if (state == kLookupOwnerEmpty)
+      continue;
+    const std::uint32_t low =
+        static_cast<std::uint32_t>(entry >> 32u) & 0xffffu;
+    const unsigned long long radix_entry = lookup_radix_pack(
+        static_cast<std::uint32_t>(entry), state);
+    if (!lookup_radix_upsert(arena, cursor, capacity_units,
+                             root_id, low, radix_entry))
+      return false;
+  }
+  return true;
+}
+
 struct PinnedHostState {
   AssignmentRunView views[kRunCapacity];
   AssignmentRunView scratch_views[kRunCapacity];
@@ -774,59 +1058,6 @@ struct PinnedHostState {
   std::uint32_t hash_heavy_count;
   std::uint32_t hash_capacity;
 };
-
-__host__ __device__ inline std::uint32_t
-lookup_owner_hash(std::uint32_t key) {
-  key ^= key >> 16;
-  key *= 0x7feb352du;
-  key ^= key >> 15;
-  key *= 0x846ca68bu;
-  return key ^ (key >> 16);
-}
-
-__device__ __forceinline__ std::uint32_t lookup_owner_start(
-    std::uint32_t key, std::uint32_t table_mask) {
-  const std::uint32_t table_bits = 32u - __clz(table_mask);
-  if (table_bits <= 16u)
-    return lookup_owner_hash(key) & table_mask;
-  const std::uint32_t local_bits = table_bits - 16u;
-  const std::uint32_t local_mask = (1u << local_bits) - 1u;
-  std::uint32_t low = key & 0xffffu;
-  low ^= low >> 7;
-  low *= 0x9e3779b1u;
-  low ^= low >> 11;
-  return ((key >> 16) << local_bits) | (low & local_mask);
-}
-
-__device__ __forceinline__ std::uint32_t lookup_owner_next(
-    std::uint32_t slot, std::uint32_t table_mask) {
-  const std::uint32_t table_bits = 32u - __clz(table_mask);
-  if (table_bits <= 16u)
-    return (slot + 1u) & table_mask;
-  const std::uint32_t local_bits = table_bits - 16u;
-  const std::uint32_t local_mask = (1u << local_bits) - 1u;
-  return (slot & ~local_mask) | ((slot + 1u) & local_mask);
-}
-
-
-__device__ __forceinline__ bool lookup_owner_find(
-    const unsigned long long *slots, std::uint32_t table_mask,
-    std::uint32_t key, std::uint32_t *token) {
-  std::uint32_t slot = lookup_owner_start(key, table_mask);
-  for (std::uint32_t probe = 0; probe < kLookupOwnerMaxProbe; ++probe) {
-    const unsigned long long entry = slots[slot];
-    if (entry == 0u) {
-      *token = 0u;
-      return true;
-    }
-    if (static_cast<std::uint32_t>(entry >> 32) == key) {
-      *token = static_cast<std::uint32_t>(entry);
-      return true;
-    }
-    slot = lookup_owner_next(slot, table_mask);
-  }
-  return false;
-}
 
 __device__ __forceinline__ void lookup_owner_legacy(
     const AssignmentRunView *runs, int run_count, BaseRunView base,
@@ -849,140 +1080,420 @@ __device__ __forceinline__ void lookup_owner_legacy(
     out_found[query] = found ? 1u : 0u;
 }
 
-// Applies leaves with one cooperative warp per quotient.
-__global__ void lookup_owner_apply_kernel(
+__global__ void lookup_sector_seed_base_kernel(
+    SortedRunView base, LookupSectorBucket *buckets,
+    std::uint32_t buckets_per_quotient,
+    std::uint32_t bucket_mask, std::uint32_t *overflow_words,
+    unsigned long long *stash, std::uint32_t *quotient_overflow) {
+  const std::size_t position =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (position >= base.count)
+    return;
+  const std::uint32_t key = base.keys[position];
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
+  const std::uint32_t local_bucket =
+      lookup_sector_bucket(key & 0xffffu, bucket_mask);
+  const std::size_t bucket_index =
+      static_cast<std::size_t>(quotient) * buckets_per_quotient +
+      local_bucket;
+  const unsigned long long packed = lookup_sector_pack(
+      key & 0xffffu, base.values[position], kLookupOwnerLive);
+  LookupSectorBucket *bucket = buckets + bucket_index;
+  for (int slot = 0; slot < 4; ++slot) {
+    if (atomicCAS(bucket->entry + slot, 0ull, packed) == 0ull)
+      return;
+  }
+  atomicOr(overflow_words + (bucket_index >> 5u),
+           1u << (bucket_index & 31u));
+  if (!lookup_sector_stash_upsert_atomic(
+          stash, quotient, key & 0xffffu, packed))
+    atomicExch(quotient_overflow + quotient, 1u);
+}
+
+// Repair only BaseRun quotients that exceeded the fixed stash.  The sorted
+// BaseRun is authoritative, so replaying its quotient slice reconstructs even
+// records that could not be inserted by the parallel seed kernel.
+__global__ void lookup_radix_repair_base_kernel(
+    SortedRunView base, const LookupSectorBucket *buckets,
+    std::uint32_t buckets_per_quotient, std::uint32_t bucket_mask,
+    std::uint32_t *quotient_overflow,
+    unsigned long long *radix_arena, std::uint32_t *radix_cursor,
+    std::uint32_t radix_capacity_units, std::uint32_t *radix_roots,
+    std::uint32_t *radix_enabled) {
+  const std::uint32_t quotient =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (quotient >= kEpochQuotients ||
+      quotient_overflow[quotient] == 0u)
+    return;
+  std::uint32_t root_id = 0u;
+  if (!lookup_radix_allocate(
+          radix_arena, radix_cursor, radix_capacity_units,
+          kLookupRadixRootUnits, &root_id))
+    return;
+  bool complete = true;
+  const std::uint32_t first_bin =
+      quotient * static_cast<std::uint32_t>(kBaseBinsPerQuotient);
+  const std::uint32_t begin = base.rank23[first_bin];
+  const std::uint32_t end =
+      base.rank23[first_bin + kBaseBinsPerQuotient];
+  for (std::uint32_t position = begin; position < end; ++position) {
+    const std::uint32_t key = base.keys[position];
+    const std::uint32_t low = key & 0xffffu;
+    const std::uint32_t local_bucket =
+        lookup_sector_bucket(low, bucket_mask);
+    const std::size_t bucket_index =
+        static_cast<std::size_t>(quotient) * buckets_per_quotient +
+        local_bucket;
+    bool primary = false;
+#pragma unroll
+    for (int slot = 0; slot < 4; ++slot) {
+      const unsigned long long entry = lookup_sector_load_relaxed(
+          buckets[bucket_index].entry + slot);
+      const std::uint32_t state = static_cast<std::uint32_t>(
+          entry >> kLookupSectorStateShift) & 3u;
+      primary |= state != kLookupOwnerEmpty &&
+                 (static_cast<std::uint32_t>(entry >> 32u) & 0xffffu) ==
+                     low;
+    }
+    if (primary)
+      continue;
+    complete &= lookup_radix_upsert(
+        radix_arena, radix_cursor, radix_capacity_units, root_id, low,
+        lookup_radix_pack(base.values[position], kLookupOwnerLive));
+  }
+  lookup_sector_store_release(radix_roots + quotient, root_id);
+  lookup_sector_store_release(radix_enabled + quotient, 1u);
+  atomicExch(quotient_overflow + quotient, complete ? 0u : 1u);
+}
+
+// One warp owns an upper-16 quotient.  Stable leaf order and stable physical
+// order make the last mutation deterministic without atomics.  Lanes sharing
+// a sector collaboratively update one register copy and store only dirty
+// scalar entries.
+__global__ __launch_bounds__(256, 4) void lookup_sector_apply_kernel(
     const LookupOwnerLeafView *leaves, std::uint32_t first_leaf,
-    std::uint32_t leaf_count, std::uint32_t position_bits,
-    unsigned long long *slots, std::uint32_t table_mask,
-    std::uint32_t *overflow) {
+    std::uint32_t leaf_count, LookupSectorBucket *buckets,
+    std::uint32_t buckets_per_quotient,
+    std::uint32_t bucket_mask, std::uint32_t *overflow_words,
+    unsigned long long *stash, std::uint32_t *quotient_overflow,
+    std::uint32_t *quotient_ready, unsigned long long *radix_arena,
+    std::uint32_t *radix_cursor, std::uint32_t radix_capacity_units,
+    std::uint32_t *radix_roots, std::uint32_t *radix_enabled) {
   const unsigned lane = threadIdx.x & 31u;
   const unsigned warp = threadIdx.x >> 5u;
   const unsigned warps_per_block = blockDim.x >> 5u;
-  const std::uint32_t quotient =
-      blockIdx.x * warps_per_block + warp;
-  if (quotient >= kEpochQuotients || *overflow != 0u)
+  const std::uint32_t quotient = blockIdx.x * warps_per_block + warp;
+  if (quotient >= kEpochQuotients)
     return;
-  const unsigned lane_bit = 1u << lane;
+  constexpr unsigned full = 0xffffffffu;
+  bool radix = false;
+  bool incomplete = false;
+  std::uint32_t root_id = 0u;
+  if (lane == 0u) {
+    radix = lookup_sector_load_acquire(radix_enabled + quotient) != 0u;
+    root_id = lookup_sector_load_acquire(radix_roots + quotient);
+    incomplete = quotient_overflow[quotient] != 0u;
+  }
+  radix = __shfl_sync(full, static_cast<int>(radix), 0) != 0;
+  incomplete =
+      __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
+  root_id = __shfl_sync(full, root_id, 0);
+
   for (std::uint32_t offset = 0; offset < leaf_count; ++offset) {
-    const std::uint32_t leaf_id = first_leaf + offset;
-    const LookupOwnerLeafView leaf = leaves[leaf_id];
+    const LookupOwnerLeafView leaf = leaves[first_leaf + offset];
     const std::uint32_t begin = leaf.offsets[quotient];
     const std::uint32_t end = leaf.offsets[quotient + 1u];
     std::uint64_t route_mask = 0u;
     for (std::uint32_t base = begin; base < end; base += 32u) {
       const std::uint32_t position = base + lane;
-      const unsigned full = __activemask();
-      unsigned active = __ballot_sync(full, position < end);
+      const unsigned active = __ballot_sync(full, position < end);
       std::uint32_t key = 0u;
-      std::uint32_t token = 0u;
-      std::uint32_t slot = 0u;
-      std::uint32_t probes = 0u;
+      std::uint32_t value = 0u;
+      std::uint32_t local_bucket = 0u;
+      std::uint64_t route_bits = 0u;
       if (position < end) {
         key = leaf.keys[position];
-        token = ((leaf_id + 1u) << position_bits) | position;
-        slot = lookup_owner_start(key, table_mask);
+        value = leaf.constant_op != 0u ? leaf.values[position] : 0u;
+        local_bucket = lookup_sector_bucket(key & 0xffffu, bucket_mask);
+        route_bits = std::uint64_t{1}
+            << ((key & 0xffffu) >>
+                (kEpochQuotientBits - kHashRouteBits));
       }
-      std::uint64_t route_bits =
-          position < end
-              ? std::uint64_t{1}
-                    << ((key & 0xffffu) >>
-                        (kEpochQuotientBits - kHashRouteBits))
-              : 0u;
       for (int delta = 16; delta != 0; delta >>= 1)
         route_bits |= __shfl_down_sync(full, route_bits, delta);
       if (lane == 0u)
         route_mask |= route_bits;
-      while ((active & lane_bit) != 0u) {
-        const unsigned group = __match_any_sync(active, slot);
-        const int leader = __ffs(group) - 1;
-        unsigned long long entry = 0u;
-        if (static_cast<int>(lane) == leader)
-          entry = slots[slot];
-        entry = __shfl_sync(group, entry, leader);
-        const std::uint32_t entry_key =
-            static_cast<std::uint32_t>(entry >> 32);
-        const std::uint32_t selected_key =
-            __shfl_sync(group, key, leader);
-        const bool claim =
-            entry == 0u ? key == selected_key : entry_key == key;
-        const unsigned claim_mask =
-            __ballot_sync(active, claim) & group;
-        if (claim_mask != 0u) {
-          const int writer = 31 - __clz(claim_mask);
-          if (static_cast<int>(lane) == writer) {
-            slots[slot] =
-                (static_cast<unsigned long long>(key) << 32) | token;
+
+      bool spill = false;
+      if ((active & (1u << lane)) != 0u) {
+        const unsigned same_bucket =
+            __match_any_sync(active, local_bucket);
+        const unsigned leader = __ffs(same_bucket) - 1u;
+        const std::size_t bucket_index =
+            static_cast<std::size_t>(quotient) *
+                buckets_per_quotient + local_bucket;
+        unsigned long long entries[4] = {};
+#pragma unroll
+        for (int slot = 0; slot < 4; ++slot) {
+          if (lane == leader)
+            entries[slot] = lookup_sector_load_relaxed(
+                buckets[bucket_index].entry + slot);
+          entries[slot] =
+              __shfl_sync(same_bucket, entries[slot], leader);
+        }
+        bool overflow = false;
+        unsigned dirty = 0u;
+        unsigned remaining = same_bucket;
+        while (remaining != 0u) {
+          const unsigned selected = __ffs(remaining) - 1u;
+          const std::uint32_t selected_key =
+              __shfl_sync(same_bucket, key, selected);
+          const std::uint32_t selected_value =
+              __shfl_sync(same_bucket, value, selected);
+          int target = -1;
+          int empty = -1;
+#pragma unroll
+          for (int slot = 0; slot < 4; ++slot) {
+            const std::uint32_t state = static_cast<std::uint32_t>(
+                entries[slot] >> kLookupSectorStateShift) & 3u;
+            if (state == kLookupOwnerEmpty && empty < 0)
+              empty = slot;
+            if (state != kLookupOwnerEmpty &&
+                (static_cast<std::uint32_t>(entries[slot] >> 32u) &
+                 0xffffu) == (selected_key & 0xffffu))
+              target = slot;
+          }
+          if (target < 0)
+            target = empty;
+          if (target >= 0) {
+            entries[target] = lookup_sector_pack(
+                selected_key & 0xffffu, selected_value,
+                leaf.constant_op != 0u ? kLookupOwnerLive
+                                       : kLookupOwnerTombstone);
+            dirty |= 1u << target;
+          } else {
+            overflow = true;
+            if (lane == selected)
+              spill = true;
+          }
+          remaining &= ~(1u << selected);
+        }
+        if (lane == leader) {
+#pragma unroll
+          for (int slot = 0; slot < 4; ++slot)
+            if ((dirty & (1u << slot)) != 0u)
+              lookup_sector_store_relaxed(
+                  buckets[bucket_index].entry + slot, entries[slot]);
+          if (overflow)
+            atomicOr(overflow_words + (bucket_index >> 5u),
+                     1u << (bucket_index & 31u));
+        }
+      }
+      __syncwarp(full);
+
+      const unsigned spills = __ballot_sync(full, spill);
+      if (spills != 0u && (radix || !incomplete)) {
+        // Distinct keys commute in the exact overflow tiers. For duplicate
+        // keys in this physical chunk, only its greatest lane writes, which
+        // retains chronological last-write-wins while allowing the common
+        // fixed-stash path to proceed in parallel.
+        bool writer = false;
+        if (spill) {
+          const unsigned same_key = __match_any_sync(spills, key);
+          writer = lane == 31u - __clz(same_key);
+        }
+        const std::uint32_t state =
+            leaf.constant_op != 0u ? kLookupOwnerLive
+                                   : kLookupOwnerTombstone;
+        bool stored = true;
+        if (writer) {
+          if (radix) {
+            stored = lookup_radix_upsert(
+                radix_arena, radix_cursor, radix_capacity_units,
+                root_id, key & 0xffffu,
+                lookup_radix_pack(value, state));
+          } else {
+            stored = lookup_sector_stash_upsert_atomic(
+                stash, quotient, key & 0xffffu,
+                lookup_sector_pack(key & 0xffffu, value, state));
           }
         }
-        const bool done = (claim_mask & lane_bit) != 0u;
-        __syncwarp(active);
-        if (!done) {
-          slot = lookup_owner_next(slot, table_mask);
-          ++probes;
+        unsigned failed = __ballot_sync(full, !stored);
+
+        if (!radix && failed != 0u) {
+          // Stash saturation is rare. Promote once, migrate every successful
+          // stash write, then insert only the distinct records that failed.
+          __syncwarp(full);
+          if (lane == 0u) {
+            if (lookup_radix_allocate(
+                    radix_arena, radix_cursor, radix_capacity_units,
+                    kLookupRadixRootUnits, &root_id)) {
+              radix = true;
+              incomplete = !lookup_radix_migrate_stash(
+                  stash, quotient, radix_arena, radix_cursor,
+                  radix_capacity_units, root_id);
+            } else {
+              incomplete = true;
+            }
+          }
+          radix =
+              __shfl_sync(full, static_cast<int>(radix), 0) != 0;
+          incomplete =
+              __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
+          root_id = __shfl_sync(full, root_id, 0);
+
+          bool adaptive_stored = true;
+          if (radix && writer && (failed & (1u << lane)) != 0u) {
+            adaptive_stored = lookup_radix_upsert(
+                radix_arena, radix_cursor, radix_capacity_units,
+                root_id, key & 0xffffu,
+                lookup_radix_pack(value, state));
+          }
+          failed = __ballot_sync(full, !adaptive_stored);
+          if (lane == 0u && failed != 0u)
+            incomplete = true;
+          incomplete =
+              __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
+        } else if (radix && failed != 0u) {
+          if (lane == 0u)
+            incomplete = true;
+          incomplete =
+              __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
         }
-        const unsigned failed = __ballot_sync(
-            active, !done && probes >= kLookupOwnerMaxProbe);
-        if (failed != 0u) {
-          if (lane == static_cast<unsigned>(__ffs(failed) - 1))
-            atomicExch(overflow, 1u);
-          return;
-        }
-        active = __ballot_sync(active, !done);
       }
+      __syncwarp(full);
     }
     if (lane == 0u)
       leaf.route_mask[quotient] = route_mask;
   }
+
+  if (lane == 0u) {
+    if (radix) {
+      lookup_sector_store_release(radix_roots + quotient, root_id);
+      lookup_sector_store_release(radix_enabled + quotient, 1u);
+    }
+    if (radix || incomplete)
+      atomicExch(quotient_overflow + quotient, incomplete ? 1u : 0u);
+    lookup_sector_store_release(
+        quotient_ready + quotient, first_leaf + leaf_count);
+  }
 }
-
-
-__global__ void lookup_owner_kernel(
-    const unsigned long long *slots, std::uint32_t table_mask,
-    const std::uint32_t *overflow, const LookupOwnerLeafView *leaves,
-    std::uint32_t leaf_count, std::uint32_t position_bits,
-    std::uint32_t position_mask, const AssignmentRunView *runs,
-    int run_count, BaseRunView base, const std::uint32_t *queries,
-    std::size_t n, std::uint32_t *out_values,
-    std::uint8_t *out_found) {
+__global__ void lookup_sector_kernel(
+    const LookupSectorBucket *buckets,
+    std::uint32_t buckets_per_quotient, std::uint32_t bucket_mask,
+    const std::uint32_t *overflow_words,
+    const unsigned long long *stash,
+    const std::uint32_t *quotient_overflow,
+    const unsigned long long *radix_arena,
+    const std::uint32_t *radix_roots,
+    const std::uint32_t *radix_enabled,
+    const LookupOwnerLeafView *leaves, std::uint32_t leaf_count,
+    const std::uint32_t *quotient_ready,
+    const AssignmentRunView *runs, int run_count, BaseRunView base,
+    const std::uint32_t *queries, std::size_t n,
+    std::uint32_t *out_values, std::uint8_t *out_found) {
   const std::size_t query =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (query >= n)
     return;
   const std::uint32_t key = queries[query];
-  std::uint32_t token = 0u;
-  if (*overflow != 0u ||
-      !lookup_owner_find(slots, table_mask, key, &token)) {
-    lookup_owner_legacy(runs, run_count, base, key, query,
-                        out_values, out_found);
-    return;
+  const std::uint32_t quotient = key >> kEpochQuotientBits;
+  const std::uint32_t indexed_leaf_count =
+      lookup_sector_load_acquire(quotient_ready + quotient);
+  for (std::uint32_t encoded = leaf_count;
+       encoded > indexed_leaf_count; --encoded) {
+    const LookupOwnerLeafView leaf = leaves[encoded - 1u];
+    const std::uint32_t begin = leaf.offsets[quotient];
+    std::uint32_t position = leaf.offsets[quotient + 1u];
+    while (position-- > begin) {
+      if (leaf.keys[position] != key)
+        continue;
+      const bool live = leaf.constant_op != 0u;
+      out_values[query] = live ? leaf.values[position] : kEmptyKey;
+      if (out_found)
+        out_found[query] = live ? 1u : 0u;
+      return;
+    }
   }
-  if (token != 0u) {
-    const std::uint32_t encoded_leaf = token >> position_bits;
-    const std::uint32_t position = token & position_mask;
-    if (encoded_leaf == 0u || encoded_leaf > leaf_count) {
-      lookup_owner_legacy(runs, run_count, base, key, query,
-                          out_values, out_found);
-      return;
-    }
-    const LookupOwnerLeafView leaf = leaves[encoded_leaf - 1u];
-    if (position >= leaf.count || leaf.keys[position] != key) {
-      lookup_owner_legacy(runs, run_count, base, key, query,
-                          out_values, out_found);
-      return;
-    }
-    const bool live = leaf.constant_op != 0u;
-    out_values[query] = live ? leaf.values[position] : kEmptyKey;
+  const std::uint32_t local_bucket =
+      lookup_sector_bucket(key & 0xffffu, bucket_mask);
+  const std::size_t bucket_index =
+      static_cast<std::size_t>(quotient) * buckets_per_quotient +
+      local_bucket;
+#pragma unroll
+  for (int slot = 0; slot < 4; ++slot) {
+    const unsigned long long entry = lookup_sector_load_relaxed(
+        buckets[bucket_index].entry + slot);
+    const std::uint32_t state = static_cast<std::uint32_t>(
+        entry >> kLookupSectorStateShift) & 3u;
+    if (state == kLookupOwnerEmpty ||
+        (static_cast<std::uint32_t>(entry >> 32u) & 0xffffu) !=
+            (key & 0xffffu))
+      continue;
+    const bool live = state == kLookupOwnerLive;
+    out_values[query] = live ? static_cast<std::uint32_t>(entry) : kEmptyKey;
     if (out_found)
       out_found[query] = live ? 1u : 0u;
     return;
   }
-  std::uint32_t value = kEmptyKey;
-  const bool found = base_find_value(base, key, &value);
-  out_values[query] = found ? value : kEmptyKey;
+  const std::uint32_t overflow =
+      overflow_words[bucket_index >> 5u] >> (bucket_index & 31u);
+  if ((overflow & 1u) != 0u) {
+    if (lookup_sector_load_acquire(radix_enabled + quotient) != 0u) {
+      unsigned long long radix_entry = 0ull;
+      const std::uint32_t root_id =
+          lookup_sector_load_acquire(radix_roots + quotient);
+      if (root_id != 0u && lookup_radix_find(
+              radix_arena, root_id, key & 0xffffu, &radix_entry)) {
+        const std::uint32_t state = static_cast<std::uint32_t>(
+            radix_entry >> kLookupRadixStateShift) & 3u;
+        const bool live = state == kLookupOwnerLive;
+        out_values[query] =
+            live ? static_cast<std::uint32_t>(radix_entry) : kEmptyKey;
+        if (out_found)
+          out_found[query] = live ? 1u : 0u;
+        return;
+      }
+      if (quotient_overflow[quotient] == 0u) {
+        out_values[query] = kEmptyKey;
+        if (out_found)
+          out_found[query] = 0u;
+        return;
+      }
+      lookup_owner_legacy(runs, run_count, base, key, query,
+                          out_values, out_found);
+      return;
+    }
+    unsigned long long stash_entry = 0ull;
+    if (lookup_sector_stash_find(
+            stash, quotient, key & 0xffffu, &stash_entry)) {
+      const std::uint32_t state = static_cast<std::uint32_t>(
+          stash_entry >> kLookupSectorStateShift) & 3u;
+      const bool live = state == kLookupOwnerLive;
+      out_values[query] =
+          live ? static_cast<std::uint32_t>(stash_entry) : kEmptyKey;
+      if (out_found)
+        out_found[query] = live ? 1u : 0u;
+      return;
+    }
+    if (quotient_overflow[quotient] == 0u) {
+      out_values[query] = kEmptyKey;
+      if (out_found)
+        out_found[query] = 0u;
+      return;
+    }
+    lookup_owner_legacy(runs, run_count, base, key, query,
+                        out_values, out_found);
+    return;
+  }
+  out_values[query] = kEmptyKey;
   if (out_found)
-    out_found[query] = found ? 1u : 0u;
+    out_found[query] = 0u;
 }
 
+// Seeds the direct visible mirror from the immutable, deduplicated BaseRun.
+// One thread owns one upper-16 quotient, so inserts into a quotient-local
+// open-addressing segment need no atomics and are deterministic under skew.
 __global__ void assignment_group_count_kernel(
     const AssignmentRunView *runs, int run_count,
     std::uint32_t *counts) {
@@ -2527,12 +3038,20 @@ explicit GPULSMOpt(const DictionaryConfig &config)
       leaf_alloc_worker_.join();
     if (leaf_alloc_stream_)
       cudaStreamSynchronize(leaf_alloc_stream_);
+    if (lookup_maintenance_stream_)
+      cudaStreamSynchronize(lookup_maintenance_stream_);
     if (leaf_alloc_result_)
       cudaFree(leaf_alloc_result_);
     if (leaf_alloc_ready_)
       cudaEventDestroy(leaf_alloc_ready_);
     if (leaf_alloc_stream_)
       cudaStreamDestroy(leaf_alloc_stream_);
+    if (lookup_publish_done_)
+      cudaEventDestroy(lookup_publish_done_);
+    if (lookup_publish_start_)
+      cudaEventDestroy(lookup_publish_start_);
+    if (lookup_maintenance_stream_)
+      cudaStreamDestroy(lookup_maintenance_stream_);
     if (stream_handoff_)
       cudaEventDestroy(stream_handoff_);
     if (host_state_)
@@ -2543,6 +3062,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (lookup_maintenance_stream_)
+      CUDA_CHECK(cudaStreamSynchronize(lookup_maintenance_stream_));
     clear_run_state();
     live_count_ = 0;
     run_sequence_ = 0;
@@ -2619,20 +3140,25 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     ensure_sorted_run_cache(stream);
     if (should_use_lookup_owner(batch.count)) {
       flush_pending_views(stream);
-      prepare_lookup_owner(stream);
       constexpr int block = 256;
       const int grid = static_cast<int>(
           (batch.count + block - 1u) / block);
       const int owner_run_count =
           static_cast<int>(chrono_views_.size());
-      gpulsmopt_detail::lookup_owner_kernel<<<grid, block, 0, stream>>>(
-          lookup_owner_slots_.data(), lookup_owner_table_mask_,
-          lookup_owner_overflow_.data(), lookup_owner_leaves_.data(),
-          lookup_owner_leaf_count_, lookup_owner_position_bits_,
-          lookup_owner_position_mask_, assignment_views_.data(),
+      publish_lookup_owner_leaves(stream);
+      gpulsmopt_detail::lookup_sector_kernel<<<grid, block, 0, stream>>>(
+          lookup_sector_buckets_.data(),
+          lookup_sector_buckets_per_quotient_,
+          lookup_sector_bucket_mask_, lookup_sector_overflow_.data(),
+          lookup_sector_stash_.data(), lookup_owner_overflow_.data(),
+          lookup_radix_arena_.data(), lookup_radix_roots_.data(),
+          lookup_radix_enabled_.data(),
+          lookup_owner_leaves_.data(), lookup_owner_leaf_count_,
+          lookup_sector_ready_.data(), assignment_views_.data(),
           owner_run_count, make_base_view(), batch.queries, batch.count,
           batch.out_values, batch.out_found);
       CUDA_CHECK(cudaGetLastError());
+      schedule_lookup_sector_publication(stream);
       return;
     }
 #ifdef GPULSMOPT_PROFILE_FOLD
@@ -2777,6 +3303,8 @@ explicit GPULSMOpt(const DictionaryConfig &config)
                   std::size_t n, cudaStream_t stream) {
     std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
     order_stream_locked(stream);
+    if (lookup_publish_done_)
+      CUDA_CHECK(cudaStreamWaitEvent(stream, lookup_publish_done_, 0));
     clear_run_state();
     live_count_ = 0;
     run_sequence_ = 0;
@@ -2828,6 +3356,7 @@ explicit GPULSMOpt(const DictionaryConfig &config)
     run.op_words.release();
     run.count_delta.release();
     build_sorted_run_cache(0u, stream);
+    seed_lookup_owner_base(stream);
     live_count_ = run.count;
     release_build_sort_storage();
     prepare_for_insert(stream);
@@ -2871,7 +3400,10 @@ explicit GPULSMOpt(const DictionaryConfig &config)
         merge_sel_keys_, merge_sel_pay_, compaction_counts_,
         compaction_offsets_,
         assignment_views_,
-        lookup_publication_, lookup_owner_slots_,
+        lookup_publication_, lookup_sector_buckets_,
+        lookup_sector_overflow_, lookup_sector_stash_, lookup_sector_ready_,
+        lookup_radix_arena_, lookup_radix_cursor_, lookup_radix_roots_,
+        lookup_radix_enabled_,
         lookup_owner_leaves_, lookup_owner_overflow_,
         hash_route_mask_views_,
         direct_sort_keys_, direct_sort_values_, sort_temp_storage_,
@@ -3418,13 +3950,8 @@ private:
     run.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
     if (!lookup_owner_usable_)
       return;
-    const std::size_t position_capacity =
-        lookup_owner_position_bits_ == 0u
-            ? 1u
-            : std::size_t{1} << lookup_owner_position_bits_;
-    if (run.count > position_capacity ||
-        lookup_owner_leaf_count_ >=
-            gpulsmopt_detail::kLookupLeafCapacity) {
+    if (lookup_owner_leaf_count_ >=
+        gpulsmopt_detail::kLookupLeafCapacity) {
       lookup_owner_usable_ = false;
       return;
     }
@@ -3454,7 +3981,7 @@ private:
     return queries >= threshold;
   }
 
-  void prepare_lookup_owner(cudaStream_t stream) {
+  void publish_lookup_owner_leaves(cudaStream_t stream) {
     if (lookup_owner_published_leaf_count_ < lookup_owner_leaf_count_) {
       const std::uint32_t first = lookup_owner_published_leaf_count_;
       const std::uint32_t count = lookup_owner_leaf_count_ - first;
@@ -3465,6 +3992,48 @@ private:
           cudaMemcpyHostToDevice, stream));
       lookup_owner_published_leaf_count_ = lookup_owner_leaf_count_;
     }
+  }
+
+  void ensure_lookup_maintenance_resources() {
+    if (lookup_maintenance_stream_)
+      return;
+    int least_priority = 0;
+    int greatest_priority = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(
+        &least_priority, &greatest_priority));
+    (void)greatest_priority;
+    CUDA_CHECK(cudaStreamCreateWithPriority(
+        &lookup_maintenance_stream_, cudaStreamNonBlocking,
+        least_priority));
+    CUDA_CHECK(cudaEventCreateWithFlags(
+        &lookup_publish_start_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(
+        &lookup_publish_done_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(lookup_publish_done_,
+                               lookup_maintenance_stream_));
+  }
+
+  // Publication is deliberately behind the result-producing query.  Every
+  // quotient carries its own applied-leaf watermark, so the query remains
+  // exact by checking immutable newer leaves first; maintenance is therefore
+  // not on the result dependency chain.  The low-priority stream serializes
+  // publications, preserving chronology even when callers issue operations
+  // without an intervening device-wide synchronization.
+  void schedule_lookup_sector_publication(cudaStream_t result_stream) {
+    if (!lookup_sector_enabled_ ||
+        lookup_owner_applied_leaf_count_ >= lookup_owner_leaf_count_)
+      return;
+    ensure_lookup_maintenance_resources();
+    CUDA_CHECK(cudaEventRecord(lookup_publish_start_, result_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(lookup_maintenance_stream_,
+                                   lookup_publish_start_, 0));
+    prepare_lookup_owner(lookup_maintenance_stream_);
+    CUDA_CHECK(cudaEventRecord(lookup_publish_done_,
+                               lookup_maintenance_stream_));
+  }
+
+  void prepare_lookup_owner(cudaStream_t stream) {
+    publish_lookup_owner_leaves(stream);
     if (lookup_owner_applied_leaf_count_ >= lookup_owner_leaf_count_)
       return;
     const std::uint32_t first = lookup_owner_applied_leaf_count_;
@@ -3473,11 +4042,16 @@ private:
     constexpr int warps = block / 32;
     constexpr int grid =
         (gpulsmopt_detail::kEpochQuotients + warps - 1) / warps;
-    gpulsmopt_detail::lookup_owner_apply_kernel<<<
+    gpulsmopt_detail::lookup_sector_apply_kernel<<<
         grid, block, 0, stream>>>(
         lookup_owner_leaves_.data(), first, pending,
-        lookup_owner_position_bits_, lookup_owner_slots_.data(),
-        lookup_owner_table_mask_, lookup_owner_overflow_.data());
+        lookup_sector_buckets_.data(),
+        lookup_sector_buckets_per_quotient_,
+        lookup_sector_bucket_mask_, lookup_sector_overflow_.data(),
+        lookup_sector_stash_.data(), lookup_owner_overflow_.data(),
+        lookup_sector_ready_.data(), lookup_radix_arena_.data(),
+        lookup_radix_cursor_.data(), lookup_radix_capacity_units_,
+        lookup_radix_roots_.data(), lookup_radix_enabled_.data());
     CUDA_CHECK(cudaGetLastError());
     mark_lookup_owner_routes(first, first + pending);
     lookup_owner_applied_leaf_count_ = lookup_owner_leaf_count_;
@@ -4274,16 +4848,6 @@ private:
         gpulsmopt_detail::kEpochQuotients + 1u);
   }
 
-  static std::uint32_t lookup_owner_position_bits(std::size_t count) {
-    std::uint32_t bits = 0u;
-    std::size_t capacity = 1u;
-    while (capacity < std::max<std::size_t>(count, 1u)) {
-      capacity <<= 1u;
-      ++bits;
-    }
-    return bits;
-  }
-
   void reset_lookup_owner(cudaStream_t stream) {
     lookup_owner_leaf_count_ = 0u;
     lookup_owner_published_leaf_count_ = 0u;
@@ -4292,65 +4856,268 @@ private:
     if (!lookup_owner_enabled_)
       return;
     CUDA_CHECK(cudaMemsetAsync(
-        lookup_owner_slots_.data(), 0,
-        lookup_owner_slots_.size() * sizeof(unsigned long long), stream));
-    CUDA_CHECK(cudaMemsetAsync(lookup_owner_overflow_.data(), 0,
-                               sizeof(std::uint32_t), stream));
+        lookup_sector_buckets_.data(), 0,
+        lookup_sector_buckets_.size() *
+            sizeof(gpulsmopt_detail::LookupSectorBucket), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_sector_overflow_.data(), 0,
+        lookup_sector_overflow_.size() * sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_sector_stash_.data(), 0,
+        lookup_sector_stash_.size() * sizeof(unsigned long long), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_owner_overflow_.data(), 0,
+        lookup_owner_overflow_.size() * sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_sector_ready_.data(), 0,
+        lookup_sector_ready_.size() * sizeof(std::uint32_t), stream));
+    // The radix arena is append-only within an epoch. Rewind it here; each
+    // subsequently allocated page clears itself before its id is published.
+    // This makes ordinary folds independent of the reserved AQX capacity.
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_radix_cursor_.data(), 0, sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_radix_roots_.data(), 0,
+        lookup_radix_roots_.size() * sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        lookup_radix_enabled_.data(), 0,
+        lookup_radix_enabled_.size() * sizeof(std::uint32_t), stream));
   }
 
-  void reserve_lookup_owner_storage(cudaStream_t stream) {
-    lookup_owner_position_bits_ =
-        lookup_owner_position_bits(batch_capacity_);
-    if (lookup_owner_position_bits_ > 22u) {
-      lookup_owner_enabled_ = false;
-      lookup_owner_usable_ = false;
+  void seed_lookup_owner_base(cudaStream_t stream) {
+    if (!lookup_owner_usable_ || !sorted_run_ready() ||
+        sorted_run().count == 0u)
       return;
-    }
-    lookup_owner_position_mask_ =
-        lookup_owner_position_bits_ == 0u
-            ? 0u
-            : (std::uint32_t{1} << lookup_owner_position_bits_) - 1u;
+    constexpr int block = 256;
+    const int grid = static_cast<int>(
+        (sorted_run().count + block - 1u) / block);
+    gpulsmopt_detail::lookup_sector_seed_base_kernel<<<
+        grid, block, 0, stream>>>(
+        make_sorted_view(), lookup_sector_buckets_.data(),
+        lookup_sector_buckets_per_quotient_,
+        lookup_sector_bucket_mask_, lookup_sector_overflow_.data(),
+        lookup_sector_stash_.data(), lookup_owner_overflow_.data());
+    CUDA_CHECK(cudaGetLastError());
+    constexpr int quotient_grid =
+        (gpulsmopt_detail::kEpochQuotients + block - 1) / block;
+    gpulsmopt_detail::lookup_radix_repair_base_kernel<<<
+        quotient_grid, block, 0, stream>>>(
+        make_sorted_view(), lookup_sector_buckets_.data(),
+        lookup_sector_buckets_per_quotient_,
+        lookup_sector_bucket_mask_, lookup_owner_overflow_.data(),
+        lookup_radix_arena_.data(), lookup_radix_cursor_.data(),
+        lookup_radix_capacity_units_, lookup_radix_roots_.data(),
+        lookup_radix_enabled_.data());
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  void release_lookup_sector_storage() {
+    lookup_sector_buckets_.release();
+    lookup_sector_overflow_.release();
+    lookup_sector_stash_.release();
+    lookup_sector_ready_.release();
+    lookup_radix_arena_.release();
+    lookup_radix_cursor_.release();
+    lookup_radix_roots_.release();
+    lookup_radix_enabled_.release();
+    lookup_owner_leaves_.release();
+    lookup_owner_overflow_.release();
+    lookup_radix_capacity_units_ = 0u;
+  }
+
+  // The sidecar is optional.  If its bounded allocation cannot be satisfied,
+  // point lookup remains exact through the ordinary temporal-run path.
+  void reserve_lookup_owner_storage(cudaStream_t stream) {
+    lookup_owner_enabled_ = false;
+    lookup_owner_usable_ = false;
+    lookup_sector_enabled_ = false;
+    lookup_sector_buckets_per_quotient_ = 0u;
+    lookup_sector_bucket_mask_ = 0u;
+
     if (max_elements_ >
         std::numeric_limits<std::size_t>::max() / 2u) {
-      lookup_owner_enabled_ = false;
-      lookup_owner_usable_ = false;
+      release_lookup_sector_storage();
       return;
     }
-    const std::size_t required =
-        std::max<std::size_t>(2u, max_elements_ * 2u);
-    std::size_t slots = 1u;
-    while (slots < required &&
-           slots < gpulsmopt_detail::kLookupOwnerMaxSlots)
-      slots <<= 1u;
-    if (slots < required ||
-        slots > gpulsmopt_detail::kLookupOwnerMaxSlots) {
-      lookup_owner_enabled_ = false;
-      lookup_owner_usable_ = false;
+    const std::size_t minimum_entries =
+        static_cast<std::size_t>(gpulsmopt_detail::kEpochQuotients) * 4u;
+    const std::size_t required_entries = std::max<std::size_t>(
+        minimum_entries, std::max<std::size_t>(1u, max_elements_) * 2u);
+    std::size_t entries = minimum_entries;
+    while (entries < required_entries &&
+           entries < gpulsmopt_detail::kLookupSectorMaxEntries)
+      entries <<= 1u;
+    if (entries < required_entries ||
+        entries > gpulsmopt_detail::kLookupSectorMaxEntries) {
+      release_lookup_sector_storage();
       return;
     }
-    if (lookup_owner_slots_.capacity() < slots) {
+
+    const std::size_t bucket_count = entries / 4u;
+    const std::size_t buckets_per_quotient =
+        bucket_count / gpulsmopt_detail::kEpochQuotients;
+    const std::size_t overflow_words = (bucket_count + 31u) / 32u;
+    const std::size_t stash_entries =
+        static_cast<std::size_t>(gpulsmopt_detail::kEpochQuotients) *
+        gpulsmopt_detail::kLookupSectorStashSlots;
+    constexpr std::size_t quotient_count =
+        gpulsmopt_detail::kEpochQuotients;
+    constexpr std::size_t leaf_capacity =
+        gpulsmopt_detail::kLookupLeafCapacity;
+    constexpr std::size_t radix_unit_bytes =
+        gpulsmopt_detail::kLookupRadixUnitU64 *
+        sizeof(unsigned long long);
+    const std::size_t primary_bytes =
+        bucket_count * sizeof(gpulsmopt_detail::LookupSectorBucket);
+    const std::size_t radix_capacity_units = std::max<std::size_t>(
+        gpulsmopt_detail::kLookupRadixDenseUnits,
+        (primary_bytes / 4u + radix_unit_bytes - 1u) /
+            radix_unit_bytes);
+    const std::size_t radix_entries =
+        radix_capacity_units * gpulsmopt_detail::kLookupRadixUnitU64;
+    if (radix_capacity_units >
+        std::numeric_limits<std::uint32_t>::max()) {
+      release_lookup_sector_storage();
+      return;
+    }
+    const std::size_t bytes =
+        primary_bytes +
+        overflow_words * sizeof(std::uint32_t) +
+        stash_entries * sizeof(unsigned long long) +
+        4u * quotient_count * sizeof(std::uint32_t) +
+        sizeof(std::uint32_t) +
+        radix_entries * sizeof(unsigned long long) +
+        leaf_capacity *
+            sizeof(gpulsmopt_detail::LookupOwnerLeafView);
+    const bool reusable =
+        lookup_sector_buckets_.capacity() >= bucket_count &&
+        lookup_sector_overflow_.capacity() >= overflow_words &&
+        lookup_sector_stash_.capacity() >= stash_entries &&
+        lookup_sector_ready_.capacity() >= quotient_count &&
+        lookup_radix_arena_.capacity() >= radix_entries &&
+        lookup_radix_cursor_.capacity() >= 1u &&
+        lookup_radix_roots_.capacity() >= quotient_count &&
+        lookup_radix_enabled_.capacity() >= quotient_count &&
+        lookup_owner_leaves_.capacity() >= leaf_capacity &&
+        lookup_owner_overflow_.capacity() >= quotient_count;
+    if (reusable) {
+      lookup_sector_buckets_.resize_discard_exact(bucket_count);
+      lookup_sector_overflow_.resize_discard_exact(overflow_words);
+      lookup_sector_stash_.resize_discard_exact(stash_entries);
+      lookup_sector_ready_.resize_discard_exact(quotient_count);
+      lookup_radix_arena_.resize_discard_exact(radix_entries);
+      lookup_radix_cursor_.resize_discard_exact(1u);
+      lookup_radix_roots_.resize_discard_exact(quotient_count);
+      lookup_radix_enabled_.resize_discard_exact(quotient_count);
+      lookup_owner_leaves_.resize_discard_exact(leaf_capacity);
+      lookup_owner_overflow_.resize_discard_exact(quotient_count);
+    } else {
+      constexpr std::size_t memory_reserve = std::size_t{256} << 20;
       std::size_t free_bytes = 0u;
       std::size_t total_bytes = 0u;
       CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
       (void)total_bytes;
-      const std::size_t bytes =
-          slots * sizeof(unsigned long long);
-      constexpr std::size_t reserve = std::size_t{256} << 20;
-      if (bytes > free_bytes || free_bytes - bytes < reserve) {
-        lookup_owner_enabled_ = false;
-        lookup_owner_usable_ = false;
+      if (bytes > free_bytes || free_bytes - bytes < memory_reserve) {
+        release_lookup_sector_storage();
         return;
       }
+      release_lookup_sector_storage();
+      gpulsmopt_detail::LookupSectorBucket *buckets = nullptr;
+      std::uint32_t *bucket_overflow = nullptr;
+      unsigned long long *stash = nullptr;
+      std::uint32_t *ready = nullptr;
+      unsigned long long *radix_arena = nullptr;
+      std::uint32_t *radix_cursor = nullptr;
+      std::uint32_t *radix_roots = nullptr;
+      std::uint32_t *radix_enabled = nullptr;
+      gpulsmopt_detail::LookupOwnerLeafView *leaves = nullptr;
+      std::uint32_t *quotient_overflow = nullptr;
+      cudaError_t status = cudaMalloc(
+          reinterpret_cast<void **>(&buckets),
+          bucket_count * sizeof(*buckets));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&bucket_overflow),
+            overflow_words * sizeof(*bucket_overflow));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&stash),
+            stash_entries * sizeof(*stash));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&ready),
+            quotient_count * sizeof(*ready));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&radix_arena),
+            radix_entries * sizeof(*radix_arena));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&radix_cursor),
+            sizeof(*radix_cursor));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&radix_roots),
+            quotient_count * sizeof(*radix_roots));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&radix_enabled),
+            quotient_count * sizeof(*radix_enabled));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&leaves),
+            leaf_capacity * sizeof(*leaves));
+      if (status == cudaSuccess)
+        status = cudaMalloc(
+            reinterpret_cast<void **>(&quotient_overflow),
+            quotient_count * sizeof(*quotient_overflow));
+      if (status != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (buckets)
+          (void)cudaFree(buckets);
+        if (bucket_overflow)
+          (void)cudaFree(bucket_overflow);
+        if (stash)
+          (void)cudaFree(stash);
+        if (ready)
+          (void)cudaFree(ready);
+        if (radix_arena)
+          (void)cudaFree(radix_arena);
+        if (radix_cursor)
+          (void)cudaFree(radix_cursor);
+        if (radix_roots)
+          (void)cudaFree(radix_roots);
+        if (radix_enabled)
+          (void)cudaFree(radix_enabled);
+        if (leaves)
+          (void)cudaFree(leaves);
+        if (quotient_overflow)
+          (void)cudaFree(quotient_overflow);
+        return;
+      }
+      lookup_sector_buckets_.adopt(buckets, bucket_count);
+      lookup_sector_overflow_.adopt(bucket_overflow, overflow_words);
+      lookup_sector_stash_.adopt(stash, stash_entries);
+      lookup_sector_ready_.adopt(ready, quotient_count);
+      lookup_radix_arena_.adopt(radix_arena, radix_entries);
+      lookup_radix_cursor_.adopt(radix_cursor, 1u);
+      lookup_radix_roots_.adopt(radix_roots, quotient_count);
+      lookup_radix_enabled_.adopt(radix_enabled, quotient_count);
+      lookup_owner_leaves_.adopt(leaves, leaf_capacity);
+      lookup_owner_overflow_.adopt(
+          quotient_overflow, quotient_count);
     }
-    lookup_owner_slots_.resize_discard_exact(slots);
-    lookup_owner_leaves_.resize_discard_exact(
-        gpulsmopt_detail::kLookupLeafCapacity);
-    lookup_owner_overflow_.resize_discard_exact(1u);
-    lookup_owner_table_mask_ = static_cast<std::uint32_t>(slots - 1u);
+
+    lookup_sector_buckets_per_quotient_ =
+        static_cast<std::uint32_t>(buckets_per_quotient);
+    lookup_sector_bucket_mask_ =
+        lookup_sector_buckets_per_quotient_ - 1u;
+    lookup_radix_capacity_units_ =
+        static_cast<std::uint32_t>(radix_capacity_units);
+    lookup_sector_enabled_ = true;
     lookup_owner_enabled_ = true;
     reset_lookup_owner(stream);
   }
-
   // Reserve successor storage before timed updates.
   void reserve_successor_storage() {
     const std::size_t queries = std::max<std::size_t>(1, batch_capacity_);
@@ -5151,6 +5918,8 @@ private:
 
   // Folds the base and assignments with last-wins.
   void fold_into_base(cudaStream_t stream) {
+    if (lookup_publish_done_)
+      CUDA_CHECK(cudaStreamWaitEvent(stream, lookup_publish_done_, 0));
     std::vector<std::size_t> updates;
     std::size_t assignment_total = 0;
     for (std::size_t r = 0; r < runs_.size(); ++r) {
@@ -5312,6 +6081,7 @@ private:
     succ_sparse_ready_ = false;
     reset_parent_storage();
     reset_lookup_owner(stream);
+    seed_lookup_owner_base(stream);
     ++base_generation_;
   }
 
@@ -5330,6 +6100,8 @@ private:
   }
 
   void temporal_hash_fold(cudaStream_t stream) {
+    if (lookup_publish_done_)
+      CUDA_CHECK(cudaStreamWaitEvent(stream, lookup_publish_done_, 0));
 #ifdef GPULSMOPT_PROFILE_FOLD
     double prof_hash_publish_ms = 0.0;
     double prof_hash_plan_ms = 0.0;
@@ -5691,21 +6463,39 @@ private:
       assignment_views_;
   gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::LookupPublication>
       lookup_publication_;
+  gpulsmopt_detail::RawDeviceBuffer<
+      gpulsmopt_detail::LookupSectorBucket> lookup_sector_buckets_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      lookup_sector_overflow_;
   gpulsmopt_detail::RawDeviceBuffer<unsigned long long>
-      lookup_owner_slots_;
+      lookup_sector_stash_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      lookup_sector_ready_;
+  gpulsmopt_detail::RawDeviceBuffer<unsigned long long>
+      lookup_radix_arena_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      lookup_radix_cursor_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      lookup_radix_roots_;
+  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
+      lookup_radix_enabled_;
   gpulsmopt_detail::RawDeviceBuffer<
       gpulsmopt_detail::LookupOwnerLeafView>
       lookup_owner_leaves_;
   gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
       lookup_owner_overflow_;
-  std::uint32_t lookup_owner_table_mask_ = 0u;
-  std::uint32_t lookup_owner_position_bits_ = 0u;
-  std::uint32_t lookup_owner_position_mask_ = 0u;
   std::uint32_t lookup_owner_leaf_count_ = 0u;
   std::uint32_t lookup_owner_published_leaf_count_ = 0u;
   std::uint32_t lookup_owner_applied_leaf_count_ = 0u;
   bool lookup_owner_enabled_ = false;
   bool lookup_owner_usable_ = false;
+  bool lookup_sector_enabled_ = false;
+  std::uint32_t lookup_sector_buckets_per_quotient_ = 0u;
+  std::uint32_t lookup_sector_bucket_mask_ = 0u;
+  std::uint32_t lookup_radix_capacity_units_ = 0u;
+  cudaStream_t lookup_maintenance_stream_ = nullptr;
+  cudaEvent_t lookup_publish_start_ = nullptr;
+  cudaEvent_t lookup_publish_done_ = nullptr;
   // Oldest-to-newest descriptor mirror.
   std::vector<gpulsmopt_detail::AssignmentRunView> chrono_views_;
   std::vector<HostLookupLeaf> lookup_host_leaves_;
