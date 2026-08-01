@@ -152,6 +152,7 @@ public:
         {"batch_capacity",
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
         {"structure", "temporal_assignment_runs"},
+        {"range", "cooperative_visible_scan_sum"},
         {"run_capacity",
          std::to_string(static_cast<size_t>(gpulsmopt_detail::kRunCapacity))},
         {"prewarm_leaves",
@@ -246,7 +247,6 @@ public:
     batch.hi = reinterpret_cast<const std::uint32_t *>(upper);
     batch.query_count = size;
     batch.out_sums = reinterpret_cast<std::uint32_t *>(result);
-    batch.out_counts = nullptr;
     dictionary_->range(batch, stream);
   }
 
