@@ -225,6 +225,29 @@ template <typename index_type>
 struct benchmark_supports_successor<index_type, std::void_t<decltype(index_type::can_successor)>>
     : std::bool_constant<index_type::can_successor == operation_support::async> {};
 
+template <typename index_type, typename = void>
+struct benchmark_index_key_limit
+{
+    static constexpr typename index_type::key_type value =
+        max_usable_key<typename index_type::key_type>();
+};
+
+template <typename index_type>
+struct benchmark_index_key_limit<
+    index_type, std::void_t<decltype(index_type::max_supported_key)>>
+{
+    static constexpr typename index_type::key_type value =
+        index_type::max_supported_key;
+};
+
+template <typename index_type, typename = void>
+struct benchmark_index_stores_tombstones : std::false_type {};
+
+template <typename index_type>
+struct benchmark_index_stores_tombstones<
+    index_type, std::void_t<decltype(index_type::stores_tombstones)>>
+    : std::bool_constant<index_type::stores_tombstones> {};
+
 template <typename key_t>
 void key_only_sort_device_timed2(const cuda_buffer<key_t> &d_keys_in,
                                  size_t n,
@@ -1335,7 +1358,10 @@ void benchmark_updates(
         // -------------------- REGULAR GENERATED KEYS
 
         std::vector<key_type> generated_keys;
-        generate_keys_file(key_generation_size, min_usable_key<key_type>(), max_usable_key<key_type>(), generated_keys, "keys_cache.txt");
+        generate_keys_file(
+            key_generation_size, min_usable_key<key_type>(),
+            benchmark_index_key_limit<index_type>::value,
+            generated_keys, "keys_cache.txt");
         // generate_keys(key_generation_size, min_usable_key<key_type>(), max_usable_key<key_type>(), generated_keys);
 
         std::cerr << "Regular generated key set of size " << key_generation_size << std::endl;
@@ -1353,7 +1379,7 @@ void benchmark_updates(
             build_size,          // Number of uniform keys
             insert_batch_size,   // Number of insert keys
             min_usable_key<key_type>(),
-            max_usable_key<key_type>(),
+            benchmark_index_key_limit<index_type>::value,
             generated_keys);
 
         // Print build_size
@@ -1376,7 +1402,7 @@ void benchmark_updates(
             insert_batch_size,   // Number of insert keys
             tc.batch_count,      // Number of batches
             min_usable_key<key_type>(),
-            max_usable_key<key_type>(),
+            benchmark_index_key_limit<index_type>::value,
             generated_keys,
             shift_insert_range,
             percentage_distribution_dense_keys, // Percentage of keys in the dense pattern (25% of the total key range)
@@ -1394,6 +1420,11 @@ void benchmark_updates(
 #endif
 
         key_generation_size = generated_keys.size();
+        const size_t index_capacity_size =
+            key_generation_size +
+            (benchmark_index_stores_tombstones<index_type>::value
+                 ? delete_batch_size * tc.batch_count
+                 : 0);
 
 #ifdef PRINT_GENERATED_KEYS
 #pragma message "PRINT_GENERATED_HYBRID_KEYS=YES"
@@ -1475,7 +1506,9 @@ void benchmark_updates(
                 // for Baselines
 #ifdef BASELINES
 #pragma message "BASELINE BUILD"
-                index.build(insert_delete_keys_buffer.ptr(), build_size, key_generation_size, available_bytes_for_index, nullptr, nullptr);
+                index.build(insert_delete_keys_buffer.ptr(), build_size,
+                            index_capacity_size, available_bytes_for_index,
+                            nullptr, nullptr);
                 // index.build_static_tree(insert_delete_keys_buffer.ptr(), build_size, key_generation_size, available_bytes_for_index, nullptr, nullptr);
 #else
 #pragma message "REGULAR CGRXU BUILD-  BUCKET LAYER ONLY"
