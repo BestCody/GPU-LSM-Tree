@@ -129,6 +129,9 @@ public:
   using key_type = key_type_;
   using value_type = smallsize;
 
+  static constexpr key_type max_supported_key =
+      std::numeric_limits<key_type>::max() >> 1u;
+
   static_assert(std::is_same_v<key_type, key32>,
                 "GPULSMOpt's current FliX adapter supports key32 only");
   static_assert(std::is_same_v<smallsize, std::uint32_t>,

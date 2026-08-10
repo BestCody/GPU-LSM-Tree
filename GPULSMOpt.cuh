@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_merge.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/iterator/counting_input_iterator.cuh>
@@ -12,6 +13,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                                       \
@@ -28,7 +30,6 @@ namespace gpulsmopt2_detail {
 
 constexpr std::uint32_t kQuotients = 1u << 16u;
 constexpr std::uint32_t kMaximumLevels = 16u;
-constexpr std::uint32_t kInitialArenaLevels = 3u;
 constexpr std::uint32_t kBatchesPerEpoch = 16u;
 constexpr std::uint32_t kBatchPositionBits = 28u;
 constexpr std::uint32_t kLocalRankBits = 7u;
@@ -36,10 +37,8 @@ constexpr std::uint32_t kLocalRankEntries =
     kQuotients * (1u << kLocalRankBits);
 constexpr std::uint32_t kThreads = 256u;
 constexpr std::uint32_t kWarpsPerBlock = kThreads / 32u;
-constexpr std::uint32_t kCarryWarpsPerBlock = 4u;
-constexpr std::uint32_t kCarryMaximum = 512u;
-constexpr std::uint32_t kMaximumSizeClass = 16u;
 constexpr std::uint32_t kInvalid = 0xffffffffu;
+constexpr std::uint32_t kInvalidAge = 0xffffffffu;
 constexpr std::uint32_t kTombstone = 1u;
 constexpr std::uint32_t kMaximumArenaRows = 1u << 26u;
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
@@ -66,6 +65,14 @@ __host__ __device__ __forceinline__ std::uint32_t key_suffix(
   return key & 0xffffu;
 }
 
+__host__ __device__ __forceinline__ std::uint32_t raw_age(
+    std::uint32_t logical_position, std::uint32_t batch_stride) {
+  const std::uint32_t batch = logical_position >> kBatchPositionBits;
+  const std::uint32_t position =
+      logical_position & ((1u << kBatchPositionBits) - 1u);
+  return kMaximumLevels + batch * batch_stride + position;
+}
+
 struct RawAssignment {
   Row row;
   std::uint32_t logical_position;
@@ -77,13 +84,9 @@ static_assert(sizeof(RawAssignment) == 12u);
 struct Descriptor {
   std::uint64_t bits{};
   __host__ __device__ static Descriptor make(std::uint32_t offset,
-                                             std::uint32_t count,
-                                             std::uint32_t size_class,
-                                             bool planned = false) {
+                                             std::uint32_t count) {
     return {std::uint64_t{offset} |
-            (std::uint64_t{count} << 26u) |
-            (std::uint64_t{size_class} << 43u) |
-            (planned ? (1ull << 63u) : 0ull)};
+            (std::uint64_t{count} << 26u)};
   }
   __host__ __device__ std::uint32_t offset() const {
     return static_cast<std::uint32_t>(bits & ((1ull << 26u) - 1ull));
@@ -91,15 +94,6 @@ struct Descriptor {
   __host__ __device__ std::uint32_t count() const {
     return static_cast<std::uint32_t>((bits >> 26u) & ((1ull << 17u) - 1ull));
   }
-  __host__ __device__ std::uint32_t size_class() const {
-    return static_cast<std::uint32_t>((bits >> 43u) & 31ull);
-  }
-  __host__ __device__ bool planned() const { return bits >> 63u; }
-  __device__ void set_count(std::uint32_t count) {
-    bits = (bits & ~(((1ull << 17u) - 1ull) << 26u)) |
-           (std::uint64_t{count} << 26u);
-  }
-  __device__ void publish() { bits &= ~(1ull << 63u); }
 };
 
 static_assert(sizeof(Descriptor) == 8u);
@@ -115,6 +109,14 @@ struct TaggedRow {
 };
 
 static_assert(sizeof(TaggedRow) == 12u);
+
+struct SameFullKey {
+  std::uint32_t age_bits = 32u;
+  __host__ __device__ bool operator()(std::uint64_t first,
+                                      std::uint64_t second) const {
+    return (first >> age_bits) == (second >> age_bits);
+  }
+};
 
 struct RangeFragment {
   std::uint32_t query;
@@ -165,19 +167,6 @@ public:
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&pointer_),
                             count * sizeof(T)));
   }
-  void grow(std::size_t count, cudaStream_t stream) {
-    if (count <= count_) return;
-    T *next{};
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&next),
-                          count * sizeof(T)));
-    if (count_)
-      CUDA_CHECK(cudaMemcpyAsync(next, pointer_, count_ * sizeof(T),
-                                 cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (pointer_) CUDA_CHECK(cudaFree(pointer_));
-    pointer_ = next;
-    count_ = count;
-  }
   T *data() { return pointer_; }
   std::size_t size() const { return count_; }
 private:
@@ -190,170 +179,20 @@ __global__ void iota_kernel(std::uint32_t *ids, std::uint32_t count) {
   if (i < count) ids[i] = i;
 }
 
-__device__ __forceinline__ bool find_planned_descriptor(
-    Descriptor *descriptors, std::uint32_t q, Descriptor *&plan,
-    std::uint32_t &level, std::uint32_t level_limit) {
-  for (level = 0u; level < level_limit; ++level) {
-    Descriptor *candidate = descriptors + descriptor_index(q, level);
-    if (candidate->planned()) {
-      plan = candidate;
-      return true;
-    }
-  }
-  plan = nullptr;
-  return false;
-}
-
 __device__ __forceinline__ std::uint32_t size_class_for(
     std::uint32_t count) {
   if (count <= 1u) return 0u;
   return 32u - static_cast<std::uint32_t>(__clz(count - 1u));
 }
 
-__device__ void release_extent(Row *arena, std::uint32_t *local_free_heads,
-                               std::uint32_t q, std::uint32_t offset,
-                               std::uint32_t size_class) {
-  std::uint32_t &local_head =
-      local_free_heads[q * (kMaximumSizeClass + 1u) + size_class];
-  arena[offset].value = local_head;
-  local_head = offset;
-}
-
 __device__ __forceinline__ bool tagged_less(const TaggedRow &a,
                                             const TaggedRow &b) {
-  const bool ai = a.age == kInvalid;
-  const bool bi = b.age == kInvalid;
+  const bool ai = a.age == kInvalidAge;
+  const bool bi = b.age == kInvalidAge;
   if (ai != bi) return !ai;
   if (ai) return false;
   if (a.row.key != b.row.key) return a.row.key < b.row.key;
   return a.age < b.age;
-}
-
-template <std::uint32_t MaximumItems>
-__device__ __forceinline__ std::uint32_t sort_and_publish_tagged_rows(
-    TaggedRow *items, std::uint32_t sort_size, std::uint32_t lane,
-    Row *arena, std::uint32_t output_offset) {
-  static_assert(MaximumItems % 32u == 0u);
-  for (std::uint32_t width = 2u; width <= sort_size; width <<= 1u) {
-    for (std::uint32_t stride = width >> 1u; stride; stride >>= 1u) {
-      for (std::uint32_t group = 0u; group < sort_size / 32u; ++group) {
-        const std::uint32_t index = lane + group * 32u;
-        const std::uint32_t other_index = index ^ stride;
-        if (other_index > index) {
-          const TaggedRow x = items[index], y = items[other_index];
-          const bool ascending = (index & width) == 0u;
-          const bool swap = ascending ? tagged_less(y, x) : tagged_less(x, y);
-          if (swap) {
-            items[index] = y;
-            items[other_index] = x;
-          }
-        }
-      }
-      __syncwarp();
-    }
-  }
-  bool winner[MaximumItems / 32u]{};
-  unsigned masks[MaximumItems / 32u]{};
-  std::uint32_t winner_count = 0u;
-  for (std::uint32_t group = 0u; group < sort_size / 32u; ++group) {
-    const std::uint32_t index = lane + group * 32u;
-    winner[group] = items[index].age != kInvalid &&
-        (index + 1u == sort_size || items[index + 1u].age == kInvalid ||
-         items[index].row.key != items[index + 1u].row.key);
-    masks[group] = __ballot_sync(0xffffffffu, winner[group]);
-    winner_count += __popc(masks[group]);
-  }
-  const unsigned before = lane == 0u ? 0u : ((1u << lane) - 1u);
-  std::uint32_t base = 0u;
-  for (std::uint32_t group = 0u; group < sort_size / 32u; ++group) {
-    if (winner[group])
-      arena[output_offset + base + __popc(masks[group] & before)] =
-          items[lane + group * 32u].row;
-    base += __popc(masks[group]);
-  }
-  return winner_count;
-}
-
-__global__ void plan_extents_kernel(
-    const std::uint32_t *__restrict__ epoch_counts,
-    Row *__restrict__ arena, std::uint32_t arena_capacity,
-    Descriptor *__restrict__ descriptors,
-    std::uint32_t *__restrict__ local_free_heads,
-    std::uint32_t *__restrict__ cursor,
-    std::uint32_t *__restrict__ overflow,
-    std::uint32_t level_limit) {
-  __shared__ std::uint32_t fresh_capacity[kThreads];
-  __shared__ std::uint32_t fresh_prefix[kThreads];
-  __shared__ std::uint32_t block_base;
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  std::uint32_t capacity = 0u, recycled = kInvalid;
-  std::uint32_t planned_count = 0u, planned_size_class = 0u;
-  std::uint32_t planned_level = 0u;
-  bool valid = false;
-  if (q < kQuotients && epoch_counts[q] != 0u) {
-    std::uint32_t depth = 0u;
-    std::uint32_t total = epoch_counts[q];
-    while (depth < level_limit) {
-      const Descriptor descriptor = descriptors[descriptor_index(q, depth)];
-      if (!descriptor.count()) break;
-      total += descriptor.count();
-      ++depth;
-    }
-    if (depth >= level_limit) {
-      atomicAdd(overflow, 1u);
-    } else {
-      const std::uint32_t size_class = size_class_for(total);
-      if (total >= (1u << 17u) || size_class > kMaximumSizeClass) {
-        atomicAdd(overflow, 1u);
-      } else {
-        std::uint32_t &head =
-            local_free_heads[q * (kMaximumSizeClass + 1u) + size_class];
-        recycled = head;
-        if (recycled != kInvalid) head = arena[recycled].value;
-        else capacity = 1u << size_class;
-        planned_count = total;
-        planned_size_class = size_class;
-        planned_level = depth;
-        valid = true;
-      }
-    }
-  }
-  fresh_capacity[threadIdx.x] = capacity;
-  __syncthreads();
-  if (threadIdx.x == 0u) {
-    std::uint32_t total = 0u;
-    for (std::uint32_t i = 0u; i < blockDim.x; ++i) {
-      fresh_prefix[i] = total;
-      total += fresh_capacity[i];
-    }
-    block_base = total ? atomicAdd(cursor, total) : 0u;
-    if (total && (block_base > arena_capacity ||
-                  total > arena_capacity - block_base))
-      atomicAdd(overflow, 1u);
-  }
-  __syncthreads();
-  if (q >= kQuotients) return;
-  if (!valid) return;
-  const std::uint32_t offset = recycled != kInvalid
-      ? recycled : block_base + fresh_prefix[threadIdx.x];
-  descriptors[descriptor_index(q, planned_level)] = Descriptor::make(
-      offset, planned_count, planned_size_class, true);
-}
-
-__device__ RawAssignment load_raw_ordinal(
-    const RawAssignment *assignments, const std::uint32_t *offsets,
-    std::uint32_t batch_stride, std::uint32_t q,
-    std::uint32_t ordinal) {
-#pragma unroll
-  for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch) {
-    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
-    const std::uint32_t begin = offsets[oi];
-    const std::uint32_t count = offsets[oi + 1u] - begin;
-    if (ordinal < count)
-      return assignments[batch * batch_stride + begin + ordinal];
-    ordinal -= count;
-  }
-  return {{0u, 0u, 0u}, 0u};
 }
 
 __device__ RawAssignment load_pending_raw_ordinal(
@@ -369,227 +208,6 @@ __device__ RawAssignment load_pending_raw_ordinal(
     ordinal -= count;
   }
   return {{0u, 0u, 0u}, 0u};
-}
-
-__global__ void fused_raw_epoch_carry_kernel(
-    const RawAssignment *__restrict__ assignments,
-    const std::uint32_t *__restrict__ raw_offsets,
-    std::uint32_t batch_stride,
-    const std::uint32_t *__restrict__ raw_counts,
-    Row *__restrict__ arena, Descriptor *__restrict__ descriptors,
-    std::uint32_t level_limit) {
-  __shared__ TaggedRow items[kCarryWarpsPerBlock][kCarryMaximum];
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t warp = threadIdx.x >> 5u;
-  const std::uint32_t q = blockIdx.x * kCarryWarpsPerBlock + warp;
-  if (q >= kQuotients) return;
-  Descriptor *allocation{};
-  std::uint32_t allocation_level{};
-  if (!find_planned_descriptor(
-          descriptors, q, allocation, allocation_level,
-          level_limit)) return;
-  const std::uint32_t total = allocation->count();
-  if (total <= 128u || total > kCarryMaximum) return;
-  const std::uint32_t raw_count = raw_counts[q];
-  const std::uint32_t sort_size = max(32u, 1u << size_class_for(total));
-  TaggedRow *local = items[warp];
-  for (std::uint32_t i = lane; i < sort_size; i += 32u) {
-    if (i < raw_count) {
-      const RawAssignment raw = load_raw_ordinal(
-          assignments, raw_offsets, batch_stride, q, i);
-      local[i] = {raw.row, 0x10000000u | raw.logical_position};
-    } else if (i < total) {
-      std::uint32_t ordinal = i - raw_count;
-      bool loaded = false;
-      for (std::uint32_t level = 0u; level < allocation_level; ++level) {
-        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-        if (ordinal < descriptor.count()) {
-          local[i] = {arena[descriptor.offset() + ordinal], kMaximumLevels - level};
-          loaded = true;
-          break;
-        }
-        ordinal -= descriptor.count();
-      }
-      if (!loaded) local[i] = {{0u, 0u, 0u}, kInvalid};
-    } else {
-      local[i] = {{0u, 0u, 0u}, kInvalid};
-    }
-  }
-  __syncwarp();
-  const std::uint32_t winner_count =
-      sort_and_publish_tagged_rows<kCarryMaximum>(
-          local, sort_size, lane, arena, allocation->offset());
-  if (lane == 0u) allocation->set_count(winner_count);
-}
-
-__global__ void fused_raw_merge_path_carry_kernel(
-    const RawAssignment *__restrict__ assignments,
-    const std::uint32_t *__restrict__ raw_offsets,
-    std::uint32_t batch_stride,
-    const std::uint32_t *__restrict__ raw_counts,
-    Row *__restrict__ arena, Descriptor *__restrict__ descriptors,
-    std::uint32_t *__restrict__ overflow,
-    std::uint32_t level_limit) {
-  constexpr std::uint32_t warps_per_block = 4u;
-  constexpr std::uint32_t raw_capacity = 64u;
-  __shared__ TaggedRow raw_shared[warps_per_block][raw_capacity];
-  __shared__ Row current_shared[warps_per_block][128];
-  __shared__ Row merged_shared[warps_per_block][128];
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t warp = threadIdx.x >> 5u;
-  const std::uint32_t q = blockIdx.x * warps_per_block + warp;
-  if (q >= kQuotients) return;
-  Descriptor *allocation{};
-  std::uint32_t allocation_level{};
-  if (!find_planned_descriptor(
-          descriptors, q, allocation, allocation_level,
-          level_limit)) return;
-  if (allocation_level == 0u) return;
-  const std::uint32_t allocation_count = allocation->count();
-  const std::uint32_t raw_count = raw_counts[q];
-  if (raw_count > raw_capacity) {
-    return;
-  }
-  if (allocation_count > 128u) return;
-  TaggedRow *raw = raw_shared[warp];
-  Row *current = current_shared[warp];
-  Row *merged = merged_shared[warp];
-  const std::uint32_t raw_sort_size = max(32u, 1u << size_class_for(raw_count));
-  for (std::uint32_t index = lane; index < raw_sort_size; index += 32u) {
-    if (index < raw_count) {
-      const RawAssignment item = load_raw_ordinal(
-          assignments, raw_offsets, batch_stride, q, index);
-      raw[index] = {item.row, item.logical_position};
-    } else {
-      raw[index] = {{0u, 0u, 0u}, kInvalid};
-    }
-  }
-  __syncwarp();
-  std::uint32_t current_count = sort_and_publish_tagged_rows<raw_capacity>(
-      raw, raw_sort_size, lane, current, 0u);
-  const unsigned before = lane == 0u ? 0u : ((1u << lane) - 1u);
-  __syncwarp();
-
-  for (std::uint32_t level = 0u; level < allocation_level; ++level) {
-    const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-    const Row *older = arena + descriptor.offset();
-    const std::uint32_t older_count = descriptor.count();
-    const std::uint32_t merged_count = current_count + older_count;
-    if (merged_count > 128u) {
-      if (lane == 0u) atomicAdd(overflow, 1u);
-      return;
-    }
-    const std::uint32_t tile = merged_count <= 32u ? 1u :
-                               merged_count <= 64u ? 2u : 4u;
-    const std::uint32_t diagonal = min(lane * tile, merged_count);
-    std::uint32_t low = diagonal > current_count
-        ? diagonal - current_count : 0u;
-    std::uint32_t high = min(diagonal, older_count);
-    while (low < high) {
-      const std::uint32_t older_index = (low + high) >> 1u;
-      const std::uint32_t current_index = diagonal - older_index;
-      if (older_index < older_count && current_index > 0u &&
-          current[current_index - 1u].key >= older[older_index].key)
-        low = older_index + 1u;
-      else
-        high = older_index;
-    }
-    std::uint32_t older_index = low;
-    std::uint32_t current_index = diagonal - older_index;
-#pragma unroll
-    for (std::uint32_t item = 0u; item < 4u; ++item) {
-      const std::uint32_t output_index = diagonal + item;
-      if (item >= tile || output_index >= merged_count) break;
-      const bool choose_older = older_index < older_count &&
-          (current_index >= current_count ||
-           older[older_index].key <= current[current_index].key);
-      if (choose_older) merged[output_index] = older[older_index++];
-      else merged[output_index] = current[current_index++];
-    }
-    __syncwarp();
-    bool winner[4]{};
-    unsigned masks[4]{};
-    std::uint32_t next_count = 0u;
-    for (std::uint32_t group = 0u; group < 4u; ++group) {
-      const std::uint32_t index = lane + group * 32u;
-      winner[group] = index < merged_count &&
-          (index + 1u == merged_count ||
-           merged[index].key != merged[index + 1u].key);
-      masks[group] = __ballot_sync(0xffffffffu, winner[group]);
-      next_count += __popc(masks[group]);
-    }
-    std::uint32_t base = 0u;
-    for (std::uint32_t group = 0u; group < 4u; ++group) {
-      if (winner[group])
-        current[base + __popc(masks[group] & before)] =
-            merged[lane + group * 32u];
-      base += __popc(masks[group]);
-    }
-    __syncwarp();
-    current_count = next_count;
-  }
-  for (std::uint32_t index = lane; index < current_count; index += 32u)
-    arena[allocation->offset() + index] = current[index];
-  if (lane == 0u) allocation->set_count(current_count);
-}
-
-__global__ void fused_raw_publish_kernel(
-    const RawAssignment *__restrict__ assignments,
-    const std::uint32_t *__restrict__ raw_offsets,
-    std::uint32_t batch_stride,
-    const std::uint32_t *__restrict__ raw_counts,
-    Row *__restrict__ arena, Descriptor *__restrict__ descriptors,
-    std::uint32_t level_limit) {
-  constexpr std::uint32_t raw_capacity = 64u;
-  __shared__ TaggedRow raw_shared[kWarpsPerBlock][raw_capacity];
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t warp = threadIdx.x >> 5u;
-  const std::uint32_t q = blockIdx.x * kWarpsPerBlock + warp;
-  if (q >= kQuotients) return;
-  Descriptor *allocation{};
-  std::uint32_t allocation_level{};
-  if (!find_planned_descriptor(
-          descriptors, q, allocation, allocation_level,
-          level_limit) ||
-      allocation_level != 0u) return;
-  const std::uint32_t raw_count = raw_counts[q];
-  if (raw_count > raw_capacity) {
-    return;
-  }
-  TaggedRow *raw = raw_shared[warp];
-  const std::uint32_t sort_size = max(32u, 1u << size_class_for(raw_count));
-  for (std::uint32_t i = lane; i < sort_size; i += 32u) {
-    if (i < raw_count) {
-      const RawAssignment item = load_raw_ordinal(
-          assignments, raw_offsets, batch_stride, q, i);
-      raw[i] = {item.row, item.logical_position};
-    } else {
-      raw[i] = {{0u, 0u, 0u}, kInvalid};
-    }
-  }
-  __syncwarp();
-  const std::uint32_t winner_count =
-      sort_and_publish_tagged_rows<raw_capacity>(
-          raw, sort_size, lane, arena, allocation->offset());
-  if (lane == 0u) allocation->set_count(winner_count);
-}
-
-__global__ void publish_and_release_kernel(
-    Row *arena, Descriptor *descriptors,
-    std::uint32_t *local_free_heads,
-    std::uint32_t level_limit) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kQuotients) return;
-  Descriptor *plan{};
-  std::uint32_t plan_level{};
-  if (!find_planned_descriptor(
-          descriptors, q, plan, plan_level, level_limit)) return;
-  for (std::uint32_t level = 0u; level < plan_level; ++level) {
-    Descriptor &old = descriptors[descriptor_index(q, level)];
-    release_extent(arena, local_free_heads, q, old.offset(), old.size_class());
-    old = {};
-  }
-  plan->publish();
 }
 
 __device__ __forceinline__ std::uint32_t lower_bound_rows(
@@ -1076,11 +694,12 @@ __global__ void cooperative_section_owned_range_kernel(
     if (pending_count <= 32u) {
       if (threadIdx.x < 32u) {
         const std::uint32_t lane = threadIdx.x;
-        TaggedRow item{{0u, 0u, 0u}, kInvalid};
+        TaggedRow item{{0u, 0u, 0u}, kInvalidAge};
         if (lane < pending_count) {
           const RawAssignment loaded = load_pending_raw_ordinal(
               raw, raw_offsets, batch_stride, pending_batches, q, lane);
-          item = {loaded.row, loaded.logical_position};
+          item = {loaded.row,
+                  raw_age(loaded.logical_position, batch_stride)};
         }
         constexpr unsigned full_mask = 0xffffffffu;
         for (std::uint32_t width = 2u; width <= 32u; width <<= 1u) {
@@ -1103,7 +722,7 @@ __global__ void cooperative_section_owned_range_kernel(
             __shfl_down_sync(full_mask, item.row.key, 1u);
         const std::uint32_t next_age =
             __shfl_down_sync(full_mask, item.age, 1u);
-        const bool winner = item.age != kInvalid &&
+        const bool winner = item.age != kInvalidAge &&
             (lane == 31u || next_age == kInvalid ||
              item.row.key != next_key);
         const unsigned winners = __ballot_sync(full_mask, winner);
@@ -1122,9 +741,10 @@ __global__ void cooperative_section_owned_range_kernel(
           const RawAssignment loaded = load_pending_raw_ordinal(
               raw, raw_offsets, batch_stride, pending_batches, q, ordinal);
           workspace.tagged[ordinal] =
-              {loaded.row, loaded.logical_position};
+              {loaded.row,
+               raw_age(loaded.logical_position, batch_stride)};
         } else {
-          workspace.tagged[ordinal] = {{0u, 0u, 0u}, kInvalid};
+          workspace.tagged[ordinal] = {{0u, 0u, 0u}, kInvalidAge};
         }
       }
       __syncthreads();
@@ -1155,9 +775,9 @@ __global__ void cooperative_section_owned_range_kernel(
       for (std::uint32_t item = 0u; item < 2u; ++item) {
         const std::uint32_t index = chunk_begin + item;
         winner[item] = index < sort_size &&
-            workspace.tagged[index].age != kInvalid &&
+            workspace.tagged[index].age != kInvalidAge &&
             (index + 1u == sort_size ||
-             workspace.tagged[index + 1u].age == kInvalid ||
+             workspace.tagged[index + 1u].age == kInvalidAge ||
              workspace.tagged[index].row.key !=
                  workspace.tagged[index + 1u].row.key);
         local_winners += winner[item];
@@ -1659,7 +1279,7 @@ __global__ void warp_range_fragment_kernel(
             pending_count + __popc(selected & before);
         if (valid && destination < kUpdateCapacity)
           scratch[warp].tagged[destination] =
-              {item.row, item.logical_position};
+              {item.row, raw_age(item.logical_position, batch_stride)};
         pending_count += __popc(selected);
       }
     }
@@ -1871,7 +1491,10 @@ __global__ void overflow_range_fragment_kernel(
 __global__ void gather_raw_batch_kernel(
     const std::uint32_t *sorted_keys, const std::uint32_t *sorted_ids,
     const std::uint32_t *values, std::uint32_t count, std::uint32_t batch_slot,
-    bool tombstone, RawAssignment *destination) {
+    bool tombstone, RawAssignment *destination,
+    std::uint32_t *destination_full_keys,
+    std::uint64_t *batch_signatures,
+    std::uint64_t *epoch_signatures) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const std::uint32_t original = sorted_ids[i];
@@ -1879,6 +1502,29 @@ __global__ void gather_raw_batch_kernel(
       make_row(sorted_keys[i], tombstone ? 0u : values[original],
                tombstone ? kTombstone : 0u),
       (batch_slot << kBatchPositionBits) | original};
+  destination_full_keys[i] = sorted_keys[i];
+  const std::uint32_t key = sorted_keys[i];
+  const std::uint32_t first = key * 0x9e3779b1u;
+  const std::uint32_t second = (key ^ (key >> 16u)) * 0x85ebca6bu;
+  const std::uint64_t bits =
+      (1ull << (first >> 26u)) | (1ull << (second >> 26u));
+  const unsigned active = __activemask();
+  const std::uint32_t quotient = key >> 16u;
+  const unsigned peers = __match_any_sync(active, quotient);
+  const std::uint32_t low = __reduce_or_sync(
+      peers, static_cast<std::uint32_t>(bits));
+  const std::uint32_t high = __reduce_or_sync(
+      peers, static_cast<std::uint32_t>(bits >> 32u));
+  if ((threadIdx.x & 31u) == static_cast<std::uint32_t>(__ffs(peers) - 1)) {
+    const std::uint64_t aggregate =
+        std::uint64_t{low} | (std::uint64_t{high} << 32u);
+    atomicOr(reinterpret_cast<unsigned long long *>(
+                 batch_signatures + quotient),
+             static_cast<unsigned long long>(aggregate));
+    atomicOr(reinterpret_cast<unsigned long long *>(
+                 epoch_signatures + quotient),
+             static_cast<unsigned long long>(aggregate));
+  }
 }
 
 __device__ __forceinline__ std::uint64_t pending_signature_bits(
@@ -1890,36 +1536,81 @@ __device__ __forceinline__ std::uint64_t pending_signature_bits(
 
 __global__ void finalize_quotient_metadata_kernel(
     const std::uint32_t *sorted_keys, std::uint32_t count,
-    std::uint32_t *offsets, std::uint32_t *epoch_counts,
-    std::uint64_t *batch_signatures, std::uint64_t *epoch_signatures) {
+    std::uint32_t *offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kQuotients) return;
+  const std::uint32_t key = q << 16u;
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (sorted_keys[mid] < key) lo = mid + 1u;
+    else hi = mid;
+  }
+  offsets[q] = lo;
+  if (q + 1u == kQuotients) offsets[kQuotients] = count;
+}
+
+__global__ void pack_publication_epoch_kernel(
+    const RawAssignment *assignments, const std::uint32_t *full_keys,
+    std::uint32_t batch_stride, const std::uint32_t *batch_offsets,
+    std::uint32_t age_bits, std::uint64_t *keys, Row *rows) {
+  const std::uint32_t batch = blockIdx.y;
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t count =
+      batch_offsets[batch + 1u] - batch_offsets[batch];
+  if (position >= count) return;
+  const std::uint32_t source = batch * batch_stride + position;
+  const std::uint32_t output = batch_offsets[batch] + position;
+  const RawAssignment item = assignments[source];
+  const std::uint32_t age =
+      raw_age(item.logical_position, batch_stride) - kMaximumLevels;
+  const std::uint64_t inverse_age =
+      ((std::uint64_t{1} << age_bits) - 1u) - age;
+  keys[output] =
+      (std::uint64_t{full_keys[source]} << age_bits) | inverse_age;
+  rows[output] = item.row;
+}
+
+__global__ void normalize_publication_keys_kernel(
+    const std::uint64_t *composite_keys, std::uint32_t *keys,
+    const std::uint32_t *count, std::uint32_t age_bits) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < *count)
+    keys[i] = static_cast<std::uint32_t>(composite_keys[i] >> age_bits);
+}
+
+__device__ __forceinline__ std::uint32_t lower_bound_full_keys(
+    const std::uint32_t *keys, std::uint32_t count, std::uint32_t target) {
+  std::uint32_t low = 0u, high = count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (keys[middle] < target) low = middle + 1u;
+    else high = middle;
+  }
+  return low;
+}
+
+__global__ void publish_global_level_descriptors_kernel(
+    const std::uint32_t *keys, std::uint32_t count,
+    std::uint32_t arena_offset, std::uint32_t level,
+    Descriptor *descriptors) {
   __shared__ std::uint32_t boundaries[kThreads + 1u];
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  auto find_boundary = [&](std::uint32_t quotient) {
-    if (quotient >= kQuotients) return count;
-    const std::uint32_t key = quotient << 16u;
-    std::uint32_t lo = 0u, hi = count;
-    while (lo < hi) {
-      const std::uint32_t mid = (lo + hi) >> 1u;
-      if (sorted_keys[mid] < key) lo = mid + 1u;
-      else hi = mid;
-    }
-    return lo;
-  };
-  boundaries[threadIdx.x] = find_boundary(q);
-  if (threadIdx.x + 1u == blockDim.x)
-    boundaries[blockDim.x] = find_boundary(q + 1u);
+  boundaries[threadIdx.x] = q < kQuotients
+      ? lower_bound_full_keys(keys, count, q << 16u) : count;
+  if (threadIdx.x + 1u == blockDim.x) {
+    const std::uint32_t next = min(q + 1u, kQuotients);
+    boundaries[blockDim.x] = next < kQuotients
+        ? lower_bound_full_keys(keys, count, next << 16u) : count;
+  }
   __syncthreads();
   if (q >= kQuotients) return;
+  for (std::uint32_t old = 0u; old < level; ++old)
+    descriptors[descriptor_index(q, old)] = {};
   const std::uint32_t begin = boundaries[threadIdx.x];
   const std::uint32_t end = boundaries[threadIdx.x + 1u];
-  offsets[q] = begin;
-  if (q + 1u == kQuotients) offsets[kQuotients] = count;
-  epoch_counts[q] += end - begin;
-  std::uint64_t signature = 0ull;
-  for (std::uint32_t index = begin; index < end; ++index)
-    signature |= pending_signature_bits(sorted_keys[index]);
-  batch_signatures[q] = signature;
-  epoch_signatures[q] |= signature;
+  descriptors[descriptor_index(q, level)] = begin == end
+      ? Descriptor{} : Descriptor::make(arena_offset + begin, end - begin);
 }
 
 __global__ void mark_base_winners_kernel(
@@ -1954,115 +1645,6 @@ __global__ void build_local_rank_directory_kernel(
       keys + section_begin, section_end - section_begin, target);
   local_rank[std::size_t{q} * 128u + cell] =
       static_cast<std::uint16_t>(position);
-}
-
-__global__ void fused_raw_dense_fallback_kernel(
-    const RawAssignment *assignments, const std::uint32_t *raw_offsets,
-    std::uint32_t batch_stride, const std::uint32_t *raw_counts,
-    Row *arena, Descriptor *descriptors,
-    std::uint32_t level_limit) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kQuotients) return;
-  Descriptor *plan{};
-  std::uint32_t plan_level{};
-  if (!find_planned_descriptor(
-          descriptors, q, plan, plan_level, level_limit)) return;
-  const std::uint32_t plan_size_class = plan->size_class();
-  const std::uint32_t raw_count = raw_counts[q];
-  const bool fast_publish = plan_level == 0u && raw_count <= 64u;
-  const bool fast_merge = plan_level != 0u && raw_count <= 64u &&
-                          plan_size_class <= 7u;
-  const bool fast_epoch = plan_size_class >= 8u &&
-                          plan_size_class <= 9u;
-  if (fast_publish || fast_merge || fast_epoch) return;
-
-  std::uint32_t raw_begin[kBatchesPerEpoch];
-  std::uint32_t raw_end[kBatchesPerEpoch];
-#pragma unroll
-  for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch) {
-    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
-    raw_begin[batch] = raw_offsets[oi];
-    raw_end[batch] = raw_offsets[oi + 1u];
-  }
-  std::uint32_t class_position[kMaximumLevels]{};
-  std::uint32_t class_end[kMaximumLevels]{};
-  for (std::uint32_t level = 0u; level < plan_level; ++level)
-    class_end[level] = descriptors[descriptor_index(q, level)].count();
-
-  std::uint32_t produced = 0u, previous = 0u;
-  bool have_previous = false;
-  while (true) {
-    std::uint32_t minimum = kInvalid;
-    bool found = false;
-#pragma unroll
-    for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch) {
-      for (std::uint32_t position = raw_begin[batch];
-           position < raw_end[batch]; ++position) {
-        const std::uint32_t key =
-            assignments[batch * batch_stride + position].row.key;
-        if ((!have_previous || key > previous) &&
-            (!found || key < minimum)) {
-          minimum = key;
-          found = true;
-        }
-      }
-    }
-    for (std::uint32_t level = 0u; level < plan_level; ++level) {
-      if (class_position[level] < class_end[level]) {
-        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-        const std::uint32_t key =
-            arena[descriptor.offset() + class_position[level]].key;
-        if (!found || key < minimum) minimum = key;
-        found = true;
-      }
-    }
-    if (!found) break;
-
-    bool have_winner = false;
-    for (int batch = int(kBatchesPerEpoch) - 1; batch >= 0; --batch) {
-      const std::uint32_t batch_index = static_cast<std::uint32_t>(batch);
-      Row candidate{};
-      std::uint32_t newest_position = 0u;
-      bool matched = false;
-      for (std::uint32_t position = raw_begin[batch_index];
-           position < raw_end[batch_index]; ++position) {
-        const RawAssignment item =
-            assignments[batch_index * batch_stride + position];
-        if (item.row.key == minimum &&
-            (!matched || item.logical_position > newest_position)) {
-          candidate = item.row;
-          newest_position = item.logical_position;
-          matched = true;
-        }
-      }
-      if (!have_winner && matched) {
-        have_winner = true;
-        arena[plan->offset() + produced] = candidate;
-      }
-    }
-    if (!have_winner) {
-      for (std::uint32_t level = 0u; level < plan_level; ++level) {
-        if (class_position[level] < class_end[level]) {
-          const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-          const Row row = arena[descriptor.offset() + class_position[level]];
-          if (!have_winner && row.key == minimum) {
-            arena[plan->offset() + produced] = row;
-            have_winner = true;
-          }
-        }
-      }
-    }
-    ++produced;
-    previous = minimum;
-    have_previous = true;
-    for (std::uint32_t level = 0u; level < plan_level; ++level)
-      if (class_position[level] < class_end[level]) {
-        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-        if (arena[descriptor.offset() + class_position[level]].key == minimum)
-          ++class_position[level];
-      }
-  }
-  plan->set_count(produced);
 }
 
 __global__ void lookup_with_pending_kernel(
@@ -2310,36 +1892,61 @@ public:
 
   explicit GPULSMOpt(const DictionaryConfig &config)
       : batch_capacity_(std::max<std::size_t>(1u, config.batch_capacity)),
+        publication_capacity_(std::min<std::size_t>(
+            gpulsmopt2_detail::kMaximumArenaRows,
+            std::max<std::size_t>(
+                config.max_elements,
+                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch))),
         local_rank_(gpulsmopt2_detail::kLocalRankEntries),
         base_offsets_(gpulsmopt2_detail::kQuotients + 1u),
         arena_(std::min<std::size_t>(
             gpulsmopt2_detail::kMaximumArenaRows,
             std::max<std::size_t>(
-                1u, 2u * ((std::size_t{1} <<
-                    gpulsmopt2_detail::kInitialArenaLevels) - 1u) *
-                    batch_capacity_ *
-                    gpulsmopt2_detail::kBatchesPerEpoch))),
+                config.max_elements,
+                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch))),
         descriptors_(std::size_t{gpulsmopt2_detail::kQuotients} *
                      gpulsmopt2_detail::kMaximumLevels),
-        free_heads_(std::size_t{gpulsmopt2_detail::kQuotients} *
-                    (gpulsmopt2_detail::kMaximumSizeClass + 1u)),
-        cursor_(1u), overflow_(1u),
         raw_assignments_(gpulsmopt2_detail::kBatchesPerEpoch *
                          batch_capacity_),
+        raw_full_keys_(gpulsmopt2_detail::kBatchesPerEpoch *
+                       batch_capacity_),
         raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
                      (gpulsmopt2_detail::kQuotients + 1u)),
         raw_signatures_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
                         gpulsmopt2_detail::kQuotients),
         raw_epoch_signatures_(gpulsmopt2_detail::kQuotients),
-        raw_counts_(gpulsmopt2_detail::kQuotients),
+        level_keys_(publication_capacity_),
+        publication_composite_keys_a_(
+            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
+        publication_composite_keys_b_(
+            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
+        publication_raw_rows_a_(
+            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
+        publication_raw_rows_b_(
+            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
+        publication_keys_a_(publication_capacity_),
+        publication_keys_b_(publication_capacity_),
+        publication_rows_a_(publication_capacity_),
+        publication_rows_b_(publication_capacity_),
+        publication_selected_count_(1u),
+        publication_batch_offsets_(gpulsmopt2_detail::kBatchesPerEpoch + 1u),
         radix_keys_(batch_capacity_), radix_ids_out_(batch_capacity_),
         range_partials_(gpulsmopt2_detail::kThreads),
         range_overflow_count_(1u) {
     if (batch_capacity_ >
-        (std::size_t{1} << gpulsmopt2_detail::kBatchPositionBits))
+        (std::size_t{1} << gpulsmopt2_detail::kBatchPositionBits) - 2u)
       throw std::invalid_argument("GPULSMOpt batch capacity exceeds logical-position encoding");
+    if (batch_capacity_ >
+        gpulsmopt2_detail::kMaximumArenaRows /
+            gpulsmopt2_detail::kBatchesPerEpoch)
+      throw std::invalid_argument("GPULSMOpt epoch exceeds publication capacity");
     if (config.max_elements > gpulsmopt2_detail::kMaximumArenaRows)
       throw std::invalid_argument("GPULSMOpt arena currently supports 2^26 rows");
+    std::size_t epoch_capacity =
+        batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch;
+    publication_age_bits_ = 1u;
+    while ((std::size_t{1} << publication_age_bits_) < epoch_capacity)
+      ++publication_age_bits_;
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
     std::size_t initial_sort_bytes{};
@@ -2349,6 +1956,7 @@ public:
         radix_keys_.data(), radix_ids_out_.data(), radix_ids_out_.data(),
         static_cast<std::uint32_t>(batch_capacity_), 16, 32, 0));
     ensure_radix_workspace(initial_sort_bytes, batch_capacity_, 0);
+    initialize_publication_workspace();
     CUDA_CHECK(cudaEventRecord(operation_done_, 0));
     reset_updates(0);
     CUDA_CHECK(cudaMemset(local_rank_.data(), 0,
@@ -2732,14 +2340,21 @@ public:
         base_offsets_.size() * sizeof(std::uint32_t) +
         arena_.size() * sizeof(gpulsmopt2_detail::Row) +
         descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
-        free_heads_.size() * sizeof(std::uint32_t) +
-        cursor_.size() * sizeof(std::uint32_t) +
-        overflow_.size() * sizeof(std::uint32_t) +
         raw_assignments_.size() * sizeof(gpulsmopt2_detail::RawAssignment) +
+        raw_full_keys_.size() * sizeof(std::uint32_t) +
         raw_offsets_.size() * sizeof(std::uint32_t) +
         raw_signatures_.size() * sizeof(std::uint64_t) +
         raw_epoch_signatures_.size() * sizeof(std::uint64_t) +
-        raw_counts_.size() * sizeof(std::uint32_t) +
+        level_keys_.size() * sizeof(std::uint32_t) +
+        (publication_composite_keys_a_.size() +
+         publication_composite_keys_b_.size()) * sizeof(std::uint64_t) +
+        (publication_raw_rows_a_.size() +
+         publication_raw_rows_b_.size() + publication_rows_a_.size() +
+         publication_rows_b_.size()) * sizeof(gpulsmopt2_detail::Row) +
+        (publication_keys_a_.size() + publication_keys_b_.size() +
+         publication_selected_count_.size() +
+         publication_batch_offsets_.size()) * sizeof(std::uint32_t) +
+        publication_temp_.size() * sizeof(std::uint8_t) +
         radix_keys_.size() * sizeof(std::uint32_t) +
         radix_ids_out_.size() * sizeof(std::uint32_t) +
         radix_temp_.size() * sizeof(std::uint8_t) +
@@ -2778,17 +2393,63 @@ private:
     return levels;
   }
 
-  void ensure_arena_for_levels(std::uint32_t levels,
-                               cudaStream_t stream) {
-    const std::uint64_t epoch_rows =
-        std::uint64_t{batch_capacity_} *
-        gpulsmopt2_detail::kBatchesPerEpoch;
-    const std::uint64_t extent_rows =
-        2u * ((std::uint64_t{1} << levels) - 1u) * epoch_rows;
-    const std::size_t target = static_cast<std::size_t>(std::min(
-        extent_rows,
-        std::uint64_t{gpulsmopt2_detail::kMaximumArenaRows}));
-    arena_.grow(target, stream);
+  void initialize_publication_workspace() {
+    const std::uint32_t epoch_capacity = static_cast<std::uint32_t>(
+        batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
+    const std::uint32_t capacity =
+        static_cast<std::uint32_t>(publication_capacity_);
+    std::size_t sort_bytes{}, raw_unique_bytes{}, merge_bytes{};
+    std::size_t merge_unique_bytes{};
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, sort_bytes, publication_composite_keys_a_.data(),
+        publication_composite_keys_b_.data(),
+        publication_raw_rows_a_.data(), publication_raw_rows_b_.data(),
+        epoch_capacity, 0, 32 + publication_age_bits_, 0));
+    CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
+        nullptr, raw_unique_bytes,
+        publication_composite_keys_b_.data(),
+        publication_raw_rows_b_.data(),
+        publication_composite_keys_a_.data(),
+        publication_rows_a_.data(), publication_selected_count_.data(),
+        epoch_capacity,
+        gpulsmopt2_detail::SameFullKey{publication_age_bits_}, 0));
+    const std::uint32_t first = capacity / 2u;
+    const std::uint32_t second = capacity - first;
+    CUDA_CHECK(cub::DeviceMerge::MergePairs(
+        nullptr, merge_bytes, publication_keys_a_.data(),
+        publication_rows_a_.data(), first, level_keys_.data(),
+        arena_.data(), second, publication_keys_b_.data(),
+        publication_rows_b_.data(), cuda::std::less<>{}, 0));
+    CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
+        nullptr, merge_unique_bytes, publication_keys_b_.data(),
+        publication_rows_b_.data(), publication_keys_a_.data(),
+        publication_rows_a_.data(), publication_selected_count_.data(),
+        capacity, cuda::std::equal_to<>{}, 0));
+    publication_temp_.resize(std::max({sort_bytes, raw_unique_bytes,
+                                       merge_bytes, merge_unique_bytes}));
+  }
+
+  std::uint32_t allocate_level_span(std::uint32_t count) const {
+    struct Interval { std::uint32_t begin, end; };
+    std::vector<Interval> occupied;
+    for (std::uint32_t level = 0u;
+         level < gpulsmopt2_detail::kMaximumLevels; ++level) {
+      if (level_counts_[level])
+        occupied.push_back({level_offsets_[level],
+                            level_offsets_[level] + level_counts_[level]});
+    }
+    std::sort(occupied.begin(), occupied.end(),
+              [](const Interval &a, const Interval &b) {
+                return a.begin < b.begin;
+              });
+    std::uint32_t cursor = 0u;
+    for (const Interval &interval : occupied) {
+      if (interval.begin >= cursor && interval.begin - cursor >= count)
+        return cursor;
+      cursor = std::max(cursor, interval.end);
+    }
+    if (std::uint64_t{cursor} + count <= arena_.size()) return cursor;
+    throw std::runtime_error("GPULSMOpt publication arena exhausted");
   }
 
   void begin_operation(cudaStream_t stream) {
@@ -2804,16 +2465,8 @@ private:
                                descriptors_.size() *
                                    sizeof(gpulsmopt2_detail::Descriptor),
                                stream));
-    CUDA_CHECK(cudaMemsetAsync(free_heads_.data(), 0xff,
-                               free_heads_.size() * sizeof(std::uint32_t),
-                               stream));
-    CUDA_CHECK(cudaMemsetAsync(cursor_.data(), 0, sizeof(std::uint32_t),
-                               stream));
     CUDA_CHECK(cudaMemsetAsync(raw_offsets_.data(), 0,
                                raw_offsets_.size() * sizeof(std::uint32_t),
-                               stream));
-    CUDA_CHECK(cudaMemsetAsync(raw_counts_.data(), 0,
-                               raw_counts_.size() * sizeof(std::uint32_t),
                                stream));
     CUDA_CHECK(cudaMemsetAsync(
         raw_epoch_signatures_.data(), 0,
@@ -2821,6 +2474,9 @@ private:
     pending_batches_ = 0u;
     pending_records_ = 0u;
     active_levels_ = 0u;
+    std::fill_n(level_counts_, gpulsmopt2_detail::kMaximumLevels, 0u);
+    std::fill_n(level_offsets_, gpulsmopt2_detail::kMaximumLevels, 0u);
+    std::fill_n(raw_batch_counts_, gpulsmopt2_detail::kBatchesPerEpoch, 0u);
     stats_ = {};
   }
 
@@ -2841,20 +2497,25 @@ private:
         radix_input_ids(), radix_ids_out_.data(), n, 16, 32, stream));
     const std::uint32_t slot = pending_batches_;
     pending_records_ += n;
+    std::uint64_t *batch_signatures = raw_signatures_.data() +
+        std::size_t{slot} * gpulsmopt2_detail::kQuotients;
+    CUDA_CHECK(cudaMemsetAsync(
+        batch_signatures, 0,
+        gpulsmopt2_detail::kQuotients * sizeof(std::uint64_t), stream));
     gpulsmopt2_detail::gather_raw_batch_kernel<<<
         blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
         radix_keys_.data(), radix_ids_out_.data(), values, n, slot, tombstone,
-        raw_assignments_.data() + std::size_t{slot} * batch_capacity_);
+        raw_assignments_.data() + std::size_t{slot} * batch_capacity_,
+        raw_full_keys_.data() + std::size_t{slot} * batch_capacity_,
+        batch_signatures, raw_epoch_signatures_.data());
     std::uint32_t *batch_offsets = raw_offsets_.data() +
         std::size_t{slot} * (gpulsmopt2_detail::kQuotients + 1u);
     gpulsmopt2_detail::finalize_quotient_metadata_kernel<<<
         gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
         gpulsmopt2_detail::kThreads, 0, stream>>>(
-            radix_keys_.data(), n, batch_offsets, raw_counts_.data(),
-            raw_signatures_.data() +
-                std::size_t{slot} * gpulsmopt2_detail::kQuotients,
-            raw_epoch_signatures_.data());
+            radix_keys_.data(), n, batch_offsets);
     CUDA_CHECK(cudaGetLastError());
+    raw_batch_counts_[slot] = n;
     ++pending_batches_;
     ++stats_.admitted_batches;
     stats_.admitted_records += count;
@@ -2868,60 +2529,104 @@ private:
         levels_for_epochs(stats_.epochs_published + 1u);
     if (publication_levels > gpulsmopt2_detail::kMaximumLevels)
       throw std::runtime_error("GPULSMOpt descriptor capacity exhausted");
-    ensure_arena_for_levels(publication_levels, stream);
-    CUDA_CHECK(cudaMemsetAsync(overflow_.data(), 0, sizeof(std::uint32_t),
-                               stream));
-    gpulsmopt2_detail::plan_extents_kernel<<<
-        blocks(gpulsmopt2_detail::kQuotients), gpulsmopt2_detail::kThreads, 0,
-        stream>>>(raw_counts_.data(), arena_.data(),
-                  static_cast<std::uint32_t>(arena_.size()),
-                  descriptors_.data(), free_heads_.data(),
-                  cursor_.data(), overflow_.data(), publication_levels);
-    gpulsmopt2_detail::fused_raw_publish_kernel<<<
-        (gpulsmopt2_detail::kQuotients +
-         gpulsmopt2_detail::kWarpsPerBlock - 1u) /
-            gpulsmopt2_detail::kWarpsPerBlock,
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
-        raw_assignments_.data(), raw_offsets_.data(),
-                  static_cast<std::uint32_t>(batch_capacity_),
-                  raw_counts_.data(), arena_.data(),
-                  descriptors_.data(), publication_levels);
-    gpulsmopt2_detail::fused_raw_merge_path_carry_kernel<<<
-        (gpulsmopt2_detail::kQuotients + 3u) / 4u, 128, 0, stream>>>(
-        raw_assignments_.data(), raw_offsets_.data(),
-        static_cast<std::uint32_t>(batch_capacity_),
-        raw_counts_.data(), arena_.data(), descriptors_.data(),
-        overflow_.data(), publication_levels);
-    gpulsmopt2_detail::fused_raw_epoch_carry_kernel<<<
-        (gpulsmopt2_detail::kQuotients +
-         gpulsmopt2_detail::kCarryWarpsPerBlock - 1u) /
-            gpulsmopt2_detail::kCarryWarpsPerBlock,
-        gpulsmopt2_detail::kCarryWarpsPerBlock * 32u, 0, stream>>>(
-        raw_assignments_.data(), raw_offsets_.data(),
-        static_cast<std::uint32_t>(batch_capacity_),
-        raw_counts_.data(), arena_.data(), descriptors_.data(),
-        publication_levels);
-    gpulsmopt2_detail::fused_raw_dense_fallback_kernel<<<
+    if (pending_records_ > publication_capacity_)
+      throw std::runtime_error("GPULSMOpt publication workspace exhausted");
+    std::uint32_t carry_levels = 0u;
+    while (carry_levels < gpulsmopt2_detail::kMaximumLevels &&
+           level_counts_[carry_levels])
+      ++carry_levels;
+    if (carry_levels == gpulsmopt2_detail::kMaximumLevels)
+      throw std::runtime_error("GPULSMOpt descriptor capacity exhausted");
+    std::uint32_t destination = gpulsmopt2_detail::kInvalid;
+    if (carry_levels == 0u)
+      destination = allocate_level_span(pending_records_);
+    std::uint32_t batch_offsets[gpulsmopt2_detail::kBatchesPerEpoch + 1u]{};
+    for (std::uint32_t batch = 0u;
+         batch < gpulsmopt2_detail::kBatchesPerEpoch; ++batch)
+      batch_offsets[batch + 1u] =
+          batch_offsets[batch] + raw_batch_counts_[batch];
+    CUDA_CHECK(cudaMemcpyAsync(
+        publication_batch_offsets_.data(), batch_offsets,
+        sizeof(batch_offsets), cudaMemcpyHostToDevice, stream));
+    const dim3 publication_grid(
+        blocks(batch_capacity_), gpulsmopt2_detail::kBatchesPerEpoch);
+    gpulsmopt2_detail::pack_publication_epoch_kernel<<<
+        publication_grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
+            raw_assignments_.data(), raw_full_keys_.data(),
+            static_cast<std::uint32_t>(batch_capacity_),
+            publication_batch_offsets_.data(), publication_age_bits_,
+            publication_composite_keys_a_.data(),
+            publication_raw_rows_a_.data());
+    std::size_t workspace_bytes = publication_temp_.size();
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        publication_temp_.data(), workspace_bytes,
+        publication_composite_keys_a_.data(),
+        publication_composite_keys_b_.data(),
+        publication_raw_rows_a_.data(), publication_raw_rows_b_.data(),
+        pending_records_, 0, 32 + publication_age_bits_, stream));
+    workspace_bytes = publication_temp_.size();
+    CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
+        publication_temp_.data(), workspace_bytes,
+        publication_composite_keys_b_.data(),
+        publication_raw_rows_b_.data(),
+        publication_composite_keys_a_.data(),
+        carry_levels ? publication_rows_a_.data()
+                     : arena_.data() + destination,
+        publication_selected_count_.data(), pending_records_,
+        gpulsmopt2_detail::SameFullKey{publication_age_bits_}, stream));
+    std::uint32_t current_count{};
+    CUDA_CHECK(cudaMemcpyAsync(
+        &current_count, publication_selected_count_.data(),
+        sizeof(current_count), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    gpulsmopt2_detail::normalize_publication_keys_kernel<<<
+        blocks(current_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            publication_composite_keys_a_.data(),
+            carry_levels ? publication_keys_a_.data()
+                         : level_keys_.data() + destination,
+            publication_selected_count_.data(), publication_age_bits_);
+
+    std::uint32_t destination_level = 0u;
+    while (level_counts_[destination_level]) {
+      const std::uint32_t old_count = level_counts_[destination_level];
+      if (std::uint64_t{current_count} + old_count > publication_capacity_)
+        throw std::runtime_error("GPULSMOpt publication workspace exhausted");
+      workspace_bytes = publication_temp_.size();
+      CUDA_CHECK(cub::DeviceMerge::MergePairs(
+          publication_temp_.data(), workspace_bytes,
+          publication_keys_a_.data(), publication_rows_a_.data(),
+          current_count, level_keys_.data() + level_offsets_[destination_level],
+          arena_.data() + level_offsets_[destination_level], old_count,
+          publication_keys_b_.data(), publication_rows_b_.data(),
+          cuda::std::less<>{}, stream));
+      const std::uint32_t merged_count = current_count + old_count;
+      level_counts_[destination_level] = 0u;
+      const bool final_merge = destination_level + 1u == carry_levels;
+      if (final_merge) destination = allocate_level_span(merged_count);
+      workspace_bytes = publication_temp_.size();
+      CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
+          publication_temp_.data(), workspace_bytes,
+          publication_keys_b_.data(), publication_rows_b_.data(),
+          final_merge ? level_keys_.data() + destination
+                      : publication_keys_a_.data(),
+          final_merge ? arena_.data() + destination
+                      : publication_rows_a_.data(),
+          publication_selected_count_.data(), merged_count,
+          cuda::std::equal_to<>{}, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          &current_count, publication_selected_count_.data(),
+          sizeof(current_count), cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      ++destination_level;
+    }
+    gpulsmopt2_detail::publish_global_level_descriptors_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
-        raw_assignments_.data(), raw_offsets_.data(),
-        static_cast<std::uint32_t>(batch_capacity_),
-        raw_counts_.data(), arena_.data(), descriptors_.data(),
-        publication_levels);
-    gpulsmopt2_detail::publish_and_release_kernel<<<
-        blocks(gpulsmopt2_detail::kQuotients), gpulsmopt2_detail::kThreads, 0,
-        stream>>>(arena_.data(), descriptors_.data(), free_heads_.data(),
-                  publication_levels);
+            level_keys_.data() + destination, current_count, destination,
+            destination_level, descriptors_.data());
+    level_offsets_[destination_level] = destination;
+    level_counts_[destination_level] = current_count;
     CUDA_CHECK(cudaGetLastError());
-    std::uint32_t overflow = 0u;
-    CUDA_CHECK(cudaMemcpyAsync(&overflow, overflow_.data(), sizeof(overflow),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (overflow)
-      throw std::runtime_error("GPULSMOpt arena or extent capacity exhausted");
-    CUDA_CHECK(cudaMemsetAsync(raw_counts_.data(), 0,
-                               raw_counts_.size() * sizeof(std::uint32_t),
-                               stream));
     CUDA_CHECK(cudaMemsetAsync(
         raw_epoch_signatures_.data(), 0,
         raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
@@ -3057,6 +2762,8 @@ private:
   }
 
   std::size_t batch_capacity_{};
+  std::size_t publication_capacity_{};
+  std::uint32_t publication_age_bits_{};
   std::uint32_t pending_batches_{};
   std::uint32_t pending_records_{};
   std::uint32_t active_levels_{};
@@ -3069,12 +2776,25 @@ private:
   gpulsmopt2_detail::Buffer<std::uint16_t> local_rank_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> arena_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> free_heads_, cursor_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> overflow_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment> raw_assignments_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_, raw_counts_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> raw_full_keys_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_signatures_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_epoch_signatures_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> level_keys_;
+  gpulsmopt2_detail::Buffer<std::uint64_t> publication_composite_keys_a_,
+      publication_composite_keys_b_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> publication_raw_rows_a_,
+      publication_raw_rows_b_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> publication_keys_a_,
+      publication_keys_b_, publication_selected_count_,
+      publication_batch_offsets_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> publication_rows_a_,
+      publication_rows_b_;
+  gpulsmopt2_detail::Buffer<std::uint8_t> publication_temp_;
+  std::uint32_t level_counts_[gpulsmopt2_detail::kMaximumLevels]{};
+  std::uint32_t level_offsets_[gpulsmopt2_detail::kMaximumLevels]{};
+  std::uint32_t raw_batch_counts_[gpulsmopt2_detail::kBatchesPerEpoch]{};
 
   gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
   gpulsmopt2_detail::Buffer<std::uint8_t> radix_temp_;
