@@ -20,7 +20,9 @@
 #include <type_traits>
 
 #include <cub/cub.cuh>
-#include <cub/device/device_merge.cuh>
+
+#include <thrust/merge.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 // The paper stores a 31-bit original key in bits [31:1] and its status in bit
 // zero. A zero status is a tombstone and a one status is a regular element.
@@ -61,7 +63,7 @@ struct lsm_paper_key
     }
 };
 
-// Section IV-A: merge on the original key only. CUB's stable merge leaves the
+// Section IV-A: merge on the original key only. A stable merge leaves the
 // first input (the newer batch/level) before the second input on ties.
 template <typename Key>
 struct lsm_original_key_less
@@ -528,8 +530,6 @@ GLOBALQUALIFIER void lsm_fill_placebos_kernel(
 
 template <typename Key, typename Value>
 void lsm_stable_merge_pairs(
-    void *temp,
-    size_t temp_bytes,
     const Key *newer_keys,
     const Value *newer_values,
     size_t newer_size,
@@ -540,27 +540,16 @@ void lsm_stable_merge_pairs(
     Value *output_values,
     cudaStream_t stream)
 {
-    cub::DeviceMerge::MergePairs(
-        temp, temp_bytes,
-        newer_keys, newer_values, newer_size,
-        older_keys, older_values, older_size,
+    // thrust::merge_by_key is stable by contract: equal keys from the first
+    // range precede equal keys from the second range. Passing the newer range
+    // first therefore preserves the paper's temporal ordering invariant.
+    thrust::merge_by_key(
+        thrust::cuda::par_nosync.on(stream),
+        newer_keys, newer_keys + newer_size,
+        older_keys, older_keys + older_size,
+        newer_values, older_values,
         output_keys, output_values,
-        lsm_original_key_less<Key>{}, stream);
-}
-
-template <typename Key, typename Value>
-size_t lsm_merge_temp_bytes(size_t first_size, size_t second_size)
-{
-    size_t bytes = 0;
-    cub::DeviceMerge::MergePairs(
-        nullptr, bytes,
-        static_cast<const Key *>(nullptr),
-        static_cast<const Value *>(nullptr), first_size,
-        static_cast<const Key *>(nullptr),
-        static_cast<const Value *>(nullptr), second_size,
-        static_cast<Key *>(nullptr), static_cast<Value *>(nullptr),
         lsm_original_key_less<Key>{});
-    return bytes;
 }
 
 template <typename T>
@@ -694,8 +683,6 @@ private:
             const size_t current_level_size = batch_size << level;
             const size_t level_offset = current_level_size - batch_size;
             lsm_stable_merge_pairs(
-                primitive_temp_buffer.raw_ptr,
-                primitive_temp_buffer.size_in_bytes(),
                 source_keys, source_values, source_size,
                 level_keys_buffer.ptr() + level_offset,
                 level_values_buffer.ptr() + level_offset,
@@ -1009,9 +996,7 @@ public:
                 : resident * (sizeof(key_type) + sizeof(value_type)) +
                       find_pair_sort_buffer_size<key_type, value_type>(resident);
         return records * (sizeof(key_type) + sizeof(value_type)) +
-               std::max(find_pair_sort_buffer_size<key_type, value_type>(batch_size),
-                        lsm_merge_temp_bytes<key_type, value_type>(
-                            largest, largest)) +
+               find_pair_sort_buffer_size<key_type, value_type>(batch_size) +
                bulk_build_bytes;
     }
 
@@ -1079,10 +1064,7 @@ public:
 
         const size_t sort_bytes =
             find_pair_sort_buffer_size<key_type, smallsize>(batch_size);
-        const size_t merge_bytes =
-            lsm_merge_temp_bytes<key_type, smallsize>(
-                max_level_size, max_level_size);
-        const size_t primitive_bytes = std::max(sort_bytes, merge_bytes);
+        const size_t primitive_bytes = sort_bytes;
         const size_t initial_resident_size = batches_for_elements(size) * batch_size;
         const size_t bulk_build_bytes =
             initial_resident_size == 0
@@ -1318,14 +1300,11 @@ public:
         selected_count.alloc(1);
         C2EX
 
-        const size_t cleanup_merge_bytes =
-            lsm_merge_temp_bytes<key_type, smallsize>(
-                total_available_slots, max_level_size);
         const size_t cleanup_select_bytes = std::max(
             lsm_select_temp_bytes<key_type>(resident_size),
             lsm_select_temp_bytes<smallsize>(resident_size));
         cuda_buffer<std::uint8_t> cleanup_temp;
-        cleanup_temp.alloc(std::max(cleanup_merge_bytes, cleanup_select_bytes));
+        cleanup_temp.alloc(cleanup_select_bytes);
         C2EX
 
         key_type *merged_keys = cleanup_keys_a.ptr();
@@ -1363,7 +1342,6 @@ public:
                     ? cleanup_values_b.ptr()
                     : cleanup_values_a.ptr();
             lsm_stable_merge_pairs(
-                cleanup_temp.raw_ptr, cleanup_temp.size_in_bytes(),
                 merged_keys, merged_values, merged_size,
                 level_keys_buffer.ptr() + current_offset,
                 level_values_buffer.ptr() + current_offset,
