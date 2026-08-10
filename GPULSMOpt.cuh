@@ -1,7763 +1,3099 @@
 #pragma once
 #include "gpu_dictionary_adapter.cuh"
-
-#include <cub/block/block_radix_sort.cuh>
-#include <cub/block/block_reduce.cuh>
-#include <cub/block/block_scan.cuh>
-#include <cub/device/device_merge.cuh>
-#include <cub/iterator/transform_input_iterator.cuh>
-#include <cub/device/device_radix_sort.cuh>
-#include <cub/device/device_scan.cuh>
-#include <cub/device/device_segmented_radix_sort.cuh>
 #include <cuda_runtime.h>
-
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
-#include <thrust/functional.h>
-#include <thrust/iterator/reverse_iterator.h>
-#include <thrust/reduce.h>
-#include <thrust/scan.h>
+#include <cub/block/block_scan.cuh>
+#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_select.cuh>
+#include <cub/device/device_scan.cuh>
+#include <cub/iterator/counting_input_iterator.cuh>
 
 #include <algorithm>
-#include <cstddef>
-#include <condition_variable>
 #include <cstdint>
 #include <limits>
-#include <mutex>
-#include <shared_mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <utility>
-#include <vector>
-
-#ifdef GPULSMOPT_PROFILE_INSERT
-#include <chrono>
-#include <cstdio>
-#endif
 
 #ifndef CUDA_CHECK
-#define CUDA_CHECK(stmt)                                                       \
+#define CUDA_CHECK(call)                                                       \
   do {                                                                         \
-    cudaError_t err__ = (stmt);                                                \
-    if (err__ != cudaSuccess) {                                                \
-      throw std::runtime_error(                                                \
-          std::string(cudaGetErrorString(err__)) + " at " + __FILE__ + ":" +   \
-          std::to_string(__LINE__) + " (" #stmt ")");                          \
-    }                                                                          \
+    const cudaError_t e__ = (call);                                             \
+    if (e__ != cudaSuccess)                                                     \
+      throw std::runtime_error(std::string(cudaGetErrorString(e__)) +           \
+                               " at " + __FILE__ + ":" +                     \
+                               std::to_string(__LINE__));                       \
   } while (false)
 #endif
 
-namespace gpulsmopt_detail {
-#ifndef GPULSMOPT_RADIX_THREADS
-#define GPULSMOPT_RADIX_THREADS 256
-#endif
-#ifndef GPULSMOPT_RADIX_ITEMS
-#define GPULSMOPT_RADIX_ITEMS 22
-#endif
-#ifndef GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES
-#define GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES (1 << 16)
-#endif
-#ifndef GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS
-#define GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS 8
-#endif
-#ifndef GPULSMOPT_PREWARM_LEAVES
-#define GPULSMOPT_PREWARM_LEAVES 576
-#endif
-constexpr int kRunCapacity = 128;
-#ifdef GPULSMOPT_EPOCH_MAX
-static_assert(GPULSMOPT_EPOCH_MAX == kRunCapacity,
-              "GPULSMOPT_EPOCH_MAX must be 128");
-#endif
-constexpr int kEpochQuotientBits = 16;
-constexpr int kEpochQuotients = 1 << kEpochQuotientBits;
-// Flat BaseRun rank directory.
-constexpr int kBaseRank23Bits = 23;
-constexpr int kBaseRank23Shift = 32 - kBaseRank23Bits;
-constexpr std::size_t kBaseRank23Size = std::size_t{1} << kBaseRank23Bits;
-constexpr int kBaseBinsPerQuotient =
-    1 << (kBaseRank23Bits - kEpochQuotientBits);
-constexpr std::size_t kSortedRunMinRecords = 1u << 22;
-// Temporal hash-fold geometry.
-constexpr int kRawFoldWidth = 64;
-constexpr int kStableFanout = 4;
-constexpr int kColdArenaSlots = 8;
-constexpr int kParentSlots = kRunCapacity;
-constexpr int kHashFoldMaxRecords = 1280;
-constexpr int kHashRouteBits = 6;
-constexpr int kHashRouteBins = 1 << kHashRouteBits;
-constexpr int kHashRouteWordsPerBin = 2;
-constexpr int kHashRouteMaskBuildMax = 4;
-constexpr int kResolveSmallMax = 128;
-constexpr int kResolveMediumMax = 512;
-constexpr int kResolveLocalMax = 2048;
-constexpr std::size_t kHashRouteWordsPerParent =
-    static_cast<std::size_t>(kEpochQuotients) *
-    kHashRouteBins * kHashRouteWordsPerBin;
-constexpr int kLookupLeafCapacity =
-    kColdArenaSlots * kRawFoldWidth + kRawFoldWidth;
-constexpr std::uint16_t kNoLookupParent = 0xffffu;
-constexpr std::uint32_t kNoOwnerLeaf = 0xffffffffu;
-constexpr std::size_t kLookupSectorMaxEntries = std::size_t{1} << 29;
-constexpr std::uint32_t kHashHeavyFlag = 1u << 31;
-constexpr std::uint32_t kHashScanFlag = 1u << 30;
-constexpr std::uint32_t kHashCountMask =
-    ~(kHashHeavyFlag | kHashScanFlag);
-constexpr std::size_t kWarmLeafCount =
-    GPULSMOPT_PREWARM_LEAVES;
-constexpr std::size_t kLeafSlabRuns = 64;
-constexpr std::size_t kInitialLeafSlabs =
-    (kWarmLeafCount + kLeafSlabRuns - 1u) /
-    kLeafSlabRuns;
-constexpr std::size_t kInitialInsertLeafSlabs =
-    (kInitialLeafSlabs + 1u) / 2u;
-constexpr std::size_t kInitialDeleteLeafSlabs =
-    kInitialLeafSlabs / 2u;
-constexpr int kStableLevels = 16;
-static_assert(kRawFoldWidth == 64, "raw fold width must be 64");
-static_assert(kWarmLeafCount >= kRawFoldWidth,
-              "prewarm must hold one raw fold");
-static_assert(kStableFanout == 4, "stable fanout must be 4");
-static_assert(kStableLevels <= 16, "stable levels bounded to 16");
-static_assert(1 + kRawFoldWidth + 3 * kStableLevels + 1 <= kRunCapacity,
-              "descriptor occupancy must fit run capacity");
-static_assert(GPULSMOPT_RADIX_THREADS % 32 == 0,
-              "radix block size must be warp aligned");
-static_assert(kRunCapacity == 128, "run kernels require 128 physical slots");
-constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
+namespace gpulsmopt2_detail {
 
-// Lazy Quotient-Visible Row Fragments (L-QVRF).  The range sidecar contains
-// rows, never aggregate prefixes.  A quotient chooses between a six-byte
-// sorted representation and a five-byte sector representation using their
-// actual byte costs.  The 32-byte sector occupancy map and eight-byte active
-// sector descriptors are included in that decision, so there is no workload-
-// or benchmark-sized threshold.
-constexpr std::uint32_t kLqvrfSectorBits = 8u;
-constexpr std::uint32_t kLqvrfSectorsPerQuotient =
-    1u << kLqvrfSectorBits;
-constexpr std::uint32_t kLqvrfOccupancyWords =
-    kLqvrfSectorsPerQuotient / 32u;
-constexpr std::uint32_t kLqvrfNoPoolOffset = 0xffffffffu;
+constexpr std::uint32_t kQuotients = 1u << 16u;
+constexpr std::uint32_t kMaximumLevels = 16u;
+constexpr std::uint32_t kInitialArenaLevels = 3u;
+constexpr std::uint32_t kBatchesPerEpoch = 16u;
+constexpr std::uint32_t kBatchPositionBits = 28u;
+constexpr std::uint32_t kLocalRankBits = 7u;
+constexpr std::uint32_t kLocalRankEntries =
+    kQuotients * (1u << kLocalRankBits);
+constexpr std::uint32_t kThreads = 256u;
+constexpr std::uint32_t kWarpsPerBlock = kThreads / 32u;
+constexpr std::uint32_t kCarryWarpsPerBlock = 4u;
+constexpr std::uint32_t kCarryMaximum = 512u;
+constexpr std::uint32_t kMaximumSizeClass = 16u;
+constexpr std::uint32_t kInvalid = 0xffffffffu;
+constexpr std::uint32_t kTombstone = 1u;
+constexpr std::uint32_t kMaximumArenaRows = 1u << 26u;
+constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
 
-constexpr std::uint32_t kInsert = 1;
-constexpr std::uint32_t kTombstone = 0;
-
-// Assignment runs avoid eager owner transitions.
-enum class RunOperation : std::uint8_t { Insert, Delete };
-// Raw = pending batch run; ColdStable = folded non-base run.
-enum class AssignmentClass : std::uint8_t { Raw, ColdStable };
-// Canonical overlay state per BaseRun position.
-struct Sm120RadixPolicy
-    : cub::DeviceRadixSortPolicy<std::uint32_t, std::uint32_t, std::uint32_t> {
-  using Base =
-      cub::DeviceRadixSortPolicy<std::uint32_t, std::uint32_t, std::uint32_t>;
-  using BasePolicy = typename Base::Policy900;
-
-  struct Policy1200 : cub::ChainedPolicy<1200, Policy1200, BasePolicy> {
-    enum {
-      PRIMARY_RADIX_BITS = 7,
-      SINGLE_TILE_RADIX_BITS = 6,
-      SEGMENTED_RADIX_BITS = 6,
-      ONESWEEP = true,
-      ONESWEEP_RADIX_BITS = 8,
-    };
-
-    using HistogramPolicy = typename BasePolicy::HistogramPolicy;
-    using ExclusiveSumPolicy = typename BasePolicy::ExclusiveSumPolicy;
-    using OnesweepPolicy = cub::AgentRadixSortOnesweepPolicy<
-        GPULSMOPT_RADIX_THREADS, GPULSMOPT_RADIX_ITEMS, std::uint32_t, 1,
-        cub::RADIX_RANK_MATCH_EARLY_COUNTS_ANY, cub::BLOCK_SCAN_RAKING_MEMOIZE,
-        cub::RADIX_SORT_STORE_DIRECT, ONESWEEP_RADIX_BITS>;
-    using ScanPolicy = typename BasePolicy::ScanPolicy;
-    using DownsweepPolicy = typename BasePolicy::DownsweepPolicy;
-    using AltDownsweepPolicy = typename BasePolicy::AltDownsweepPolicy;
-    using UpsweepPolicy = typename BasePolicy::UpsweepPolicy;
-    using AltUpsweepPolicy = typename BasePolicy::AltUpsweepPolicy;
-    using SingleTilePolicy = typename BasePolicy::SingleTilePolicy;
-    using SegmentedPolicy = typename BasePolicy::SegmentedPolicy;
-    using AltSegmentedPolicy = typename BasePolicy::AltSegmentedPolicy;
-  };
-
-  using MaxPolicy = Policy1200;
+struct Row {
+  std::uint32_t value;
+  std::uint16_t key;
+  std::uint16_t flags;
 };
 
-inline cudaError_t
-epoch_radix_sort_pairs(void *temp_storage, std::size_t &temp_bytes,
-                       const std::uint32_t *keys_in, std::uint32_t *keys_out,
-                       const std::uint32_t *values_in,
-                       std::uint32_t *values_out, std::uint32_t count,
-                       int begin_bit, int end_bit, cudaStream_t stream) {
-  cub::DoubleBuffer<std::uint32_t> keys(const_cast<std::uint32_t *>(keys_in),
-                                        keys_out);
-  cub::DoubleBuffer<std::uint32_t> values(
-      const_cast<std::uint32_t *>(values_in), values_out);
-  return cub::DispatchRadixSort<
-      false, std::uint32_t, std::uint32_t, std::uint32_t,
-      Sm120RadixPolicy>::Dispatch(temp_storage, temp_bytes, keys, values, count,
-                                  begin_bit, end_bit, false, stream);
+__host__ __device__ __forceinline__ Row make_row(
+    std::uint32_t key, std::uint32_t value, std::uint32_t flags) {
+  return {value, static_cast<std::uint16_t>(key),
+          static_cast<std::uint16_t>(flags)};
 }
 
-inline cudaError_t
-epoch_radix_sort_keys(void *temp_storage, std::size_t &temp_bytes,
-                      const std::uint32_t *keys_in,
-                      std::uint32_t *keys_out, std::uint32_t count,
-                      int begin_bit, int end_bit, cudaStream_t stream) {
-  // Public CUB's keys-only SM120 tuning is Pareto-robust across uniform,
-  // skewed, one-quotient, and duplicate-heavy batches and avoids coupling the
-  // implementation to CUB's internal dispatch API.
-  return cub::DeviceRadixSort::SortKeys(
-      temp_storage, temp_bytes, keys_in, keys_out, count,
-      begin_bit, end_bit, stream);
+__host__ __device__ __forceinline__ std::uint32_t full_key(
+    std::uint32_t q, std::uint32_t suffix) {
+  return (q << 16u) | suffix;
 }
 
-#if defined(GPULSMOPT_PROFILE_INSERT) || defined(GPULSMOPT_PROFILE_FOLD)
-struct ScopedInsertPhaseTimer {
-  cudaStream_t stream_;
-  double *acc_;
-  std::chrono::high_resolution_clock::time_point t0_;
-  ScopedInsertPhaseTimer(cudaStream_t stream, double *acc)
-      : stream_(stream), acc_(acc),
-        t0_(std::chrono::high_resolution_clock::now()) {}
-  ~ScopedInsertPhaseTimer() {
-    cudaStreamSynchronize(stream_);
-    const auto t1 = std::chrono::high_resolution_clock::now();
-    *acc_ += std::chrono::duration<double, std::milli>(t1 - t0_).count();
+__host__ __device__ __forceinline__ std::uint32_t key_suffix(
+    std::uint32_t key) {
+  return key & 0xffffu;
+}
+
+struct RawAssignment {
+  Row row;
+  std::uint32_t logical_position;
+};
+
+static_assert(sizeof(Row) == 8u);
+static_assert(sizeof(RawAssignment) == 12u);
+
+struct Descriptor {
+  std::uint64_t bits{};
+  __host__ __device__ static Descriptor make(std::uint32_t offset,
+                                             std::uint32_t count,
+                                             std::uint32_t size_class,
+                                             bool planned = false) {
+    return {std::uint64_t{offset} |
+            (std::uint64_t{count} << 26u) |
+            (std::uint64_t{size_class} << 43u) |
+            (planned ? (1ull << 63u) : 0ull)};
   }
-};
-#define GPULSMOPT_PROF_CAT2(a, b) a##b
-#define GPULSMOPT_PROF_CAT(a, b) GPULSMOPT_PROF_CAT2(a, b)
-#define GPULSMOPT_PROF_PHASE(acc)                                              \
-  gpulsmopt_detail::ScopedInsertPhaseTimer GPULSMOPT_PROF_CAT(                 \
-      prof_phase_, __LINE__)(stream, &(acc))
-#else
-#define GPULSMOPT_PROF_PHASE(acc)                                              \
-  do {                                                                         \
-  } while (false)
-#endif
-#ifndef GPULSMOPT_PROFILE_INSERT
-#if defined(GPULSMOPT_PROFILE_FOLD)
-#undef GPULSMOPT_PROF_PHASE
-#define GPULSMOPT_PROF_PHASE(acc)                                              \
-  do {                                                                         \
-  } while (false)
-#endif
-#endif
-// Fold-phase timing; diagnostic builds only (syncs per phase).
-#ifdef GPULSMOPT_PROFILE_FOLD
-#define GPULSMOPT_FOLD_PHASE(acc)                                              \
-  gpulsmopt_detail::ScopedInsertPhaseTimer GPULSMOPT_PROF_CAT(                 \
-      fold_phase_, __LINE__)(stream, &(acc))
-#else
-#define GPULSMOPT_FOLD_PHASE(acc)                                              \
-  do {                                                                         \
-  } while (false)
-#endif
-
-struct DeviceKeyBatch {
-  const std::uint32_t *keys = nullptr;
-  std::size_t count = 0;
-  // Compatibility hint only. Deletion correctness never trusts caller order.
-  bool sorted = false;
+  __host__ __device__ std::uint32_t offset() const {
+    return static_cast<std::uint32_t>(bits & ((1ull << 26u) - 1ull));
+  }
+  __host__ __device__ std::uint32_t count() const {
+    return static_cast<std::uint32_t>((bits >> 26u) & ((1ull << 17u) - 1ull));
+  }
+  __host__ __device__ std::uint32_t size_class() const {
+    return static_cast<std::uint32_t>((bits >> 43u) & 31ull);
+  }
+  __host__ __device__ bool planned() const { return bits >> 63u; }
+  __device__ void set_count(std::uint32_t count) {
+    bits = (bits & ~(((1ull << 17u) - 1ull) << 26u)) |
+           (std::uint64_t{count} << 26u);
+  }
+  __device__ void publish() { bits &= ~(1ull << 63u); }
 };
 
-template <class T> class RawDeviceBuffer {
+static_assert(sizeof(Descriptor) == 8u);
+
+__host__ __device__ __forceinline__ std::size_t descriptor_index(
+    std::uint32_t q, std::uint32_t level) {
+  return std::size_t{q} * kMaximumLevels + level;
+}
+
+struct TaggedRow {
+  Row row;
+  std::uint32_t age;
+};
+
+static_assert(sizeof(TaggedRow) == 12u);
+
+struct RangeFragment {
+  std::uint32_t query;
+  std::uint32_t quotient;
+};
+
+static_assert(sizeof(RangeFragment) == 8u);
+
+struct SectionRangeFragment {
+  std::uint32_t original_index;
+  std::uint16_t low_suffix;
+  std::uint16_t high_suffix;
+};
+
+static_assert(sizeof(SectionRangeFragment) == 8u);
+
+struct SectionRangeTask {
+  std::uint32_t quotient;
+  std::uint32_t begin;
+  std::uint32_t end;
+};
+
+static_assert(sizeof(SectionRangeTask) == 12u);
+constexpr std::uint32_t kSectionTaskFragments = 256u;
+
+template <class T> class Buffer {
 public:
-  RawDeviceBuffer() = default;
-  RawDeviceBuffer(const RawDeviceBuffer &) = delete;
-  RawDeviceBuffer &operator=(const RawDeviceBuffer &) = delete;
-  RawDeviceBuffer(RawDeviceBuffer &&other) noexcept
-      : data_(other.data_), size_(other.size_), capacity_(other.capacity_),
-        owns_(other.owns_) {
-    other.data_ = nullptr;
-    other.size_ = 0;
-    other.capacity_ = 0;
-    other.owns_ = false;
-  }
-  RawDeviceBuffer &operator=(RawDeviceBuffer &&other) noexcept {
-    if (this == &other)
-      return *this;
-    if (data_ && owns_)
-      cudaFree(data_);
-    data_ = other.data_;
-    size_ = other.size_;
-    capacity_ = other.capacity_;
-    owns_ = other.owns_;
-    other.data_ = nullptr;
-    other.size_ = 0;
-    other.capacity_ = 0;
-    other.owns_ = false;
+  Buffer() = default;
+  explicit Buffer(std::size_t count) { resize(count); }
+  Buffer(const Buffer &) = delete;
+  Buffer &operator=(const Buffer &) = delete;
+  Buffer &operator=(Buffer &&other) noexcept {
+    if (this != &other) {
+      if (pointer_) cudaFree(pointer_);
+      pointer_ = other.pointer_;
+      count_ = other.count_;
+      other.pointer_ = nullptr;
+      other.count_ = 0u;
+    }
     return *this;
   }
-  ~RawDeviceBuffer() {
-    if (data_ && owns_)
-      cudaFree(data_);
+  ~Buffer() { if (pointer_) cudaFree(pointer_); }
+  void resize(std::size_t count) {
+    if (pointer_) CUDA_CHECK(cudaFree(pointer_));
+    pointer_ = nullptr;
+    count_ = count;
+    if (count)
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&pointer_),
+                            count * sizeof(T)));
   }
-  void resize_discard(std::size_t count) {
-    if (count > capacity_) {
-      std::size_t next_capacity = capacity_ == 0 ? 1 : capacity_;
-      while (next_capacity < count)
-        next_capacity *= 2;
-      T *next = nullptr;
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&next),
-                            next_capacity * sizeof(T)));
-      if (data_ && owns_)
-        CUDA_CHECK(cudaFree(data_));
-      data_ = next;
-      capacity_ = next_capacity;
-      owns_ = true;
-    }
-    size_ = count;
+  void grow(std::size_t count, cudaStream_t stream) {
+    if (count <= count_) return;
+    T *next{};
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&next),
+                          count * sizeof(T)));
+    if (count_)
+      CUDA_CHECK(cudaMemcpyAsync(next, pointer_, count_ * sizeof(T),
+                                 cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (pointer_) CUDA_CHECK(cudaFree(pointer_));
+    pointer_ = next;
+    count_ = count;
   }
-
-  void resize_discard_exact(std::size_t count) {
-    if (count > capacity_) {
-      T *next = nullptr;
-      CUDA_CHECK(
-          cudaMalloc(reinterpret_cast<void **>(&next), count * sizeof(T)));
-      if (data_ && owns_)
-        CUDA_CHECK(cudaFree(data_));
-      data_ = next;
-      capacity_ = count;
-      owns_ = true;
-    }
-    size_ = count;
-  }
-
-  void release() {
-    if (data_ && owns_)
-      CUDA_CHECK(cudaFree(data_));
-    data_ = nullptr;
-    size_ = 0;
-    capacity_ = 0;
-    owns_ = false;
-  }
-
-  void bind_external(T *data, std::size_t capacity) {
-    if (data_ && owns_)
-      CUDA_CHECK(cudaFree(data_));
-    data_ = data;
-    size_ = 0;
-    capacity_ = capacity;
-    owns_ = false;
-  }
-
-  void adopt(T *data, std::size_t count) {
-    if (data_ && owns_)
-      CUDA_CHECK(cudaFree(data_));
-    data_ = data;
-    size_ = count;
-    capacity_ = count;
-    owns_ = true;
-  }
-
-  T *data() { return data_; }
-  const T *data() const { return data_; }
-  std::size_t size() const { return size_; }
-  std::size_t capacity() const { return capacity_; }
-  bool owns() const { return owns_; }
-  bool external() const { return data_ != nullptr && !owns_; }
-
+  T *data() { return pointer_; }
+  std::size_t size() const { return count_; }
 private:
-  T *data_ = nullptr;
-  std::size_t size_ = 0;
-  std::size_t capacity_ = 0;
-  bool owns_ = false;
+  T *pointer_{};
+  std::size_t count_{};
 };
 
-__host__ __device__ inline std::size_t
-lower_bound_u32(const std::uint32_t *data, std::size_t n, std::uint32_t key) {
-  std::size_t first = 0;
-  while (n > 0) {
-    const std::size_t step = n >> 1;
-    const std::size_t mid = first + step;
-    if (data[mid] < key) {
-      first = mid + 1;
-      n -= step + 1;
-    } else {
-      n = step;
+__global__ void iota_kernel(std::uint32_t *ids, std::uint32_t count) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count) ids[i] = i;
+}
+
+__device__ __forceinline__ bool find_planned_descriptor(
+    Descriptor *descriptors, std::uint32_t q, Descriptor *&plan,
+    std::uint32_t &level, std::uint32_t level_limit) {
+  for (level = 0u; level < level_limit; ++level) {
+    Descriptor *candidate = descriptors + descriptor_index(q, level);
+    if (candidate->planned()) {
+      plan = candidate;
+      return true;
     }
   }
-  return first;
+  plan = nullptr;
+  return false;
 }
 
-__host__ __device__ inline std::size_t
-upper_bound_u32(const std::uint32_t *data, std::size_t n, std::uint32_t key) {
-  std::size_t first = 0;
-  while (n > 0) {
-    const std::size_t step = n >> 1;
-    const std::size_t mid = first + step;
-    if (data[mid] <= key) {
-      first = mid + 1;
-      n -= step + 1;
-    } else {
-      n = step;
+__device__ __forceinline__ std::uint32_t size_class_for(
+    std::uint32_t count) {
+  if (count <= 1u) return 0u;
+  return 32u - static_cast<std::uint32_t>(__clz(count - 1u));
+}
+
+__device__ void release_extent(Row *arena, std::uint32_t *local_free_heads,
+                               std::uint32_t q, std::uint32_t offset,
+                               std::uint32_t size_class) {
+  std::uint32_t &local_head =
+      local_free_heads[q * (kMaximumSizeClass + 1u) + size_class];
+  arena[offset].value = local_head;
+  local_head = offset;
+}
+
+__device__ __forceinline__ bool tagged_less(const TaggedRow &a,
+                                            const TaggedRow &b) {
+  const bool ai = a.age == kInvalid;
+  const bool bi = b.age == kInvalid;
+  if (ai != bi) return !ai;
+  if (ai) return false;
+  if (a.row.key != b.row.key) return a.row.key < b.row.key;
+  return a.age < b.age;
+}
+
+template <std::uint32_t MaximumItems>
+__device__ __forceinline__ std::uint32_t sort_and_publish_tagged_rows(
+    TaggedRow *items, std::uint32_t sort_size, std::uint32_t lane,
+    Row *arena, std::uint32_t output_offset) {
+  static_assert(MaximumItems % 32u == 0u);
+  for (std::uint32_t width = 2u; width <= sort_size; width <<= 1u) {
+    for (std::uint32_t stride = width >> 1u; stride; stride >>= 1u) {
+      for (std::uint32_t group = 0u; group < sort_size / 32u; ++group) {
+        const std::uint32_t index = lane + group * 32u;
+        const std::uint32_t other_index = index ^ stride;
+        if (other_index > index) {
+          const TaggedRow x = items[index], y = items[other_index];
+          const bool ascending = (index & width) == 0u;
+          const bool swap = ascending ? tagged_less(y, x) : tagged_less(x, y);
+          if (swap) {
+            items[index] = y;
+            items[other_index] = x;
+          }
+        }
+      }
+      __syncwarp();
     }
   }
-  return first;
-}
-
-__host__ __device__ inline std::size_t
-lower_bound_u16(const std::uint16_t *data, std::size_t n,
-                std::uint16_t key) {
-  std::size_t first = 0;
-  while (n > 0) {
-    const std::size_t step = n >> 1;
-    const std::size_t mid = first + step;
-    if (data[mid] < key) {
-      first = mid + 1;
-      n -= step + 1;
-    } else {
-      n = step;
-    }
+  bool winner[MaximumItems / 32u]{};
+  unsigned masks[MaximumItems / 32u]{};
+  std::uint32_t winner_count = 0u;
+  for (std::uint32_t group = 0u; group < sort_size / 32u; ++group) {
+    const std::uint32_t index = lane + group * 32u;
+    winner[group] = items[index].age != kInvalid &&
+        (index + 1u == sort_size || items[index + 1u].age == kInvalid ||
+         items[index].row.key != items[index + 1u].row.key);
+    masks[group] = __ballot_sync(0xffffffffu, winner[group]);
+    winner_count += __popc(masks[group]);
   }
-  return first;
-}
-
-__host__ __device__ inline std::size_t
-lower_bound_u8(const std::uint8_t *data, std::size_t n,
-               std::uint8_t key) {
-  std::size_t first = 0;
-  while (n > 0) {
-    const std::size_t step = n >> 1;
-    const std::size_t mid = first + step;
-    if (data[mid] < key) {
-      first = mid + 1;
-      n -= step + 1;
-    } else {
-      n = step;
-    }
+  const unsigned before = lane == 0u ? 0u : ((1u << lane) - 1u);
+  std::uint32_t base = 0u;
+  for (std::uint32_t group = 0u; group < sort_size / 32u; ++group) {
+    if (winner[group])
+      arena[output_offset + base + __popc(masks[group] & before)] =
+          items[lane + group * 32u].row;
+    base += __popc(masks[group]);
   }
-  return first;
+  return winner_count;
 }
 
-struct RunView {
-  const std::uint32_t *keys;
-  const std::uint32_t *quotient_off;
-};
-
-struct SortedRunView {
-  const std::uint32_t *keys;
-  const std::uint32_t *values;
-  const std::uint32_t *rank23;
-  std::size_t count;
-  std::uint32_t unit_counts;
-};
-
-__device__ inline void
-sorted_search_bounds(const SortedRunView &sorted, std::uint32_t key,
-                     std::size_t *begin, std::size_t *end) {
-  const std::uint32_t bin = key >> kBaseRank23Shift;
-  *begin = sorted.rank23[bin];
-  *end = sorted.rank23[bin + 1];
-}
-
-__device__ inline bool sorted_find_value(const SortedRunView &sorted,
-                                         std::uint32_t key,
-                                         std::uint32_t *value) {
-  if (sorted.count == 0)
-    return false;
-  std::size_t begin = 0;
-  std::size_t end = 0;
-  sorted_search_bounds(sorted, key, &begin, &end);
-  const std::size_t position =
-      begin + lower_bound_u32(sorted.keys + begin, end - begin, key);
-  if (position >= end || sorted.keys[position] != key)
-    return false;
-  *value = sorted.values[position];
-  return true;
-}
-
-struct BaseRunView {
-  SortedRunView base;
-};
-
-__device__ inline bool base_find_value(
-    const BaseRunView &v, std::uint32_t key,
-    std::uint32_t *value) {
-  return sorted_find_value(v.base, key, value);
-}
-
-enum class LqvrfFragmentFormat : std::uint8_t {
-  Empty = 0u,
-  Sorted16 = 1u,
-  PackedSector8 = 2u,
-};
-
-struct alignas(8) LqvrfSectorDescriptor {
-  std::uint32_t row_begin;
-  std::uint16_t row_count;
-  std::uint8_t high8;
-  std::uint8_t reserved;
-};
-static_assert(sizeof(LqvrfSectorDescriptor) == 8u,
-              "L-QVRF sector descriptor byte model changed");
-
-struct alignas(16) LqvrfFragmentDescriptor {
-  std::uint32_t row_begin;
-  std::uint32_t row_count;
-  std::uint32_t sector_begin;
-  std::uint32_t occupancy_begin;
-  std::uint16_t sector_count;
-  std::uint8_t format;
-  std::uint8_t reserved[5];
-};
-static_assert(sizeof(LqvrfFragmentDescriptor) == 32u,
-              "L-QVRF fragment descriptor layout changed");
-
-// The immutable BaseRun remains the primary row store. A set bit hides a Base
-// row whose key has a newer assignment. Every live newer winner is stored as
-// an actual (key,value) row in exactly one quotient fragment. Tombstones hide
-// but are never emitted. Thus Base-visible U fragment-rows is precisely the
-// current dictionary and can feed reporting or any associative row consumer.
-struct LqvrfView {
-  SortedRunView base;
-  const std::uint32_t *base_hidden_words;
-  const LqvrfFragmentDescriptor *fragments;
-  const std::uint16_t *active_quotients;
-  const std::uint16_t *sorted_low16;
-  const std::uint32_t *sorted_values;
-  const std::uint8_t *packed_low8;
-  const std::uint32_t *packed_values;
-  const std::uint32_t *packed_occupancy;
-  const LqvrfSectorDescriptor *sectors;
-  std::uint32_t active_quotient_count;
-  std::uint32_t has_hidden_base;
-};
-
-struct LqvrfRangeTask {
-  std::uint32_t query;
-  std::uint32_t lower;
-  std::uint32_t upper;
-};
-static_assert(sizeof(LqvrfRangeTask) == 12u,
-              "L-QVRF range task layout changed");
-
-struct TakeLastU32 {
-  __host__ __device__ std::uint32_t operator()(std::uint32_t,
-                                               std::uint32_t newer) const {
-    return newer;
-  }
-};
-
-
-// Scalar op for a leaf, or one packed bit for a mixed run.
-__device__ inline int assignment_op_at(const std::uint32_t *op_words,
-                                       std::uint8_t constant_op,
-                                       std::uint8_t mixed, std::uint32_t p) {
-  if (!mixed)
-    return constant_op;
-  return (op_words[p >> 5] >> (p & 31u)) & 1u;
-}
-
-// Successor over the BaseRun alone: every base key is live.
-__global__ void base_successor_kernel(BaseRunView base,
-                                      const std::uint32_t *queries,
-                                      std::size_t query_count,
-                                      std::uint32_t *results) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= query_count)
-    return;
-  if (base.base.count == 0) {
-    results[i] = 0u;
-    return;
-  }
-  const std::uint32_t key = queries[i];
-  std::size_t begin = 0;
-  std::size_t end = 0;
-  sorted_search_bounds(base.base, key, &begin, &end);
-  // Empty bins start at the next nonempty bin.
-  std::size_t position =
-      begin + lower_bound_u32(base.base.keys + begin, end - begin, key);
-  results[i] = position < base.base.count ? base.base.keys[position] : 0u;
-}
-
-// Immutable assignment run seen by device readers.
-struct AssignmentRunView {
-  const std::uint32_t *keys;
-  const std::uint32_t *values;
-  const std::uint32_t *offsets;
-  const std::uint32_t *quotient_meta;
-  const std::uint32_t *op_words;
-  const std::uint64_t *quotient_mask;
-  const AssignmentRunView *hash_children;
-  const std::uint32_t *child_router;
-  const AssignmentRunView *group_children;
-  std::uint16_t child_count;
-  std::uint8_t constant_op;
-  std::uint8_t mixed;
-  std::uint8_t hashed;
-  std::uint8_t grouped;
-};
-
-struct FlatAssignmentLeafView {
-  const std::uint32_t *keys;
-  const std::uint32_t *values;
-  const std::uint32_t *offsets;
-  std::uint32_t count;
-  std::uint32_t rank_base;
-  std::uint8_t constant_op;
-};
-
-__global__ void flat_assignment_count_kernel(
-    const FlatAssignmentLeafView *leaves, int leaf_count,
-    std::uint32_t *counts) {
+__global__ void plan_extents_kernel(
+    const std::uint32_t *__restrict__ epoch_counts,
+    Row *__restrict__ arena, std::uint32_t arena_capacity,
+    Descriptor *__restrict__ descriptors,
+    std::uint32_t *__restrict__ local_free_heads,
+    std::uint32_t *__restrict__ cursor,
+    std::uint32_t *__restrict__ overflow,
+    std::uint32_t level_limit) {
+  __shared__ std::uint32_t fresh_capacity[kThreads];
+  __shared__ std::uint32_t fresh_prefix[kThreads];
+  __shared__ std::uint32_t block_base;
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
-    return;
-  if (q == kEpochQuotients) {
-    counts[q] = 0u;
-    return;
+  std::uint32_t capacity = 0u, recycled = kInvalid;
+  std::uint32_t planned_count = 0u, planned_size_class = 0u;
+  std::uint32_t planned_level = 0u;
+  bool valid = false;
+  if (q < kQuotients && epoch_counts[q] != 0u) {
+    std::uint32_t depth = 0u;
+    std::uint32_t total = epoch_counts[q];
+    while (depth < level_limit) {
+      const Descriptor descriptor = descriptors[descriptor_index(q, depth)];
+      if (!descriptor.count()) break;
+      total += descriptor.count();
+      ++depth;
+    }
+    if (depth >= level_limit) {
+      atomicAdd(overflow, 1u);
+    } else {
+      const std::uint32_t size_class = size_class_for(total);
+      if (total >= (1u << 17u) || size_class > kMaximumSizeClass) {
+        atomicAdd(overflow, 1u);
+      } else {
+        std::uint32_t &head =
+            local_free_heads[q * (kMaximumSizeClass + 1u) + size_class];
+        recycled = head;
+        if (recycled != kInvalid) head = arena[recycled].value;
+        else capacity = 1u << size_class;
+        planned_count = total;
+        planned_size_class = size_class;
+        planned_level = depth;
+        valid = true;
+      }
+    }
   }
-  std::uint32_t total = 0u;
-  for (int leaf = 0; leaf < leaf_count; ++leaf)
-    total += leaves[leaf].offsets[q + 1u] -
-             leaves[leaf].offsets[q];
-  counts[q] = total;
-}
-
-__global__ void flat_assignment_base_kernel(
-    const FlatAssignmentLeafView *leaves, int leaf_count,
-    const std::uint32_t *quotient_offsets,
-    std::uint32_t *leaf_bases) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kEpochQuotients)
-    return;
-  std::uint32_t cursor = quotient_offsets[q];
-  for (int leaf = 0; leaf < leaf_count; ++leaf) {
-    leaf_bases[static_cast<std::size_t>(leaf) *
-                   kEpochQuotients +
-               q] = cursor;
-    cursor += leaves[leaf].offsets[q + 1u] -
-              leaves[leaf].offsets[q];
-  }
-}
-
-__global__ void flat_assignment_gather_kernel(
-    const FlatAssignmentLeafView *leaves, int leaf_count,
-    std::uint32_t max_count, const std::uint32_t *leaf_bases,
-    std::uint32_t *out_keys, std::uint64_t *out_payload) {
-  const std::uint32_t leaf = blockIdx.y;
-  const std::uint32_t position =
-      blockIdx.x * blockDim.x + threadIdx.x;
-  if (leaf >= static_cast<std::uint32_t>(leaf_count) ||
-      position >= max_count)
-    return;
-  const FlatAssignmentLeafView view = leaves[leaf];
-  if (position >= view.count)
-    return;
-  const std::uint32_t key = view.keys[position];
-  const std::uint32_t q = key >> kEpochQuotientBits;
-  const std::uint32_t output =
-      leaf_bases[static_cast<std::size_t>(leaf) *
-                      kEpochQuotients +
-                  q] +
-      position - view.offsets[q];
-  const std::uint32_t value =
-      view.constant_op != 0u ? view.values[position] : 0u;
-  out_keys[output] = key;
-  out_payload[output] =
-      (static_cast<std::uint64_t>(value) << 32) |
-      static_cast<std::uint64_t>(view.constant_op != 0u);
-}
-
-__device__ inline void assignment_bounds(const AssignmentRunView &run,
-                                         std::uint32_t q,
-                                         std::uint32_t *begin,
-                                         std::uint32_t *end) {
-  *begin = run.offsets[q];
-  *end = run.offsets[q + 1u];
-}
-
-__device__ inline std::uint32_t hash_fold_slot(std::uint32_t low,
-                                              std::uint32_t slots) {
-  return __umulhi(low * 0x9e3779b1u, slots);
-}
-
-__device__ inline std::uint64_t raw_quotient_mask_bits(
-    std::uint32_t low) {
-  const std::uint32_t first =
-      (low * 0x9e3779b1u) >> 27;
-  std::uint32_t mixed = low ^ (low >> 7);
-  mixed *= 0x85ebca6bu;
-  const std::uint32_t second = mixed >> 27;
-  return (std::uint64_t{1} << first) |
-         (std::uint64_t{1} << (32u + second));
-}
-
-__device__ inline std::uint32_t
-assignment_record_count(const AssignmentRunView &run, std::uint32_t q) {
-  if (run.grouped) {
+  fresh_capacity[threadIdx.x] = capacity;
+  __syncthreads();
+  if (threadIdx.x == 0u) {
     std::uint32_t total = 0u;
-    for (std::uint32_t child = 0; child < run.child_count; ++child)
-      total += assignment_record_count(run.group_children[child], q);
-    return total;
-  }
-  if (run.hashed)
-    return run.quotient_meta[q] & kHashCountMask;
-  std::uint32_t begin = 0u, end = 0u;
-  assignment_bounds(run, q, &begin, &end);
-  return end - begin;
-}
-
-__device__ inline bool assignment_find(const AssignmentRunView &run,
-                                       std::uint32_t key,
-                                       std::uint32_t *value,
-                                       bool *live) {
-  if (run.grouped) {
-    for (int child = static_cast<int>(run.child_count) - 1;
-         child >= 0; --child) {
-      if (assignment_find(run.group_children[child], key, value, live))
-        return true;
+    for (std::uint32_t i = 0u; i < blockDim.x; ++i) {
+      fresh_prefix[i] = total;
+      total += fresh_capacity[i];
     }
-    return false;
-  }
-  const std::uint32_t q = key >> kEpochQuotientBits;
-  if (run.hashed) {
-    const std::uint32_t meta = run.quotient_meta[q];
-    const std::uint32_t count = meta & kHashCountMask;
-    if (count == 0u)
-      return false;
-    if (meta & kHashScanFlag) {
-      const std::uint32_t route =
-          (key >> (kEpochQuotientBits - kHashRouteBits)) &
-          (kHashRouteBins - 1u);
-      const std::size_t base =
-          (static_cast<std::size_t>(q) * kHashRouteBins + route) *
-          kHashRouteWordsPerBin;
-      for (int word = kHashRouteWordsPerBin - 1;
-           word >= 0; --word) {
-        std::uint32_t candidates = run.child_router[base + word];
-        while (candidates != 0u) {
-          const int bit = 31 - __clz(candidates);
-          const int child = word * 32 + bit;
-          if (assignment_find(
-                  run.hash_children[child], key, value, live))
-            return true;
-          candidates &= ~(1u << bit);
-        }
-      }
-      return false;
-    }
-    const std::uint32_t low = key & 0xffffu;
-    const std::uint32_t slots =
-        run.offsets[q + 1u] - run.offsets[q];
-    const std::uint32_t *table = run.keys + run.offsets[q];
-    std::uint32_t slot = slots == 65536u
-                             ? low
-                             : hash_fold_slot(low, slots);
-    for (std::uint32_t probe = 0; probe < slots; ++probe) {
-      const std::uint32_t entry = table[slot];
-      if (entry == 0u)
-        return false;
-      if ((entry & 0xffffu) == low) {
-        const std::uint32_t child = (entry >> 16) & 0x7fffu;
-        return assignment_find(
-            run.hash_children[child], key, value, live);
-      }
-      if (++slot == slots)
-        slot = 0u;
-    }
-    return false;
-  }
-  if (run.quotient_mask != nullptr) {
-    const std::uint64_t required =
-        raw_quotient_mask_bits(key & 0xffffu);
-    if ((run.quotient_mask[q] & required) != required)
-      return false;
-  }
-  std::uint32_t begin = 0u, position = 0u;
-  assignment_bounds(run, q, &begin, &position);
-  while (position-- > begin) {
-    if (run.keys[position] != key)
-      continue;
-    const bool is_live = assignment_op_at(
-                             run.op_words, run.constant_op,
-                             run.mixed, position) != 0;
-    *live = is_live;
-    *value = is_live ? run.values[position] : 0u;
-    return true;
-  }
-  return false;
-}
-
-__device__ inline void assignment_decode_hash(
-    const AssignmentRunView &run, std::uint32_t q,
-    std::uint32_t entry, std::uint32_t *key,
-    std::uint32_t *value, int *op) {
-  const std::uint32_t child = (entry >> 16) & 0x7fffu;
-  *key = (q << kEpochQuotientBits) | (entry & 0xffffu);
-  bool live = false;
-  if (!assignment_find(run.hash_children[child], *key, value, &live)) {
-    *value = 0u;
-    *op = 0;
-    return;
-  }
-  *op = live ? 1 : 0;
-}
-
-__device__ inline void assignment_gather_quotient(
-    const AssignmentRunView &run, std::uint32_t q,
-    std::uint32_t *cursor, std::uint32_t *shared_cursor,
-    std::uint32_t *out_keys, std::uint64_t *out_payload) {
-  if (run.grouped) {
-    for (std::uint32_t child = 0; child < run.child_count; ++child)
-      assignment_gather_quotient(
-          run.group_children[child], q, cursor, shared_cursor,
-          out_keys, out_payload);
-    return;
-  }
-  if (run.hashed) {
-    const std::uint32_t meta = run.quotient_meta[q];
-    const std::uint32_t count = meta & kHashCountMask;
-    if (count == 0u)
-      return;
-    if (meta & kHashScanFlag) {
-      for (std::uint32_t child = 0; child < run.child_count; ++child)
-        assignment_gather_quotient(
-            run.hash_children[child], q, cursor, shared_cursor,
-            out_keys, out_payload);
-      return;
-    }
-    const std::uint32_t slots =
-        run.offsets[q + 1u] - run.offsets[q];
-    const std::uint32_t *table = run.keys + run.offsets[q];
-    if (threadIdx.x == 0)
-      *shared_cursor = *cursor;
-    __syncthreads();
-    for (std::uint32_t slot = threadIdx.x; slot < slots;
-         slot += blockDim.x) {
-      const std::uint32_t entry = table[slot];
-      if (entry == 0u)
-        continue;
-      const std::uint32_t output = atomicAdd(shared_cursor, 1u);
-      std::uint32_t key = 0u, value = 0u;
-      int op = 0;
-      assignment_decode_hash(run, q, entry, &key, &value, &op);
-      out_keys[output] = key;
-      out_payload[output] =
-          (static_cast<std::uint64_t>(value) << 32) |
-          static_cast<std::uint64_t>(op != 0);
-    }
-    __syncthreads();
-    *cursor += count;
-    return;
-  }
-  std::uint32_t begin = 0u, end = 0u;
-  assignment_bounds(run, q, &begin, &end);
-  const std::uint32_t count = end - begin;
-  for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
-    const std::uint32_t position = begin + i;
-    const int op = assignment_op_at(
-        run.op_words, run.constant_op, run.mixed, position);
-    const std::uint32_t value = op ? run.values[position] : 0u;
-    out_keys[*cursor + i] = run.keys[position];
-    out_payload[*cursor + i] =
-        (static_cast<std::uint64_t>(value) << 32) |
-        static_cast<std::uint64_t>(op != 0);
-  }
-  *cursor += count;
-}
-
-struct LookupLeafView {
-  AssignmentRunView leaf;
-  std::uint32_t rank;
-  std::uint16_t parent;
-  std::uint8_t parent_leader;
-};
-
-struct LookupPublication {
-  LookupLeafView leaves[kLookupLeafCapacity];
-  AssignmentRunView parents[kColdArenaSlots];
-  std::uint32_t parent_ranks[kColdArenaSlots];
-};
-
-struct LookupOwnerLeafView {
-  const std::uint32_t *keys;
-  const std::uint32_t *values;
-  const std::uint32_t *offsets;
-  std::uint64_t *route_mask;
-  std::uint32_t count;
-  std::uint8_t constant_op;
-};
-
-// Lazy Quotient-Visible Sector Fabric (L-QVSF).  One quotient-local lookup
-// transaction reads four exact visible records in one 32-byte GPU sector.
-// The high key half is implicit in the table segment; immutable LSM chronology
-// is consulted only while a quotient is unpublished or its bounded overflow
-// tier saturates.  Explicit empty/live/tombstone state preserves every
-// uint32_t key and value.
-struct alignas(32) LookupSectorBucket {
-  unsigned long long entry[4];
-};
-static_assert(sizeof(LookupSectorBucket) == 32u,
-              "lookup sector bucket must be exactly one memory sector");
-constexpr std::uint32_t kLookupSectorStateShift = 48u;
-constexpr std::uint32_t kLookupSectorStashSlots = 64u;
-constexpr std::uint32_t kLookupRadixStateShift = 32u;
-constexpr std::uint32_t kLookupRadixUnitU64 = 16u;
-constexpr std::uint32_t kLookupRadixRootUnits = 8u;
-constexpr std::uint32_t kLookupRadixDenseUnits =
-    kLookupRadixRootUnits + 256u + 4096u;
-
-__host__ __device__ inline unsigned long long lookup_sector_pack(
-    std::uint32_t low, std::uint32_t value, std::uint32_t state) {
-  return static_cast<unsigned long long>(value) |
-         (static_cast<unsigned long long>(low) << 32u) |
-         (static_cast<unsigned long long>(state) <<
-          kLookupSectorStateShift);
-}
-
-__host__ __device__ inline std::uint32_t lookup_sector_bucket(
-    std::uint32_t low, std::uint32_t bucket_mask) {
-  low ^= low >> 7u;
-  low *= 0x9e3779b1u;
-  low ^= low >> 11u;
-  return low & bucket_mask;
-}
-
-__host__ __device__ inline std::uint32_t lookup_sector_stash_start(
-    std::uint32_t low) {
-  low ^= 0xa511e9b3u;
-  low ^= low >> 16u;
-  low *= 0x7feb352du;
-  low ^= low >> 15u;
-  low *= 0x846ca68bu;
-  low ^= low >> 16u;
-  return low & (kLookupSectorStashSlots - 1u);
-}
-
-__device__ __forceinline__ unsigned long long
-lookup_sector_load_relaxed(const unsigned long long *address);
-
-__device__ __forceinline__ bool lookup_sector_stash_upsert_atomic(
-    unsigned long long *stash, std::uint32_t quotient,
-    std::uint32_t low, unsigned long long packed) {
-  unsigned long long *row = stash +
-      static_cast<std::size_t>(quotient) * kLookupSectorStashSlots;
-  std::uint32_t slot = lookup_sector_stash_start(low);
-  for (std::uint32_t probe = 0; probe < kLookupSectorStashSlots; ++probe) {
-    unsigned long long current = lookup_sector_load_relaxed(row + slot);
-    const std::uint32_t state = static_cast<std::uint32_t>(
-        current >> kLookupSectorStateShift) & 3u;
-    if (state == 0u) {
-      current = atomicCAS(row + slot, 0ull, packed);
-      if (current == 0ull)
-        return true;
-    }
-    if ((static_cast<std::uint32_t>(current >> 32u) & 0xffffu) == low) {
-      atomicExch(row + slot, packed);
-      return true;
-    }
-    slot = (slot + 1u) & (kLookupSectorStashSlots - 1u);
-  }
-  return false;
-}
-
-__device__ __forceinline__ bool lookup_sector_stash_find(
-    const unsigned long long *stash, std::uint32_t quotient,
-    std::uint32_t low, unsigned long long *entry) {
-  const unsigned long long *row = stash +
-      static_cast<std::size_t>(quotient) * kLookupSectorStashSlots;
-  std::uint32_t slot = lookup_sector_stash_start(low);
-  for (std::uint32_t probe = 0; probe < kLookupSectorStashSlots; ++probe) {
-    const unsigned long long current =
-        lookup_sector_load_relaxed(row + slot);
-    const std::uint32_t state = static_cast<std::uint32_t>(
-        current >> kLookupSectorStateShift) & 3u;
-    if (state == 0u)
-      return false;
-    if ((static_cast<std::uint32_t>(current >> 32u) & 0xffffu) == low) {
-      *entry = current;
-      return true;
-    }
-    slot = (slot + 1u) & (kLookupSectorStashSlots - 1u);
-  }
-  return false;
-}
-
-constexpr std::uint32_t kLookupOwnerEmpty = 0u;
-constexpr std::uint32_t kLookupOwnerLive = 1u;
-constexpr std::uint32_t kLookupOwnerTombstone = 2u;
-
-// Scalar relaxed accesses prevent torn entry observations; the per-quotient
-// release watermark makes every completed sector/stash write visible to the
-// acquiring lookup that follows publication on the caller's stream.
-__device__ __forceinline__ unsigned long long
-lookup_sector_load_relaxed(const unsigned long long *address) {
-  unsigned long long value;
-#if __CUDA_ARCH__ >= 700
-  asm volatile("ld.relaxed.gpu.u64 %0, [%1];"
-               : "=l"(value) : "l"(address) : "memory");
-#else
-  value = atomicAdd(const_cast<unsigned long long *>(address), 0ull);
-#endif
-  return value;
-}
-
-__device__ __forceinline__ void lookup_sector_store_relaxed(
-    unsigned long long *address, unsigned long long value) {
-#if __CUDA_ARCH__ >= 700
-  asm volatile("st.relaxed.gpu.u64 [%0], %1;"
-               : : "l"(address), "l"(value) : "memory");
-#else
-  atomicExch(address, value);
-#endif
-}
-
-__device__ __forceinline__ std::uint32_t lookup_sector_load_acquire(
-    const std::uint32_t *address) {
-  std::uint32_t value;
-#if __CUDA_ARCH__ >= 700
-  asm volatile("ld.acquire.gpu.u32 %0, [%1];"
-               : "=r"(value) : "l"(address) : "memory");
-#else
-  value = atomicAdd(const_cast<std::uint32_t *>(address), 0u);
-#endif
-  return value;
-}
-
-__device__ __forceinline__ void lookup_sector_store_release(
-    std::uint32_t *address, std::uint32_t value) {
-#if __CUDA_ARCH__ >= 700
-  asm volatile("st.release.gpu.u32 [%0], %1;"
-               : : "l"(address), "r"(value) : "memory");
-#else
-  __threadfence();
-  atomicExch(address, value);
-#endif
-}
-
-__host__ __device__ inline unsigned long long lookup_radix_pack(
-    std::uint32_t value, std::uint32_t state) {
-  return static_cast<unsigned long long>(value) |
-         (static_cast<unsigned long long>(state) <<
-          kLookupRadixStateShift);
-}
-
-__device__ __forceinline__ bool lookup_radix_allocate(
-    unsigned long long *arena, std::uint32_t *cursor,
-    std::uint32_t capacity_units, std::uint32_t units,
-    std::uint32_t *encoded_id) {
-  std::uint32_t first = atomicAdd(cursor, 0u);
-  while (first <= capacity_units &&
-         units <= capacity_units - first) {
-    const std::uint32_t observed =
-        atomicCAS(cursor, first, first + units);
-    if (observed == first) {
-      // Epoch resets rewind the append-only arena instead of clearing its
-      // entire reserved capacity. Zero only the pages that this allocation
-      // actually reuses, before any directory CAS can publish their id.
-      unsigned long long *allocation =
-          arena + static_cast<std::size_t>(first) * kLookupRadixUnitU64;
-      const std::uint32_t entries = units * kLookupRadixUnitU64;
-      for (std::uint32_t entry = 0u; entry < entries; ++entry)
-        allocation[entry] = 0ull;
-      __threadfence();
-      *encoded_id = first + 1u;
-      return true;
-    }
-    first = observed;
-  }
-  return false;
-}
-
-__device__ __forceinline__ unsigned long long *lookup_radix_unit(
-    unsigned long long *arena, std::uint32_t encoded_id) {
-  return arena +
-         static_cast<std::size_t>(encoded_id - 1u) *
-             kLookupRadixUnitU64;
-}
-
-__device__ __forceinline__ const unsigned long long *lookup_radix_unit(
-    const unsigned long long *arena, std::uint32_t encoded_id) {
-  return arena +
-         static_cast<std::size_t>(encoded_id - 1u) *
-             kLookupRadixUnitU64;
-}
-
-// Exact suffix radix: root[high8] -> middle[next4] -> leaf[low4]. Pages are
-// append-only 128-byte arena units, zeroed by the allocator before publication.
-// A directory CAS may leak one losing unit under same-warp contention, but
-// never publishes partial data or compromises exactness; arena exhaustion
-// simply activates legacy fallback.
-__device__ __forceinline__ bool lookup_radix_upsert(
-    unsigned long long *arena, std::uint32_t *cursor,
-    std::uint32_t capacity_units, std::uint32_t root_id,
-    std::uint32_t low, unsigned long long packed) {
-  auto *root = reinterpret_cast<std::uint32_t *>(
-      lookup_radix_unit(arena, root_id));
-  const std::uint32_t high8 = low >> 8u;
-  std::uint32_t middle_id = lookup_sector_load_acquire(root + high8);
-  if (middle_id == 0u) {
-    std::uint32_t candidate = 0u;
-    if (!lookup_radix_allocate(
-            arena, cursor, capacity_units, 1u, &candidate))
-      return false;
-    const std::uint32_t old = atomicCAS(root + high8, 0u, candidate);
-    middle_id = old == 0u ? candidate : old;
-  }
-  auto *middle = reinterpret_cast<std::uint32_t *>(
-      lookup_radix_unit(arena, middle_id));
-  const std::uint32_t middle_index = (low >> 4u) & 0xfu;
-  std::uint32_t leaf_id =
-      lookup_sector_load_acquire(middle + middle_index);
-  if (leaf_id == 0u) {
-    std::uint32_t candidate = 0u;
-    if (!lookup_radix_allocate(
-            arena, cursor, capacity_units, 1u, &candidate))
-      return false;
-    const std::uint32_t old =
-        atomicCAS(middle + middle_index, 0u, candidate);
-    leaf_id = old == 0u ? candidate : old;
-  }
-  unsigned long long *leaf = lookup_radix_unit(arena, leaf_id);
-  lookup_sector_store_relaxed(leaf + (low & 0xfu), packed);
-  return true;
-}
-
-__device__ __noinline__ bool lookup_radix_find(
-    const unsigned long long *arena, std::uint32_t root_id,
-    std::uint32_t low, unsigned long long *entry) {
-  const auto *root = reinterpret_cast<const std::uint32_t *>(
-      lookup_radix_unit(arena, root_id));
-  const std::uint32_t middle_id =
-      lookup_sector_load_acquire(root + (low >> 8u));
-  if (middle_id == 0u)
-    return false;
-  const auto *middle = reinterpret_cast<const std::uint32_t *>(
-      lookup_radix_unit(arena, middle_id));
-  const std::uint32_t leaf_id = lookup_sector_load_acquire(
-      middle + ((low >> 4u) & 0xfu));
-  if (leaf_id == 0u)
-    return false;
-  const unsigned long long value = lookup_sector_load_relaxed(
-      lookup_radix_unit(arena, leaf_id) + (low & 0xfu));
-  const std::uint32_t state = static_cast<std::uint32_t>(
-      value >> kLookupRadixStateShift) & 3u;
-  if (state == kLookupOwnerEmpty)
-    return false;
-  *entry = value;
-  return true;
-}
-
-__device__ __forceinline__ bool lookup_radix_migrate_stash(
-    const unsigned long long *stash, std::uint32_t quotient,
-    unsigned long long *arena, std::uint32_t *cursor,
-    std::uint32_t capacity_units, std::uint32_t root_id) {
-  const unsigned long long *row = stash +
-      static_cast<std::size_t>(quotient) * kLookupSectorStashSlots;
-  for (std::uint32_t slot = 0; slot < kLookupSectorStashSlots; ++slot) {
-    const unsigned long long entry =
-        lookup_sector_load_relaxed(row + slot);
-    const std::uint32_t state = static_cast<std::uint32_t>(
-        entry >> kLookupSectorStateShift) & 3u;
-    if (state == kLookupOwnerEmpty)
-      continue;
-    const std::uint32_t low =
-        static_cast<std::uint32_t>(entry >> 32u) & 0xffffu;
-    const unsigned long long radix_entry = lookup_radix_pack(
-        static_cast<std::uint32_t>(entry), state);
-    if (!lookup_radix_upsert(arena, cursor, capacity_units,
-                             root_id, low, radix_entry))
-      return false;
-  }
-  return true;
-}
-
-struct PinnedHostState {
-  AssignmentRunView views[kRunCapacity];
-  AssignmentRunView scratch_views[kRunCapacity];
-  const std::uint64_t *route_masks[kRawFoldWidth];
-  LookupPublication lookup;
-  LookupOwnerLeafView owner_leaves[kLookupLeafCapacity];
-  std::uint32_t resolved_count;
-  std::uint32_t successor_miss_count;
-  std::uint32_t gathered_count;
-  std::uint32_t resolve_class_counts[4];
-  std::uint32_t fused_winner_count;
-  std::uint32_t hash_heavy_count;
-  std::uint32_t hash_capacity;
-  std::uint32_t lqvrf_overlay_count;
-  std::uint32_t lqvrf_has_hidden_base;
-  std::uint32_t lqvrf_sorted_rows;
-  std::uint32_t lqvrf_packed_rows;
-  std::uint32_t lqvrf_sector_count;
-  std::uint32_t lqvrf_packed_quotients;
-  std::uint32_t lqvrf_active_quotients;
-  std::uint32_t lqvrf_new_quotients;
-};
-
-__device__ __forceinline__ void lookup_owner_legacy(
-    const AssignmentRunView *runs, int run_count, BaseRunView base,
-    std::uint32_t key, std::size_t query, std::uint32_t *out_values,
-    std::uint8_t *out_found) {
-  for (int r = run_count - 1; r >= 0; --r) {
-    std::uint32_t value = 0u;
-    bool live = false;
-    if (!assignment_find(runs[r], key, &value, &live))
-      continue;
-    out_values[query] = live ? value : kEmptyKey;
-    if (out_found)
-      out_found[query] = live ? 1u : 0u;
-    return;
-  }
-  std::uint32_t value = kEmptyKey;
-  const bool found = base_find_value(base, key, &value);
-  out_values[query] = found ? value : kEmptyKey;
-  if (out_found)
-    out_found[query] = found ? 1u : 0u;
-}
-
-__global__ void lookup_sector_seed_base_kernel(
-    SortedRunView base, LookupSectorBucket *buckets,
-    std::uint32_t buckets_per_quotient,
-    std::uint32_t bucket_mask, std::uint32_t *overflow_words,
-    unsigned long long *stash, std::uint32_t *quotient_overflow) {
-  const std::size_t position =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (position >= base.count)
-    return;
-  const std::uint32_t key = base.keys[position];
-  const std::uint32_t quotient = key >> kEpochQuotientBits;
-  const std::uint32_t local_bucket =
-      lookup_sector_bucket(key & 0xffffu, bucket_mask);
-  const std::size_t bucket_index =
-      static_cast<std::size_t>(quotient) * buckets_per_quotient +
-      local_bucket;
-  const unsigned long long packed = lookup_sector_pack(
-      key & 0xffffu, base.values[position], kLookupOwnerLive);
-  LookupSectorBucket *bucket = buckets + bucket_index;
-  for (int slot = 0; slot < 4; ++slot) {
-    if (atomicCAS(bucket->entry + slot, 0ull, packed) == 0ull)
-      return;
-  }
-  atomicOr(overflow_words + (bucket_index >> 5u),
-           1u << (bucket_index & 31u));
-  if (!lookup_sector_stash_upsert_atomic(
-          stash, quotient, key & 0xffffu, packed))
-    atomicExch(quotient_overflow + quotient, 1u);
-}
-
-// Repair only BaseRun quotients that exceeded the fixed stash.  The sorted
-// BaseRun is authoritative, so replaying its quotient slice reconstructs even
-// records that could not be inserted by the parallel seed kernel.
-__global__ void lookup_radix_repair_base_kernel(
-    SortedRunView base, const LookupSectorBucket *buckets,
-    std::uint32_t buckets_per_quotient, std::uint32_t bucket_mask,
-    std::uint32_t *quotient_overflow,
-    unsigned long long *radix_arena, std::uint32_t *radix_cursor,
-    std::uint32_t radix_capacity_units, std::uint32_t *radix_roots,
-    std::uint32_t *radix_enabled) {
-  const std::uint32_t quotient =
-      blockIdx.x * blockDim.x + threadIdx.x;
-  if (quotient >= kEpochQuotients ||
-      quotient_overflow[quotient] == 0u)
-    return;
-  std::uint32_t root_id = 0u;
-  if (!lookup_radix_allocate(
-          radix_arena, radix_cursor, radix_capacity_units,
-          kLookupRadixRootUnits, &root_id))
-    return;
-  bool complete = true;
-  const std::uint32_t first_bin =
-      quotient * static_cast<std::uint32_t>(kBaseBinsPerQuotient);
-  const std::uint32_t begin = base.rank23[first_bin];
-  const std::uint32_t end =
-      base.rank23[first_bin + kBaseBinsPerQuotient];
-  for (std::uint32_t position = begin; position < end; ++position) {
-    const std::uint32_t key = base.keys[position];
-    const std::uint32_t low = key & 0xffffu;
-    const std::uint32_t local_bucket =
-        lookup_sector_bucket(low, bucket_mask);
-    const std::size_t bucket_index =
-        static_cast<std::size_t>(quotient) * buckets_per_quotient +
-        local_bucket;
-    bool primary = false;
-#pragma unroll
-    for (int slot = 0; slot < 4; ++slot) {
-      const unsigned long long entry = lookup_sector_load_relaxed(
-          buckets[bucket_index].entry + slot);
-      const std::uint32_t state = static_cast<std::uint32_t>(
-          entry >> kLookupSectorStateShift) & 3u;
-      primary |= state != kLookupOwnerEmpty &&
-                 (static_cast<std::uint32_t>(entry >> 32u) & 0xffffu) ==
-                     low;
-    }
-    if (primary)
-      continue;
-    complete &= lookup_radix_upsert(
-        radix_arena, radix_cursor, radix_capacity_units, root_id, low,
-        lookup_radix_pack(base.values[position], kLookupOwnerLive));
-  }
-  lookup_sector_store_release(radix_roots + quotient, root_id);
-  lookup_sector_store_release(radix_enabled + quotient, 1u);
-  atomicExch(quotient_overflow + quotient, complete ? 0u : 1u);
-}
-
-// One warp owns an upper-16 quotient.  Stable leaf order and stable physical
-// order make the last mutation deterministic without atomics.  Lanes sharing
-// a sector collaboratively update one register copy and store only dirty
-// scalar entries.
-__global__ __launch_bounds__(256, 4) void lookup_sector_apply_kernel(
-    const LookupOwnerLeafView *leaves, std::uint32_t first_leaf,
-    std::uint32_t leaf_count, LookupSectorBucket *buckets,
-    std::uint32_t buckets_per_quotient,
-    std::uint32_t bucket_mask, std::uint32_t *overflow_words,
-    unsigned long long *stash, std::uint32_t *quotient_overflow,
-    std::uint32_t *quotient_ready, unsigned long long *radix_arena,
-    std::uint32_t *radix_cursor, std::uint32_t radix_capacity_units,
-    std::uint32_t *radix_roots, std::uint32_t *radix_enabled) {
-  const unsigned lane = threadIdx.x & 31u;
-  const unsigned warp = threadIdx.x >> 5u;
-  const unsigned warps_per_block = blockDim.x >> 5u;
-  const std::uint32_t quotient = blockIdx.x * warps_per_block + warp;
-  if (quotient >= kEpochQuotients)
-    return;
-  constexpr unsigned full = 0xffffffffu;
-  bool state_loaded = false;
-  bool radix = false;
-  bool incomplete = false;
-  std::uint32_t root_id = 0u;
-
-  for (std::uint32_t offset = 0; offset < leaf_count; ++offset) {
-    const LookupOwnerLeafView leaf = leaves[first_leaf + offset];
-    const std::uint32_t begin = leaf.offsets[quotient];
-    const std::uint32_t end = leaf.offsets[quotient + 1u];
-    std::uint64_t route_mask = 0u;
-    for (std::uint32_t base = begin; base < end; base += 32u) {
-      const std::uint32_t position = base + lane;
-      const unsigned active = __ballot_sync(full, position < end);
-      std::uint32_t key = 0u;
-      std::uint32_t value = 0u;
-      std::uint32_t local_bucket = 0u;
-      std::uint64_t route_bits = 0u;
-      if (position < end) {
-        key = leaf.keys[position];
-        value = leaf.constant_op != 0u ? leaf.values[position] : 0u;
-        local_bucket = lookup_sector_bucket(key & 0xffffu, bucket_mask);
-        route_bits = std::uint64_t{1}
-            << ((key & 0xffffu) >>
-                (kEpochQuotientBits - kHashRouteBits));
-      }
-      for (int delta = 16; delta != 0; delta >>= 1)
-        route_bits |= __shfl_down_sync(full, route_bits, delta);
-      if (lane == 0u)
-        route_mask |= route_bits;
-
-      bool spill = false;
-      if ((active & (1u << lane)) != 0u) {
-        const unsigned same_bucket =
-            __match_any_sync(active, local_bucket);
-        const unsigned leader = __ffs(same_bucket) - 1u;
-        const std::size_t bucket_index =
-            static_cast<std::size_t>(quotient) *
-                buckets_per_quotient + local_bucket;
-        unsigned long long entry0 = 0ull;
-        unsigned long long entry1 = 0ull;
-        unsigned long long entry2 = 0ull;
-        unsigned long long entry3 = 0ull;
-        if (lane == leader) {
-          entry0 = lookup_sector_load_relaxed(
-              buckets[bucket_index].entry + 0);
-          entry1 = lookup_sector_load_relaxed(
-              buckets[bucket_index].entry + 1);
-          entry2 = lookup_sector_load_relaxed(
-              buckets[bucket_index].entry + 2);
-          entry3 = lookup_sector_load_relaxed(
-              buckets[bucket_index].entry + 3);
-        }
-        entry0 = __shfl_sync(same_bucket, entry0, leader);
-        entry1 = __shfl_sync(same_bucket, entry1, leader);
-        entry2 = __shfl_sync(same_bucket, entry2, leader);
-        entry3 = __shfl_sync(same_bucket, entry3, leader);
-        bool overflow = false;
-        unsigned dirty = 0u;
-        unsigned remaining = same_bucket;
-        while (remaining != 0u) {
-          const unsigned selected = __ffs(remaining) - 1u;
-          const std::uint32_t selected_key =
-              __shfl_sync(same_bucket, key, selected);
-          const std::uint32_t selected_value =
-              __shfl_sync(same_bucket, value, selected);
-          const std::uint32_t selected_low = selected_key & 0xffffu;
-          const std::uint32_t state0 = static_cast<std::uint32_t>(
-              entry0 >> kLookupSectorStateShift) & 3u;
-          const std::uint32_t state1 = static_cast<std::uint32_t>(
-              entry1 >> kLookupSectorStateShift) & 3u;
-          const std::uint32_t state2 = static_cast<std::uint32_t>(
-              entry2 >> kLookupSectorStateShift) & 3u;
-          const std::uint32_t state3 = static_cast<std::uint32_t>(
-              entry3 >> kLookupSectorStateShift) & 3u;
-          int empty = state0 == kLookupOwnerEmpty ? 0
-                    : state1 == kLookupOwnerEmpty ? 1
-                    : state2 == kLookupOwnerEmpty ? 2
-                    : state3 == kLookupOwnerEmpty ? 3
-                                                  : -1;
-          int target = -1;
-          if (state0 != kLookupOwnerEmpty &&
-              (static_cast<std::uint32_t>(entry0 >> 32u) & 0xffffu) ==
-                  selected_low)
-            target = 0;
-          if (state1 != kLookupOwnerEmpty &&
-              (static_cast<std::uint32_t>(entry1 >> 32u) & 0xffffu) ==
-                  selected_low)
-            target = 1;
-          if (state2 != kLookupOwnerEmpty &&
-              (static_cast<std::uint32_t>(entry2 >> 32u) & 0xffffu) ==
-                  selected_low)
-            target = 2;
-          if (state3 != kLookupOwnerEmpty &&
-              (static_cast<std::uint32_t>(entry3 >> 32u) & 0xffffu) ==
-                  selected_low)
-            target = 3;
-          if (target < 0)
-            target = empty;
-          if (target >= 0) {
-            const unsigned long long replacement = lookup_sector_pack(
-                selected_low, selected_value,
-                leaf.constant_op != 0u ? kLookupOwnerLive
-                                       : kLookupOwnerTombstone);
-            if (target == 0)
-              entry0 = replacement;
-            else if (target == 1)
-              entry1 = replacement;
-            else if (target == 2)
-              entry2 = replacement;
-            else
-              entry3 = replacement;
-            dirty |= 1u << target;
-          } else {
-            overflow = true;
-            if (lane == selected)
-              spill = true;
-          }
-          remaining &= ~(1u << selected);
-        }
-        if (lane == leader) {
-          if ((dirty & 1u) != 0u)
-            lookup_sector_store_relaxed(
-                buckets[bucket_index].entry + 0, entry0);
-          if ((dirty & 2u) != 0u)
-            lookup_sector_store_relaxed(
-                buckets[bucket_index].entry + 1, entry1);
-          if ((dirty & 4u) != 0u)
-            lookup_sector_store_relaxed(
-                buckets[bucket_index].entry + 2, entry2);
-          if ((dirty & 8u) != 0u)
-            lookup_sector_store_relaxed(
-                buckets[bucket_index].entry + 3, entry3);
-          if (overflow)
-            atomicOr(overflow_words + (bucket_index >> 5u),
-                     1u << (bucket_index & 31u));
-        }
-      }
-      __syncwarp(full);
-
-      const unsigned spills = __ballot_sync(full, spill);
-      if (spills != 0u && !state_loaded) {
-        if (lane == 0u) {
-          radix =
-              lookup_sector_load_acquire(radix_enabled + quotient) != 0u;
-          root_id = lookup_sector_load_acquire(radix_roots + quotient);
-          incomplete = quotient_overflow[quotient] != 0u;
-        }
-        radix = __shfl_sync(full, static_cast<int>(radix), 0) != 0;
-        incomplete =
-            __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
-        root_id = __shfl_sync(full, root_id, 0);
-        state_loaded = true;
-      }
-      if (spills != 0u && (radix || !incomplete)) {
-        // Distinct keys commute in the exact overflow tiers. For duplicate
-        // keys in this physical chunk, only its greatest lane writes, which
-        // retains chronological last-write-wins while allowing the common
-        // fixed-stash path to proceed in parallel.
-        bool writer = false;
-        if (spill) {
-          const unsigned same_key = __match_any_sync(spills, key);
-          writer = lane == 31u - __clz(same_key);
-        }
-        const std::uint32_t state =
-            leaf.constant_op != 0u ? kLookupOwnerLive
-                                   : kLookupOwnerTombstone;
-        bool stored = true;
-        if (writer) {
-          if (radix) {
-            stored = lookup_radix_upsert(
-                radix_arena, radix_cursor, radix_capacity_units,
-                root_id, key & 0xffffu,
-                lookup_radix_pack(value, state));
-          } else {
-            stored = lookup_sector_stash_upsert_atomic(
-                stash, quotient, key & 0xffffu,
-                lookup_sector_pack(key & 0xffffu, value, state));
-          }
-        }
-        unsigned failed = __ballot_sync(full, !stored);
-
-        if (!radix && failed != 0u) {
-          // Stash saturation is rare. Promote once, migrate every successful
-          // stash write, then insert only the distinct records that failed.
-          __syncwarp(full);
-          if (lane == 0u) {
-            if (lookup_radix_allocate(
-                    radix_arena, radix_cursor, radix_capacity_units,
-                    kLookupRadixRootUnits, &root_id)) {
-              radix = true;
-              incomplete = !lookup_radix_migrate_stash(
-                  stash, quotient, radix_arena, radix_cursor,
-                  radix_capacity_units, root_id);
-            } else {
-              incomplete = true;
-            }
-          }
-          radix =
-              __shfl_sync(full, static_cast<int>(radix), 0) != 0;
-          incomplete =
-              __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
-          root_id = __shfl_sync(full, root_id, 0);
-
-          bool adaptive_stored = true;
-          if (radix && writer && (failed & (1u << lane)) != 0u) {
-            adaptive_stored = lookup_radix_upsert(
-                radix_arena, radix_cursor, radix_capacity_units,
-                root_id, key & 0xffffu,
-                lookup_radix_pack(value, state));
-          }
-          failed = __ballot_sync(full, !adaptive_stored);
-          if (lane == 0u && failed != 0u)
-            incomplete = true;
-          incomplete =
-              __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
-        } else if (radix && failed != 0u) {
-          if (lane == 0u)
-            incomplete = true;
-          incomplete =
-              __shfl_sync(full, static_cast<int>(incomplete), 0) != 0;
-        }
-      }
-      __syncwarp(full);
-    }
-    if (lane == 0u)
-      leaf.route_mask[quotient] = route_mask;
-  }
-
-  if (lane == 0u) {
-    if (state_loaded && radix) {
-      lookup_sector_store_release(radix_roots + quotient, root_id);
-      lookup_sector_store_release(radix_enabled + quotient, 1u);
-    }
-    if (state_loaded && (radix || incomplete))
-      atomicExch(quotient_overflow + quotient, incomplete ? 1u : 0u);
-    lookup_sector_store_release(
-        quotient_ready + quotient, first_leaf + leaf_count);
-  }
-}
-__global__ void lookup_sector_kernel(
-    const LookupSectorBucket *buckets,
-    std::uint32_t buckets_per_quotient, std::uint32_t bucket_mask,
-    const std::uint32_t *overflow_words,
-    const unsigned long long *stash,
-    const std::uint32_t *quotient_overflow,
-    const unsigned long long *radix_arena,
-    const std::uint32_t *radix_roots,
-    const std::uint32_t *radix_enabled,
-    const LookupOwnerLeafView *leaves, std::uint32_t leaf_count,
-    const std::uint32_t *quotient_ready,
-    const AssignmentRunView *runs, int run_count, BaseRunView base,
-    const std::uint32_t *queries, std::size_t n,
-    std::uint32_t *out_values, std::uint8_t *out_found) {
-  const std::size_t query =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (query >= n)
-    return;
-  const std::uint32_t key = queries[query];
-  const std::uint32_t quotient = key >> kEpochQuotientBits;
-  const std::uint32_t indexed_leaf_count =
-      lookup_sector_load_acquire(quotient_ready + quotient);
-  for (std::uint32_t encoded = leaf_count;
-       encoded > indexed_leaf_count; --encoded) {
-    const LookupOwnerLeafView leaf = leaves[encoded - 1u];
-    const std::uint32_t begin = leaf.offsets[quotient];
-    std::uint32_t position = leaf.offsets[quotient + 1u];
-    while (position-- > begin) {
-      if (leaf.keys[position] != key)
-        continue;
-      const bool live = leaf.constant_op != 0u;
-      out_values[query] = live ? leaf.values[position] : kEmptyKey;
-      if (out_found)
-        out_found[query] = live ? 1u : 0u;
-      return;
-    }
-  }
-  const std::uint32_t local_bucket =
-      lookup_sector_bucket(key & 0xffffu, bucket_mask);
-  const std::size_t bucket_index =
-      static_cast<std::size_t>(quotient) * buckets_per_quotient +
-      local_bucket;
-#pragma unroll
-  for (int slot = 0; slot < 4; ++slot) {
-    const unsigned long long entry = lookup_sector_load_relaxed(
-        buckets[bucket_index].entry + slot);
-    const std::uint32_t state = static_cast<std::uint32_t>(
-        entry >> kLookupSectorStateShift) & 3u;
-    if (state == kLookupOwnerEmpty ||
-        (static_cast<std::uint32_t>(entry >> 32u) & 0xffffu) !=
-            (key & 0xffffu))
-      continue;
-    const bool live = state == kLookupOwnerLive;
-    out_values[query] = live ? static_cast<std::uint32_t>(entry) : kEmptyKey;
-    if (out_found)
-      out_found[query] = live ? 1u : 0u;
-    return;
-  }
-  const std::uint32_t overflow =
-      overflow_words[bucket_index >> 5u] >> (bucket_index & 31u);
-  if ((overflow & 1u) != 0u) {
-    if (lookup_sector_load_acquire(radix_enabled + quotient) != 0u) {
-      unsigned long long radix_entry = 0ull;
-      const std::uint32_t root_id =
-          lookup_sector_load_acquire(radix_roots + quotient);
-      if (root_id != 0u && lookup_radix_find(
-              radix_arena, root_id, key & 0xffffu, &radix_entry)) {
-        const std::uint32_t state = static_cast<std::uint32_t>(
-            radix_entry >> kLookupRadixStateShift) & 3u;
-        const bool live = state == kLookupOwnerLive;
-        out_values[query] =
-            live ? static_cast<std::uint32_t>(radix_entry) : kEmptyKey;
-        if (out_found)
-          out_found[query] = live ? 1u : 0u;
-        return;
-      }
-      if (quotient_overflow[quotient] == 0u) {
-        out_values[query] = kEmptyKey;
-        if (out_found)
-          out_found[query] = 0u;
-        return;
-      }
-      lookup_owner_legacy(runs, run_count, base, key, query,
-                          out_values, out_found);
-      return;
-    }
-    unsigned long long stash_entry = 0ull;
-    if (lookup_sector_stash_find(
-            stash, quotient, key & 0xffffu, &stash_entry)) {
-      const std::uint32_t state = static_cast<std::uint32_t>(
-          stash_entry >> kLookupSectorStateShift) & 3u;
-      const bool live = state == kLookupOwnerLive;
-      out_values[query] =
-          live ? static_cast<std::uint32_t>(stash_entry) : kEmptyKey;
-      if (out_found)
-        out_found[query] = live ? 1u : 0u;
-      return;
-    }
-    if (quotient_overflow[quotient] == 0u) {
-      out_values[query] = kEmptyKey;
-      if (out_found)
-        out_found[query] = 0u;
-      return;
-    }
-    lookup_owner_legacy(runs, run_count, base, key, query,
-                        out_values, out_found);
-    return;
-  }
-  out_values[query] = kEmptyKey;
-  if (out_found)
-    out_found[query] = 0u;
-}
-
-// Seeds the direct visible mirror from the immutable, deduplicated BaseRun.
-// One thread owns one upper-16 quotient, so inserts into a quotient-local
-// open-addressing segment need no atomics and are deterministic under skew.
-__global__ void assignment_group_count_kernel(
-    const AssignmentRunView *runs, int run_count,
-    std::uint32_t *counts) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
-    return;
-  if (q == kEpochQuotients) {
-    counts[q] = 0u;
-    return;
-  }
-  std::uint32_t total = 0u;
-  for (int r = 0; r < run_count; ++r)
-    total += assignment_record_count(runs[r], q);
-  counts[q] = total;
-}
-
-__global__ void assignment_group_gather_kernel(
-    const AssignmentRunView *runs, int run_count,
-    const std::uint32_t *offsets, std::uint32_t *out_keys,
-    std::uint64_t *out_payload) {
-  __shared__ std::uint32_t hash_cursor;
-  const std::uint32_t q = blockIdx.x;
-  if (q >= kEpochQuotients)
-    return;
-  std::uint32_t cursor = offsets[q];
-  for (int r = 0; r < run_count; ++r)
-    assignment_gather_quotient(
-        runs[r], q, &cursor, &hash_cursor,
-        out_keys, out_payload);
-}
-
-// Scan newest first, then fall through to BaseRun.
-__global__ void temporal_lookup_kernel(const AssignmentRunView *runs,
-                                       int run_count, BaseRunView base,
-                                       const std::uint32_t *queries,
-                                       std::size_t n,
-                                       std::uint32_t *out_values,
-                                       std::uint8_t *out_found) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  const std::uint32_t key = queries[i];
-  for (int r = run_count - 1; r >= 0; --r) {
-    const AssignmentRunView run = runs[r];
-    std::uint32_t value = 0u;
-    bool live = false;
-    if (!assignment_find(run, key, &value, &live))
-      continue;
-    out_values[i] = live ? value : kEmptyKey;
-    if (out_found)
-      out_found[i] = live ? 1u : 0u;
-    return;
-  }
-  std::uint32_t value = 0u;
-  if (base_find_value(base, key, &value)) {
-    out_values[i] = value;
-    if (out_found)
-      out_found[i] = 1u;
-    return;
-  }
-  out_values[i] = kEmptyKey;
-  if (out_found)
-    out_found[i] = 0u;
-}
-
-// Sparse successor state for the base and corrections.
-struct SuccessorSparseView {
-  SortedRunView base;
-  const std::uint32_t *deleted_base_words;
-  const std::uint32_t *base_live_l1;
-  const std::uint32_t *base_live_l2;
-  const std::uint32_t *base_live_l3;
-  const std::uint32_t *correction_keys;
-  const std::uint32_t *correction_offsets;
-  const std::uint32_t *positive_words;
-  const std::uint32_t *positive_l1;
-  const std::uint32_t *positive_l2;
-  const std::uint32_t *positive_l3;
-  std::uint32_t correction_count;
-  std::uint32_t base_l0_words;
-  std::uint32_t base_l3_words;
-  std::uint32_t positive_l0_words;
-  std::uint32_t positive_l3_words;
-};
-
-__device__ inline std::uint32_t succ_ffs0(std::uint32_t bits) {
-  return static_cast<std::uint32_t>(__ffs(static_cast<int>(bits))) - 1u;
-}
-
-// Bits at or above `bit`.
-__device__ inline std::uint32_t succ_mask_from(std::uint32_t bit) {
-  return 0xffffffffu << bit;
-}
-
-// Bits strictly above `bit` (bit 31 leaves nothing).
-__device__ inline std::uint32_t succ_mask_above(std::uint32_t bit) {
-  return bit >= 31u ? 0u : (0xffffffffu << (bit + 1u));
-}
-
-// Finds the next nonempty L0 word.
-__device__ inline std::uint32_t
-successor_next_set_word(const std::uint32_t *l1,
-                        const std::uint32_t *l2,
-                        const std::uint32_t *l3,
-                        std::uint32_t l0_words,
-                        std::uint32_t l3_words,
-                        std::uint32_t w) {
-  if (w >= l0_words)
-    return l0_words;
-  std::uint32_t i1 = w >> 5;
-  std::uint32_t b1 = l1[i1] & succ_mask_from(w & 31u);
-  if (b1)
-    return (i1 << 5) | succ_ffs0(b1);
-  std::uint32_t i2 = i1 >> 5;
-  std::uint32_t b2 = l2[i2] & succ_mask_above(i1 & 31u);
-  if (!b2) {
-    std::uint32_t i3 = i2 >> 5;
-    std::uint32_t b3 = l3[i3] & succ_mask_above(i2 & 31u);
-    while (!b3) {
-      if (++i3 >= l3_words)
-        return l0_words;
-      b3 = l3[i3];
-    }
-    i2 = (i3 << 5) | succ_ffs0(b3);
-    b2 = l2[i2];
-  }
-  i1 = (i2 << 5) | succ_ffs0(b2);
-  b1 = l1[i1];
-  return (i1 << 5) | succ_ffs0(b1);
-}
-
-// Finds the first surviving BaseRun position.
-__device__ inline std::size_t
-successor_first_base_live(const SuccessorSparseView &view,
-                          std::size_t position) {
-  if (position >= view.base.count)
-    return view.base.count;
-  std::uint32_t w = static_cast<std::uint32_t>(position >> 5);
-  std::uint32_t bits = ~view.deleted_base_words[w] &
-                       succ_mask_from(static_cast<std::uint32_t>(position) & 31u);
-  if (!bits) {
-    w = successor_next_set_word(
-        view.base_live_l1, view.base_live_l2, view.base_live_l3,
-        view.base_l0_words, view.base_l3_words, w + 1u);
-    if (w >= view.base_l0_words)
-      return view.base.count;
-    bits = ~view.deleted_base_words[w];
-  }
-  const std::size_t found =
-      (static_cast<std::size_t>(w) << 5) | succ_ffs0(bits);
-  return found < view.base.count ? found : view.base.count;
-}
-
-// Finds the first positive correction position.
-__device__ inline std::size_t
-successor_first_positive(const SuccessorSparseView &view,
-                         std::size_t position) {
-  if (position >= view.correction_count)
-    return view.correction_count;
-  std::uint32_t w = static_cast<std::uint32_t>(position >> 5);
-  std::uint32_t bits =
-      view.positive_words[w] &
-      succ_mask_from(static_cast<std::uint32_t>(position) & 31u);
-  if (!bits) {
-    w = successor_next_set_word(
-        view.positive_l1, view.positive_l2, view.positive_l3,
-        view.positive_l0_words, view.positive_l3_words, w + 1u);
-    if (w >= view.positive_l0_words)
-      return view.correction_count;
-    bits = view.positive_words[w];
-  }
-  const std::size_t found =
-      (static_cast<std::size_t>(w) << 5) | succ_ffs0(bits);
-  return found < view.correction_count ? found
-                                       : view.correction_count;
-}
-
-// Resolves hits and compacts misses once per block.
-__global__ void successor_live_or_miss_kernel(
-    const AssignmentRunView *runs, int run_count, BaseRunView base,
-    const std::uint32_t *queries, std::size_t query_count,
-    std::uint32_t *results, std::uint32_t *miss_indices,
-    std::uint32_t *miss_count) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  bool missing = false;
-  if (i < query_count) {
-    const std::uint32_t key = queries[i];
-    int live = -1;
-    for (int r = run_count - 1; r >= 0 && live < 0; --r) {
-      const AssignmentRunView run = runs[r];
-      std::uint32_t value = 0u;
-      bool found_live = false;
-      if (assignment_find(run, key, &value, &found_live))
-        live = found_live ? 1 : 0;
-    }
-    if (live < 0) {
-      std::uint32_t value = 0u;
-      live = base_find_value(base, key, &value) ? 1 : 0;
-    }
-    if (live > 0)
-      results[i] = key;
-    else
-      missing = true;
-  }
-  constexpr unsigned kWarps = 8u;
-  __shared__ unsigned warp_counts[kWarps];
-  __shared__ unsigned warp_offsets[kWarps];
-  __shared__ unsigned block_slot;
-  const unsigned lane = threadIdx.x & 31u;
-  const unsigned warp = threadIdx.x >> 5;
-  const unsigned mask = __ballot_sync(0xffffffffu, missing);
-  const unsigned warp_count = static_cast<unsigned>(__popc(mask));
-  if (lane == 0u)
-    warp_counts[warp] = warp_count;
-  if (!__syncthreads_or(missing))
-    return;
-  if (warp == 0u) {
-    const unsigned value = lane < kWarps ? warp_counts[lane] : 0u;
-    unsigned prefix = value;
-#pragma unroll
-    for (unsigned offset = 1u; offset < kWarps; offset <<= 1u) {
-      const unsigned add =
-          __shfl_up_sync(0xffffffffu, prefix, offset);
-      if (lane >= offset)
-        prefix += add;
-    }
-    if (lane < kWarps)
-      warp_offsets[lane] = prefix - value;
-    if (lane == kWarps - 1u)
-      block_slot = atomicAdd(miss_count, prefix);
+    block_base = total ? atomicAdd(cursor, total) : 0u;
+    if (total && (block_base > arena_capacity ||
+                  total > arena_capacity - block_base))
+      atomicAdd(overflow, 1u);
   }
   __syncthreads();
-  if (missing) {
-    const unsigned rank =
-        static_cast<unsigned>(__popc(mask & ((1u << lane) - 1u)));
-    miss_indices[block_slot + warp_offsets[warp] + rank] =
-        static_cast<std::uint32_t>(i);
-  }
+  if (q >= kQuotients) return;
+  if (!valid) return;
+  const std::uint32_t offset = recycled != kInvalid
+      ? recycled : block_base + fresh_prefix[threadIdx.x];
+  descriptors[descriptor_index(q, planned_level)] = Descriptor::make(
+      offset, planned_count, planned_size_class, true);
 }
 
-// Classifies resolved corrections into two bitmaps.
-__global__ void successor_classify_kernel(const std::uint32_t *keys,
-                                          const std::int8_t *count_delta,
-                                          std::size_t count, SortedRunView base,
-                                          std::uint32_t *positive_words,
-                                          std::uint32_t *deleted_base_words) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  const int delta = static_cast<int>(count_delta[i]);
-  if (delta > 0) {
-    atomicOr(positive_words + (i >> 5),
-             1u << (static_cast<std::uint32_t>(i) & 31u));
-    return;
+__device__ RawAssignment load_raw_ordinal(
+    const RawAssignment *assignments, const std::uint32_t *offsets,
+    std::uint32_t batch_stride, std::uint32_t q,
+    std::uint32_t ordinal) {
+#pragma unroll
+  for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch) {
+    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+    const std::uint32_t begin = offsets[oi];
+    const std::uint32_t count = offsets[oi + 1u] - begin;
+    if (ordinal < count)
+      return assignments[batch * batch_stride + begin + ordinal];
+    ordinal -= count;
   }
-  if (delta >= 0 || base.count == 0)
-    return;
-  const std::uint32_t key = keys[i];
-  std::size_t begin = 0;
-  std::size_t end = 0;
-  sorted_search_bounds(base, key, &begin, &end);
-  const std::size_t position =
-      begin + lower_bound_u32(base.keys + begin, end - begin, key);
-  if (position >= end || base.keys[position] != key)
-    return;
-  // Shared words require atomic updates.
-  atomicOr(deleted_base_words + (position >> 5),
-           1u << (static_cast<std::uint32_t>(position) & 31u));
+  return {{0u, 0u, 0u}, 0u};
 }
 
-// Masks unused BaseRun tail positions.
-__global__ void successor_tail_mask_kernel(std::uint32_t *words,
-                                           std::uint32_t word_count,
-                                           std::uint32_t base_count) {
-  if (word_count == 0u)
-    return;
-  const std::uint32_t used = base_count & 31u;
-  if (used)
-    words[word_count - 1u] |= ~((1u << used) - 1u);
+__device__ RawAssignment load_pending_raw_ordinal(
+    const RawAssignment *assignments, const std::uint32_t *offsets,
+    std::uint32_t batch_stride, std::uint32_t pending_batches,
+    std::uint32_t q, std::uint32_t ordinal) {
+  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+    const std::uint32_t begin = offsets[oi];
+    const std::uint32_t count = offsets[oi + 1u] - begin;
+    if (ordinal < count)
+      return assignments[batch * batch_stride + begin + ordinal];
+    ordinal -= count;
+  }
+  return {{0u, 0u, 0u}, 0u};
 }
 
-// Marks nonempty lower-level words.
-__global__ void successor_live_level_kernel(const std::uint32_t *lower,
-                                            std::uint32_t lower_words,
-                                            std::uint32_t *upper,
-                                            std::uint32_t upper_words,
-                                            int deleted_bits) {
-  const std::uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= upper_words)
-    return;
-  const std::uint32_t first = j << 5;
-  const std::uint32_t limit =
-      lower_words > first ? min(32u, lower_words - first) : 0u;
-  std::uint32_t bits = 0u;
-  for (std::uint32_t k = 0; k < limit; ++k) {
-    const std::uint32_t word = lower[first + k];
-    const bool live = deleted_bits ? (~word) != 0u : word != 0u;
-    if (live)
-      bits |= 1u << k;
-  }
-  upper[j] = bits;
-}
-
-// Returns the smaller base or positive correction key.
-__global__ void sparse_successor_kernel(SuccessorSparseView view,
-                                        const std::uint32_t *queries,
-                                        const std::uint32_t *indices,
-                                        std::size_t count,
-                                        std::uint32_t *results) {
-  const std::size_t t =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= count)
-    return;
-  const std::size_t i =
-      indices ? static_cast<std::size_t>(indices[t]) : t;
-  const std::uint32_t key = queries[i];
-  std::uint32_t best = 0u;
-  bool found = false;
-  if (view.base.count != 0) {
-    std::size_t begin = 0;
-    std::size_t end = 0;
-    sorted_search_bounds(view.base, key, &begin, &end);
-    std::size_t position =
-        begin + lower_bound_u32(view.base.keys + begin, end - begin, key);
-    position = successor_first_base_live(view, position);
-    if (position < view.base.count) {
-      best = view.base.keys[position];
-      found = true;
-    }
-  }
-  if (view.correction_count != 0u) {
-    const std::uint32_t q = key >> kEpochQuotientBits;
-    const std::uint32_t begin = view.correction_offsets[q];
-    const std::uint32_t end = view.correction_offsets[q + 1u];
-    std::size_t position =
-        begin + lower_bound_u32(view.correction_keys + begin,
-                                end - begin, key);
-    position = successor_first_positive(view, position);
-    if (position < view.correction_count) {
-      const std::uint32_t candidate =
-          view.correction_keys[position];
-      if (!found || candidate < best) {
-        best = candidate;
-        found = true;
+__global__ void fused_raw_epoch_carry_kernel(
+    const RawAssignment *__restrict__ assignments,
+    const std::uint32_t *__restrict__ raw_offsets,
+    std::uint32_t batch_stride,
+    const std::uint32_t *__restrict__ raw_counts,
+    Row *__restrict__ arena, Descriptor *__restrict__ descriptors,
+    std::uint32_t level_limit) {
+  __shared__ TaggedRow items[kCarryWarpsPerBlock][kCarryMaximum];
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  const std::uint32_t q = blockIdx.x * kCarryWarpsPerBlock + warp;
+  if (q >= kQuotients) return;
+  Descriptor *allocation{};
+  std::uint32_t allocation_level{};
+  if (!find_planned_descriptor(
+          descriptors, q, allocation, allocation_level,
+          level_limit)) return;
+  const std::uint32_t total = allocation->count();
+  if (total <= 128u || total > kCarryMaximum) return;
+  const std::uint32_t raw_count = raw_counts[q];
+  const std::uint32_t sort_size = max(32u, 1u << size_class_for(total));
+  TaggedRow *local = items[warp];
+  for (std::uint32_t i = lane; i < sort_size; i += 32u) {
+    if (i < raw_count) {
+      const RawAssignment raw = load_raw_ordinal(
+          assignments, raw_offsets, batch_stride, q, i);
+      local[i] = {raw.row, 0x10000000u | raw.logical_position};
+    } else if (i < total) {
+      std::uint32_t ordinal = i - raw_count;
+      bool loaded = false;
+      for (std::uint32_t level = 0u; level < allocation_level; ++level) {
+        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+        if (ordinal < descriptor.count()) {
+          local[i] = {arena[descriptor.offset() + ordinal], kMaximumLevels - level};
+          loaded = true;
+          break;
+        }
+        ordinal -= descriptor.count();
       }
+      if (!loaded) local[i] = {{0u, 0u, 0u}, kInvalid};
+    } else {
+      local[i] = {{0u, 0u, 0u}, kInvalid};
     }
   }
-  results[i] = found ? best : 0u;
+  __syncwarp();
+  const std::uint32_t winner_count =
+      sort_and_publish_tagged_rows<kCarryMaximum>(
+          local, sort_size, lane, arena, allocation->offset());
+  if (lane == 0u) allocation->set_count(winner_count);
 }
 
-// Pack the visible BaseRun.
-__global__ void resolve_pack_base_kernel(
-    BaseRunView base, std::uint32_t *out_keys,
-    std::uint64_t *out_payload) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= base.base.count)
+__global__ void fused_raw_merge_path_carry_kernel(
+    const RawAssignment *__restrict__ assignments,
+    const std::uint32_t *__restrict__ raw_offsets,
+    std::uint32_t batch_stride,
+    const std::uint32_t *__restrict__ raw_counts,
+    Row *__restrict__ arena, Descriptor *__restrict__ descriptors,
+    std::uint32_t *__restrict__ overflow,
+    std::uint32_t level_limit) {
+  constexpr std::uint32_t warps_per_block = 4u;
+  constexpr std::uint32_t raw_capacity = 64u;
+  __shared__ TaggedRow raw_shared[warps_per_block][raw_capacity];
+  __shared__ Row current_shared[warps_per_block][128];
+  __shared__ Row merged_shared[warps_per_block][128];
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  const std::uint32_t q = blockIdx.x * warps_per_block + warp;
+  if (q >= kQuotients) return;
+  Descriptor *allocation{};
+  std::uint32_t allocation_level{};
+  if (!find_planned_descriptor(
+          descriptors, q, allocation, allocation_level,
+          level_limit)) return;
+  if (allocation_level == 0u) return;
+  const std::uint32_t allocation_count = allocation->count();
+  const std::uint32_t raw_count = raw_counts[q];
+  if (raw_count > raw_capacity) {
     return;
-  out_keys[i] = base.base.keys[i];
-  out_payload[i] =
-      (static_cast<std::uint64_t>(base.base.values[i]) << 32) | 1u;
+  }
+  if (allocation_count > 128u) return;
+  TaggedRow *raw = raw_shared[warp];
+  Row *current = current_shared[warp];
+  Row *merged = merged_shared[warp];
+  const std::uint32_t raw_sort_size = max(32u, 1u << size_class_for(raw_count));
+  for (std::uint32_t index = lane; index < raw_sort_size; index += 32u) {
+    if (index < raw_count) {
+      const RawAssignment item = load_raw_ordinal(
+          assignments, raw_offsets, batch_stride, q, index);
+      raw[index] = {item.row, item.logical_position};
+    } else {
+      raw[index] = {{0u, 0u, 0u}, kInvalid};
+    }
+  }
+  __syncwarp();
+  std::uint32_t current_count = sort_and_publish_tagged_rows<raw_capacity>(
+      raw, raw_sort_size, lane, current, 0u);
+  const unsigned before = lane == 0u ? 0u : ((1u << lane) - 1u);
+  __syncwarp();
+
+  for (std::uint32_t level = 0u; level < allocation_level; ++level) {
+    const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+    const Row *older = arena + descriptor.offset();
+    const std::uint32_t older_count = descriptor.count();
+    const std::uint32_t merged_count = current_count + older_count;
+    if (merged_count > 128u) {
+      if (lane == 0u) atomicAdd(overflow, 1u);
+      return;
+    }
+    const std::uint32_t tile = merged_count <= 32u ? 1u :
+                               merged_count <= 64u ? 2u : 4u;
+    const std::uint32_t diagonal = min(lane * tile, merged_count);
+    std::uint32_t low = diagonal > current_count
+        ? diagonal - current_count : 0u;
+    std::uint32_t high = min(diagonal, older_count);
+    while (low < high) {
+      const std::uint32_t older_index = (low + high) >> 1u;
+      const std::uint32_t current_index = diagonal - older_index;
+      if (older_index < older_count && current_index > 0u &&
+          current[current_index - 1u].key >= older[older_index].key)
+        low = older_index + 1u;
+      else
+        high = older_index;
+    }
+    std::uint32_t older_index = low;
+    std::uint32_t current_index = diagonal - older_index;
+#pragma unroll
+    for (std::uint32_t item = 0u; item < 4u; ++item) {
+      const std::uint32_t output_index = diagonal + item;
+      if (item >= tile || output_index >= merged_count) break;
+      const bool choose_older = older_index < older_count &&
+          (current_index >= current_count ||
+           older[older_index].key <= current[current_index].key);
+      if (choose_older) merged[output_index] = older[older_index++];
+      else merged[output_index] = current[current_index++];
+    }
+    __syncwarp();
+    bool winner[4]{};
+    unsigned masks[4]{};
+    std::uint32_t next_count = 0u;
+    for (std::uint32_t group = 0u; group < 4u; ++group) {
+      const std::uint32_t index = lane + group * 32u;
+      winner[group] = index < merged_count &&
+          (index + 1u == merged_count ||
+           merged[index].key != merged[index + 1u].key);
+      masks[group] = __ballot_sync(0xffffffffu, winner[group]);
+      next_count += __popc(masks[group]);
+    }
+    std::uint32_t base = 0u;
+    for (std::uint32_t group = 0u; group < 4u; ++group) {
+      if (winner[group])
+        current[base + __popc(masks[group] & before)] =
+            merged[lane + group * 32u];
+      base += __popc(masks[group]);
+    }
+    __syncwarp();
+    current_count = next_count;
+  }
+  for (std::uint32_t index = lane; index < current_count; index += 32u)
+    arena[allocation->offset() + index] = current[index];
+  if (lane == 0u) allocation->set_count(current_count);
 }
 
-// Builds assignment quotient offsets.
-__global__ void assignment_boundary_kernel(const std::uint32_t *keys,
-                                           std::uint32_t count,
-                                           std::uint32_t *offsets) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
+__global__ void fused_raw_publish_kernel(
+    const RawAssignment *__restrict__ assignments,
+    const std::uint32_t *__restrict__ raw_offsets,
+    std::uint32_t batch_stride,
+    const std::uint32_t *__restrict__ raw_counts,
+    Row *__restrict__ arena, Descriptor *__restrict__ descriptors,
+    std::uint32_t level_limit) {
+  constexpr std::uint32_t raw_capacity = 64u;
+  __shared__ TaggedRow raw_shared[kWarpsPerBlock][raw_capacity];
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  const std::uint32_t q = blockIdx.x * kWarpsPerBlock + warp;
+  if (q >= kQuotients) return;
+  Descriptor *allocation{};
+  std::uint32_t allocation_level{};
+  if (!find_planned_descriptor(
+          descriptors, q, allocation, allocation_level,
+          level_limit) ||
+      allocation_level != 0u) return;
+  const std::uint32_t raw_count = raw_counts[q];
+  if (raw_count > raw_capacity) {
     return;
-  if (i == 0u)
-    offsets[kEpochQuotients] = count;
-  const std::uint32_t q = keys[i] >> kEpochQuotientBits;
-  const std::uint32_t prev = i == 0u ? q : keys[i - 1u] >> kEpochQuotientBits;
-  if (i == 0u || q != prev)
-    offsets[q] = i;
+  }
+  TaggedRow *raw = raw_shared[warp];
+  const std::uint32_t sort_size = max(32u, 1u << size_class_for(raw_count));
+  for (std::uint32_t i = lane; i < sort_size; i += 32u) {
+    if (i < raw_count) {
+      const RawAssignment item = load_raw_ordinal(
+          assignments, raw_offsets, batch_stride, q, i);
+      raw[i] = {item.row, item.logical_position};
+    } else {
+      raw[i] = {{0u, 0u, 0u}, kInvalid};
+    }
+  }
+  __syncwarp();
+  const std::uint32_t winner_count =
+      sort_and_publish_tagged_rows<raw_capacity>(
+          raw, sort_size, lane, arena, allocation->offset());
+  if (lane == 0u) allocation->set_count(winner_count);
 }
 
-// Dense quotient offsets in one pass over the SORTED keys:
-// offsets[q] = lower_bound(keys, q << 16) = count of records whose
-// quotient is < q. Empty quotients collapse for free; no histogram
-// atomics, no boundary marking, no reverse-min repair, no scan.
-__global__ void quotient_lower_bound_kernel(const std::uint32_t *sorted_keys,
-                                            std::uint32_t count,
-                                            std::uint32_t *offsets) {
+__global__ void publish_and_release_kernel(
+    Row *arena, Descriptor *descriptors,
+    std::uint32_t *local_free_heads,
+    std::uint32_t level_limit) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
+  if (q >= kQuotients) return;
+  Descriptor *plan{};
+  std::uint32_t plan_level{};
+  if (!find_planned_descriptor(
+          descriptors, q, plan, plan_level, level_limit)) return;
+  for (std::uint32_t level = 0u; level < plan_level; ++level) {
+    Descriptor &old = descriptors[descriptor_index(q, level)];
+    release_extent(arena, local_free_heads, q, old.offset(), old.size_class());
+    old = {};
+  }
+  plan->publish();
+}
+
+__device__ __forceinline__ std::uint32_t lower_bound_rows(
+    const Row *rows, std::uint32_t count, std::uint32_t key) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (rows[mid].key < key) lo = mid + 1u;
+    else hi = mid;
+  }
+  return lo;
+}
+
+__device__ __forceinline__ std::uint32_t upper_bound_rows(
+    const Row *rows, std::uint32_t count, std::uint32_t key) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (rows[mid].key <= key) lo = mid + 1u;
+    else hi = mid;
+  }
+  return lo;
+}
+
+__device__ __forceinline__ std::uint32_t lower_bound_keys(
+    const std::uint16_t *keys, std::uint32_t count, std::uint32_t key) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (keys[mid] < key) lo = mid + 1u;
+    else hi = mid;
+  }
+  return lo;
+}
+
+__device__ __forceinline__ std::uint32_t upper_bound_keys(
+    const std::uint16_t *keys, std::uint32_t count, std::uint32_t key) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (keys[mid] <= key) lo = mid + 1u;
+    else hi = mid;
+  }
+  return lo;
+}
+
+struct SumRowsAggregate {
+  using State = unsigned long long;
+  __device__ static State identity() { return 0ull; }
+  __device__ static State consume(State state, const Row &row) {
+    return state + row.value;
+  }
+  __device__ State operator()(State a, State b) const { return a + b; }
+};
+
+__global__ void count_range_fragments_kernel(
+    const std::uint32_t *low, const std::uint32_t *high,
+    std::uint32_t query_count, std::uint32_t *counts) {
+  const std::uint32_t query = blockIdx.x * blockDim.x + threadIdx.x;
+  if (query > query_count) return;
+  if (query == query_count) {
+    counts[query] = 0u;
     return;
-  if (q == kEpochQuotients) {
+  }
+  const std::uint32_t lo = low[query], hi = high[query];
+  const std::uint32_t count =
+      lo <= hi ? (hi >> 16u) - (lo >> 16u) + 1u : 0u;
+  counts[query] = count;
+}
+
+template <bool SectionOwned>
+__device__ __forceinline__ void emit_range_fragment(
+    std::uint32_t index, std::uint32_t query, std::uint32_t quotient,
+    std::uint32_t low, std::uint32_t high, RangeFragment *fragments,
+    std::uint32_t *section_keys, SectionRangeFragment *section_fragments) {
+  if constexpr (SectionOwned) {
+    const std::uint32_t q_low = quotient << 16u;
+    const std::uint32_t clipped_low = max(low, q_low);
+    const std::uint32_t clipped_high = min(high, q_low | 0xffffu);
+    section_keys[index] = q_low | (clipped_low & 0xffffu);
+    section_fragments[index] = {
+        index, static_cast<std::uint16_t>(clipped_low),
+        static_cast<std::uint16_t>(clipped_high)};
+  } else {
+    fragments[index] = {query, quotient};
+  }
+}
+
+template <bool SectionOwned>
+__global__ void emit_range_fragments_kernel(
+    const std::uint32_t *low, const std::uint32_t *high,
+    const std::uint32_t *offsets, std::uint32_t query_count,
+    RangeFragment *fragments, std::uint32_t *section_keys,
+    SectionRangeFragment *section_fragments) {
+  const std::uint32_t warp =
+      (blockIdx.x * blockDim.x + threadIdx.x) >> 5u;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  if (warp >= query_count || low[warp] > high[warp]) return;
+  const std::uint32_t first = low[warp] >> 16u;
+  const std::uint32_t count = offsets[warp + 1u] - offsets[warp];
+  for (std::uint32_t local = lane; local < count; local += 32u)
+    emit_range_fragment<SectionOwned>(
+        offsets[warp] + local, warp, first + local, low[warp], high[warp],
+        fragments, section_keys, section_fragments);
+}
+
+template <bool SectionOwned>
+__global__ void emit_range_fragments_thread_kernel(
+    const std::uint32_t *low, const std::uint32_t *high,
+    const std::uint32_t *offsets, std::uint32_t query_count,
+    RangeFragment *fragments, std::uint32_t *section_keys,
+    SectionRangeFragment *section_fragments) {
+  const std::uint32_t query =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (query >= query_count || low[query] > high[query]) return;
+  const std::uint32_t first = low[query] >> 16u;
+  const std::uint32_t count = offsets[query + 1u] - offsets[query];
+  for (std::uint32_t local = 0u; local < count; ++local)
+    emit_range_fragment<SectionOwned>(
+        offsets[query] + local, query, first + local, low[query], high[query],
+        fragments, section_keys, section_fragments);
+}
+template <bool SectionOwned>
+__global__ void emit_single_range_fragments_kernel(
+    const std::uint32_t *low, const std::uint32_t *high,
+    const std::uint32_t *offsets, RangeFragment *fragments,
+    std::uint32_t *section_keys,
+    SectionRangeFragment *section_fragments) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t count = offsets[1u];
+  if (index < count) {
+    const std::uint32_t quotient = (low[0u] >> 16u) + index;
+    emit_range_fragment<SectionOwned>(
+        index, 0u, quotient, low[0u], high[0u], fragments, section_keys,
+        section_fragments);
+  }
+}
+
+__global__ void reduce_range_fragment_partials_kernel(
+    const std::uint32_t *offsets, std::uint32_t query_count,
+    const unsigned long long *partials, std::uint32_t *out_sums) {
+  const std::uint32_t warp =
+      (blockIdx.x * blockDim.x + threadIdx.x) >> 5u;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  if (warp >= query_count) return;
+  unsigned long long local = 0ull;
+  for (std::uint32_t index = offsets[warp] + lane;
+       index < offsets[warp + 1u]; index += 32u)
+    local += partials[index];
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    local += __shfl_down_sync(0xffffffffu, local, offset);
+  if (lane == 0u) out_sums[warp] = static_cast<std::uint32_t>(local);
+}
+
+__global__ void reduce_range_fragment_partials_thread_kernel(
+    const std::uint32_t *offsets, std::uint32_t query_count,
+    const unsigned long long *partials, std::uint32_t *out_sums) {
+  const std::uint32_t query =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (query >= query_count) return;
+  unsigned long long local = 0ull;
+  for (std::uint32_t index = offsets[query];
+       index < offsets[query + 1u]; ++index)
+    local += partials[index];
+  out_sums[query] = static_cast<std::uint32_t>(local);
+}
+__global__ void reduce_single_range_partials_stage1_kernel(
+    const unsigned long long *partials,
+    const std::uint32_t *device_fragment_count,
+    unsigned long long *block_partials) {
+  __shared__ unsigned long long values[256];
+  unsigned long long local = 0ull;
+  const std::uint32_t count = *device_fragment_count;
+  for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < count; index += gridDim.x * blockDim.x)
+    local += partials[index];
+  values[threadIdx.x] = local;
+  __syncthreads();
+  for (std::uint32_t stride = 128u; stride; stride >>= 1u) {
+    if (threadIdx.x < stride)
+      values[threadIdx.x] += values[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u) block_partials[blockIdx.x] = values[0u];
+}
+
+__global__ void reduce_single_range_partials_stage2_kernel(
+    const unsigned long long *block_partials, std::uint32_t *out_sum) {
+  __shared__ unsigned long long values[256];
+  values[threadIdx.x] = block_partials[threadIdx.x];
+  __syncthreads();
+  for (std::uint32_t stride = 128u; stride; stride >>= 1u) {
+    if (threadIdx.x < stride)
+      values[threadIdx.x] += values[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u)
+    out_sum[0u] = static_cast<std::uint32_t>(values[0u]);
+}
+
+__device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
+    std::uint32_t q, std::uint32_t low, std::uint32_t high,
+    const RawAssignment *raw, const std::uint32_t *raw_offsets,
+    std::uint32_t batch_stride, std::uint32_t pending_batches,
+    const Row *arena, const Descriptor *descriptors,
+    const std::uint16_t *base_keys, const std::uint32_t *base_values,
+    const std::uint32_t *base_offsets,
+    std::uint32_t active_levels) {
+  constexpr unsigned mask = 0xffffffffu;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t low_suffix = key_suffix(low);
+  const std::uint32_t high_suffix = key_suffix(high);
+  unsigned long long local = 0ull;
+
+  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+    const std::uint32_t section_begin = raw_offsets[oi];
+    const std::uint32_t section_end = raw_offsets[oi + 1u];
+    const RawAssignment *rows = raw + batch * batch_stride;
+    for (std::uint32_t index = section_begin + lane; index < section_end;
+         index += 32u) {
+      const RawAssignment item = rows[index];
+      if (item.row.key < low_suffix || item.row.key > high_suffix) continue;
+      bool covered = false;
+      for (std::uint32_t other_batch = 0u;
+           other_batch < pending_batches && !covered; ++other_batch) {
+        const std::size_t noi =
+            std::size_t{other_batch} * (kQuotients + 1u) + q;
+        const std::uint32_t nb = raw_offsets[noi], ne = raw_offsets[noi + 1u];
+        const RawAssignment *other_rows = raw + other_batch * batch_stride;
+        for (std::uint32_t other = nb; other < ne; ++other) {
+          const RawAssignment candidate = other_rows[other];
+          if (candidate.row.key == item.row.key &&
+              candidate.logical_position > item.logical_position) {
+            covered = true;
+            break;
+          }
+        }
+      }
+      if (!covered && (item.row.flags & kTombstone) == 0u)
+        local += item.row.value;
+    }
+  }
+
+  for (std::uint32_t level = 0u; level < active_levels; ++level) {
+    const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+    const Row *rows = arena + descriptor.offset();
+    const std::uint32_t begin =
+        lower_bound_rows(rows, descriptor.count(), low_suffix);
+    const std::uint32_t end = high == kInvalid
+        ? descriptor.count()
+        : upper_bound_rows(rows, descriptor.count(), high_suffix);
+    for (std::uint32_t index = begin + lane; index < end; index += 32u) {
+      const Row item = rows[index];
+      bool covered = false;
+      for (std::uint32_t batch = 0u;
+           batch < pending_batches && !covered; ++batch) {
+        const std::size_t oi =
+            std::size_t{batch} * (kQuotients + 1u) + q;
+        const std::uint32_t rb = raw_offsets[oi], re = raw_offsets[oi + 1u];
+        const RawAssignment *pending_rows = raw + batch * batch_stride;
+        for (std::uint32_t position = rb; position < re; ++position)
+          if (pending_rows[position].row.key == item.key) {
+            covered = true;
+            break;
+          }
+      }
+      for (std::uint32_t newer = 0u; newer < level && !covered; ++newer) {
+        const Descriptor newer_descriptor =
+            descriptors[descriptor_index(q, newer)];
+        const Row *newer_rows = arena + newer_descriptor.offset();
+        const std::uint32_t position =
+            lower_bound_rows(newer_rows, newer_descriptor.count(), item.key);
+        covered = position < newer_descriptor.count() &&
+            newer_rows[position].key == item.key;
+      }
+      if (!covered && (item.flags & kTombstone) == 0u) local += item.value;
+    }
+  }
+
+  const std::uint32_t section_begin = base_offsets[q];
+  const std::uint32_t section_end = base_offsets[q + 1u];
+  const std::uint32_t begin = section_begin +
+      lower_bound_keys(base_keys + section_begin,
+                       section_end - section_begin, low_suffix);
+  const std::uint32_t end = high == kInvalid
+      ? section_end
+      : section_begin + upper_bound_keys(base_keys + section_begin,
+                                         section_end - section_begin,
+                                         high_suffix);
+  for (std::uint32_t index = begin + lane; index < end; index += 32u) {
+    const std::uint32_t key = base_keys[index];
+    const std::uint32_t suffix = key_suffix(key);
+    bool covered = false;
+    for (std::uint32_t batch = 0u;
+         batch < pending_batches && !covered; ++batch) {
+      const std::size_t oi =
+          std::size_t{batch} * (kQuotients + 1u) + q;
+      const std::uint32_t rb = raw_offsets[oi], re = raw_offsets[oi + 1u];
+      const RawAssignment *pending_rows = raw + batch * batch_stride;
+      for (std::uint32_t position = rb; position < re; ++position)
+        if (pending_rows[position].row.key == suffix) {
+          covered = true;
+          break;
+        }
+    }
+    for (std::uint32_t level = 0u;
+         level < active_levels && !covered; ++level) {
+      const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+      const Row *rows = arena + descriptor.offset();
+      const std::uint32_t position =
+          lower_bound_rows(rows, descriptor.count(), suffix);
+      covered = position < descriptor.count() &&
+          rows[position].key == suffix;
+    }
+    if (!covered) local += base_values[index];
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    local += __shfl_down_sync(mask, local, offset);
+  return __shfl_sync(mask, local, 0u);
+}
+
+__global__ void find_section_fragment_offsets_kernel(
+    const std::uint32_t *sorted_sections, std::uint32_t count,
+    std::uint32_t *offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients) return;
+  if (q == kQuotients) {
     offsets[q] = count;
     return;
   }
-  const std::uint32_t target = q << kEpochQuotientBits;
   std::uint32_t lo = 0u, hi = count;
   while (lo < hi) {
-    const std::uint32_t mid = lo + ((hi - lo) >> 1);
-    if (sorted_keys[mid] < target)
-      lo = mid + 1u;
-    else
-      hi = mid;
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    const std::uint32_t section = sorted_sections[mid] >> 16u;
+    if (section < q) lo = mid + 1u;
+    else hi = mid;
   }
   offsets[q] = lo;
 }
 
-// Flat directory boundary: rank23[key>>9] = first position.
-__global__ void base_rank23_boundary_kernel(const std::uint32_t *keys,
-                                            std::uint32_t count,
-                                            std::uint32_t *rank23) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  if (i == 0u)
-    rank23[kBaseRank23Size] = count;
-  const std::uint32_t bin = keys[i] >> kBaseRank23Shift;
-  const std::uint32_t prev =
-      i == 0u ? bin : keys[i - 1u] >> kBaseRank23Shift;
-  if (i == 0u || bin != prev)
-    rank23[bin] = i;
-}
-
-__device__ inline std::uint32_t visible_base_lower_rank(
-    const SortedRunView &base, std::uint32_t key) {
-  if (base.count == 0u)
-    return 0u;
-  const std::uint32_t bin = key >> kBaseRank23Shift;
-  const std::uint32_t begin = base.rank23[bin];
-  const std::uint32_t end = base.rank23[bin + 1u];
-  return begin + static_cast<std::uint32_t>(
-      lower_bound_u32(base.keys + begin, end - begin, key));
-}
-
-// Resolve corrections into real visible rows and Base shadow bits. A zero
-// count delta means a newer value for a Base key; a positive delta means a
-// live non-Base key; a negative delta is a tombstone for a Base key.
-__global__ void lqvrf_prepare_rows_kernel(
-    SortedRunView base, const std::uint32_t *correction_keys,
-    const std::uint32_t *correction_values,
-    const std::int8_t *correction_counts, std::uint32_t correction_count,
-    const std::uint8_t *materialized_quotients,
-    std::uint32_t *base_hidden_words, std::uint32_t *candidate_values,
-    std::uint8_t *live_flags, std::uint32_t *has_hidden_base) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= correction_count)
-    return;
-  // DeviceSelect may vector-load rejected inputs before consulting their
-  // flags. Initialize every lane so filtered tombstones and non-materialized
-  // quotients never expose indeterminate bytes to CUB or sanitizers.
-  candidate_values[i] = 0u;
-  live_flags[i] = 0u;
-  const std::uint32_t key = correction_keys[i];
-  if (materialized_quotients[key >> kEpochQuotientBits] == 0u)
-    return;
-  const int count_delta = static_cast<int>(correction_counts[i]);
-  std::uint32_t base_value = 0u;
-  bool base_match = false;
-  std::uint32_t base_position = 0u;
-  if (count_delta <= 0 && base.count != 0u) {
-    std::size_t begin = 0u, end = 0u;
-    sorted_search_bounds(base, key, &begin, &end);
-    const std::size_t position =
-        begin + lower_bound_u32(base.keys + begin, end - begin, key);
-    base_match = position < end && base.keys[position] == key;
-    if (base_match) {
-      base_position = static_cast<std::uint32_t>(position);
-      base_value = base.values[position];
-      atomicOr(base_hidden_words + (base_position >> 5),
-               1u << (base_position & 31u));
-      atomicExch(has_hidden_base, 1u);
-    }
-  }
-
-  const bool live = count_delta > 0 || (count_delta == 0 && base_match);
-  live_flags[i] = live ? 1u : 0u;
-  if (live) {
-    candidate_values[i] = count_delta > 0
-                              ? correction_values[i]
-                              : base_value + correction_values[i];
-  }
-}
-
-// A range batch is converted to a transient quotient-coverage mask with two
-// endpoint atomics per valid query. The scan is structural scheduling state;
-// it contains no values, row counts, or aggregate answers.
-__global__ void lqvrf_mark_coverage_kernel(
-    const std::uint32_t *lo, const std::uint32_t *hi,
-    std::size_t query_count, std::int32_t *cover_delta) {
-  const std::size_t query =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (query >= query_count || lo[query] > hi[query])
-    return;
-  const std::uint32_t first = lo[query] >> kEpochQuotientBits;
-  const std::uint32_t after_last =
-      (hi[query] >> kEpochQuotientBits) + 1u;
-  atomicAdd(cover_delta + first, 1);
-  atomicAdd(cover_delta + after_last, -1);
-}
-
-__global__ void lqvrf_extend_materialized_kernel(
-    const std::int32_t *coverage, const std::uint64_t *latest_sequences,
-    const std::uint64_t *published_sequences,
-    std::uint8_t *materialized_quotients,
-    std::uint32_t *stale_quotient_count) {
+__global__ void summarize_section_fragment_density_kernel(
+    const std::uint32_t *section_offsets,
+    std::uint32_t *maximum_fragments) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kEpochQuotients || coverage[q] <= 0)
-    return;
-  const bool missing = materialized_quotients[q] == 0u;
-  const bool stale = !missing &&
-                     published_sequences[q] < latest_sequences[q];
-  if (!missing && !stale)
-    return;
-  materialized_quotients[q] = 1u;
-  atomicAdd(stale_quotient_count, 1u);
+  if (q >= kQuotients) return;
+  atomicMax(maximum_fragments,
+            section_offsets[q + 1u] - section_offsets[q]);
 }
 
-__global__ void lqvrf_mark_latest_sequences_kernel(
-    const std::uint32_t *new_record_counts, std::uint64_t sequence,
-    std::uint64_t *latest_sequences) {
+__global__ void count_section_range_tasks_kernel(
+    const std::uint32_t *section_offsets, std::uint32_t *task_counts) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q < kEpochQuotients && new_record_counts[q] != 0u)
-    latest_sequences[q] = sequence;
+  if (q > kQuotients) return;
+  if (q == kQuotients) {
+    task_counts[q] = 0u;
+    return;
+  }
+  const std::uint32_t begin = section_offsets[q];
+  const std::uint32_t end = section_offsets[q + 1u];
+  const std::uint32_t count = end - begin;
+  task_counts[q] =
+      (count + kSectionTaskFragments - 1u) / kSectionTaskFragments;
 }
 
-__global__ void lqvrf_publish_sequences_kernel(
-    const std::uint8_t *materialized_quotients,
-    const std::uint64_t *latest_sequences,
-    std::uint64_t *published_sequences) {
+__global__ void emit_section_range_tasks_kernel(
+    const std::uint32_t *section_offsets,
+    const std::uint32_t *task_offsets, SectionRangeTask *tasks) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q < kEpochQuotients && materialized_quotients[q] != 0u)
-    published_sequences[q] = latest_sequences[q];
-}
-
-// Selects the physically smaller exact fragment representation.  Sorted16
-// costs six bytes per row. PackedSector8 costs five bytes per row, one
-// eight-byte descriptor per occupied high-8 sector, and one 32-byte occupancy
-// map. Descriptor costs common to both choices cancel out.
-__global__ void lqvrf_classify_fragments_kernel(
-    const std::uint32_t *keys, const std::uint32_t *quotient_offsets,
-    std::uint8_t *formats, std::uint32_t *sorted_counts,
-    std::uint32_t *packed_counts, std::uint32_t *sector_counts,
-    std::uint32_t *packed_quotient_counts,
-    std::uint32_t *active_counts) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
-    return;
-  if (q == kEpochQuotients) {
-    sorted_counts[q] = 0u;
-    packed_counts[q] = 0u;
-    sector_counts[q] = 0u;
-    packed_quotient_counts[q] = 0u;
-    active_counts[q] = 0u;
-    return;
-  }
-  const std::uint32_t begin = quotient_offsets[q];
-  const std::uint32_t end = quotient_offsets[q + 1u];
-  const std::uint32_t rows = end - begin;
-  if (rows == 0u) {
-    formats[q] = static_cast<std::uint8_t>(LqvrfFragmentFormat::Empty);
-    sorted_counts[q] = packed_counts[q] = sector_counts[q] = 0u;
-    packed_quotient_counts[q] = active_counts[q] = 0u;
-    return;
-  }
-
-  std::uint32_t sectors = 0u;
-  std::uint32_t previous = kLqvrfSectorsPerQuotient;
-  for (std::uint32_t i = begin; i < end; ++i) {
-    const std::uint32_t high = (keys[i] >> kLqvrfSectorBits) & 0xffu;
-    if (high != previous) {
-      ++sectors;
-      previous = high;
-    }
-  }
-  const std::uint64_t sorted_bytes = std::uint64_t{6} * rows;
-  const std::uint64_t packed_bytes =
-      std::uint64_t{5} * rows +
-      sizeof(LqvrfSectorDescriptor) * std::uint64_t{sectors} +
-      sizeof(std::uint32_t) * std::uint64_t{kLqvrfOccupancyWords};
-  const bool packed = packed_bytes < sorted_bytes;
-  formats[q] = static_cast<std::uint8_t>(
-      packed ? LqvrfFragmentFormat::PackedSector8
-             : LqvrfFragmentFormat::Sorted16);
-  sorted_counts[q] = packed ? 0u : rows;
-  packed_counts[q] = packed ? rows : 0u;
-  sector_counts[q] = packed ? sectors : 0u;
-  packed_quotient_counts[q] = packed ? 1u : 0u;
-  active_counts[q] = 1u;
-}
-
-__global__ void lqvrf_init_fragments_kernel(
-    const std::uint32_t *quotient_offsets, const std::uint8_t *formats,
-    const std::uint32_t *sorted_offsets,
-    const std::uint32_t *packed_offsets,
-    const std::uint32_t *sector_offsets,
-    const std::uint32_t *packed_quotient_offsets,
-    const std::uint32_t *active_offsets,
-    LqvrfFragmentDescriptor *fragments,
-    std::uint16_t *active_quotients) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kEpochQuotients)
-    return;
-  const std::uint32_t rows =
-      quotient_offsets[q + 1u] - quotient_offsets[q];
-  const std::uint8_t format = formats[q];
-  LqvrfFragmentDescriptor descriptor{};
-  descriptor.row_count = rows;
-  descriptor.format = format;
-  descriptor.sector_begin = kLqvrfNoPoolOffset;
-  descriptor.occupancy_begin = kLqvrfNoPoolOffset;
-  if (format == static_cast<std::uint8_t>(
-                    LqvrfFragmentFormat::Sorted16)) {
-    descriptor.row_begin = sorted_offsets[q];
-  } else if (format == static_cast<std::uint8_t>(
-                           LqvrfFragmentFormat::PackedSector8)) {
-    descriptor.row_begin = packed_offsets[q];
-    descriptor.sector_begin = sector_offsets[q];
-    descriptor.sector_count = static_cast<std::uint16_t>(
-        sector_offsets[q + 1u] - sector_offsets[q]);
-    descriptor.occupancy_begin =
-        packed_quotient_offsets[q] * kLqvrfOccupancyWords;
-  }
-  fragments[q] = descriptor;
-  if (rows != 0u)
-    active_quotients[active_offsets[q]] = static_cast<std::uint16_t>(q);
-}
-
-__global__ void lqvrf_pack_rows_kernel(
-    const std::uint32_t *keys, const std::uint32_t *values,
-    const std::uint32_t *quotient_offsets,
-    const std::uint16_t *active_quotients,
-    const LqvrfFragmentDescriptor *fragments,
-    std::uint16_t *sorted_low16, std::uint32_t *sorted_values,
-    std::uint8_t *packed_low8, std::uint32_t *packed_values,
-    std::uint32_t *packed_occupancy) {
-  const std::uint32_t q = active_quotients[blockIdx.x];
-  const LqvrfFragmentDescriptor descriptor = fragments[q];
-  const std::uint32_t input = quotient_offsets[q];
-  for (std::uint32_t local = threadIdx.x; local < descriptor.row_count;
-       local += blockDim.x) {
-    const std::uint32_t key = keys[input + local];
-    const std::uint32_t output = descriptor.row_begin + local;
-    if (descriptor.format == static_cast<std::uint8_t>(
-                                 LqvrfFragmentFormat::Sorted16)) {
-      sorted_low16[output] = static_cast<std::uint16_t>(key);
-      sorted_values[output] = values[input + local];
-    } else {
-      packed_low8[output] = static_cast<std::uint8_t>(key);
-      packed_values[output] = values[input + local];
-      const std::uint32_t high = (key >> kLqvrfSectorBits) & 0xffu;
-      atomicOr(packed_occupancy + descriptor.occupancy_begin + (high >> 5),
-               1u << (high & 31u));
-    }
+  if (q >= kQuotients) return;
+  const std::uint32_t begin = section_offsets[q];
+  const std::uint32_t end = section_offsets[q + 1u];
+  const std::uint32_t local_tasks = task_offsets[q + 1u] - task_offsets[q];
+  const std::uint32_t task_base = task_offsets[q];
+  for (std::uint32_t tile = 0u; tile < local_tasks; ++tile) {
+    const std::uint32_t tile_begin =
+        begin + tile * kSectionTaskFragments;
+    tasks[task_base + tile] =
+        {q, tile_begin, min(tile_begin + kSectionTaskFragments, end)};
   }
 }
 
-__device__ inline std::uint32_t lqvrf_sector_rank(
-    const std::uint32_t *occupancy, std::uint32_t high) {
-  std::uint32_t rank = 0u;
-  const std::uint32_t word = high >> 5;
-  for (std::uint32_t i = 0u; i < word; ++i)
-    rank += static_cast<std::uint32_t>(__popc(occupancy[i]));
-  const std::uint32_t bit = high & 31u;
-  const std::uint32_t before =
-      bit == 0u ? 0u : occupancy[word] & ((1u << bit) - 1u);
-  return rank + static_cast<std::uint32_t>(__popc(before));
-}
+template <class Aggregate, bool HasPending, bool Tiled>
+__global__ void cooperative_section_owned_range_kernel(
+    const SectionRangeFragment *fragments,
+    const std::uint32_t *section_offsets, const SectionRangeTask *tasks,
+    const std::uint32_t *task_count,
+    const std::uint16_t *base_keys, const std::uint32_t *base_values,
+    const std::uint32_t *base_offsets, const Row *arena,
+    const Descriptor *descriptors, const RawAssignment *raw,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, std::uint32_t active_levels,
+    typename Aggregate::State *aggregate_partials) {
+  constexpr std::uint32_t kCapacity = 512u;
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  union Workspace {
+    Row merged[kCapacity];
+    TaggedRow tagged[kCapacity];
+    uint2 base_rows[kWarpsPerBlock][128u];
+  };
+  __shared__ Row current[kCapacity];
+  __shared__ Workspace workspace;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  constexpr std::uint32_t kFragmentBaseMaskRows = 2048u;
+  constexpr std::uint32_t kFragmentBaseMaskWords =
+      kFragmentBaseMaskRows / 32u;
+  constexpr std::uint32_t kSectionBaseMaskRows = 16384u;
+  constexpr std::uint32_t kSectionBaseMaskWords =
+      kSectionBaseMaskRows / 32u;
+  union BaseMaskWorkspace {
+    std::uint32_t section[kSectionBaseMaskWords];
+    std::uint32_t fragments[kWarpsPerBlock][kFragmentBaseMaskWords];
+  };
+  __shared__ BaseMaskWorkspace base_mask_workspace;
+  __shared__ std::uint32_t current_count_shared;
+  __shared__ std::uint32_t pending_count_shared;
+  __shared__ std::uint32_t overflow_shared;
+  __shared__ std::uint32_t next_fragment_shared;
+  __shared__ std::uint32_t dynamic_queue_shared;
+  __shared__ std::uint32_t section_base_mask_valid_shared;
+  __shared__ std::uint32_t quotient_shared;
+  __shared__ std::uint32_t fragment_begin_shared;
+  __shared__ std::uint32_t fragment_end_shared;
+  __shared__ std::uint32_t task_valid_shared;
+  __shared__ std::uint32_t base_section_begin_shared;
+  __shared__ std::uint32_t base_section_count_shared;
+  __shared__ Descriptor section_descriptors[kMaximumLevels];
 
-__global__ void lqvrf_pack_sectors_kernel(
-    const std::uint32_t *keys, const std::uint32_t *quotient_offsets,
-    const std::uint16_t *active_quotients,
-    const LqvrfFragmentDescriptor *fragments,
-    const std::uint32_t *packed_occupancy,
-    LqvrfSectorDescriptor *sectors) {
-  const std::uint32_t q = active_quotients[blockIdx.x];
-  const LqvrfFragmentDescriptor descriptor = fragments[q];
-  if (descriptor.format != static_cast<std::uint8_t>(
-                               LqvrfFragmentFormat::PackedSector8))
-    return;
-  const std::uint32_t high = threadIdx.x;
-  if (high >= kLqvrfSectorsPerQuotient)
-    return;
-  const std::uint32_t *occupancy =
-      packed_occupancy + descriptor.occupancy_begin;
-  if ((occupancy[high >> 5] & (1u << (high & 31u))) == 0u)
-    return;
-  const std::uint32_t input = quotient_offsets[q];
-  const std::uint32_t rows = descriptor.row_count;
-  const std::uint32_t first_key =
-      (q << kEpochQuotientBits) | (high << kLqvrfSectorBits);
-  const std::uint32_t local_begin = static_cast<std::uint32_t>(
-      lower_bound_u32(keys + input, rows, first_key));
-  const std::uint32_t local_end =
-      high + 1u == kLqvrfSectorsPerQuotient
-          ? rows
-          : static_cast<std::uint32_t>(lower_bound_u32(
-                keys + input, rows,
-                (q << kEpochQuotientBits) |
-                    ((high + 1u) << kLqvrfSectorBits)));
-  const std::uint32_t rank = lqvrf_sector_rank(occupancy, high);
-  sectors[descriptor.sector_begin + rank] =
-      {descriptor.row_begin + local_begin,
-       static_cast<std::uint16_t>(local_end - local_begin),
-       static_cast<std::uint8_t>(high), 0u};
-}
-
-__device__ inline std::uint32_t lqvrf_lower_sector(
-    const LqvrfSectorDescriptor *sectors, std::uint32_t count,
-    std::uint32_t high) {
-  std::uint32_t first = 0u;
-  while (count > 0u) {
-    const std::uint32_t step = count >> 1;
-    const std::uint32_t mid = first + step;
-    if (sectors[mid].high8 < high) {
-      first = mid + 1u;
-      count -= step + 1u;
-    } else {
-      count = step;
-    }
-  }
-  return first;
-}
-
-// Base-only is kept as a separate fast path: it pays no range-sidecar branch
-// or bitmap read and therefore preserves immutable-build range performance.
-__global__ void base_range_scan_sum_kernel(
-    SortedRunView base, const std::uint32_t *lo, const std::uint32_t *hi,
-    std::size_t query_count, std::uint32_t *out_sums) {
-  const std::size_t query =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const bool pending = query < query_count;
-
-  std::uint32_t base_begin = static_cast<std::uint32_t>(base.count);
-  std::uint32_t upper_key = 0u;
-  if (pending && lo[query] <= hi[query]) {
-    base_begin = visible_base_lower_rank(base, lo[query]);
-    upper_key = hi[query];
-  }
-
-  constexpr std::uint32_t full_warp = 0xffffffffu;
-  std::uint32_t work = __ballot_sync(full_warp, pending);
-  while (work != 0u) {
-    const std::uint32_t owner =
-        static_cast<std::uint32_t>(__ffs(static_cast<int>(work)) - 1);
-    const std::uint32_t first_base =
-        __shfl_sync(full_warp, base_begin, owner);
-    const std::uint32_t upper =
-        __shfl_sync(full_warp, upper_key, owner);
-
-    std::uint32_t sum = 0u;
-    for (std::uint32_t i = first_base + lane;; i += 32u) {
-      const bool valid = i < base.count;
-      const std::uint32_t key = valid ? base.keys[i] : 0u;
-      const bool over = !valid || key > upper;
-      if (!over)
-        sum += base.values[i];
-      if (__any_sync(full_warp, over))
-        break;
-    }
-    for (std::uint32_t offset = 16u; offset != 0u; offset >>= 1u)
-      sum += __shfl_down_sync(full_warp, sum, offset);
-    sum = __shfl_sync(full_warp, sum, 0u);
-
-    if (lane == owner)
-      out_sums[query] = sum;
-    work &= ~(std::uint32_t{1} << owner);
-  }
-}
-
-// One cooperative row traversal per query. It reads the visible Base rows and
-// the actual overlay rows. The only reduction is the query's transient warp
-// reduction; no maintained aggregate or value prefix participates.
-__global__ void lqvrf_range_sum_kernel(
-    LqvrfView view, const std::uint32_t *lo, const std::uint32_t *hi,
-    std::size_t query_count, std::uint32_t *out_sums) {
-  const std::size_t query =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const bool pending = query < query_count;
-
-  std::uint32_t base_begin = static_cast<std::uint32_t>(view.base.count);
-  std::uint32_t active_begin = view.active_quotient_count;
-  std::uint32_t active_end = view.active_quotient_count;
-  std::uint32_t lower_key = 0u;
-  std::uint32_t upper_key = 0u;
-  if (pending && lo[query] <= hi[query]) {
-    lower_key = lo[query];
-    upper_key = hi[query];
-    base_begin = visible_base_lower_rank(view.base, lower_key);
-    const std::uint16_t qlo =
-        static_cast<std::uint16_t>(lower_key >> kEpochQuotientBits);
-    const std::uint32_t qhi = upper_key >> kEpochQuotientBits;
-    active_begin = static_cast<std::uint32_t>(lower_bound_u16(
-        view.active_quotients, view.active_quotient_count, qlo));
-    active_end = qhi == 0xffffu
-                     ? view.active_quotient_count
-                     : static_cast<std::uint32_t>(lower_bound_u16(
-                           view.active_quotients,
-                           view.active_quotient_count,
-                           static_cast<std::uint16_t>(qhi + 1u)));
-  }
-
-  constexpr std::uint32_t full_warp = 0xffffffffu;
-  std::uint32_t work = __ballot_sync(full_warp, pending);
-  while (work != 0u) {
-    const std::uint32_t owner =
-        static_cast<std::uint32_t>(__ffs(static_cast<int>(work)) - 1);
-    const std::uint32_t first_base =
-        __shfl_sync(full_warp, base_begin, owner);
-    const std::uint32_t first_fragment =
-        __shfl_sync(full_warp, active_begin, owner);
-    const std::uint32_t last_fragment =
-        __shfl_sync(full_warp, active_end, owner);
-    const std::uint32_t lower =
-        __shfl_sync(full_warp, lower_key, owner);
-    const std::uint32_t upper =
-        __shfl_sync(full_warp, upper_key, owner);
-
-    std::uint32_t sum = 0u;
-    for (std::uint32_t i = first_base + lane;; i += 32u) {
-      const bool valid = i < view.base.count;
-      const std::uint32_t key = valid ? view.base.keys[i] : 0u;
-      const bool over = !valid || key > upper;
-      if (!over) {
-        const bool hidden =
-            view.has_hidden_base != 0u &&
-            (view.base_hidden_words[i >> 5] & (1u << (i & 31u))) != 0u;
-        if (!hidden)
-          sum += view.base.values[i];
-      }
-      if (__any_sync(full_warp, over))
-        break;
-    }
-
-    const std::uint32_t qlo = lower >> kEpochQuotientBits;
-    const std::uint32_t qhi = upper >> kEpochQuotientBits;
-    for (std::uint32_t fragment = first_fragment;
-         fragment < last_fragment; ++fragment) {
-      const std::uint32_t q = view.active_quotients[fragment];
-      const LqvrfFragmentDescriptor descriptor = view.fragments[q];
-      const std::uint16_t low = static_cast<std::uint16_t>(
-          q == qlo ? lower : 0u);
-      const std::uint16_t high = static_cast<std::uint16_t>(
-          q == qhi ? upper : 0xffffu);
-      if (descriptor.format == static_cast<std::uint8_t>(
-                                   LqvrfFragmentFormat::Sorted16)) {
-        const std::uint32_t begin = descriptor.row_begin;
-        const std::uint32_t first =
-            low == 0u
-                ? begin
-                : begin + static_cast<std::uint32_t>(lower_bound_u16(
-                              view.sorted_low16 + begin,
-                              descriptor.row_count, low));
-        const std::uint32_t end = begin + descriptor.row_count;
-        for (std::uint32_t i = first + lane;; i += 32u) {
-          const bool valid = i < end;
-          const std::uint16_t key = valid ? view.sorted_low16[i] : 0u;
-          const bool over = !valid || key > high;
-          if (!over)
-            sum += view.sorted_values[i];
-          if (__any_sync(full_warp, over))
-            break;
-        }
+  if (threadIdx.x == 0u) {
+    task_valid_shared = 1u;
+    if constexpr (Tiled) {
+      const std::uint32_t task_index = blockIdx.x;
+      if (task_index >= *task_count) {
+        task_valid_shared = 0u;
       } else {
-        const LqvrfSectorDescriptor *sector_base =
-            view.sectors + descriptor.sector_begin;
-        const std::uint32_t low_sector = low >> kLqvrfSectorBits;
-        const std::uint32_t high_sector = high >> kLqvrfSectorBits;
-        const std::uint32_t sector_first = lqvrf_lower_sector(
-            sector_base, descriptor.sector_count, low_sector);
-        const std::uint32_t sector_last =
-            high_sector == 0xffu
-                ? descriptor.sector_count
-                : lqvrf_lower_sector(sector_base, descriptor.sector_count,
-                                      high_sector + 1u);
-        for (std::uint32_t sector = sector_first; sector < sector_last;
-             ++sector) {
-          const LqvrfSectorDescriptor item = sector_base[sector];
-          const std::uint8_t low8 =
-              item.high8 == low_sector ? static_cast<std::uint8_t>(low) : 0u;
-          const std::uint8_t high8 =
-              item.high8 == high_sector ? static_cast<std::uint8_t>(high)
-                                        : 0xffu;
-          const std::uint32_t first =
-              low8 == 0u
-                  ? item.row_begin
-                  : item.row_begin + static_cast<std::uint32_t>(
-                        lower_bound_u8(view.packed_low8 + item.row_begin,
-                                       item.row_count, low8));
-          const std::uint32_t end = item.row_begin + item.row_count;
-          for (std::uint32_t i = first + lane;; i += 32u) {
-            const bool valid = i < end;
-            const std::uint8_t key = valid ? view.packed_low8[i] : 0u;
-            const bool over = !valid || key > high8;
-            if (!over)
-              sum += view.packed_values[i];
-            if (__any_sync(full_warp, over))
-              break;
+        const SectionRangeTask task = tasks[task_index];
+        quotient_shared = task.quotient;
+        fragment_begin_shared = task.begin;
+        fragment_end_shared = task.end;
+      }
+    } else {
+      quotient_shared = blockIdx.x;
+      fragment_begin_shared = section_offsets[blockIdx.x];
+      fragment_end_shared = section_offsets[blockIdx.x + 1u];
+      task_valid_shared =
+          fragment_begin_shared != fragment_end_shared;
+    }
+  }
+  __syncthreads();
+  if (!task_valid_shared) return;
+  const std::uint32_t q = quotient_shared;
+  const std::uint32_t fragment_begin = fragment_begin_shared;
+  const std::uint32_t fragment_end = fragment_end_shared;
+  if (threadIdx.x < active_levels)
+    section_descriptors[threadIdx.x] =
+        descriptors[descriptor_index(q, threadIdx.x)];
+  if (threadIdx.x == 0u) {
+    base_section_begin_shared = base_offsets[q];
+    base_section_count_shared =
+        base_offsets[q + 1u] - base_section_begin_shared;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0u) {
+    std::uint32_t physical = 0u;
+    pending_count_shared = 0u;
+    if constexpr (HasPending) {
+      for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+        const std::size_t oi =
+            std::size_t{batch} * (kQuotients + 1u) + q;
+        pending_count_shared += raw_offsets[oi + 1u] - raw_offsets[oi];
+      }
+      physical += pending_count_shared;
+    }
+    for (std::uint32_t level = 0u; level < active_levels; ++level)
+      physical += section_descriptors[level].count();
+    overflow_shared = physical > kCapacity;
+    current_count_shared = 0u;
+  }
+  __syncthreads();
+
+  if (!overflow_shared && pending_count_shared) {
+    const std::uint32_t pending_count = pending_count_shared;
+    if (pending_count <= 32u) {
+      if (threadIdx.x < 32u) {
+        const std::uint32_t lane = threadIdx.x;
+        TaggedRow item{{0u, 0u, 0u}, kInvalid};
+        if (lane < pending_count) {
+          const RawAssignment loaded = load_pending_raw_ordinal(
+              raw, raw_offsets, batch_stride, pending_batches, q, lane);
+          item = {loaded.row, loaded.logical_position};
+        }
+        constexpr unsigned full_mask = 0xffffffffu;
+        for (std::uint32_t width = 2u; width <= 32u; width <<= 1u) {
+          for (std::uint32_t stride = width >> 1u; stride; stride >>= 1u) {
+            TaggedRow other{};
+            other.row.key = __shfl_xor_sync(full_mask, item.row.key, stride);
+            other.row.value =
+                __shfl_xor_sync(full_mask, item.row.value, stride);
+            other.row.flags =
+                __shfl_xor_sync(full_mask, item.row.flags, stride);
+            other.age = __shfl_xor_sync(full_mask, item.age, stride);
+            const bool ascending = (lane & width) == 0u;
+            const bool take_min = ((lane & stride) == 0u) == ascending;
+            if ((take_min && tagged_less(other, item)) ||
+                (!take_min && tagged_less(item, other)))
+              item = other;
+          }
+        }
+        const std::uint32_t next_key =
+            __shfl_down_sync(full_mask, item.row.key, 1u);
+        const std::uint32_t next_age =
+            __shfl_down_sync(full_mask, item.age, 1u);
+        const bool winner = item.age != kInvalid &&
+            (lane == 31u || next_age == kInvalid ||
+             item.row.key != next_key);
+        const unsigned winners = __ballot_sync(full_mask, winner);
+        if (winner) {
+          const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+          current[__popc(winners & before)] = item.row;
+        }
+        if (lane == 0u) current_count_shared = __popc(winners);
+      }
+      __syncthreads();
+    } else {
+      const std::uint32_t sort_size = 1u << size_class_for(pending_count);
+      for (std::uint32_t ordinal = threadIdx.x; ordinal < sort_size;
+           ordinal += blockDim.x) {
+        if (ordinal < pending_count) {
+          const RawAssignment loaded = load_pending_raw_ordinal(
+              raw, raw_offsets, batch_stride, pending_batches, q, ordinal);
+          workspace.tagged[ordinal] =
+              {loaded.row, loaded.logical_position};
+        } else {
+          workspace.tagged[ordinal] = {{0u, 0u, 0u}, kInvalid};
+        }
+      }
+      __syncthreads();
+      for (std::uint32_t width = 2u; width <= sort_size; width <<= 1u) {
+        for (std::uint32_t stride = width >> 1u; stride; stride >>= 1u) {
+          for (std::uint32_t index = threadIdx.x; index < sort_size;
+               index += blockDim.x) {
+            const std::uint32_t other_index = index ^ stride;
+            if (other_index > index) {
+              const TaggedRow x = workspace.tagged[index];
+              const TaggedRow y = workspace.tagged[other_index];
+              const bool ascending = (index & width) == 0u;
+              const bool swap = ascending ? tagged_less(y, x)
+                                          : tagged_less(x, y);
+              if (swap) {
+                workspace.tagged[index] = y;
+                workspace.tagged[other_index] = x;
+              }
+            }
+          }
+          __syncthreads();
+        }
+      }
+      const std::uint32_t chunk_begin = threadIdx.x * 2u;
+      std::uint32_t local_winners = 0u;
+      bool winner[2]{};
+#pragma unroll
+      for (std::uint32_t item = 0u; item < 2u; ++item) {
+        const std::uint32_t index = chunk_begin + item;
+        winner[item] = index < sort_size &&
+            workspace.tagged[index].age != kInvalid &&
+            (index + 1u == sort_size ||
+             workspace.tagged[index + 1u].age == kInvalid ||
+             workspace.tagged[index].row.key !=
+                 workspace.tagged[index + 1u].row.key);
+        local_winners += winner[item];
+      }
+      std::uint32_t thread_base{}, winner_count{};
+      BlockScan(scan_storage).ExclusiveSum(local_winners, thread_base,
+                                            winner_count);
+      std::uint32_t local_rank = 0u;
+#pragma unroll
+      for (std::uint32_t item = 0u; item < 2u; ++item)
+        if (winner[item])
+          current[thread_base + local_rank++] =
+              workspace.tagged[chunk_begin + item].row;
+      __syncthreads();
+      if (threadIdx.x == 0u) current_count_shared = winner_count;
+      __syncthreads();
+    }
+  }
+
+  if (!overflow_shared) {
+    for (std::uint32_t level = 0u; level < active_levels; ++level) {
+      const Descriptor descriptor = section_descriptors[level];
+      const std::uint32_t source_count = descriptor.count();
+      if (!source_count) continue;
+      const Row *source = arena + descriptor.offset();
+      const std::uint32_t current_count = current_count_shared;
+      if (!current_count) {
+        for (std::uint32_t index = threadIdx.x; index < source_count;
+             index += blockDim.x)
+          current[index] = source[index];
+        __syncthreads();
+        if (threadIdx.x == 0u) current_count_shared = source_count;
+        __syncthreads();
+        continue;
+      }
+
+      const std::uint32_t merged_count = current_count + source_count;
+      const std::uint32_t tile =
+          (merged_count + blockDim.x - 1u) / blockDim.x;
+      const std::uint32_t diagonal =
+          min(threadIdx.x * tile, merged_count);
+      std::uint32_t partition_low =
+          diagonal > current_count ? diagonal - current_count : 0u;
+      std::uint32_t partition_high = min(diagonal, source_count);
+      while (partition_low < partition_high) {
+        const std::uint32_t source_index =
+            (partition_low + partition_high) >> 1u;
+        const std::uint32_t current_index = diagonal - source_index;
+        if (source_index < source_count && current_index > 0u &&
+            current[current_index - 1u].key >= source[source_index].key)
+          partition_low = source_index + 1u;
+        else
+          partition_high = source_index;
+      }
+      std::uint32_t source_index = partition_low;
+      std::uint32_t current_index = diagonal - source_index;
+#pragma unroll
+      for (std::uint32_t item = 0u; item < 2u; ++item) {
+        const std::uint32_t output_index = diagonal + item;
+        if (item >= tile || output_index >= merged_count) break;
+        const bool choose_source = source_index < source_count &&
+            (current_index >= current_count ||
+             source[source_index].key <= current[current_index].key);
+        workspace.merged[output_index] = choose_source
+            ? source[source_index++] : current[current_index++];
+      }
+      __syncthreads();
+
+      const std::uint32_t chunk_begin = threadIdx.x * 2u;
+      std::uint32_t local_winners = 0u;
+      bool winner[2]{};
+#pragma unroll
+      for (std::uint32_t item = 0u; item < 2u; ++item) {
+        const std::uint32_t index = chunk_begin + item;
+        winner[item] = index < merged_count &&
+            (index + 1u == merged_count ||
+             workspace.merged[index].key !=
+                 workspace.merged[index + 1u].key);
+        local_winners += winner[item];
+      }
+      std::uint32_t thread_base{}, winner_count{};
+      BlockScan(scan_storage).ExclusiveSum(local_winners, thread_base,
+                                            winner_count);
+      std::uint32_t local_rank = 0u;
+#pragma unroll
+      for (std::uint32_t item = 0u; item < 2u; ++item)
+        if (winner[item])
+          current[thread_base + local_rank++] =
+              workspace.merged[chunk_begin + item];
+      __syncthreads();
+      if (threadIdx.x == 0u) current_count_shared = winner_count;
+      __syncthreads();
+    }
+  }
+
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  constexpr unsigned full_mask = 0xffffffffu;
+  const std::uint32_t current_count = current_count_shared;
+  const std::uint32_t base_section_begin = base_section_begin_shared;
+  const std::uint32_t base_section_count = base_section_count_shared;
+
+  if (!overflow_shared && current_count &&
+      base_section_count <= kSectionBaseMaskRows) {
+    const std::uint32_t words = (base_section_count + 31u) >> 5u;
+    for (std::uint32_t word = threadIdx.x; word < words;
+         word += blockDim.x)
+      base_mask_workspace.section[word] = 0u;
+    __syncthreads();
+    for (std::uint32_t update = threadIdx.x; update < current_count;
+         update += blockDim.x) {
+      const std::uint32_t key = current[update].key;
+      const std::uint32_t position = lower_bound_keys(
+          base_keys + base_section_begin, base_section_count, key);
+      if (position < base_section_count &&
+          base_keys[base_section_begin + position] == key)
+        atomicOr(base_mask_workspace.section + (position >> 5u),
+                 1u << (position & 31u));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) section_base_mask_valid_shared = 1u;
+  } else {
+    if (threadIdx.x == 0u) section_base_mask_valid_shared = 0u;
+  }
+  __syncthreads();
+  if constexpr (Tiled) {
+    if (threadIdx.x == 0u) {
+      const std::uint32_t count = fragment_end - fragment_begin;
+      const std::uint32_t samples = min(count, 8u);
+      std::uint32_t widths[8]{};
+      for (std::uint32_t sample = 0u; sample < samples; ++sample) {
+        const std::uint32_t local =
+            (std::uint64_t{sample} * count) / samples;
+        const SectionRangeFragment item = fragments[fragment_begin + local];
+        widths[sample] =
+            std::uint32_t{item.high_suffix} - item.low_suffix + 1u;
+        for (std::uint32_t position = sample; position > 0u &&
+             widths[position] < widths[position - 1u]; --position) {
+          const std::uint32_t temporary = widths[position];
+          widths[position] = widths[position - 1u];
+          widths[position - 1u] = temporary;
+        }
+      }
+      const std::uint32_t lower = widths[samples / 4u];
+      const std::uint32_t upper = widths[(3u * samples) / 4u];
+      const bool variable = 10u * upper > 11u * lower;
+      dynamic_queue_shared = variable;
+      next_fragment_shared = fragment_begin;
+    }
+    __syncthreads();
+  }
+  if (!overflow_shared && (!Tiled || !dynamic_queue_shared) &&
+      (section_base_mask_valid_shared || current_count == 0u)) {
+      constexpr std::uint32_t kGroup = 4u;
+      constexpr std::uint32_t kSubgroup = 32u / kGroup;
+      constexpr std::uint32_t kTileRows = 128u;
+      const std::uint32_t subgroup = lane / kSubgroup;
+      const std::uint32_t subgroup_lane = lane & (kSubgroup - 1u);
+      const unsigned subgroup_mask =
+          ((1u << kSubgroup) - 1u) << (subgroup * kSubgroup);
+      std::uint32_t group_begin =
+          fragment_begin + warp * kGroup;
+      while (true) {
+        if constexpr (Tiled) {
+          if (dynamic_queue_shared) {
+            if (lane == 0u)
+              group_begin = atomicAdd(&next_fragment_shared, kGroup);
+            group_begin = __shfl_sync(full_mask, group_begin, 0u);
+          }
+        }
+        if (group_begin >= fragment_end) break;
+        const std::uint32_t fragment_index = group_begin + subgroup;
+        const bool active = fragment_index < fragment_end;
+        SectionRangeFragment fragment{};
+        if (active && subgroup_lane == 0u)
+          fragment = fragments[fragment_index];
+        std::uint32_t low_suffix = fragment.low_suffix;
+        std::uint32_t high_suffix = fragment.high_suffix;
+        low_suffix = __shfl_sync(full_mask, low_suffix,
+                                 subgroup * kSubgroup);
+        high_suffix = __shfl_sync(full_mask, high_suffix,
+                                  subgroup * kSubgroup);
+        std::uint32_t update_begin = 0u, update_end = 0u;
+        std::uint32_t base_begin = 0u, base_end = 0u;
+        if (active && subgroup_lane == 0u) {
+          if (current_count) {
+            update_begin = lower_bound_rows(
+                current, current_count, low_suffix);
+            update_end = upper_bound_rows(
+                current, current_count, high_suffix);
+          }
+          if (base_section_count) {
+            base_begin = lower_bound_keys(base_keys + base_section_begin,
+                                          base_section_count, low_suffix);
+            base_end = upper_bound_keys(base_keys + base_section_begin,
+                                        base_section_count, high_suffix);
+          }
+        }
+        const std::uint32_t leader = subgroup * kSubgroup;
+        update_begin = __shfl_sync(full_mask, update_begin, leader);
+        update_end = __shfl_sync(full_mask, update_end, leader);
+        base_begin = __shfl_sync(full_mask, base_begin, leader);
+        base_end = __shfl_sync(full_mask, base_end, leader);
+
+        unsigned long long local = 0ull;
+        if (active) {
+          for (std::uint32_t index = update_begin + subgroup_lane;
+               index < update_end; index += kSubgroup) {
+            const Row row = current[index];
+            if ((row.flags & kTombstone) == 0u)
+              local = Aggregate::consume(local, row);
+          }
+        }
+
+        std::uint32_t union_begin = base_section_count;
+        std::uint32_t union_end = 0u;
+        std::uint32_t direct_rows = 0u;
+#pragma unroll
+        for (std::uint32_t member = 0u; member < kGroup; ++member) {
+          const std::uint32_t member_lane = member * kSubgroup;
+          const bool member_active =
+              __shfl_sync(full_mask, active, member_lane);
+          const std::uint32_t member_begin =
+              __shfl_sync(full_mask, base_begin, member_lane);
+          const std::uint32_t member_end =
+              __shfl_sync(full_mask, base_end, member_lane);
+          if (member_active) {
+            union_begin = min(union_begin, member_begin);
+            union_end = max(union_end, member_end);
+            direct_rows += member_end - member_begin;
+          }
+        }
+        const std::uint32_t union_rows = union_end - union_begin;
+        const bool share_rows = union_rows != 0u &&
+            direct_rows >= union_rows + (union_rows >> 1u);
+
+        if (share_rows) {
+          for (std::uint32_t tile_begin = union_begin;
+               tile_begin < union_end; tile_begin += kTileRows) {
+            const std::uint32_t tile_end =
+                min(tile_begin + kTileRows, union_end);
+            for (std::uint32_t index = lane;
+                 index < tile_end - tile_begin; index += 32u) {
+              const std::uint32_t position =
+                  base_section_begin + tile_begin + index;
+              workspace.base_rows[warp][index] =
+                  {base_keys[position], base_values[position]};
+            }
+            __syncwarp();
+            if (active) {
+              const std::uint32_t consume_begin =
+                  max(base_begin, tile_begin);
+              const std::uint32_t consume_end =
+                  min(base_end, tile_end);
+              for (std::uint32_t index =
+                       consume_begin + subgroup_lane;
+                   index < consume_end; index += kSubgroup) {
+                const uint2 row =
+                    workspace.base_rows[warp][index - tile_begin];
+                bool covered = false;
+                if (section_base_mask_valid_shared) {
+                  covered =
+                      (base_mask_workspace.section[index >> 5u] &
+                       (1u << (index & 31u))) != 0u;
+                } else if (current_count) {
+                  const std::uint32_t update_position =
+                      lower_bound_rows(current, current_count,
+                                       key_suffix(row.x));
+                  covered = update_position < current_count &&
+                      current[update_position].key == key_suffix(row.x);
+                }
+                if (!covered)
+                  local = Aggregate::consume(
+                      local, make_row(row.x, row.y, 0u));
+              }
+            }
+            __syncwarp();
+          }
+        } else if (active) {
+          for (std::uint32_t index = base_begin + subgroup_lane;
+               index < base_end; index += kSubgroup) {
+            const std::uint32_t position =
+                base_section_begin + index;
+            const std::uint32_t key = base_keys[position];
+            bool covered = false;
+            if (section_base_mask_valid_shared) {
+              covered =
+                  (base_mask_workspace.section[index >> 5u] &
+                   (1u << (index & 31u))) != 0u;
+            } else if (current_count) {
+              const std::uint32_t suffix = key_suffix(key);
+              const std::uint32_t update_position =
+                  lower_bound_rows(current, current_count, suffix);
+              covered = update_position < current_count &&
+                  current[update_position].key == suffix;
+            }
+            if (!covered)
+              local = Aggregate::consume(
+                  local, make_row(key, base_values[position], 0u));
+          }
+        }
+
+        for (std::uint32_t offset = kSubgroup / 2u; offset;
+             offset >>= 1u) {
+          const unsigned long long other = __shfl_down_sync(
+              subgroup_mask, local, offset, kSubgroup);
+          local = Aggregate{}(local, other);
+        }
+        if (active && subgroup_lane == 0u)
+          aggregate_partials[fragment.original_index] = local;
+        if constexpr (Tiled) {
+          if (!dynamic_queue_shared)
+            group_begin += kWarpsPerBlock * kGroup;
+        } else {
+          group_begin += kWarpsPerBlock * kGroup;
+        }
+      }
+      return;
+  }
+  std::uint32_t fragment_index = fragment_begin + warp;
+  while (true) {
+    if constexpr (Tiled) {
+      if (dynamic_queue_shared) {
+        if (lane == 0u)
+          fragment_index = atomicAdd(&next_fragment_shared, 1u);
+        fragment_index = __shfl_sync(full_mask, fragment_index, 0u);
+      }
+    }
+    if (fragment_index >= fragment_end) break;
+    const SectionRangeFragment fragment = fragments[fragment_index];
+    const std::uint32_t q_low = q << 16u;
+    const std::uint32_t low = q_low | fragment.low_suffix;
+    const std::uint32_t high = q_low | fragment.high_suffix;
+    const std::uint32_t low_suffix = fragment.low_suffix;
+    const std::uint32_t high_suffix = fragment.high_suffix;
+    unsigned long long local = 0ull;
+    if (overflow_shared) {
+      local = warp_sum_visible_by_verification(
+          q, low, high, HasPending ? raw : nullptr,
+          HasPending ? raw_offsets : nullptr,
+          batch_stride,
+          HasPending ? pending_batches : 0u, arena, descriptors,
+          base_keys, base_values, base_offsets, active_levels);
+    } else {
+      std::uint32_t update_begin = 0u, update_end = 0u;
+      if (lane == 0u && current_count) {
+        update_begin = lower_bound_rows(
+            current, current_count, low_suffix);
+        update_end = upper_bound_rows(
+            current, current_count, high_suffix);
+      }
+      update_begin = __shfl_sync(full_mask, update_begin, 0u);
+      update_end = __shfl_sync(full_mask, update_end, 0u);
+      const std::uint32_t update_count = update_end - update_begin;
+      for (std::uint32_t index = update_begin + lane; index < update_end;
+           index += 32u) {
+        const Row row = current[index];
+        if ((row.flags & kTombstone) == 0u)
+          local = Aggregate::consume(local, row);
+      }
+
+      std::uint32_t begin = 0u, end = 0u;
+      if (lane == 0u && base_section_count) {
+        begin = lower_bound_keys(base_keys + base_section_begin,
+                                 base_section_count, low_suffix);
+        end = upper_bound_keys(base_keys + base_section_begin,
+                               base_section_count, high_suffix);
+      }
+      begin = __shfl_sync(full_mask, begin, 0u);
+      end = __shfl_sync(full_mask, end, 0u);
+      if (!update_count) {
+        for (std::uint32_t index = begin + lane; index < end; index += 32u)
+          local += base_values[base_section_begin + index];
+      } else {
+        const Row *updates = current + update_begin;
+        const std::uint32_t base_count = end - begin;
+        if (section_base_mask_valid_shared) {
+          for (std::uint32_t index = begin + lane; index < end;
+               index += 32u)
+            if ((base_mask_workspace.section[index >> 5u] &
+                 (1u << (index & 31u))) == 0u)
+              local += base_values[base_section_begin + index];
+        } else if (base_count <= kFragmentBaseMaskRows) {
+          const std::uint32_t mask_words = (base_count + 31u) >> 5u;
+          for (std::uint32_t word = lane; word < mask_words; word += 32u)
+            base_mask_workspace.fragments[warp][word] = 0u;
+          __syncwarp();
+
+          const std::uint32_t base_absolute = base_section_begin + begin;
+          for (std::uint32_t update = lane; update < update_count;
+               update += 32u) {
+            const std::uint32_t key = updates[update].key;
+            const std::uint32_t position =
+                lower_bound_keys(base_keys + base_absolute, base_count, key);
+            if (position < base_count &&
+                base_keys[base_absolute + position] == key)
+              atomicOr(base_mask_workspace.fragments[warp] +
+                           (position >> 5u),
+                       1u << (position & 31u));
+          }
+          __syncwarp();
+          for (std::uint32_t index = lane; index < base_count; index += 32u)
+            if ((base_mask_workspace.fragments[warp][index >> 5u] &
+                 (1u << (index & 31u))) == 0u)
+              local += base_values[base_absolute + index];
+        } else {
+          for (std::uint32_t index = begin + lane; index < end;
+               index += 32u) {
+            const std::uint32_t position = base_section_begin + index;
+            const std::uint32_t key = base_keys[position];
+            const std::uint32_t suffix = key_suffix(key);
+            const std::uint32_t update_position =
+                lower_bound_rows(updates, update_count, suffix);
+            if (update_position == update_count ||
+                updates[update_position].key != suffix)
+              local += base_values[position];
+          }
+        }
+      }
+      for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+        local += __shfl_down_sync(full_mask, local, offset);
+    }
+    if (lane == 0u)
+      aggregate_partials[fragment.original_index] = local;
+    if constexpr (Tiled) {
+      if (!dynamic_queue_shared) fragment_index += kWarpsPerBlock;
+    } else {
+      fragment_index += kWarpsPerBlock;
+    }
+  }
+}
+
+template <class Aggregate, bool HasPending>
+__global__ void warp_range_fragment_kernel(
+    const RangeFragment *fragments, std::uint32_t fragment_count,
+    const std::uint32_t *device_fragment_count,
+    const std::uint32_t *query_low, const std::uint32_t *query_high,
+    const std::uint16_t *base_keys, const std::uint32_t *base_values,
+    const std::uint32_t *base_offsets, const Row *arena,
+    const Descriptor *descriptors, const RawAssignment *raw,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, std::uint32_t active_levels,
+    typename Aggregate::State *aggregate_partials,
+    std::uint32_t *overflow_fragments, std::uint32_t *overflow_count) {
+  constexpr std::uint32_t kWarps = 4u;
+  constexpr std::uint32_t kUpdateCapacity = 128u;
+  union WarpScratch {
+    Row merged[kUpdateCapacity];
+    TaggedRow tagged[HasPending ? kUpdateCapacity : 1u];
+  };
+  __shared__ Row current_shared[kWarps][kUpdateCapacity];
+  __shared__ WarpScratch scratch[kWarps];
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  const std::uint32_t fragment_index = blockIdx.x * kWarps + warp;
+  if (fragment_index >= fragment_count ||
+      fragment_index >= *device_fragment_count) return;
+  constexpr unsigned full_mask = 0xffffffffu;
+  std::uint32_t query = 0u, q = 0u;
+  if (lane == 0u) {
+    const RangeFragment fragment = fragments[fragment_index];
+    query = fragment.query;
+    q = fragment.quotient;
+  }
+  query = __shfl_sync(full_mask, query, 0u);
+  q = __shfl_sync(full_mask, q, 0u);
+  std::uint32_t query_begin = 0u, query_end = 0u;
+  if (lane == 0u) {
+    query_begin = query_low[query];
+    query_end = query_high[query];
+  }
+  query_begin = __shfl_sync(full_mask, query_begin, 0u);
+  query_end = __shfl_sync(full_mask, query_end, 0u);
+  const std::uint32_t q_low = q << 16u;
+  const std::uint32_t q_high = q_low | 0xffffu;
+  const std::uint32_t low = max(query_begin, q_low);
+  const std::uint32_t high = min(query_end, q_high);
+  const std::uint32_t low_suffix = key_suffix(low);
+  const std::uint32_t high_suffix = key_suffix(high);
+  const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+  Row *current = current_shared[warp];
+  Row *merged = scratch[warp].merged;
+
+  std::uint32_t current_count = 0u;
+  if constexpr (HasPending) {
+    std::uint32_t pending_count = 0u;
+    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+      const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+      const std::uint32_t begin = raw_offsets[oi];
+      const std::uint32_t end = raw_offsets[oi + 1u];
+      for (std::uint32_t chunk = begin; chunk < end; chunk += 32u) {
+        const std::uint32_t position = chunk + lane;
+        RawAssignment item{};
+        const bool valid = position < end &&
+            ((item = raw[batch * batch_stride + position]).row.key >=
+             low_suffix) && item.row.key <= high_suffix;
+        const unsigned selected = __ballot_sync(full_mask, valid);
+        const std::uint32_t destination =
+            pending_count + __popc(selected & before);
+        if (valid && destination < kUpdateCapacity)
+          scratch[warp].tagged[destination] =
+              {item.row, item.logical_position};
+        pending_count += __popc(selected);
+      }
+    }
+    const bool pending_overflow = pending_count > kUpdateCapacity;
+    if (__shfl_sync(full_mask, pending_overflow, 0u)) {
+      if (lane == 0u) {
+        aggregate_partials[fragment_index] = 0ull;
+        overflow_fragments[atomicAdd(overflow_count, 1u)] = fragment_index;
+      }
+      return;
+    }
+
+    for (std::uint32_t index = lane; index < pending_count; index += 32u) {
+      const TaggedRow item = scratch[warp].tagged[index];
+      std::uint32_t rank = 0u;
+      for (std::uint32_t other_index = 0u; other_index < pending_count;
+           ++other_index) {
+        const TaggedRow other = scratch[warp].tagged[other_index];
+        rank += other.row.key < item.row.key ||
+            (other.row.key == item.row.key &&
+             (other.age < item.age ||
+              (other.age == item.age && other_index < index)));
+      }
+      current[rank] = item.row;
+    }
+    __syncwarp();
+    for (std::uint32_t group = 0u; group < 4u; ++group) {
+      const std::uint32_t index = lane + group * 32u;
+      const bool winner = index < pending_count &&
+          (index + 1u == pending_count ||
+           current[index].key != current[index + 1u].key);
+      const unsigned winners = __ballot_sync(full_mask, winner);
+      if (winner)
+        merged[current_count + __popc(winners & before)] = current[index];
+      current_count += __popc(winners);
+    }
+    __syncwarp();
+    Row *temporary = current;
+    current = merged;
+    merged = temporary;
+  }
+
+  bool class_overflow = false;
+  for (std::uint32_t level = 0u; level < active_levels; ++level) {
+    unsigned long long descriptor_bits = 0ull;
+    if (lane == 0u)
+      descriptor_bits = descriptors[descriptor_index(q, level)].bits;
+    descriptor_bits = __shfl_sync(full_mask, descriptor_bits, 0u);
+    const Descriptor descriptor{descriptor_bits};
+    const Row *rows = arena + descriptor.offset();
+    std::uint32_t older_begin = 0u, older_end = 0u;
+    if (lane == 0u && descriptor.count()) {
+      older_begin = low == q_low
+          ? 0u
+          : lower_bound_rows(rows, descriptor.count(), low_suffix);
+      older_end = high == q_high
+          ? descriptor.count()
+          : upper_bound_rows(rows, descriptor.count(), high_suffix);
+    }
+    older_begin = __shfl_sync(full_mask, older_begin, 0u);
+    older_end = __shfl_sync(full_mask, older_end, 0u);
+    const std::uint32_t older_count = older_end - older_begin;
+    if (!older_count) continue;
+    if (current_count + older_count > kUpdateCapacity) {
+      class_overflow = true;
+      break;
+    }
+    const Row *older = rows + older_begin;
+    if (!current_count) {
+      for (std::uint32_t index = lane; index < older_count; index += 32u)
+        current[index] = older[index];
+      current_count = older_count;
+      __syncwarp();
+      continue;
+    }
+    for (std::uint32_t index = lane; index < older_count; index += 32u) {
+      const Row row = older[index];
+      std::uint32_t lo = 0u, hi = current_count;
+      while (lo < hi) {
+        const std::uint32_t mid = (lo + hi) >> 1u;
+        if (current[mid].key < row.key) lo = mid + 1u;
+        else hi = mid;
+      }
+      merged[index + lo] = row;
+    }
+    for (std::uint32_t index = lane; index < current_count; index += 32u) {
+      const Row row = current[index];
+      std::uint32_t lo = 0u, hi = older_count;
+      while (lo < hi) {
+        const std::uint32_t mid = (lo + hi) >> 1u;
+        if (older[mid].key <= row.key) lo = mid + 1u;
+        else hi = mid;
+      }
+      merged[index + lo] = row;
+    }
+    __syncwarp();
+    const std::uint32_t merged_count = current_count + older_count;
+    std::uint32_t output_count = 0u;
+    for (std::uint32_t group = 0u; group < 4u; ++group) {
+      const std::uint32_t index = lane + group * 32u;
+      const bool winner = index < merged_count &&
+          (index + 1u == merged_count ||
+           merged[index].key != merged[index + 1u].key);
+      const unsigned winners = __ballot_sync(full_mask, winner);
+      if (winner)
+        current[output_count + __popc(winners & before)] = merged[index];
+      output_count += __popc(winners);
+    }
+    current_count = output_count;
+    __syncwarp();
+  }
+  class_overflow = __shfl_sync(full_mask, class_overflow, 0u);
+  if (class_overflow) {
+    if (lane == 0u) {
+      aggregate_partials[fragment_index] = 0ull;
+      overflow_fragments[atomicAdd(overflow_count, 1u)] = fragment_index;
+    }
+    return;
+  }
+
+  typename Aggregate::State local = Aggregate::identity();
+  for (std::uint32_t index = lane; index < current_count; index += 32u) {
+    const Row row = current[index];
+    if ((row.flags & kTombstone) == 0u)
+      local = Aggregate::consume(local, row);
+  }
+  const std::uint32_t base_section_begin = base_offsets[q];
+  const std::uint32_t base_section_count =
+      base_offsets[q + 1u] - base_section_begin;
+  std::uint32_t base_begin = 0u, base_end = 0u;
+  if (lane == 0u && base_section_count) {
+    base_begin = low == q_low
+        ? 0u
+        : lower_bound_keys(base_keys + base_section_begin,
+                           base_section_count, low_suffix);
+    base_end = high == q_high
+        ? base_section_count
+        : upper_bound_keys(base_keys + base_section_begin,
+                           base_section_count, high_suffix);
+  }
+  base_begin = __shfl_sync(full_mask, base_begin, 0u);
+  base_end = __shfl_sync(full_mask, base_end, 0u);
+  if (!current_count) {
+    for (std::uint32_t index = base_begin + lane; index < base_end;
+         index += 32u)
+      local += base_values[base_section_begin + index];
+  } else {
+    for (std::uint32_t index = base_begin + lane; index < base_end;
+         index += 32u) {
+      const std::uint32_t position_in_base = base_section_begin + index;
+      const Row row = make_row(base_keys[position_in_base],
+                               base_values[position_in_base], 0u);
+      const std::uint32_t position =
+          lower_bound_rows(current, current_count, row.key);
+      if (position == current_count || current[position].key != row.key)
+        local = Aggregate::consume(local, row);
+    }
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    local += __shfl_down_sync(full_mask, local, offset);
+  if (lane == 0u) {
+    aggregate_partials[fragment_index] = local;
+  }
+}
+
+template <bool HasPending>
+__global__ void overflow_range_fragment_kernel(
+    const std::uint32_t *overflow_fragments,
+    const std::uint32_t *overflow_count,
+    const RangeFragment *fragments,
+    const std::uint32_t *query_low, const std::uint32_t *query_high,
+    const std::uint16_t *base_keys, const std::uint32_t *base_values,
+    const std::uint32_t *base_offsets, const Row *arena,
+    const Descriptor *descriptors, const RawAssignment *raw,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, std::uint32_t active_levels,
+    unsigned long long *aggregate_partials) {
+  constexpr std::uint32_t kWarps = 4u;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp_in_block = threadIdx.x >> 5u;
+  const std::uint32_t worker = blockIdx.x * kWarps + warp_in_block;
+  const std::uint32_t workers = gridDim.x * kWarps;
+  const std::uint32_t count = *overflow_count;
+  for (std::uint32_t overflow_index = worker; overflow_index < count;
+       overflow_index += workers) {
+    std::uint32_t fragment_index = 0u, query = 0u, q = 0u;
+    if (lane == 0u) {
+      fragment_index = overflow_fragments[overflow_index];
+      const RangeFragment fragment = fragments[fragment_index];
+      query = fragment.query;
+      q = fragment.quotient;
+    }
+    constexpr unsigned full_mask = 0xffffffffu;
+    fragment_index = __shfl_sync(full_mask, fragment_index, 0u);
+    query = __shfl_sync(full_mask, query, 0u);
+    q = __shfl_sync(full_mask, q, 0u);
+    const std::uint32_t q_low = q << 16u;
+    const std::uint32_t q_high = q_low | 0xffffu;
+    const std::uint32_t low = max(query_low[query], q_low);
+    const std::uint32_t high = min(query_high[query], q_high);
+    const unsigned long long value = warp_sum_visible_by_verification(
+        q, low, high, raw, raw_offsets, batch_stride,
+        HasPending ? pending_batches : 0u, arena, descriptors, base_keys,
+        base_values, base_offsets, active_levels);
+    if (lane == 0u) aggregate_partials[fragment_index] = value;
+  }
+}
+
+__global__ void gather_raw_batch_kernel(
+    const std::uint32_t *sorted_keys, const std::uint32_t *sorted_ids,
+    const std::uint32_t *values, std::uint32_t count, std::uint32_t batch_slot,
+    bool tombstone, RawAssignment *destination) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t original = sorted_ids[i];
+  destination[i] = {
+      make_row(sorted_keys[i], tombstone ? 0u : values[original],
+               tombstone ? kTombstone : 0u),
+      (batch_slot << kBatchPositionBits) | original};
+}
+
+__device__ __forceinline__ std::uint64_t pending_signature_bits(
+    std::uint32_t key) {
+  const std::uint32_t first = key * 0x9e3779b1u;
+  const std::uint32_t second = (key ^ (key >> 16u)) * 0x85ebca6bu;
+  return (1ull << (first >> 26u)) | (1ull << (second >> 26u));
+}
+
+__global__ void finalize_quotient_metadata_kernel(
+    const std::uint32_t *sorted_keys, std::uint32_t count,
+    std::uint32_t *offsets, std::uint32_t *epoch_counts,
+    std::uint64_t *batch_signatures, std::uint64_t *epoch_signatures) {
+  __shared__ std::uint32_t boundaries[kThreads + 1u];
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  auto find_boundary = [&](std::uint32_t quotient) {
+    if (quotient >= kQuotients) return count;
+    const std::uint32_t key = quotient << 16u;
+    std::uint32_t lo = 0u, hi = count;
+    while (lo < hi) {
+      const std::uint32_t mid = (lo + hi) >> 1u;
+      if (sorted_keys[mid] < key) lo = mid + 1u;
+      else hi = mid;
+    }
+    return lo;
+  };
+  boundaries[threadIdx.x] = find_boundary(q);
+  if (threadIdx.x + 1u == blockDim.x)
+    boundaries[blockDim.x] = find_boundary(q + 1u);
+  __syncthreads();
+  if (q >= kQuotients) return;
+  const std::uint32_t begin = boundaries[threadIdx.x];
+  const std::uint32_t end = boundaries[threadIdx.x + 1u];
+  offsets[q] = begin;
+  if (q + 1u == kQuotients) offsets[kQuotients] = count;
+  epoch_counts[q] += end - begin;
+  std::uint64_t signature = 0ull;
+  for (std::uint32_t index = begin; index < end; ++index)
+    signature |= pending_signature_bits(sorted_keys[index]);
+  batch_signatures[q] = signature;
+  epoch_signatures[q] |= signature;
+}
+
+__global__ void mark_base_winners_kernel(
+    const std::uint32_t *keys, std::uint32_t count, std::uint8_t *keep) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  keep[i] = i + 1u == count || keys[i] != keys[i + 1u];
+}
+
+__global__ void gather_base_winners_kernel(
+    const std::uint32_t *sorted_keys, const std::uint32_t *sorted_values,
+    const std::uint32_t *selected, std::uint32_t count, std::uint16_t *keys,
+    std::uint32_t *values, std::uint32_t *quotient_shifted) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t source = selected[i];
+  const std::uint32_t key = sorted_keys[source];
+  keys[i] = static_cast<std::uint16_t>(key);
+  values[i] = sorted_values[source];
+  atomicAdd(quotient_shifted + (key >> 16u) + 1u, 1u);
+}
+
+__global__ void build_local_rank_directory_kernel(
+    const std::uint16_t *keys, const std::uint32_t *base_offsets,
+    std::uint16_t *local_rank) {
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t cell = threadIdx.x;
+  const std::uint32_t section_begin = base_offsets[q];
+  const std::uint32_t section_end = base_offsets[q + 1u];
+  const std::uint32_t target = cell << 9u;
+  const std::uint32_t position = lower_bound_keys(
+      keys + section_begin, section_end - section_begin, target);
+  local_rank[std::size_t{q} * 128u + cell] =
+      static_cast<std::uint16_t>(position);
+}
+
+__global__ void fused_raw_dense_fallback_kernel(
+    const RawAssignment *assignments, const std::uint32_t *raw_offsets,
+    std::uint32_t batch_stride, const std::uint32_t *raw_counts,
+    Row *arena, Descriptor *descriptors,
+    std::uint32_t level_limit) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kQuotients) return;
+  Descriptor *plan{};
+  std::uint32_t plan_level{};
+  if (!find_planned_descriptor(
+          descriptors, q, plan, plan_level, level_limit)) return;
+  const std::uint32_t plan_size_class = plan->size_class();
+  const std::uint32_t raw_count = raw_counts[q];
+  const bool fast_publish = plan_level == 0u && raw_count <= 64u;
+  const bool fast_merge = plan_level != 0u && raw_count <= 64u &&
+                          plan_size_class <= 7u;
+  const bool fast_epoch = plan_size_class >= 8u &&
+                          plan_size_class <= 9u;
+  if (fast_publish || fast_merge || fast_epoch) return;
+
+  std::uint32_t raw_begin[kBatchesPerEpoch];
+  std::uint32_t raw_end[kBatchesPerEpoch];
+#pragma unroll
+  for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch) {
+    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+    raw_begin[batch] = raw_offsets[oi];
+    raw_end[batch] = raw_offsets[oi + 1u];
+  }
+  std::uint32_t class_position[kMaximumLevels]{};
+  std::uint32_t class_end[kMaximumLevels]{};
+  for (std::uint32_t level = 0u; level < plan_level; ++level)
+    class_end[level] = descriptors[descriptor_index(q, level)].count();
+
+  std::uint32_t produced = 0u, previous = 0u;
+  bool have_previous = false;
+  while (true) {
+    std::uint32_t minimum = kInvalid;
+    bool found = false;
+#pragma unroll
+    for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch) {
+      for (std::uint32_t position = raw_begin[batch];
+           position < raw_end[batch]; ++position) {
+        const std::uint32_t key =
+            assignments[batch * batch_stride + position].row.key;
+        if ((!have_previous || key > previous) &&
+            (!found || key < minimum)) {
+          minimum = key;
+          found = true;
+        }
+      }
+    }
+    for (std::uint32_t level = 0u; level < plan_level; ++level) {
+      if (class_position[level] < class_end[level]) {
+        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+        const std::uint32_t key =
+            arena[descriptor.offset() + class_position[level]].key;
+        if (!found || key < minimum) minimum = key;
+        found = true;
+      }
+    }
+    if (!found) break;
+
+    bool have_winner = false;
+    for (int batch = int(kBatchesPerEpoch) - 1; batch >= 0; --batch) {
+      const std::uint32_t batch_index = static_cast<std::uint32_t>(batch);
+      Row candidate{};
+      std::uint32_t newest_position = 0u;
+      bool matched = false;
+      for (std::uint32_t position = raw_begin[batch_index];
+           position < raw_end[batch_index]; ++position) {
+        const RawAssignment item =
+            assignments[batch_index * batch_stride + position];
+        if (item.row.key == minimum &&
+            (!matched || item.logical_position > newest_position)) {
+          candidate = item.row;
+          newest_position = item.logical_position;
+          matched = true;
+        }
+      }
+      if (!have_winner && matched) {
+        have_winner = true;
+        arena[plan->offset() + produced] = candidate;
+      }
+    }
+    if (!have_winner) {
+      for (std::uint32_t level = 0u; level < plan_level; ++level) {
+        if (class_position[level] < class_end[level]) {
+          const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+          const Row row = arena[descriptor.offset() + class_position[level]];
+          if (!have_winner && row.key == minimum) {
+            arena[plan->offset() + produced] = row;
+            have_winner = true;
           }
         }
       }
     }
-
-    for (std::uint32_t offset = 16u; offset != 0u; offset >>= 1u)
-      sum += __shfl_down_sync(full_warp, sum, offset);
-    sum = __shfl_sync(full_warp, sum, 0u);
-    if (lane == owner)
-      out_sums[query] = sum;
-    work &= ~(std::uint32_t{1} << owner);
-  }
-}
-
-__device__ inline std::uint32_t visible_base_upper_rank(
-    const SortedRunView &base, std::uint32_t key) {
-  if (base.count == 0u)
-    return 0u;
-  const std::uint32_t bin = key >> kBaseRank23Shift;
-  const std::uint32_t begin = base.rank23[bin];
-  const std::uint32_t end = base.rank23[bin + 1u];
-  return begin + static_cast<std::uint32_t>(
-      upper_bound_u32(base.keys + begin, end - begin, key));
-}
-
-// Few-query path: a fixed occupancy-sized grid gives every query an equal
-// number of task slots. A range activates at most one slot per quotient and
-// partitions wider spans evenly; unused slots exit immediately. Every active
-// CTA scans actual rows and contributes one modulo-32-bit partial.
-__global__ __launch_bounds__(256) void lqvrf_range_task_sum_kernel(
-    LqvrfView view, const std::uint32_t *lo, const std::uint32_t *hi,
-    std::size_t query_count, std::uint32_t slots_per_query,
-    std::uint32_t *out_sums) {
-  const std::uint32_t query = blockIdx.x / slots_per_query;
-  const std::uint32_t slot =
-      blockIdx.x - query * slots_per_query;
-  if (query >= query_count || lo[query] > hi[query])
-    return;
-  const std::uint32_t first_quotient =
-      lo[query] >> kEpochQuotientBits;
-  const std::uint32_t after_last_quotient =
-      (hi[query] >> kEpochQuotientBits) + 1u;
-  const std::uint32_t span =
-      after_last_quotient - first_quotient;
-  const std::uint32_t chunks = min(span, slots_per_query);
-  if (slot >= chunks)
-    return;
-  const std::uint32_t q_begin =
-      first_quotient + static_cast<std::uint32_t>(
-          (static_cast<std::uint64_t>(span) * slot) / chunks);
-  const std::uint32_t q_end =
-      first_quotient + static_cast<std::uint32_t>(
-          (static_cast<std::uint64_t>(span) * (slot + 1u)) / chunks);
-  const LqvrfRangeTask task{
-      query,
-      max(lo[query], q_begin << kEpochQuotientBits),
-      min(hi[query], q_end == kEpochQuotients
-                         ? std::numeric_limits<std::uint32_t>::max()
-                         : (q_end << kEpochQuotientBits) - 1u)};
-  std::uint32_t sum = 0u;
-
-  const std::uint32_t base_begin =
-      visible_base_lower_rank(view.base, task.lower);
-  const std::uint32_t base_end =
-      visible_base_upper_rank(view.base, task.upper);
-  for (std::uint32_t i = base_begin + threadIdx.x; i < base_end;
-       i += blockDim.x) {
-    const bool hidden =
-        view.has_hidden_base != 0u &&
-        (view.base_hidden_words[i >> 5] & (1u << (i & 31u))) != 0u;
-    if (!hidden)
-      sum += view.base.values[i];
-  }
-
-  const std::uint32_t qlo = task.lower >> kEpochQuotientBits;
-  const std::uint32_t qhi = task.upper >> kEpochQuotientBits;
-  const std::uint32_t active_begin = static_cast<std::uint32_t>(
-      lower_bound_u16(view.active_quotients,
-                      view.active_quotient_count,
-                      static_cast<std::uint16_t>(qlo)));
-  const std::uint32_t active_end =
-      qhi == 0xffffu
-          ? view.active_quotient_count
-          : static_cast<std::uint32_t>(lower_bound_u16(
-                view.active_quotients, view.active_quotient_count,
-                static_cast<std::uint16_t>(qhi + 1u)));
-  for (std::uint32_t fragment = active_begin; fragment < active_end;
-       ++fragment) {
-    const std::uint32_t q = view.active_quotients[fragment];
-    const LqvrfFragmentDescriptor descriptor = view.fragments[q];
-    const std::uint16_t low = static_cast<std::uint16_t>(
-        q == qlo ? task.lower : 0u);
-    const std::uint16_t high = static_cast<std::uint16_t>(
-        q == qhi ? task.upper : 0xffffu);
-    if (descriptor.format == static_cast<std::uint8_t>(
-                                 LqvrfFragmentFormat::Sorted16)) {
-      const std::uint32_t begin = descriptor.row_begin;
-      const std::uint32_t first =
-          low == 0u
-              ? begin
-              : begin + static_cast<std::uint32_t>(lower_bound_u16(
-                            view.sorted_low16 + begin,
-                            descriptor.row_count, low));
-      const std::uint32_t end =
-          high == 0xffffu
-              ? begin + descriptor.row_count
-              : begin + static_cast<std::uint32_t>(lower_bound_u16(
-                            view.sorted_low16 + begin,
-                            descriptor.row_count,
-                            static_cast<std::uint16_t>(high + 1u)));
-      for (std::uint32_t i = first + threadIdx.x; i < end;
-           i += blockDim.x)
-        sum += view.sorted_values[i];
-    } else {
-      const LqvrfSectorDescriptor *sector_base =
-          view.sectors + descriptor.sector_begin;
-      const std::uint32_t low_sector = low >> kLqvrfSectorBits;
-      const std::uint32_t high_sector = high >> kLqvrfSectorBits;
-      const std::uint32_t sector_first = lqvrf_lower_sector(
-          sector_base, descriptor.sector_count, low_sector);
-      const std::uint32_t sector_last =
-          high_sector == 0xffu
-              ? descriptor.sector_count
-              : lqvrf_lower_sector(sector_base, descriptor.sector_count,
-                                    high_sector + 1u);
-      for (std::uint32_t sector = sector_first; sector < sector_last;
-           ++sector) {
-        const LqvrfSectorDescriptor item = sector_base[sector];
-        const std::uint8_t low8 =
-            item.high8 == low_sector ? static_cast<std::uint8_t>(low) : 0u;
-        const std::uint8_t high8 =
-            item.high8 == high_sector ? static_cast<std::uint8_t>(high)
-                                      : 0xffu;
-        const std::uint32_t first =
-            low8 == 0u
-                ? item.row_begin
-                : item.row_begin + static_cast<std::uint32_t>(lower_bound_u8(
-                      view.packed_low8 + item.row_begin,
-                      item.row_count, low8));
-        const std::uint32_t end =
-            high8 == 0xffu
-                ? item.row_begin + item.row_count
-                : item.row_begin + static_cast<std::uint32_t>(lower_bound_u8(
-                      view.packed_low8 + item.row_begin,
-                      item.row_count, static_cast<std::uint8_t>(high8 + 1u)));
-        for (std::uint32_t i = first + threadIdx.x; i < end;
-             i += blockDim.x)
-          sum += view.packed_values[i];
+    ++produced;
+    previous = minimum;
+    have_previous = true;
+    for (std::uint32_t level = 0u; level < plan_level; ++level)
+      if (class_position[level] < class_end[level]) {
+        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+        if (arena[descriptor.offset() + class_position[level]].key == minimum)
+          ++class_position[level];
       }
-    }
   }
-
-  using Reduce = cub::BlockReduce<std::uint32_t, 256>;
-  __shared__ typename Reduce::TempStorage reduction;
-  const std::uint32_t block_sum = Reduce(reduction).Sum(sum);
-  if (threadIdx.x == 0u)
-    atomicAdd(out_sums + task.query, block_sum);
+  plan->set_count(produced);
 }
 
-// Keeps only the newest live record for each key.
-__global__ void resolve_live_last_kernel(
-    const std::uint32_t *keys, const std::uint64_t *payload,
-    std::size_t n, std::uint32_t *out_values,
-    std::uint8_t *flags) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  const bool last = i + 1u == n || keys[i] != keys[i + 1u];
-  out_values[i] = static_cast<std::uint32_t>(payload[i] >> 32);
-  flags[i] = last && (payload[i] & 1u) != 0u ? 1u : 0u;
-}
-
-// Corrections use modulo-32-bit value arithmetic.
-__host__ __device__ inline std::uint64_t
-corr_pack(std::uint32_t value_delta, std::int8_t count_delta) {
-  return (static_cast<std::uint64_t>(value_delta) << 32) |
-         static_cast<std::uint32_t>(static_cast<std::int32_t>(count_delta));
-}
-
-struct CacheTaggedKey {
-  __host__ __device__ std::uint64_t operator()(std::uint32_t key) const {
-    return static_cast<std::uint64_t>(key) << 32;
-  }
-};
-
-// Converts assignments to base corrections.
-__global__ void normalize_correction_kernel(
-    const std::uint32_t *keys, const std::uint64_t *assignment,
-    std::size_t count, BaseRunView base,
-    std::uint64_t *tagged_keys, std::uint64_t *corrections) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  const std::uint32_t key = keys[i];
-  const std::uint32_t value =
-      static_cast<std::uint32_t>(assignment[i] >> 32);
-  const bool insert = (assignment[i] & 1u) != 0u;
-  // Baseline is the immutable BaseRun state.
-  std::uint32_t base_value = 0u;
-  bool base_live = false;
-  if (base.base.count != 0u && base_find_value(base, key, &base_value))
-    base_live = true;
-  std::uint32_t value_delta = 0u;
-  std::int8_t count_delta = 0;
-  if (insert) {
-    value_delta = base_live ? value - base_value : value;
-    count_delta = base_live ? 0 : 1;
-  } else if (base_live) {
-    value_delta = 0u - base_value;
-    count_delta = -1;
-  }
-  const std::uint64_t rank = static_cast<std::uint32_t>(i + 1u);
-  tagged_keys[i] = (static_cast<std::uint64_t>(key) << 32) | rank;
-  corrections[i] = corr_pack(value_delta, count_delta);
-}
-
-__global__ void resolve_classify_kernel(
-    const std::uint32_t *counts, std::uint32_t *lists,
-    std::uint32_t *class_counts,
-    std::uint32_t *winner_counts) {
-  const std::uint32_t q =
-      blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
-    return;
-  winner_counts[q] = 0u;
-  if (q == kEpochQuotients || counts[q] == 0u)
-    return;
-  const std::uint32_t count = counts[q];
-  const int cls = count <= kResolveSmallMax
-                      ? 0
-                      : count <= kResolveMediumMax
-                            ? 1
-                            : count <= kResolveLocalMax ? 2 : 3;
-  const std::uint32_t slot =
-      atomicAdd(class_counts + cls, 1u);
-  lists[static_cast<std::size_t>(cls) *
-            kEpochQuotients +
-        slot] = q;
-}
-
-template <int Capacity> struct ResolveRecordStorage {
-  std::uint32_t keys[Capacity];
-  std::uint64_t payload[Capacity];
-};
-
-template <int Threads, int Items, bool KeepZero,
-          bool CacheBaseOffsets>
-__global__ __launch_bounds__(Threads)
-void quotient_local_resolve_kernel(
-    const FlatAssignmentLeafView *leaves, int leaf_count,
-    const std::uint32_t *quotient_list,
-    const std::uint32_t *input_counts,
-    const std::uint32_t *input_offsets, BaseRunView base,
-    std::uint32_t *out_keys, std::uint32_t *out_values,
-    std::int8_t *out_counts,
-    std::uint32_t *winner_counts) {
-  constexpr int capacity = Threads * Items;
-  constexpr int warps = Threads / 32;
-  using Sort = cub::BlockRadixSort<
-      std::uint32_t, Threads, Items, std::uint64_t>;
-  using Scan = cub::BlockScan<std::uint32_t, Threads>;
-  union SharedStorage {
-    typename Sort::TempStorage sort;
-    typename Scan::TempStorage scan;
-    ResolveRecordStorage<capacity> records;
-  };
-  __shared__ SharedStorage shared;
-  __shared__ std::uint32_t leaf_bases[kLookupLeafCapacity + 1];
-  __shared__ std::uint32_t base_offsets[
-      CacheBaseOffsets ? kBaseBinsPerQuotient + 1 : 1];
-
-  const std::uint32_t q = quotient_list[blockIdx.x];
-  const std::uint32_t count = input_counts[q];
-  if (threadIdx.x == 0) {
-    std::uint32_t cursor = 0u;
-    for (int leaf = 0; leaf < leaf_count; ++leaf) {
-      leaf_bases[leaf] = cursor;
-      cursor += leaves[leaf].offsets[q + 1u] -
-                leaves[leaf].offsets[q];
-    }
-    leaf_bases[leaf_count] = cursor;
-  }
-  __syncthreads();
-
-  const int warp = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  for (int leaf = warp; leaf < leaf_count; leaf += warps) {
-    const FlatAssignmentLeafView view = leaves[leaf];
-    const std::uint32_t begin = view.offsets[q];
-    const std::uint32_t end = view.offsets[q + 1u];
-    const std::uint32_t output = leaf_bases[leaf];
-    for (std::uint32_t i = lane; i < end - begin; i += 32u) {
-      const std::uint32_t position = begin + i;
-      const std::uint32_t key = view.keys[position];
-      const std::uint32_t value =
-          view.constant_op != 0u ? view.values[position] : 0u;
-      const std::uint32_t rank =
-          view.rank_base + position + 1u;
-      shared.records.keys[output + i] = key & 0xffffu;
-      shared.records.payload[output + i] =
-          (static_cast<std::uint64_t>(view.constant_op != 0u)
-           << 63) |
-          (static_cast<std::uint64_t>(rank) << 32) |
-          value;
-    }
-  }
-  __syncthreads();
-
-  std::uint32_t keys[Items];
-  std::uint64_t payload[Items];
-  bool keep[Items];
-#pragma unroll
-  for (int item = 0; item < Items; ++item) {
-    const int local = threadIdx.x * Items + item;
-    if (local < static_cast<int>(count)) {
-      keys[item] = shared.records.keys[local];
-      payload[item] = shared.records.payload[local];
-    } else {
-      keys[item] = 0xffffffffu;
-      payload[item] = 0u;
-    }
-    keep[item] = false;
-  }
-  __syncthreads();
-  Sort(shared.sort).Sort(keys, payload, 0, 16);
-  __syncthreads();
-#pragma unroll
-  for (int item = 0; item < Items; ++item) {
-    const int local = threadIdx.x * Items + item;
-    shared.records.keys[local] = keys[item];
-    shared.records.payload[local] = payload[item];
-  }
-  __syncthreads();
-
-  if constexpr (CacheBaseOffsets) {
-    const std::size_t first_bin =
-        static_cast<std::size_t>(q) *
-        kBaseBinsPerQuotient;
-    for (int bin = threadIdx.x;
-         bin <= kBaseBinsPerQuotient;
-         bin += blockDim.x) {
-      base_offsets[bin] =
-          base.base.count == 0u
-              ? 0u
-              : base.base.rank23[first_bin + bin];
-    }
-    __syncthreads();
-  }
-
-#pragma unroll
-  for (int item = 0; item < Items; ++item) {
-    const int local = threadIdx.x * Items + item;
-    if (local >= static_cast<int>(count))
-      continue;
-    const std::uint32_t low = shared.records.keys[local];
-    if (local != 0 &&
-        shared.records.keys[local - 1] == low)
-      continue;
-    std::uint64_t newest = shared.records.payload[local];
-    std::uint32_t newest_rank =
-        static_cast<std::uint32_t>(
-            (newest >> 32) & 0x7fffffffu);
-    int next = local + 1;
-    while (next < static_cast<int>(count) &&
-           shared.records.keys[next] == low) {
-      const std::uint64_t candidate =
-          shared.records.payload[next];
-      const std::uint32_t rank =
-          static_cast<std::uint32_t>(
-              (candidate >> 32) & 0x7fffffffu);
-      if (rank > newest_rank) {
-        newest = candidate;
-        newest_rank = rank;
-      }
-      ++next;
-    }
-
-    const std::uint32_t key =
-        (q << kEpochQuotientBits) | low;
-    const bool insert = (newest >> 63) != 0u;
-    const std::uint32_t value =
-        static_cast<std::uint32_t>(newest);
-    std::uint32_t base_value = 0u;
-    bool base_live = false;
-    if (base.base.count != 0u) {
-      if constexpr (CacheBaseOffsets) {
-        const std::uint32_t base_bin =
-            low >> kBaseRank23Shift;
-        const std::uint32_t base_begin =
-            base_offsets[base_bin];
-        const std::uint32_t base_end =
-            base_offsets[base_bin + 1u];
-        const std::uint32_t base_position =
-            base_begin + static_cast<std::uint32_t>(
-                lower_bound_u32(
-                    base.base.keys + base_begin,
-                    base_end - base_begin, key));
-        base_live =
-            base_position < base_end &&
-            base.base.keys[base_position] == key;
-        if (base_live)
-          base_value = base.base.values[base_position];
-      } else {
-        base_live = base_find_value(
-            base, key, &base_value);
-      }
-    }
-
-    std::uint32_t value_delta = 0u;
-    std::int8_t count_delta = 0;
-    if (insert) {
-      value_delta = base_live ? value - base_value : value;
-      count_delta = base_live ? 0 : 1;
-    } else if (base_live) {
-      value_delta = 0u - base_value;
-      count_delta = -1;
-    }
-    const std::uint64_t correction =
-        corr_pack(value_delta, count_delta);
-    keep[item] = KeepZero || correction != 0u;
-    keys[item] = key;
-    payload[item] = correction;
-  }
-  __syncthreads();
-
-  std::uint32_t thread_count = 0u;
-#pragma unroll
-  for (int item = 0; item < Items; ++item)
-    thread_count += keep[item] ? 1u : 0u;
-  std::uint32_t thread_offset = 0u;
-  std::uint32_t block_total = 0u;
-  Scan(shared.scan).ExclusiveSum(
-      thread_count, thread_offset, block_total);
-  std::uint32_t local_offset = 0u;
-  const std::uint32_t output_base = input_offsets[q];
-#pragma unroll
-  for (int item = 0; item < Items; ++item) {
-    if (!keep[item])
-      continue;
-    const std::uint32_t output =
-        output_base + thread_offset + local_offset++;
-    out_keys[output] = keys[item];
-    out_values[output] =
-        static_cast<std::uint32_t>(payload[item] >> 32);
-    out_counts[output] = static_cast<std::int8_t>(
-        static_cast<std::uint32_t>(payload[item]));
-  }
-  if (threadIdx.x == 0)
-    winner_counts[q] = block_total;
-}
-__global__ void fused_resolve_pack_kernel(
-    const std::uint32_t *input_offsets,
-    const std::uint32_t *winner_counts,
-    const std::uint32_t *winner_offsets,
-    const std::uint32_t *input_keys,
-    const std::uint32_t *input_values,
-    const std::int8_t *input_counts,
-    std::uint64_t *output_keys,
-    std::uint64_t *output_payload) {
-  const std::uint32_t q = blockIdx.x;
-  const std::uint32_t count = winner_counts[q];
-  const std::uint32_t input = input_offsets[q];
-  const std::uint32_t output = winner_offsets[q];
-  for (std::uint32_t i = threadIdx.x; i < count;
-       i += blockDim.x) {
-    output_keys[output + i] =
-        (static_cast<std::uint64_t>(input_keys[input + i]) << 32) |
-        1u;
-    output_payload[output + i] =
-        corr_pack(input_values[input + i], input_counts[input + i]);
-  }
-}
-
-__global__ void fused_resolve_unpack_kernel(
-    const std::uint32_t *input_offsets,
-    const std::uint32_t *winner_counts,
-    const std::uint32_t *winner_offsets,
-    const std::uint32_t *input_keys,
-    const std::uint32_t *input_values,
-    const std::int8_t *input_counts,
-    std::uint32_t *output_keys,
-    std::uint32_t *output_values,
-    std::int8_t *output_counts,
-    std::uint32_t *output_offsets) {
-  const std::uint32_t q = blockIdx.x;
-  const std::uint32_t count = winner_counts[q];
-  const std::uint32_t input = input_offsets[q];
-  const std::uint32_t output = winner_offsets[q];
-  for (std::uint32_t i = threadIdx.x; i < count;
-       i += blockDim.x) {
-    output_keys[output + i] = input_keys[input + i];
-    output_values[output + i] = input_values[input + i];
-    output_counts[output + i] = input_counts[input + i];
-  }
-  if (threadIdx.x == 0) {
-    output_offsets[q] = output;
-    if (q + 1u == kEpochQuotients)
-      output_offsets[q + 1u] = winner_offsets[q + 1u];
-  }
-}
-
-__global__ void corr_pack_kernel(const std::uint32_t *value_delta,
-                                 const std::int8_t *count_delta, std::size_t n,
-                                 std::uint64_t *out_payload) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  out_payload[i] = corr_pack(value_delta[i], count_delta[i]);
-}
-
-__global__ void corr_unpack_kernel(const std::uint64_t *tagged_keys,
-                                   const std::uint64_t *payload, std::size_t n,
-                                   std::uint32_t *out_keys,
-                                   std::uint32_t *out_value_delta,
-                                   std::int8_t *out_count_delta) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  out_keys[i] = static_cast<std::uint32_t>(tagged_keys[i] >> 32);
-  out_value_delta[i] = static_cast<std::uint32_t>(payload[i] >> 32);
-  out_count_delta[i] = static_cast<std::int8_t>(
-      static_cast<std::uint32_t>(payload[i]));
-}
-
-// The greatest temporal rank is the visible assignment.
-__global__ void resolve_merge_flag_kernel(const std::uint64_t *tagged_keys,
-                                          const std::uint64_t *payload,
-                                          std::size_t total,
-                                          std::uint8_t *flags) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= total)
-    return;
-  const std::uint32_t key =
-      static_cast<std::uint32_t>(tagged_keys[i] >> 32);
-  const bool last =
-      i + 1u == total ||
-      static_cast<std::uint32_t>(tagged_keys[i + 1u] >> 32) != key;
-  flags[i] = (last && payload[i] != 0u) ? 1u : 0u;
-}
-
-
-__device__ __forceinline__ bool lookup_raw_leaf(
-    const AssignmentRunView &run, std::uint32_t key,
-    std::uint32_t *value, bool *live) {
-  const std::uint32_t q = key >> kEpochQuotientBits;
-  if (run.quotient_mask != nullptr) {
-    const std::uint64_t required =
-        raw_quotient_mask_bits(key & 0xffffu);
-    if ((run.quotient_mask[q] & required) != required)
-      return false;
-  }
-  std::uint32_t begin = 0u, position = 0u;
-  assignment_bounds(run, q, &begin, &position);
-  while (position-- > begin) {
-    if (run.keys[position] != key)
-      continue;
-    const bool is_live = assignment_op_at(
-                             run.op_words, run.constant_op,
-                             run.mixed, position) != 0;
-    *live = is_live;
-    *value = is_live ? run.values[position] : 0u;
-    return true;
-  }
-  return false;
-}
-
-__device__ __forceinline__ bool lookup_heavy_parent(
-    const AssignmentRunView &parent, std::uint32_t key,
-    std::uint32_t *value, bool *live,
-    std::uint32_t *found_child) {
-  const std::uint32_t q = key >> kEpochQuotientBits;
-  const std::uint32_t slots =
-      parent.offsets[q + 1u] - parent.offsets[q];
-  const std::uint32_t low = key & 0xffffu;
-  const std::uint32_t *table =
-      parent.keys + parent.offsets[q];
-  std::uint32_t slot =
-      slots == 65536u ? low : hash_fold_slot(low, slots);
-  for (std::uint32_t probe = 0; probe < slots; ++probe) {
-    const std::uint32_t entry = table[slot];
-    if (entry == 0u)
-      return false;
-    if ((entry & 0xffffu) == low) {
-      const std::uint32_t child =
-          (entry >> 16) & 0x7fffu;
-      *found_child = child;
-      return lookup_raw_leaf(
-          parent.hash_children[child], key, value, live);
-    }
-    if (++slot == slots)
-      slot = 0u;
-  }
-  return false;
-}
-
-__device__ __forceinline__ bool lookup_routed_parent(
-    const AssignmentRunView &parent, std::uint32_t key,
-    std::uint32_t *value, bool *live,
-    std::uint32_t *found_child) {
-  const std::uint32_t q = key >> kEpochQuotientBits;
-  if (parent.child_router == nullptr) {
-    for (int child = static_cast<int>(parent.child_count) - 1;
-         child >= 0; --child) {
-      if (lookup_raw_leaf(
-              parent.hash_children[child], key, value, live)) {
-        *found_child = static_cast<std::uint32_t>(child);
-        return true;
-      }
-    }
-    return false;
-  }
-  const std::uint32_t route =
-      (key >> (kEpochQuotientBits - kHashRouteBits)) &
-      (kHashRouteBins - 1u);
-  const std::size_t base =
-      (static_cast<std::size_t>(q) * kHashRouteBins + route) *
-      kHashRouteWordsPerBin;
-  for (int word = kHashRouteWordsPerBin - 1;
-       word >= 0; --word) {
-    std::uint32_t candidates = parent.child_router[base + word];
-    while (candidates != 0u) {
-      const int bit = 31 - __clz(candidates);
-      const std::uint32_t child =
-          static_cast<std::uint32_t>(word * 32 + bit);
-      if (lookup_raw_leaf(
-              parent.hash_children[child], key, value, live)) {
-        *found_child = child;
-        return true;
-      }
-      candidates &= ~(1u << bit);
-    }
-  }
-  return false;
-}
-
-template <bool RouteParent>
-__device__ __forceinline__ unsigned long long
-lookup_leaf_candidate(
-    const LookupLeafView &item,
-    const LookupPublication *publication,
-    std::uint32_t key) {
-  std::uint32_t rank = item.rank;
-  std::uint32_t value = 0u;
-  bool live = false;
-  bool found = false;
-  if (item.parent != kNoLookupParent) {
-    const AssignmentRunView parent =
-        publication->parents[item.parent];
-    const std::uint32_t q = key >> kEpochQuotientBits;
-    const std::uint32_t meta = parent.quotient_meta[q];
-    const bool indexed =
-        (meta & kHashHeavyFlag) != 0u &&
-        (meta & kHashScanFlag) == 0u;
-    if (indexed || RouteParent) {
-      if (!item.parent_leader)
-        return 0u;
-      std::uint32_t child = 0u;
-      if (indexed) {
-        found = lookup_heavy_parent(
-            parent, key, &value, &live, &child);
-      } else {
-        found = lookup_routed_parent(
-            parent, key, &value, &live, &child);
-      }
-      rank = publication->parent_ranks[item.parent] -
-             (parent.child_count - 1u - child);
-    } else {
-      found = lookup_raw_leaf(
-          item.leaf, key, &value, &live);
-    }
-  } else {
-    found = lookup_raw_leaf(
-        item.leaf, key, &value, &live);
-  }
-  if (!found)
-    return 0u;
-  return (static_cast<unsigned long long>(rank) << 33) |
-         (static_cast<unsigned long long>(live) << 32) |
-         (live ? value : kEmptyKey);
-}
-
-__device__ inline void write_lookup_candidate(
-    unsigned long long best, BaseRunView base,
-    std::uint32_t key, std::size_t query,
-    std::uint32_t *out_values, std::uint8_t *out_found) {
-  if (best != 0u) {
-    const bool live = ((best >> 32) & 1u) != 0u;
-    out_values[query] =
-        live ? static_cast<std::uint32_t>(best) : kEmptyKey;
-    if (out_found)
-      out_found[query] = live ? 1u : 0u;
-    return;
-  }
-  std::uint32_t value = kEmptyKey;
-  const bool found = base_find_value(base, key, &value);
-  if (!found)
-    value = kEmptyKey;
-  out_values[query] = value;
-  if (out_found)
-    out_found[query] = found ? 1u : 0u;
-}
-
-// One block evaluates all chronological leaves.
-__global__ void temporal_lookup_leaf_block_kernel(
-    const LookupPublication *publication, int leaf_count,
-    BaseRunView base, const std::uint32_t *queries,
-    std::size_t n, std::uint32_t *out_values,
-    std::uint8_t *out_found) {
-  const std::size_t query = blockIdx.x;
-  if (query >= n)
-    return;
-  __shared__ unsigned long long candidates[256];
-  const int tid = threadIdx.x;
-  const std::uint32_t key = queries[query];
-  unsigned long long best = 0u;
-  for (int leaf = tid; leaf < leaf_count;
-       leaf += blockDim.x) {
-    const unsigned long long candidate =
-        lookup_leaf_candidate<false>(
-            publication->leaves[leaf], publication, key);
-    if (candidate > best)
-      best = candidate;
-  }
-  candidates[tid] = best;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      const unsigned long long other = candidates[tid + stride];
-      if (other > candidates[tid])
-        candidates[tid] = other;
-    }
-    __syncthreads();
-  }
-  if (tid == 0)
-    write_lookup_candidate(
-        candidates[0], base, key, query,
-        out_values, out_found);
-}
-
-// Large batches map one thread to each query.
-__global__ void temporal_lookup_leaf_thread_kernel(
-    const LookupPublication *publication, int leaf_count,
-    BaseRunView base, const std::uint32_t *queries,
-    std::size_t n, std::uint32_t *out_values,
-    std::uint8_t *out_found) {
-  const std::size_t query =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-      threadIdx.x;
-  if (query >= n)
-    return;
-  const std::uint32_t key = queries[query];
-  unsigned long long best = 0u;
-  for (int leaf = leaf_count - 1; leaf >= 0; --leaf) {
-    const LookupLeafView item = publication->leaves[leaf];
-    best = lookup_leaf_candidate<true>(
-        item, publication, key);
-    if (best != 0u)
-      break;
-    if (item.parent != kNoLookupParent && item.parent_leader)
-      leaf -= publication->parents[item.parent].child_count - 1u;
-  }
-  write_lookup_candidate(
-      best, base, key, query, out_values, out_found);
-}
-
-template <bool WithLookup>
-__global__ void raw_quotient_masks_kernel(
-    const std::uint32_t *keys,
-    const std::uint32_t *offsets,
-    std::uint64_t *lookup_masks,
-    std::uint64_t *route_masks) {
-  const std::uint32_t warp = threadIdx.x >> 5;
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t q =
-      blockIdx.x * (blockDim.x >> 5) + warp;
-  if (q >= kEpochQuotients)
-    return;
-  const std::uint32_t begin = offsets[q];
-  const std::uint32_t end = offsets[q + 1u];
-  std::uint32_t low_mask = 0u;
-  std::uint32_t high_mask = 0u;
-  std::uint64_t route_mask = 0u;
-  for (std::uint32_t position = begin + lane;
-       position < end; position += 32u) {
-    const std::uint32_t low = keys[position] & 0xffffu;
-    if constexpr (WithLookup) {
-      const std::uint64_t bits = raw_quotient_mask_bits(low);
-      low_mask |= static_cast<std::uint32_t>(bits);
-      high_mask |= static_cast<std::uint32_t>(bits >> 32);
-    }
-    route_mask |= std::uint64_t{1}
-                  << (low >> (kEpochQuotientBits - kHashRouteBits));
-  }
-  for (int delta = 16; delta != 0; delta >>= 1) {
-    if constexpr (WithLookup) {
-      low_mask |= __shfl_down_sync(
-          0xffffffffu, low_mask, delta);
-      high_mask |= __shfl_down_sync(
-          0xffffffffu, high_mask, delta);
-    }
-    route_mask |= __shfl_down_sync(
-        0xffffffffu, route_mask, delta);
-  }
-  if (lane == 0u) {
-    if constexpr (WithLookup)
-      lookup_masks[q] =
-          (static_cast<std::uint64_t>(high_mask) << 32) | low_mask;
-    route_masks[q] = route_mask;
-  }
-}
-
-// Plans pointer scans and indexes only heavy quotients.
-__global__ void temporal_hash_plan_kernel(
-    const AssignmentRunView *runs, int run_count,
-    std::uint32_t *capacities,
-    std::uint32_t *quotient_counts,
-    std::uint32_t *heavy_quotients,
-    std::uint32_t *heavy_count) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kEpochQuotients)
-    return;
-  if (q == kEpochQuotients) {
-    capacities[q] = 0u;
-    quotient_counts[q] = 0u;
-    return;
-  }
-
-  std::uint32_t total = 0u;
-  for (int child = 0; child < run_count; ++child)
-    total += runs[child].offsets[q + 1u] - runs[child].offsets[q];
-
-  std::uint32_t capacity = 0u;
-  if (total > kHashFoldMaxRecords) {
-    if (total >= 32768u) {
-      capacity = 65536u;
-    } else {
-      const std::uint32_t target = total + (total >> 2) + 1u;
-      capacity = 2048u;
-      while (capacity < target)
-        capacity <<= 1;
-    }
-  }
-  capacities[q] = capacity;
-  quotient_counts[q] =
-      capacity == 0u && total != 0u ? kHashScanFlag | total : 0u;
-
-  const unsigned mask =
-      __ballot_sync(0xffffffffu, capacity != 0u);
-  if (capacity == 0u)
-    return;
-  const unsigned lane = threadIdx.x & 31u;
-  const unsigned leader = __ffs(mask) - 1u;
-  std::uint32_t base = 0u;
-  if (lane == leader)
-    base = atomicAdd(heavy_count, __popc(mask));
-  base = __shfl_sync(mask, base, leader);
-  const unsigned lower =
-      lane == 0u ? 0u : mask & ((1u << lane) - 1u);
-  heavy_quotients[base + __popc(lower)] = q;
-}
-
-// Builds indexes only for heavy quotients.
-__global__ __launch_bounds__(256)
-void temporal_hash_heavy_kernel(
-    const AssignmentRunView *runs, int run_count,
-    const std::uint32_t *heavy_quotients,
-    const std::uint32_t *heavy_offsets,
-    std::uint32_t *quotient_counts,
-    std::uint32_t heavy_capacity,
-    std::uint32_t *heavy_table) {
-  __shared__ AssignmentRunView views[kRawFoldWidth];
-  __shared__ std::uint32_t prefix[kRawFoldWidth + 1];
-  __shared__ std::uint32_t occupied_count;
-  const std::uint32_t q = heavy_quotients[blockIdx.x];
-  const int tid = threadIdx.x;
-  if (tid < run_count)
-    views[tid] = runs[tid];
-  if (tid == 0) {
-    occupied_count = 0u;
-    prefix[0] = 0u;
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    for (int child = 0; child < run_count; ++child) {
-      const std::uint32_t begin = views[child].offsets[q];
-      const std::uint32_t count =
-          views[child].offsets[q + 1u] - begin;
-      prefix[child + 1] = prefix[child] + count;
-    }
-  }
-  __syncthreads();
-
-  const std::uint32_t total = prefix[run_count];
-  const std::uint32_t table_begin = heavy_offsets[q];
-  const std::uint32_t table_end = heavy_offsets[q + 1u];
-  const std::uint32_t slots = table_end - table_begin;
-  if (table_end > heavy_capacity) {
-    if (tid == 0)
-      quotient_counts[q] = kHashHeavyFlag | kHashScanFlag | total;
-    return;
-  }
-
-  std::uint32_t *table = heavy_table + table_begin;
-  for (std::uint32_t slot = tid; slot < slots;
-       slot += blockDim.x)
-    table[slot] = 0u;
-  __syncthreads();
-
-  if (slots == 65536u) {
-    for (int child = 0; child < run_count; ++child) {
-      const std::uint32_t begin = views[child].offsets[q];
-      const std::uint32_t end = views[child].offsets[q + 1u];
-      const std::uint32_t tag =
-          0x80000000u |
-          (static_cast<std::uint32_t>(child) << 16);
-      for (std::uint32_t position = begin + tid;
-           position < end; position += blockDim.x) {
-        const std::uint32_t low =
-            views[child].keys[position] & 0xffffu;
-        table[low] = tag | low;
-      }
-      __syncthreads();
-    }
-  } else {
-    for (std::uint32_t ordinal = tid; ordinal < total;
-         ordinal += blockDim.x) {
-      int child = 0;
-      while (ordinal >= prefix[child + 1])
-        ++child;
-      const std::uint32_t position =
-          views[child].offsets[q] + ordinal - prefix[child];
-      const std::uint32_t low =
-          views[child].keys[position] & 0xffffu;
-      const std::uint32_t entry =
-          0x80000000u |
-          (static_cast<std::uint32_t>(child) << 16) | low;
-      std::uint32_t slot = hash_fold_slot(low, slots);
-      while (true) {
-        const std::uint32_t old =
-            atomicCAS(table + slot, 0u, entry);
-        if (old == 0u)
-          break;
-        if ((old & 0xffffu) == low) {
-          atomicMax(table + slot, entry);
-          break;
+__global__ void lookup_with_pending_kernel(
+    const std::uint32_t *queries, std::uint32_t *out_values,
+    std::uint8_t *out_found, std::uint32_t count,
+    const RawAssignment *raw, const std::uint32_t *raw_offsets,
+    std::uint32_t batch_stride, std::uint32_t pending_batches,
+    const std::uint64_t *batch_signatures,
+    const std::uint64_t *epoch_signatures,
+    const Row *arena, const Descriptor *descriptors,
+    const std::uint16_t *base_keys, const std::uint32_t *base_values,
+    const std::uint16_t *local_rank, const std::uint32_t *base_offsets,
+    std::uint32_t active_levels,
+    const std::uint32_t *query_ids,
+    std::uint32_t *final_values, std::uint8_t *final_found) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t key = queries[i], q = key >> 16u;
+  const std::uint32_t suffix = key_suffix(key);
+  const std::uint64_t signature_bits = pending_signature_bits(key);
+  if (pending_batches &&
+      (epoch_signatures[q] & signature_bits) == signature_bits) {
+    for (int batch = int(pending_batches) - 1; batch >= 0; --batch) {
+      const std::uint32_t batch_index = static_cast<std::uint32_t>(batch);
+      const std::uint64_t signature =
+          batch_signatures[std::size_t{batch_index} * kQuotients + q];
+      if ((signature & signature_bits) != signature_bits) continue;
+      const std::size_t oi =
+          std::size_t{batch_index} * (kQuotients + 1u) + q;
+      const std::uint32_t begin = raw_offsets[oi], end = raw_offsets[oi + 1u];
+      Row row{};
+      std::uint32_t newest_position = 0u;
+      bool matched = false;
+      for (std::uint32_t position = begin; position < end; ++position) {
+        const RawAssignment candidate =
+            raw[batch_index * batch_stride + position];
+        if (candidate.row.key == suffix &&
+            (!matched || candidate.logical_position > newest_position)) {
+          row = candidate.row;
+          newest_position = candidate.logical_position;
+          matched = true;
         }
-        if (++slot == slots)
-          slot = 0u;
+      }
+      if (matched) {
+        const bool live = (row.flags & kTombstone) == 0u;
+        const std::uint32_t destination = query_ids ? query_ids[i] : i;
+        std::uint32_t *values = final_values ? final_values : out_values;
+        std::uint8_t *found = final_found ? final_found : out_found;
+        values[destination] = live ? row.value : found ? 0u : kInvalid;
+        if (found) found[destination] = live;
+        return;
       }
     }
   }
-  __syncthreads();
-
-  std::uint32_t occupied = 0u;
-  for (std::uint32_t slot = tid; slot < slots;
-       slot += blockDim.x)
-    occupied += table[slot] != 0u ? 1u : 0u;
-  occupied = __reduce_add_sync(0xffffffffu, occupied);
-  if ((tid & 31) == 0)
-    atomicAdd(&occupied_count, occupied);
-  __syncthreads();
-  if (tid == 0)
-    quotient_counts[q] = kHashHeavyFlag | occupied_count;
+  for (std::uint32_t level = 0u; level < active_levels; ++level) {
+    const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+    if (!descriptor.count()) continue;
+    const Row *rows = arena + descriptor.offset();
+    const std::uint32_t position =
+        lower_bound_rows(rows, descriptor.count(), suffix);
+    if (position < descriptor.count() && rows[position].key == suffix) {
+      const bool live = (rows[position].flags & kTombstone) == 0u;
+      const std::uint32_t destination = query_ids ? query_ids[i] : i;
+      std::uint32_t *values = final_values ? final_values : out_values;
+      std::uint8_t *found = final_found ? final_found : out_found;
+      values[destination] =
+          live ? rows[position].value : found ? 0u : kInvalid;
+      if (found) found[destination] = live;
+      return;
+    }
+  }
+  const std::uint32_t cell = (key >> 9u) & 127u;
+  const std::uint32_t section_begin = base_offsets[q];
+  const std::size_t local_index = std::size_t{q} * 128u + cell;
+  const std::uint32_t begin = section_begin + local_rank[local_index];
+  const std::uint32_t end = cell == 127u
+      ? base_offsets[q + 1u]
+      : section_begin + local_rank[local_index + 1u];
+  const std::uint32_t position =
+      lower_bound_keys(base_keys + begin, end - begin, suffix);
+  const bool live = position < end - begin &&
+      base_keys[begin + position] == suffix;
+  const std::uint32_t destination = query_ids ? query_ids[i] : i;
+  std::uint32_t *values = final_values ? final_values : out_values;
+  std::uint8_t *found = final_found ? final_found : out_found;
+  values[destination] =
+      live ? base_values[begin + position] : found ? 0u : kInvalid;
+  if (found) found[destination] = live;
 }
 
-// Routes one key-prefix bin to candidate children.
-__global__ __launch_bounds__(128)
-void temporal_hash_route_kernel(
-    const AssignmentRunView *runs, int run_count,
-    const std::uint32_t *quotient_counts,
-    std::uint32_t *child_router) {
-  constexpr int words =
-      kHashRouteBins * kHashRouteWordsPerBin;
-  __shared__ std::uint32_t route_masks[words];
-  const std::uint32_t q = blockIdx.x;
-  const int tid = threadIdx.x;
-  if (tid < words)
-    route_masks[tid] = 0u;
-  __syncthreads();
-
-  const std::uint32_t meta = quotient_counts[q];
-  if ((meta & kHashScanFlag) != 0u) {
-    for (int child = tid; child < run_count;
-         child += blockDim.x) {
-      const std::uint32_t begin = runs[child].offsets[q];
-      const std::uint32_t end = runs[child].offsets[q + 1u];
-      for (std::uint32_t position = begin; position < end;
-           ++position) {
-        const std::uint32_t route =
-            (runs[child].keys[position] >>
-             (kEpochQuotientBits - kHashRouteBits)) &
-            (kHashRouteBins - 1u);
-        const int word = child >> 5;
-        atomicOr(route_masks +
-                     route * kHashRouteWordsPerBin + word,
-                 1u << (child & 31));
+__device__ bool first_visible_in_quotient(
+    std::uint32_t q, std::uint32_t lower, const RawAssignment *raw,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, const Row *arena,
+    const Descriptor *descriptors, const std::uint16_t *base_keys,
+    const std::uint32_t *base_values,
+    const std::uint32_t *base_offsets, std::uint32_t active_levels,
+    std::uint32_t &result) {
+  const std::uint32_t lower_suffix = key_suffix(lower);
+  std::uint32_t raw_begin[kBatchesPerEpoch]{}, raw_end[kBatchesPerEpoch]{};
+  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+    raw_begin[batch] = raw_offsets[oi];
+    raw_end[batch] = raw_offsets[oi + 1u];
+  }
+  std::uint32_t class_position[kMaximumLevels]{}, class_end[kMaximumLevels]{};
+  for (std::uint32_t level = 0u; level < active_levels; ++level) {
+    const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+    class_end[level] = descriptor.count();
+    class_position[level] = lower_bound_rows(
+        arena + descriptor.offset(), descriptor.count(), lower_suffix);
+  }
+  const std::uint32_t base_begin = base_offsets[q],
+                      base_end = base_offsets[q + 1u];
+  std::uint32_t base_position = base_begin +
+      lower_bound_keys(base_keys + base_begin, base_end - base_begin,
+                       lower_suffix);
+  std::uint32_t previous{};
+  bool have_previous = false;
+  while (true) {
+    std::uint32_t minimum = kInvalid;
+    bool found = false;
+    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch)
+      for (std::uint32_t position = raw_begin[batch];
+           position < raw_end[batch]; ++position) {
+        const std::uint32_t key =
+            raw[batch * batch_stride + position].row.key;
+        if (key >= lower_suffix && (!have_previous || key > previous) &&
+            (!found || key < minimum)) {
+          minimum = key;
+          found = true;
+        }
       }
+    for (std::uint32_t level = 0u; level < active_levels; ++level)
+      if (class_position[level] < class_end[level]) {
+        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+        const std::uint32_t key =
+            arena[descriptor.offset() + class_position[level]].key;
+        if (!found || key < minimum) { minimum = key; found = true; }
     }
-  }
-  __syncthreads();
+    if (base_position < base_end) {
+      const std::uint32_t key = key_suffix(base_keys[base_position]);
+      if (!found || key < minimum) { minimum = key; found = true; }
+    }
+    if (!found) return false;
 
-  const std::size_t base =
-      static_cast<std::size_t>(q) * words;
-  if (tid < words)
-    child_router[base + tid] = route_masks[tid];
+    Row winner{};
+    bool have_winner = false;
+    for (int batch = int(pending_batches) - 1; batch >= 0; --batch) {
+      const std::uint32_t batch_index = static_cast<std::uint32_t>(batch);
+      Row candidate{};
+      std::uint32_t newest_position{};
+      bool matched = false;
+      for (std::uint32_t position = raw_begin[batch_index];
+           position < raw_end[batch_index]; ++position) {
+        const RawAssignment item =
+            raw[batch_index * batch_stride + position];
+        if (item.row.key == minimum &&
+            (!matched || item.logical_position > newest_position)) {
+          candidate = item.row;
+          newest_position = item.logical_position;
+          matched = true;
+        }
+      }
+      if (!have_winner && matched) { winner = candidate; have_winner = true; }
+    }
+    if (!have_winner)
+      for (std::uint32_t level = 0u; level < active_levels; ++level) {
+        if (class_position[level] >= class_end[level]) continue;
+        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+        const Row row = arena[descriptor.offset() + class_position[level]];
+        if (!have_winner && row.key == minimum) {
+          winner = row; have_winner = true;
+        }
+      }
+    if (!have_winner && base_position < base_end &&
+        key_suffix(base_keys[base_position]) == minimum) {
+      winner = make_row(base_keys[base_position],
+                        base_values[base_position], 0u);
+      have_winner = true;
+    }
+    if (have_winner && (winner.flags & kTombstone) == 0u) {
+      result = full_key(q, winner.key);
+      return true;
+    }
+    for (std::uint32_t level = 0u; level < active_levels; ++level)
+      if (class_position[level] < class_end[level]) {
+        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+        if (arena[descriptor.offset() + class_position[level]].key == minimum)
+          ++class_position[level];
+      }
+    if (base_position < base_end &&
+        key_suffix(base_keys[base_position]) == minimum)
+      ++base_position;
+    previous = minimum;
+    have_previous = true;
+  }
 }
 
-__global__ __launch_bounds__(64)
-void temporal_hash_route_mask_kernel(
-    const std::uint64_t *const *route_masks, int run_count,
-    const std::uint32_t *quotient_counts,
-    std::uint32_t *child_router) {
-  const std::uint32_t q = blockIdx.x;
-  const std::uint32_t child = threadIdx.x;
-  const std::uint32_t lane = child & 31u;
-  const std::uint32_t word = child >> 5;
-  const std::size_t base =
-      static_cast<std::size_t>(q) * kHashRouteBins *
-      kHashRouteWordsPerBin;
-  if ((quotient_counts[q] & kHashScanFlag) == 0u) {
-    if (child < kHashRouteBins) {
-      child_router[base + child * kHashRouteWordsPerBin] = 0u;
-      child_router[base + child * kHashRouteWordsPerBin + 1u] = 0u;
+__global__ void successor_with_pending_kernel(
+    const std::uint32_t *queries, std::uint32_t count,
+    std::uint32_t *out_keys, const RawAssignment *raw,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, const Row *arena,
+    const Descriptor *descriptors, const std::uint16_t *base_keys,
+    const std::uint32_t *base_values,
+    const std::uint32_t *base_offsets,
+    std::uint32_t active_levels) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t query = queries[i];
+  for (std::uint32_t q = query >> 16u; q < kQuotients; ++q) {
+    const std::uint32_t lower = q == (query >> 16u) ? query : q << 16u;
+    std::uint32_t result{};
+    if (first_visible_in_quotient(
+            q, lower, raw, raw_offsets, batch_stride, pending_batches, arena,
+            descriptors, base_keys, base_values, base_offsets,
+            active_levels, result)) {
+      out_keys[i] = result;
+      return;
     }
-    return;
   }
-  const std::uint64_t mask =
-      child < static_cast<std::uint32_t>(run_count)
-          ? route_masks[child][q]
-          : 0u;
-  for (int route = 0; route < kHashRouteBins; ++route) {
-    const std::uint32_t candidates = __ballot_sync(
-        0xffffffffu,
-        (mask & (std::uint64_t{1} << route)) != 0u);
-    if (lane == 0u)
-      child_router[base + route * kHashRouteWordsPerBin + word] =
-          candidates;
-  }
+  out_keys[i] = kInvalid;
 }
 
-} // namespace gpulsmopt_detail
+
+}
 
 class GPULSMOpt {
 public:
-  using DeviceKeyBatch = gpulsmopt_detail::DeviceKeyBatch;
-
-  // Host-side maintenance counters for sustained workloads.
-  struct MaintenanceStats {
-    std::uint64_t compaction_count = 0;
-    std::uint64_t compacted_input_records = 0;
-    std::uint64_t compacted_output_records = 0;
-    std::size_t physical_runs = 0;
-    std::size_t assignment_runs = 0;
-    // Temporal hash-fold counters.
-    std::uint64_t hash_fold_count = 0;
-    std::uint64_t hash_fold_input_records = 0;
-    std::uint64_t cold_tier_compaction_count = 0;
-    std::uint64_t cold_tier_input_records = 0;
-    std::uint64_t cold_tier_output_records = 0;
-    std::size_t raw_runs = 0;
-    std::size_t stable_levels_occupied = 0;
+  struct DeviceKeyBatch {
+    const std::uint32_t *keys = nullptr;
+    std::size_t count = 0u;
+    bool sorted = false;
   };
 
-  // Read-only snapshot; run counts reflect current state.
-  // Device fold counters are copied here, outside timed updates.
-  MaintenanceStats maintenance_stats() const {
-    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    MaintenanceStats stats = maintenance_stats_;
-    stats.physical_runs = runs_.size();
-    std::size_t assignment = 0, raw = 0;
-    bool level_seen[gpulsmopt_detail::kStableLevels] = {};
-    for (const auto &run : runs_) {
-      if (!run.assignment)
-        continue;
-      ++assignment;
-      if (run.assignment_class == gpulsmopt_detail::AssignmentClass::Raw)
-        ++raw;
-      else if (run.stable_level >= 0 &&
-               run.stable_level < gpulsmopt_detail::kStableLevels)
-        level_seen[run.stable_level] = true;
-    }
-    stats.assignment_runs = assignment;
-    stats.raw_runs = raw;
-    std::size_t occupied = 0;
-    for (bool s : level_seen)
-      occupied += s ? 1u : 0u;
-    stats.stable_levels_occupied = occupied;
-    return stats;
+  struct MaintenanceStats {
+    std::uint64_t epochs_published = 0u;
+    std::uint64_t admitted_batches = 0u;
+    std::uint64_t admitted_records = 0u;
+    std::uint32_t pending_batches = 0u;
+    std::uint32_t pending_records = 0u;
+    std::uint32_t active_levels = 0u;
+  };
+
+  explicit GPULSMOpt(const DictionaryConfig &config)
+      : batch_capacity_(std::max<std::size_t>(1u, config.batch_capacity)),
+        local_rank_(gpulsmopt2_detail::kLocalRankEntries),
+        base_offsets_(gpulsmopt2_detail::kQuotients + 1u),
+        arena_(std::min<std::size_t>(
+            gpulsmopt2_detail::kMaximumArenaRows,
+            std::max<std::size_t>(
+                1u, 2u * ((std::size_t{1} <<
+                    gpulsmopt2_detail::kInitialArenaLevels) - 1u) *
+                    batch_capacity_ *
+                    gpulsmopt2_detail::kBatchesPerEpoch))),
+        descriptors_(std::size_t{gpulsmopt2_detail::kQuotients} *
+                     gpulsmopt2_detail::kMaximumLevels),
+        free_heads_(std::size_t{gpulsmopt2_detail::kQuotients} *
+                    (gpulsmopt2_detail::kMaximumSizeClass + 1u)),
+        cursor_(1u), overflow_(1u),
+        raw_assignments_(gpulsmopt2_detail::kBatchesPerEpoch *
+                         batch_capacity_),
+        raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
+                     (gpulsmopt2_detail::kQuotients + 1u)),
+        raw_signatures_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
+                        gpulsmopt2_detail::kQuotients),
+        raw_epoch_signatures_(gpulsmopt2_detail::kQuotients),
+        raw_counts_(gpulsmopt2_detail::kQuotients),
+        radix_keys_(batch_capacity_), radix_ids_out_(batch_capacity_),
+        range_partials_(gpulsmopt2_detail::kThreads),
+        range_overflow_count_(1u) {
+    if (batch_capacity_ >
+        (std::size_t{1} << gpulsmopt2_detail::kBatchPositionBits))
+      throw std::invalid_argument("GPULSMOpt batch capacity exceeds logical-position encoding");
+    if (config.max_elements > gpulsmopt2_detail::kMaximumArenaRows)
+      throw std::invalid_argument("GPULSMOpt arena currently supports 2^26 rows");
+    CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
+                                         cudaEventDisableTiming));
+    std::size_t initial_sort_bytes{};
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, initial_sort_bytes,
+        reinterpret_cast<const std::uint32_t *>(raw_assignments_.data()),
+        radix_keys_.data(), radix_ids_out_.data(), radix_ids_out_.data(),
+        static_cast<std::uint32_t>(batch_capacity_), 16, 32, 0));
+    ensure_radix_workspace(initial_sort_bytes, batch_capacity_, 0);
+    CUDA_CHECK(cudaEventRecord(operation_done_, 0));
+    reset_updates(0);
+    CUDA_CHECK(cudaMemset(local_rank_.data(), 0,
+                          local_rank_.size() * sizeof(std::uint16_t)));
+    CUDA_CHECK(cudaMemset(base_offsets_.data(), 0,
+                          base_offsets_.size() * sizeof(std::uint32_t)));
+    CUDA_CHECK(cudaEventRecord(operation_done_, 0));
   }
 
-explicit GPULSMOpt(const DictionaryConfig &config)
-      : max_elements_(config.max_elements),
-        batch_capacity_(config.batch_capacity) {
-    if (max_elements_ > 0x7fffffffu) {
-      throw std::invalid_argument(
-          "GPULSMOpt currently supports at most 2^31-1 records");
-    }
-    runs_.reserve(gpulsmopt_detail::kRunCapacity);
-    run_pool_.reserve(gpulsmopt_detail::kRunCapacity);
-    insert_leaf_pool_.reserve(
-        (gpulsmopt_detail::kInitialInsertLeafSlabs + 1u) *
-        gpulsmopt_detail::kLeafSlabRuns);
-    delete_leaf_pool_.reserve(
-        (gpulsmopt_detail::kInitialDeleteLeafSlabs + 1u) *
-        gpulsmopt_detail::kLeafSlabRuns);
-    hash_storage_pool_.reserve(
-        gpulsmopt_detail::kColdArenaSlots + 1u);
-    hash_child_pool_.reserve(
-        gpulsmopt_detail::kColdArenaSlots + 1u);
-    for (int slot = 0;
-         slot < gpulsmopt_detail::kColdArenaSlots + 1; ++slot) {
-      hash_child_pool_.emplace_back();
-      hash_child_pool_.back().resize(
-          gpulsmopt_detail::kRawFoldWidth);
-    }
-    leaf_slabs_.reserve(
-        gpulsmopt_detail::kLookupLeafCapacity /
-        gpulsmopt_detail::kLeafSlabRuns + 4u);
-    CUDA_CHECK(cudaMallocHost(
-        reinterpret_cast<void **>(&host_state_), sizeof(*host_state_)));
-    const cudaError_t event_error =
-        cudaEventCreateWithFlags(&stream_handoff_, cudaEventDisableTiming);
-    if (event_error != cudaSuccess) {
-      cudaFreeHost(host_state_);
-      host_state_ = nullptr;
-      CUDA_CHECK(event_error);
-    }
-    const cudaError_t stream_error =
-        cudaStreamCreateWithFlags(&leaf_alloc_stream_,
-                                  cudaStreamNonBlocking);
-    if (stream_error != cudaSuccess) {
-      cudaEventDestroy(stream_handoff_);
-      stream_handoff_ = nullptr;
-      cudaFreeHost(host_state_);
-      host_state_ = nullptr;
-      CUDA_CHECK(stream_error);
-    }
-    const cudaError_t leaf_event_error =
-        cudaEventCreateWithFlags(&leaf_alloc_ready_,
-                                 cudaEventDisableTiming);
-    if (leaf_event_error != cudaSuccess) {
-      cudaStreamDestroy(leaf_alloc_stream_);
-      leaf_alloc_stream_ = nullptr;
-      cudaEventDestroy(stream_handoff_);
-      stream_handoff_ = nullptr;
-      cudaFreeHost(host_state_);
-      host_state_ = nullptr;
-      CUDA_CHECK(leaf_event_error);
-    }
-    const cudaError_t device_error =
-        cudaGetDevice(&leaf_alloc_device_);
-    if (device_error != cudaSuccess) {
-      cudaEventDestroy(leaf_alloc_ready_);
-      leaf_alloc_ready_ = nullptr;
-      cudaStreamDestroy(leaf_alloc_stream_);
-      leaf_alloc_stream_ = nullptr;
-      cudaEventDestroy(stream_handoff_);
-      stream_handoff_ = nullptr;
-      cudaFreeHost(host_state_);
-      host_state_ = nullptr;
-      CUDA_CHECK(device_error);
-    }
-    try {
-      leaf_alloc_worker_ = std::thread(
-          [this] { leaf_alloc_worker_loop(); });
-    } catch (...) {
-      cudaEventDestroy(leaf_alloc_ready_);
-      leaf_alloc_ready_ = nullptr;
-      cudaStreamDestroy(leaf_alloc_stream_);
-      leaf_alloc_stream_ = nullptr;
-      cudaEventDestroy(stream_handoff_);
-      stream_handoff_ = nullptr;
-      cudaFreeHost(host_state_);
-      host_state_ = nullptr;
-      throw;
-    }
-  }
+  GPULSMOpt(const GPULSMOpt &) = delete;
+  GPULSMOpt &operator=(const GPULSMOpt &) = delete;
 
   ~GPULSMOpt() {
-    {
-      std::lock_guard<std::mutex> guard(leaf_alloc_mutex_);
-      leaf_alloc_stop_ = true;
+    if (operation_done_) {
+      cudaEventSynchronize(operation_done_);
+      cudaEventDestroy(operation_done_);
     }
-    leaf_alloc_cv_.notify_one();
-    if (leaf_alloc_worker_.joinable())
-      leaf_alloc_worker_.join();
-    // Operations return after enqueue. Drain the final caller stream before
-    // member-owned device buffers begin destruction, including when the
-    // caller used CUDA's null/default stream.
-    if (operation_stream_valid_)
-      cudaStreamSynchronize(operation_stream_);
-    if (leaf_alloc_stream_)
-      cudaStreamSynchronize(leaf_alloc_stream_);
-    if (leaf_alloc_result_)
-      cudaFree(leaf_alloc_result_);
-    if (leaf_alloc_ready_)
-      cudaEventDestroy(leaf_alloc_ready_);
-    if (leaf_alloc_stream_)
-      cudaStreamDestroy(leaf_alloc_stream_);
-    if (stream_handoff_)
-      cudaEventDestroy(stream_handoff_);
-    if (host_state_)
-      cudaFreeHost(host_state_);
   }
 
   void clear(cudaStream_t stream) {
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    order_stream_locked(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    clear_run_state();
-    live_count_ = 0;
-    run_sequence_ = 0;
-    chrono_views_.clear();
-    invalidate_resolved();
-    succ_sparse_ready_ = false;
-    reset_parent_storage();
-    reset_lookup_owner(stream);
-    ++base_generation_;
-    initialize_empty_base(stream);
-  }
-
-  void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
-    validate_device_count(batch.count, "insert");
-    if (batch.count == 0)
-      return;
-    {
-      std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-      order_stream_locked(stream);
-#ifdef GPULSMOPT_PROFILE_INSERT
-      reset_insert_prof_();
-      const auto prof_t0 = std::chrono::high_resolution_clock::now();
-#endif
-      insert_records(batch.keys, batch.values,
-                     static_cast<std::uint8_t>(gpulsmopt_detail::kInsert),
-                     batch.count, stream);
-#ifdef GPULSMOPT_PROFILE_INSERT
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      const auto prof_t1 = std::chrono::high_resolution_clock::now();
-      const double total =
-          std::chrono::duration<double, std::milli>(prof_t1 - prof_t0).count();
-      const double measured = prof_delta_sort_ms_ + prof_delta_ingest_ms_;
-      const double other = total - measured;
-      auto pct = [total](double x) {
-        return total > 0.0 ? 100.0 * x / total : 0.0;
-      };
-      printf("[prof] insert %zu keys: total=%.3f ms\n", batch.count, total);
-      printf("[prof]   delta_sort  = %.3f ms (%5.1f%%)\n", prof_delta_sort_ms_,
-             pct(prof_delta_sort_ms_));
-      printf("[prof]   delta_write = %.3f ms (%5.1f%%)\n",
-             prof_delta_ingest_ms_, pct(prof_delta_ingest_ms_));
-      printf("[prof]   other/host  = %.3f ms (%5.1f%%)\n", other, pct(other));
-#endif
-    }
-  }
-
-  void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
-    validate_device_count(batch.count, "erase");
-    if (batch.count == 0)
-      return;
-    {
-      std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-      order_stream_locked(stream);
-#ifdef GPULSMOPT_PROFILE_INSERT
-      reset_insert_prof_();
-      const auto prof_t0 = std::chrono::high_resolution_clock::now();
-#endif
-      insert_records(batch.keys, batch.keys,
-                     static_cast<std::uint8_t>(gpulsmopt_detail::kTombstone),
-                     batch.count, stream);
-#ifdef GPULSMOPT_PROFILE_INSERT
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      const auto prof_t1 = std::chrono::high_resolution_clock::now();
-      const double total =
-          std::chrono::duration<double, std::milli>(prof_t1 - prof_t0).count();
-      printf("[prof] delete %zu keys: total=%.3f ms\n", batch.count, total);
-#endif
-    }
-  }
-
-  void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
-    validate_device_count(batch.count, "lookup");
-    if (batch.count == 0)
-      return;
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    order_stream_locked(stream);
-    ensure_sorted_run_cache(stream);
-    if (should_use_lookup_owner(batch.count)) {
-      flush_pending_views(stream);
-      constexpr int block = 256;
-      const int grid = static_cast<int>(
-          (batch.count + block - 1u) / block);
-      const int owner_run_count =
-          static_cast<int>(chrono_views_.size());
-      // A complete lookup must settle pending publication. Apply each leaf
-      // once before probing so the query kernel does not rescan the same
-      // quotient slice independently for every query.
-      prepare_lookup_owner(stream);
-      gpulsmopt_detail::lookup_sector_kernel<<<grid, block, 0, stream>>>(
-          lookup_sector_buckets_.data(),
-          lookup_sector_buckets_per_quotient_,
-          lookup_sector_bucket_mask_, lookup_sector_overflow_.data(),
-          lookup_sector_stash_.data(), lookup_owner_overflow_.data(),
-          lookup_radix_arena_.data(), lookup_radix_roots_.data(),
-          lookup_radix_enabled_.data(),
-          lookup_owner_leaves_.data(), lookup_owner_leaf_count_,
-          lookup_sector_ready_.data(), assignment_views_.data(),
-          owner_run_count, make_base_view(), batch.queries, batch.count,
-          batch.out_values, batch.out_found);
-      CUDA_CHECK(cudaGetLastError());
-      return;
-    }
-#ifdef GPULSMOPT_PROFILE_FOLD
-    double prof_masks = 0.0;
-    double prof_publish = 0.0;
-    double prof_kernel = 0.0;
-#endif
-    {
-      GPULSMOPT_FOLD_PHASE(prof_masks);
-      ensure_raw_lookup_masks(stream);
-    }
-    int leaf_count = 0;
-    {
-      GPULSMOPT_FOLD_PHASE(prof_publish);
-      leaf_count = prepare_lookup_leaf_views(stream);
-      if (leaf_count <
-          GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS)
-        flush_pending_views(stream);
-    }
-    const int run_count = static_cast<int>(chrono_views_.size());
-    const bool leaf_parallel =
-        leaf_count >= GPULSMOPT_LOOKUP_RUN_PARALLEL_MIN_RUNS;
-    {
-      GPULSMOPT_FOLD_PHASE(prof_kernel);
-      if (leaf_parallel &&
-          batch.count <=
-              static_cast<std::size_t>(
-                  GPULSMOPT_LOOKUP_RUN_PARALLEL_MAX_QUERIES)) {
-        constexpr int block = 256;
-        const int grid = static_cast<int>(batch.count);
-        gpulsmopt_detail::temporal_lookup_leaf_block_kernel<<<
-            grid, block, 0, stream>>>(
-            lookup_publication_.data(), leaf_count,
-            make_base_view(), batch.queries,
-            batch.count, batch.out_values, batch.out_found);
-      } else if (leaf_parallel) {
-        constexpr int block = 256;
-        const int grid = static_cast<int>(
-            (batch.count + block - 1u) / block);
-        gpulsmopt_detail::temporal_lookup_leaf_thread_kernel<<<
-            grid, block, 0, stream>>>(
-            lookup_publication_.data(), leaf_count,
-            make_base_view(), batch.queries,
-            batch.count, batch.out_values, batch.out_found);
-      } else {
-        constexpr int block = 256;
-        const int grid = static_cast<int>(
-            (batch.count + block - 1u) / block);
-        gpulsmopt_detail::temporal_lookup_kernel<<<
-            grid, block, 0, stream>>>(
-            assignment_views_.data(), run_count,
-            make_base_view(), batch.queries,
-            batch.count, batch.out_values, batch.out_found);
-      }
-      CUDA_CHECK(cudaGetLastError());
-    }
-#ifdef GPULSMOPT_PROFILE_FOLD
-    printf("[lookup] leaves=%d masks=%.3f publish=%.3f "
-           "kernel=%.3f ms\n",
-           leaf_count, prof_masks, prof_publish, prof_kernel);
-#endif
-  }
-
-  void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
-    validate_device_count(batch.count, "successor");
-    if (batch.count == 0)
-      return;
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    order_stream_locked(stream);
-    ensure_sorted_run_cache(stream);
-    flush_pending_views(stream);
-    constexpr int block = 256;
-    const int grid = static_cast<int>((batch.count + block - 1) / block);
-    const int run_count = static_cast<int>(chrono_views_.size());
-    if (run_count == 0) {
-      gpulsmopt_detail::base_successor_kernel<<<grid, block, 0, stream>>>(
-          make_base_view(), batch.queries, batch.count,
-          batch.out_keys);
-      CUDA_CHECK(cudaGetLastError());
-      return;
-    }
-    if (sparse_view_is_current()) {
-      gpulsmopt_detail::sparse_successor_kernel<<<grid, block, 0, stream>>>(
-          make_sparse_successor_view(), batch.queries, nullptr, batch.count,
-          batch.out_keys);
-      CUDA_CHECK(cudaGetLastError());
-      return;
-    }
-    succ_miss_indices_.resize_discard(batch.count);
-    succ_miss_count_.resize_discard(1);
-    CUDA_CHECK(cudaMemsetAsync(succ_miss_count_.data(), 0,
-                               sizeof(std::uint32_t), stream));
-    gpulsmopt_detail::successor_live_or_miss_kernel<<<grid, block, 0, stream>>>(
-        assignment_views_.data(), run_count, make_base_view(),
-        batch.queries, batch.count, batch.out_keys, succ_miss_indices_.data(),
-        succ_miss_count_.data());
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpyAsync(&host_state_->successor_miss_count,
-                               succ_miss_count_.data(), sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const std::uint32_t misses = host_state_->successor_miss_count;
-    if (misses == 0u)
-      return;
-    ensure_sparse_successor_view(stream);
-    const int miss_grid = static_cast<int>((misses + block - 1u) / block);
-    gpulsmopt_detail::sparse_successor_kernel<<<miss_grid, block, 0, stream>>>(
-        make_sparse_successor_view(), batch.queries, succ_miss_indices_.data(),
-        misses, batch.out_keys);
-    CUDA_CHECK(cudaGetLastError());
-  }
-
-  void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
-    validate_device_count(batch.query_count, "range");
-    if (batch.query_count == 0u)
-      return;
-    if (batch.lo == nullptr || batch.hi == nullptr ||
-        batch.out_sums == nullptr)
-      throw std::invalid_argument("range requires lo, hi, and out_sums");
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    order_stream_locked(stream);
-    ensure_sorted_run_cache(stream);
-    if (run_sequence_ != 0u)
-      ensure_lqvrf(batch, stream);
-    const bool has_lqvrf = run_sequence_ != 0u && lqvrf_has_effects_;
-    const gpulsmopt_detail::LqvrfView row_view =
-        has_lqvrf ? make_lqvrf_view() : make_base_only_lqvrf_view();
-    if (launch_lqvrf_wide_sum(batch, row_view, stream)) {
-      CUDA_CHECK(cudaGetLastError());
-      return;
-    }
-    // Match LSMu's range-kernel block geometry for the scan-only comparison.
-    constexpr int block = 512;
-    const int grid =
-        static_cast<int>((batch.query_count + block - 1u) / block);
-    if (has_lqvrf) {
-      gpulsmopt_detail::lqvrf_range_sum_kernel<<<grid, block, 0, stream>>>(
-          row_view, batch.lo, batch.hi, batch.query_count,
-          batch.out_sums);
-    } else {
-      gpulsmopt_detail::base_range_scan_sum_kernel<<<grid, block, 0, stream>>>(
-          make_sorted_view(), batch.lo, batch.hi, batch.query_count,
-          batch.out_sums);
-    }
-    CUDA_CHECK(cudaGetLastError());
-  }
-
-  void consolidate(cudaStream_t stream) {
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    order_stream_locked(stream);
-    fold_into_base(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    begin_operation(stream);
+    base_keys_ = {};
+    base_values_ = {};
+    CUDA_CHECK(cudaMemsetAsync(local_rank_.data(), 0,
+                               local_rank_.size() * sizeof(std::uint16_t),
+                               stream));
+    CUDA_CHECK(cudaMemsetAsync(base_offsets_.data(), 0,
+                               base_offsets_.size() * sizeof(std::uint32_t),
+                               stream));
+    reset_updates(stream);
+    end_operation(stream);
   }
 
   void bulk_build(const std::uint32_t *keys, const std::uint32_t *values,
-                  std::size_t n, cudaStream_t stream) {
-    validate_device_count(n, "bulk_build");
-    std::unique_lock<std::shared_mutex> guard(snapshot_mutex_);
-    order_stream_locked(stream);
-    clear_run_state();
-    live_count_ = 0;
-    run_sequence_ = 0;
-    chrono_views_.clear();
-    invalidate_resolved();
-    succ_sparse_ready_ = false;
-    ++base_generation_;
-    maintenance_stats_ = MaintenanceStats{};
-    reserve_lookup_owner_storage(stream);
-    if (n == 0) {
-      initialize_empty_base(stream);
-      prepare_for_insert(stream);
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+                  std::size_t count, cudaStream_t stream) {
+    if ((count && (!keys || !values)) || count > std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument("invalid GPULSMOpt BaseRun input");
+    begin_operation(stream);
+    reset_updates(stream);
+    if (!count) {
+      base_keys_ = {};
+      base_values_ = {};
+      CUDA_CHECK(cudaMemsetAsync(local_rank_.data(), 0,
+                                 local_rank_.size() * sizeof(std::uint16_t),
+                                 stream));
+      CUDA_CHECK(cudaMemsetAsync(base_offsets_.data(), 0,
+                                 base_offsets_.size() * sizeof(std::uint32_t),
+                                 stream));
+      end_operation(stream);
       return;
     }
-    sort_direct_batch(keys, values, n, stream);
-    acquire_compaction_slot();
-    RunStorage &run = runs_.back();
-    run.sequence_begin = 0;
-    run.sequence_end = 0;
-    run.stable_level = -1;
-    run.operation = gpulsmopt_detail::RunOperation::Insert;
-    run.assignment_class = gpulsmopt_detail::AssignmentClass::Raw;
-    run.mixed = false;
-    run.assignment = false;
-    run.hashed = false;
-    run.grouped = false;
-    run.nested = false;
-    run.lookup_mask_ready = false;
-    run.route_mask_ready = false;
-    run.group_child_count = 0;
-    run.parent_slot = -1;
-    run.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
-    run.count = n;
-    run.fully_sorted = true;
-    run.unit_counts = true;
-    run.unique_keys = true;
-    run.keys.resize_discard(n);
-    run.values.resize_discard(n);
-    auto policy = thrust::cuda::par.on(stream);
-    auto unique_end = thrust::reduce_by_key(
-        policy, direct_sort_keys_.data(), direct_sort_keys_.data() + n,
-        direct_sort_values_.data(), run.keys.data(), run.values.data(),
-        thrust::equal_to<std::uint32_t>(), gpulsmopt_detail::TakeLastU32{});
-    run.count = static_cast<std::size_t>(unique_end.first - run.keys.data());
-    run.keys.resize_discard(run.count);
-    run.values.resize_discard(run.count);
-    run.quotient_off.release();
-    run.op_words.release();
-    run.count_delta.release();
-    build_sorted_run_cache(0u, stream);
-    seed_lookup_owner_base(stream);
-    live_count_ = run.count;
-    release_build_sort_storage();
-    prepare_for_insert(stream);
+    const std::uint32_t n = static_cast<std::uint32_t>(count);
+    gpulsmopt2_detail::Buffer<std::uint32_t> sorted_keys(n), sorted_values(n);
+    gpulsmopt2_detail::Buffer<std::uint8_t> keep(n);
+    gpulsmopt2_detail::Buffer<std::uint32_t> selected_ids(n);
+    gpulsmopt2_detail::Buffer<std::uint32_t> selected_count(1u);
+    std::size_t sort_bytes{};
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, sort_bytes, keys, sorted_keys.data(), values,
+        sorted_values.data(), n, 0, 32, stream));
+    gpulsmopt2_detail::Buffer<std::uint8_t> sort_temp(sort_bytes);
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        sort_temp.data(), sort_bytes, keys, sorted_keys.data(), values,
+        sorted_values.data(), n, 0, 32, stream));
+    gpulsmopt2_detail::mark_base_winners_kernel<<<
+        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        sorted_keys.data(), n, keep.data());
+    CUDA_CHECK(cudaGetLastError());
+    cub::CountingInputIterator<std::uint32_t> input_ids(0u);
+    std::size_t select_bytes{};
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        nullptr, select_bytes, input_ids, keep.data(), selected_ids.data(),
+        selected_count.data(), n, stream));
+    gpulsmopt2_detail::Buffer<std::uint8_t> select_temp(select_bytes);
+    CUDA_CHECK(cub::DeviceSelect::Flagged(
+        select_temp.data(), select_bytes, input_ids, keep.data(),
+        selected_ids.data(), selected_count.data(), n, stream));
+    std::uint32_t base_count{};
+    CUDA_CHECK(cudaMemcpyAsync(&base_count, selected_count.data(),
+                               sizeof(base_count), cudaMemcpyDeviceToHost,
+                               stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    base_keys_.resize(base_count);
+    base_values_.resize(base_count);
+    gpulsmopt2_detail::Buffer<std::uint32_t> quotient_counts(
+        gpulsmopt2_detail::kQuotients + 1u);
+    CUDA_CHECK(cudaMemsetAsync(quotient_counts.data(), 0,
+                               quotient_counts.size() * sizeof(std::uint32_t),
+                               stream));
+    gpulsmopt2_detail::gather_base_winners_kernel<<<
+        blocks(base_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            sorted_keys.data(), sorted_values.data(), selected_ids.data(),
+            base_count, base_keys_.data(), base_values_.data(),
+            quotient_counts.data());
+    CUDA_CHECK(cudaGetLastError());
+    std::size_t quotient_scan_bytes{};
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        nullptr, quotient_scan_bytes, quotient_counts.data(),
+        base_offsets_.data(), gpulsmopt2_detail::kQuotients + 1u, stream));
+    gpulsmopt2_detail::Buffer<std::uint8_t> scan_temp(quotient_scan_bytes);
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        scan_temp.data(), quotient_scan_bytes, quotient_counts.data(),
+        base_offsets_.data(), gpulsmopt2_detail::kQuotients + 1u, stream));
+    gpulsmopt2_detail::build_local_rank_directory_kernel<<<
+        gpulsmopt2_detail::kQuotients, 128u, 0, stream>>>(
+            base_keys_.data(), base_offsets_.data(), local_rank_.data());
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
   }
 
-  std::size_t live_count() const {
-    auto *self = const_cast<GPULSMOpt *>(this);
-    std::unique_lock<std::shared_mutex> guard(self->snapshot_mutex_);
-    const cudaStream_t stream = self->operation_stream_;
-    self->ensure_resolved(stream);
-    std::int64_t live = self->sorted_run_ready()
-                            ? static_cast<std::int64_t>(
-                                  self->sorted_run().count)
-                            : 0;
-    auto policy = thrust::cuda::par.on(stream);
-    // BaseRun count plus pending assignment corrections.
-    if (self->resolved_.count > 0)
-      live += thrust::reduce(
-          policy, self->resolved_.count_delta.data(),
-          self->resolved_.count_delta.data() + self->resolved_.count,
-          std::int64_t{0}, thrust::plus<std::int64_t>());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    self->live_count_ = static_cast<std::size_t>(std::max<std::int64_t>(0, live));
-    return self->live_count_;
+  void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
+    admit(batch.keys, batch.values, batch.count, false, stream);
+  }
+
+  void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
+    admit(batch.keys, nullptr, batch.count, true, stream);
+  }
+
+  void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
+    if (!batch.count) return;
+    if (!batch.queries || !batch.out_values ||
+        batch.count > std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument("invalid GPULSMOpt lookup");
+    begin_operation(stream);
+    const std::uint32_t count = static_cast<std::uint32_t>(batch.count);
+    if (count >= gpulsmopt2_detail::kQuotients * 4u) {
+      ensure_radix_buffers(count);
+      std::size_t bytes{};
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          nullptr, bytes, batch.queries, radix_keys_.data(),
+          radix_ids_out_.data(), radix_ids_out_.data(), count, 16, 32,
+          stream));
+      ensure_radix_workspace(bytes, count, stream);
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          radix_workspace(), bytes, batch.queries, radix_keys_.data(),
+          radix_input_ids(), radix_ids_out_.data(), count, 16, 32, stream));
+      gpulsmopt2_detail::lookup_with_pending_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          radix_keys_.data(), nullptr, nullptr, count,
+          raw_assignments_.data(), raw_offsets_.data(),
+          static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+          raw_signatures_.data(),
+          raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
+          base_keys_.data(), base_values_.data(), local_rank_.data(),
+          base_offsets_.data(), active_levels_, radix_ids_out_.data(),
+          batch.out_values, batch.out_found);
+      CUDA_CHECK(cudaGetLastError());
+    } else {
+      gpulsmopt2_detail::lookup_with_pending_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          batch.queries, batch.out_values, batch.out_found, count,
+          raw_assignments_.data(), raw_offsets_.data(),
+          static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+          raw_signatures_.data(),
+          raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
+          base_keys_.data(), base_values_.data(), local_rank_.data(),
+          base_offsets_.data(), active_levels_, nullptr, nullptr, nullptr);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+  }
+
+  void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
+    if (!batch.query_count) return;
+    if (!batch.lo || !batch.hi || !batch.out_sums ||
+        batch.query_count > std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument("invalid GPULSMOpt range input");
+    begin_operation(stream);
+    const std::uint32_t query_count =
+        static_cast<std::uint32_t>(batch.query_count);
+    ensure_range_fragment_query_capacity(query_count);
+    gpulsmopt2_detail::count_range_fragments_kernel<<<
+        blocks(std::size_t{query_count} + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            batch.lo, batch.hi, query_count,
+            range_fragment_counts_.data());
+
+    std::size_t scan_bytes{};
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, scan_bytes, range_fragment_counts_.data(),
+        range_fragment_offsets_.data(), query_count + 1u, stream));
+    ensure_range_temp(scan_bytes);
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        range_temp_.data(), scan_bytes, range_fragment_counts_.data(),
+        range_fragment_offsets_.data(), query_count + 1u, stream));
+    std::uint32_t fragment_count{};
+    if (query_count == 1u) {
+      fragment_count = gpulsmopt2_detail::kQuotients;
+    } else {
+      CUDA_CHECK(cudaMemcpyAsync(
+          &fragment_count, range_fragment_offsets_.data() + query_count,
+          sizeof(fragment_count), cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (!fragment_count) {
+        CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
+                                   std::size_t{query_count} *
+                                       sizeof(std::uint32_t),
+                                   stream));
+        end_operation(stream);
+        return;
+      }
+    }
+    const bool use_section_owners = query_count > 1u &&
+        (stats_.epochs_published != 0u || pending_batches_ != 0u) &&
+        std::uint64_t{fragment_count} >=
+            std::uint64_t{gpulsmopt2_detail::kQuotients} *
+                gpulsmopt2_detail::kSectionOwnerMinimumReuse;
+    ensure_range_partial_capacity(fragment_count);
+    if (use_section_owners)
+      ensure_range_section_capacity(fragment_count);
+    else
+      ensure_range_fragment_capacity(fragment_count);
+    if (query_count == 1u) {
+      gpulsmopt2_detail::emit_single_range_fragments_kernel<false><<<
+          gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              batch.lo, batch.hi, range_fragment_offsets_.data(),
+              range_fragments_.data(), nullptr, nullptr);
+    } else if (std::uint64_t{fragment_count} <=
+               std::uint64_t{query_count} * 4u) {
+      if (use_section_owners)
+        gpulsmopt2_detail::emit_range_fragments_thread_kernel<true><<<
+            blocks(query_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+                batch.lo, batch.hi, range_fragment_offsets_.data(), query_count,
+                nullptr, range_section_keys_in_.data(),
+                range_section_fragments_in_.data());
+      else
+        gpulsmopt2_detail::emit_range_fragments_thread_kernel<false><<<
+            blocks(query_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+                batch.lo, batch.hi, range_fragment_offsets_.data(), query_count,
+                range_fragments_.data(), nullptr, nullptr);
+    } else {
+      if (use_section_owners)
+        gpulsmopt2_detail::emit_range_fragments_kernel<true><<<
+            (query_count + 7u) / 8u, gpulsmopt2_detail::kThreads, 0, stream>>>(
+                batch.lo, batch.hi, range_fragment_offsets_.data(), query_count,
+                nullptr, range_section_keys_in_.data(),
+                range_section_fragments_in_.data());
+      else
+        gpulsmopt2_detail::emit_range_fragments_kernel<false><<<
+            (query_count + 7u) / 8u, gpulsmopt2_detail::kThreads, 0, stream>>>(
+                batch.lo, batch.hi, range_fragment_offsets_.data(), query_count,
+                range_fragments_.data(), nullptr, nullptr);
+    }
+    if (use_section_owners) {
+      std::size_t section_sort_bytes{};
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          nullptr, section_sort_bytes, range_section_keys_in_.data(),
+          range_section_keys_out_.data(),
+          range_section_fragments_in_.data(),
+          range_section_fragments_out_.data(), fragment_count, 0,
+          32, stream));
+      ensure_range_temp(section_sort_bytes);
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          range_temp_.data(), section_sort_bytes,
+          range_section_keys_in_.data(), range_section_keys_out_.data(),
+          range_section_fragments_in_.data(),
+          range_section_fragments_out_.data(), fragment_count, 0,
+          32, stream));
+      gpulsmopt2_detail::find_section_fragment_offsets_kernel<<<
+          blocks(gpulsmopt2_detail::kQuotients + 1u),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+          range_section_keys_out_.data(), fragment_count,
+              range_section_offsets_.data());
+      CUDA_CHECK(cudaMemsetAsync(range_section_max_fragments_.data(), 0,
+                                 sizeof(std::uint32_t), stream));
+      gpulsmopt2_detail::summarize_section_fragment_density_kernel<<<
+          blocks(gpulsmopt2_detail::kQuotients),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_section_offsets_.data(),
+              range_section_max_fragments_.data());
+      std::uint32_t maximum_section_fragments{};
+      CUDA_CHECK(cudaMemcpyAsync(
+          &maximum_section_fragments, range_section_max_fragments_.data(),
+          sizeof(maximum_section_fragments), cudaMemcpyDeviceToHost,
+          stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      const bool tile_sections = maximum_section_fragments >
+          gpulsmopt2_detail::kSectionTaskFragments;
+      const std::uint32_t maximum_section_tasks =
+          gpulsmopt2_detail::kQuotients +
+          (fragment_count + gpulsmopt2_detail::kSectionTaskFragments - 1u) /
+              gpulsmopt2_detail::kSectionTaskFragments;
+      if (tile_sections) {
+        gpulsmopt2_detail::count_section_range_tasks_kernel<<<
+            blocks(gpulsmopt2_detail::kQuotients + 1u),
+            gpulsmopt2_detail::kThreads, 0, stream>>>(
+                range_section_offsets_.data(),
+                range_section_task_counts_.data());
+        std::size_t task_scan_bytes{};
+        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+            nullptr, task_scan_bytes, range_section_task_counts_.data(),
+            range_section_task_offsets_.data(),
+            gpulsmopt2_detail::kQuotients + 1u, stream));
+        ensure_range_temp(task_scan_bytes);
+        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+            range_temp_.data(), task_scan_bytes,
+            range_section_task_counts_.data(),
+            range_section_task_offsets_.data(),
+            gpulsmopt2_detail::kQuotients + 1u, stream));
+        gpulsmopt2_detail::emit_section_range_tasks_kernel<<<
+            blocks(gpulsmopt2_detail::kQuotients),
+            gpulsmopt2_detail::kThreads, 0, stream>>>(
+                range_section_offsets_.data(),
+                range_section_task_offsets_.data(),
+                range_section_tasks_.data());
+      }
+      if (pending_batches_)
+        tile_sections
+            ? launch_section_ranges<true, true>(maximum_section_tasks, stream)
+            : launch_section_ranges<true, false>(maximum_section_tasks,
+                                                 stream);
+      else
+        tile_sections
+            ? launch_section_ranges<false, true>(maximum_section_tasks,
+                                                 stream)
+            : launch_section_ranges<false, false>(maximum_section_tasks,
+                                                  stream);
+    } else if (pending_batches_) {
+      launch_fragment_ranges<true>(fragment_count, query_count, batch, stream);
+    } else {
+      launch_fragment_ranges<false>(fragment_count, query_count, batch,
+                                    stream);
+    }
+    if (query_count == 1u) {
+      gpulsmopt2_detail::reduce_single_range_partials_stage1_kernel<<<
+          256, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_fragment_partials_.data(),
+              range_fragment_offsets_.data() + 1u,
+              range_partials_.data());
+      gpulsmopt2_detail::reduce_single_range_partials_stage2_kernel<<<
+          1, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_partials_.data(), batch.out_sums);
+    } else if (std::uint64_t{fragment_count} <=
+               std::uint64_t{query_count} * 4u) {
+      gpulsmopt2_detail::reduce_range_fragment_partials_thread_kernel<<<
+          blocks(query_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_fragment_offsets_.data(), query_count,
+              range_fragment_partials_.data(), batch.out_sums);
+    } else {
+      gpulsmopt2_detail::reduce_range_fragment_partials_kernel<<<
+          (query_count + 7u) / 8u, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_fragment_offsets_.data(), query_count,
+              range_fragment_partials_.data(), batch.out_sums);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+  }
+
+  void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
+    if (!batch.count) return;
+    if (!batch.queries || !batch.out_keys ||
+        batch.count > std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument("invalid GPULSMOpt successor input");
+    begin_operation(stream);
+    gpulsmopt2_detail::successor_with_pending_kernel<<<
+        blocks(batch.count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        batch.queries, static_cast<std::uint32_t>(batch.count), batch.out_keys,
+        raw_assignments_.data(), raw_offsets_.data(),
+        static_cast<std::uint32_t>(batch_capacity_),
+        pending_batches_, arena_.data(), descriptors_.data(),
+        base_keys_.data(), base_values_.data(), base_offsets_.data(),
+        active_levels_);
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+  }
+
+  MaintenanceStats maintenance_stats() const {
+    MaintenanceStats result = stats_;
+    result.pending_batches = pending_batches_;
+    result.pending_records = pending_records_;
+    result.active_levels = active_levels_;
+    return result;
   }
 
   std::size_t gpu_resident_bytes() const {
-    std::shared_lock<std::shared_mutex> guard(snapshot_mutex_);
-    std::size_t total = device_bytes_all(
-        resolve_keys_, resolve_payload_, resolve_alt_keys_, resolve_alt_payload_,
-        resolve_flags_, resolve_sel_vdelta_, resolve_count_,
-        resolve_quotient_lists_, resolve_class_counts_,
-        resolve_winner_counts_, resolve_winner_offsets_,
-        normalize_views_, flat_normalize_views_,
-        flat_normalize_bases_, norm_keys_, norm_pay_,
-        resolve_winner_keys_data_, resolve_winner_values_,
-        resolve_winner_deltas_, winner_workspace_arena_,
-        resolved_workspace_arena_,
-        cache_pay_, merge_out_keys_, merge_out_pay_, merge_flags_,
-        merge_sel_keys_, merge_sel_pay_, compaction_counts_,
-        compaction_offsets_,
-        assignment_views_,
-        lookup_publication_, lookup_sector_buckets_,
-        lookup_sector_overflow_, lookup_sector_stash_, lookup_sector_ready_,
-        lookup_radix_arena_, lookup_radix_cursor_, lookup_radix_roots_,
-        lookup_radix_enabled_,
-        lookup_owner_leaves_, lookup_owner_overflow_,
-        hash_route_mask_views_,
-        direct_sort_keys_, direct_sort_values_, sort_temp_storage_,
-        base_rank23_, lqvrf_base_hidden_words_, lqvrf_hidden_flag_,
-        lqvrf_candidate_values_, lqvrf_live_flags_, lqvrf_full_keys_,
-        lqvrf_full_values_, lqvrf_selected_count_, lqvrf_full_q_offsets_,
-        lqvrf_materialized_quotients_, lqvrf_cover_delta_,
-        lqvrf_coverage_, lqvrf_new_quotient_count_,
-        lqvrf_latest_sequences_, lqvrf_published_sequences_,
-        lqvrf_formats_, lqvrf_sorted_counts_, lqvrf_packed_counts_,
-        lqvrf_sector_counts_, lqvrf_packed_q_counts_, lqvrf_active_counts_,
-        lqvrf_sorted_offsets_, lqvrf_packed_offsets_,
-        lqvrf_sector_offsets_, lqvrf_packed_q_offsets_,
-        lqvrf_active_offsets_, lqvrf_fragments_,
-        lqvrf_active_quotients_, lqvrf_sorted_low16_,
-        lqvrf_sorted_values_, lqvrf_packed_low8_, lqvrf_packed_values_,
-        lqvrf_packed_occupancy_, lqvrf_sectors_,
-        succ_miss_indices_, succ_miss_count_,
-        succ_deleted_base_words_, succ_live_word_l1_, succ_live_word_l2_,
-        succ_live_word_l3_, succ_positive_words_, succ_positive_l1_,
-        succ_positive_l2_, succ_positive_l3_);
-    total += device_bytes_all(
-        resolved_.keys, resolved_.values, resolved_.count_delta,
-        resolved_.quotient_off, resolved_.op_words);
-    // Hash-fold scratch and pointer-only parent storage.
-    total += device_bytes_all(
-        hash_heavy_capacities_, hash_active_quotients_,
-        hash_heavy_count_, parent_child_views_arena_);
-    for (const auto &epoch : runs_) {
-      total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask, epoch.route_mask,
-          epoch.hash_storage.keys, epoch.hash_storage.offsets,
-          epoch.hash_storage.counts, epoch.hash_storage.child_views,
-          epoch.hash_storage.child_router);
-      for (const auto &child : epoch.hash_children)
-        total += device_bytes_all(
-            child.keys, child.values, child.quotient_off,
-            child.op_words, child.lookup_mask, child.route_mask);
-    }
-    for (const auto &epoch : run_pool_)
-      total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask, epoch.route_mask);
-    for (const auto &epoch : insert_leaf_pool_)
-      total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask, epoch.route_mask);
-    for (const auto &epoch : delete_leaf_pool_)
-      total += device_bytes_all(
-          epoch.keys, epoch.values, epoch.count_delta, epoch.quotient_off,
-          epoch.op_words, epoch.lookup_mask, epoch.route_mask);
-    for (const auto &storage : hash_storage_pool_)
-      total += device_bytes_all(
-          storage.keys, storage.offsets, storage.counts,
-          storage.child_views, storage.child_router);
-    for (const auto &slab : leaf_slabs_)
-      total += device_bytes(slab.arena);
-    if (pending_leaf_slab_valid_) {
-      const std::size_t owned =
-          device_bytes(pending_leaf_slab_.arena);
-      total += owned != 0u ? owned : pending_leaf_slab_bytes_;
-    }
-    return total;
+    return base_keys_.size() * sizeof(std::uint16_t) +
+        base_values_.size() * sizeof(std::uint32_t) +
+        local_rank_.size() * sizeof(std::uint16_t) +
+        base_offsets_.size() * sizeof(std::uint32_t) +
+        arena_.size() * sizeof(gpulsmopt2_detail::Row) +
+        descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
+        free_heads_.size() * sizeof(std::uint32_t) +
+        cursor_.size() * sizeof(std::uint32_t) +
+        overflow_.size() * sizeof(std::uint32_t) +
+        raw_assignments_.size() * sizeof(gpulsmopt2_detail::RawAssignment) +
+        raw_offsets_.size() * sizeof(std::uint32_t) +
+        raw_signatures_.size() * sizeof(std::uint64_t) +
+        raw_epoch_signatures_.size() * sizeof(std::uint64_t) +
+        raw_counts_.size() * sizeof(std::uint32_t) +
+        radix_keys_.size() * sizeof(std::uint32_t) +
+        radix_ids_out_.size() * sizeof(std::uint32_t) +
+        radix_temp_.size() * sizeof(std::uint8_t) +
+        range_partials_.size() * sizeof(unsigned long long) +
+        range_fragment_counts_.size() * sizeof(std::uint32_t) +
+        range_fragment_offsets_.size() * sizeof(std::uint32_t) +
+        range_fragments_.size() * sizeof(gpulsmopt2_detail::RangeFragment) +
+        range_fragment_partials_.size() * sizeof(unsigned long long) +
+        (range_overflow_fragments_.size() + range_overflow_count_.size()) *
+            sizeof(std::uint32_t) +
+        (range_section_keys_in_.size() + range_section_keys_out_.size() +
+         range_section_offsets_.size()) * sizeof(std::uint32_t) +
+        (range_section_fragments_in_.size() +
+         range_section_fragments_out_.size()) *
+            sizeof(gpulsmopt2_detail::SectionRangeFragment) +
+        range_section_tasks_.size() *
+            sizeof(gpulsmopt2_detail::SectionRangeTask) +
+        (range_section_task_counts_.size() +
+         range_section_task_offsets_.size()) * sizeof(std::uint32_t) +
+        range_section_max_fragments_.size() * sizeof(std::uint32_t) +
+        range_temp_.size() * sizeof(std::uint8_t);
   }
 
 private:
-  static void validate_device_count(std::size_t count,
-                                    const char *operation) {
-    if (count > static_cast<std::size_t>(
-                    std::numeric_limits<std::uint32_t>::max()))
-      throw std::invalid_argument(
-          std::string(operation) +
-          " count exceeds GPULSMOpt's 32-bit device metadata");
+  static int blocks(std::size_t count) {
+    return static_cast<int>((count + gpulsmopt2_detail::kThreads - 1u) /
+                            gpulsmopt2_detail::kThreads);
   }
 
-  struct AssignmentLeafStorage {
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> values;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> quotient_off;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> op_words;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> lookup_mask;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> route_mask;
-    // Paged cold-run metadata (empty for packed runs).
-  };
-
-  struct HashFoldStorage {
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> keys;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> offsets;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> counts;
-    gpulsmopt_detail::RawDeviceBuffer<
-        gpulsmopt_detail::AssignmentRunView> child_views;
-    gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> child_router;
-  };
-
-  struct LeafSlab {
-    gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> arena;
-    std::uint32_t *keys = nullptr;
-    std::uint32_t *values = nullptr;
-    std::uint32_t *quotient_off = nullptr;
-    std::uint64_t *lookup_mask = nullptr;
-    std::uint64_t *route_mask = nullptr;
-    std::size_t records_per_leaf = 0;
-    bool with_values = false;
-  };
-
-  struct LeafSlabLayout {
-    std::size_t bytes = 0;
-    std::size_t keys_offset = 0;
-    std::size_t values_offset = 0;
-    std::size_t quotient_offset = 0;
-    std::size_t lookup_offset = 0;
-    std::size_t route_offset = 0;
-  };
-
-  struct RetainedLeaf : AssignmentLeafStorage {
-    std::size_t count = 0;
-    std::uint64_t sequence = 0;
-    gpulsmopt_detail::RunOperation operation =
-        gpulsmopt_detail::RunOperation::Insert;
-    bool lookup_mask_ready = false;
-    bool route_mask_ready = false;
-    std::uint32_t owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
-  };
-
-  struct HostLookupLeaf {
-    std::uint64_t sequence = 0;
-    gpulsmopt_detail::LookupLeafView view{};
-  };
-
-  struct RunStorage : AssignmentLeafStorage {
-    gpulsmopt_detail::RawDeviceBuffer<std::int8_t> count_delta;
-    HashFoldStorage hash_storage;
-    std::vector<RetainedLeaf> hash_children;
-    std::size_t count = 0;
-    // Temporal identity of an immutable assignment run.
-    std::uint64_t sequence_begin = 0;
-    std::uint64_t sequence_end = 0;
-    int stable_level = -1;
-    gpulsmopt_detail::RunOperation operation =
-        gpulsmopt_detail::RunOperation::Insert;
-    gpulsmopt_detail::AssignmentClass assignment_class =
-        gpulsmopt_detail::AssignmentClass::Raw;
-    bool mixed = false;
-    bool assignment = false;
-    bool fully_sorted = false;
-    bool unit_counts = false;
-    bool unique_keys = false;
-    bool hashed = false;
-    bool grouped = false;
-    bool nested = false;
-    bool lookup_mask_ready = false;
-    bool route_mask_ready = false;
-    std::uint16_t group_child_count = 0;
-    int parent_slot = -1;
-    std::uint32_t owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
-  };
-
-  void order_stream_locked(cudaStream_t stream) {
-    if (!operation_stream_valid_) {
-      operation_stream_ = stream;
-      operation_stream_valid_ = true;
-      return;
+  static std::uint32_t levels_for_epochs(std::uint64_t epochs) {
+    std::uint32_t levels = 0u;
+    while (epochs) {
+      ++levels;
+      epochs >>= 1u;
     }
-    if (stream == operation_stream_)
-      return;
-    CUDA_CHECK(cudaEventRecord(stream_handoff_, operation_stream_));
-    CUDA_CHECK(cudaStreamWaitEvent(stream, stream_handoff_, 0));
-    operation_stream_ = stream;
+    return levels;
   }
 
-  template <class T>
-  static T *raw_or_null(gpulsmopt_detail::RawDeviceBuffer<T> &v) {
-    return v.size() == 0 ? nullptr : v.data();
-  }
-  template <class T>
-  static const T *raw_or_null(const gpulsmopt_detail::RawDeviceBuffer<T> &v) {
-    return v.size() == 0 ? nullptr : v.data();
-  }
-  template <class T>
-  static std::size_t
-  device_bytes(const gpulsmopt_detail::RawDeviceBuffer<T> &v) {
-    return v.owns() ? v.capacity() * sizeof(T) : 0u;
-  }
-  template <class... Vecs>
-  static std::size_t device_bytes_all(const Vecs &...vecs) {
-    return (std::size_t{0} + ... + device_bytes(vecs));
-  }
-  bool sorted_run_ready() const { return sorted_run_index_ < runs_.size(); }
-
-  const RunStorage &sorted_run() const { return runs_[sorted_run_index_]; }
-
-  gpulsmopt_detail::SortedRunView make_sorted_view() const {
-    if (!sorted_run_ready())
-      return {};
-    const RunStorage &run = sorted_run();
-    return {run.keys.data(),
-            run.values.data(),
-            base_rank23_.data(),
-            run.count,
-            run.unit_counts ? 1u : 0u};
+  void ensure_arena_for_levels(std::uint32_t levels,
+                               cudaStream_t stream) {
+    const std::uint64_t epoch_rows =
+        std::uint64_t{batch_capacity_} *
+        gpulsmopt2_detail::kBatchesPerEpoch;
+    const std::uint64_t extent_rows =
+        2u * ((std::uint64_t{1} << levels) - 1u) * epoch_rows;
+    const std::size_t target = static_cast<std::size_t>(std::min(
+        extent_rows,
+        std::uint64_t{gpulsmopt2_detail::kMaximumArenaRows}));
+    arena_.grow(target, stream);
   }
 
-  gpulsmopt_detail::BaseRunView make_base_view() const {
-    return {make_sorted_view()};
+  void begin_operation(cudaStream_t stream) {
+    CUDA_CHECK(cudaStreamWaitEvent(stream, operation_done_, 0));
   }
 
-  gpulsmopt_detail::LqvrfView make_lqvrf_view() const {
-    return {make_sorted_view(),
-            raw_or_null(lqvrf_base_hidden_words_),
-            raw_or_null(lqvrf_fragments_),
-            raw_or_null(lqvrf_active_quotients_),
-            raw_or_null(lqvrf_sorted_low16_),
-            raw_or_null(lqvrf_sorted_values_),
-            raw_or_null(lqvrf_packed_low8_),
-            raw_or_null(lqvrf_packed_values_),
-            raw_or_null(lqvrf_packed_occupancy_),
-            raw_or_null(lqvrf_sectors_),
-            lqvrf_active_quotient_count_,
-            lqvrf_has_hidden_base_ ? 1u : 0u};
+  void end_operation(cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(operation_done_, stream));
   }
 
-  gpulsmopt_detail::LqvrfView make_base_only_lqvrf_view() const {
-    return {make_sorted_view(), nullptr, nullptr, nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr, nullptr, 0u, 0u};
-  }
-
-  std::uint32_t lqvrf_range_task_target_blocks() {
-    if (lqvrf_task_target_blocks_ != 0u)
-      return lqvrf_task_target_blocks_;
-    int device = 0;
-    int multiprocessors = 0;
-    int active_blocks_per_multiprocessor = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(
-        &multiprocessors, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks_per_multiprocessor,
-        gpulsmopt_detail::lqvrf_range_task_sum_kernel, 256, 0));
-    const std::uint64_t target =
-        static_cast<std::uint64_t>(
-            std::max(multiprocessors, 1)) *
-        static_cast<std::uint64_t>(
-            std::max(active_blocks_per_multiprocessor, 1));
-    lqvrf_task_target_blocks_ = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(
-            target, std::numeric_limits<std::uint32_t>::max()));
-    return lqvrf_task_target_blocks_;
-  }
-
-  // Few ranges cannot fill the GPU when one warp owns an entire query. Give
-  // each query an equal share of a device-occupancy-sized task grid and let
-  // the kernel activate only the quotient chunks that exist. The occupancy
-  // API supplies the number of resident 256-thread CTAs per multiprocessor;
-  // there is no device-to-host decision, stored answer summary, or
-  // benchmark-sized threshold.
-  bool launch_lqvrf_wide_sum(
-      const DeviceRangeOutputBatch &batch,
-      gpulsmopt_detail::LqvrfView view, cudaStream_t stream) {
-    const std::uint32_t target_blocks =
-        lqvrf_range_task_target_blocks();
-    if (batch.query_count >= target_blocks)
-      return false;
-    const std::uint32_t query_count =
-        static_cast<std::uint32_t>(batch.query_count);
-    const std::uint32_t slots_per_query =
-        std::max<std::uint32_t>(target_blocks / query_count, 1u);
-    const std::uint64_t task_grid64 =
-        static_cast<std::uint64_t>(query_count) *
-        slots_per_query;
-    if (task_grid64 == 0u ||
-        task_grid64 > static_cast<std::uint64_t>(
-                            std::numeric_limits<int>::max()))
-      return false;
-    const std::uint32_t task_grid =
-        static_cast<std::uint32_t>(task_grid64);
-    CUDA_CHECK(cudaMemsetAsync(
-        batch.out_sums, 0,
-        batch.query_count * sizeof(std::uint32_t), stream));
-    gpulsmopt_detail::lqvrf_range_task_sum_kernel<<<
-        static_cast<int>(task_grid), 256, 0, stream>>>(
-        view, batch.lo, batch.hi, batch.query_count,
-        slots_per_query, batch.out_sums);
-    return true;
-  }
-
-  void clear_sorted_state() {
-    sorted_run_index_ = std::numeric_limits<std::size_t>::max();
-    base_rank23_.resize_discard(0);
-    lqvrf_ready_ = false;
-    lqvrf_has_effects_ = false;
-  }
-
-  // Builds the flat rank directory per base.
-  void build_base_rank23(RunStorage &base, cudaStream_t stream) {
-    base_rank23_.resize_discard_exact(
-        gpulsmopt_detail::kBaseRank23Size + 1);
-    std::uint32_t *dir = base_rank23_.data();
-    const std::uint32_t count = static_cast<std::uint32_t>(base.count);
-    if (count == 0u) {
-      CUDA_CHECK(cudaMemsetAsync(dir, 0,
-                                 (gpulsmopt_detail::kBaseRank23Size + 1) *
-                                     sizeof(std::uint32_t),
-                                 stream));
-      return;
-    }
-    CUDA_CHECK(cudaMemsetAsync(dir, 0xff,
-                               (gpulsmopt_detail::kBaseRank23Size + 1) *
-                                   sizeof(std::uint32_t),
+  void reset_updates(cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(descriptors_.data(), 0,
+                               descriptors_.size() *
+                                   sizeof(gpulsmopt2_detail::Descriptor),
                                stream));
-    constexpr int block = 256;
-    const int grid = static_cast<int>((count + block - 1) / block);
-    gpulsmopt_detail::base_rank23_boundary_kernel<<<grid, block, 0, stream>>>(
-        base.keys.data(), count, dir);
-    CUDA_CHECK(cudaGetLastError());
-    // Empty bins inherit the next start.
-    constexpr int items = gpulsmopt_detail::kBaseRank23Size + 1;
-    auto rev = thrust::make_reverse_iterator(
-        thrust::device_pointer_cast(dir + items));
-    std::size_t bytes = 0;
-    CUDA_CHECK(cub::DeviceScan::InclusiveScan(
-        nullptr, bytes, rev, rev, thrust::minimum<std::uint32_t>(), items,
-        stream));
-    ensure_sort_temp(bytes);
-    CUDA_CHECK(cub::DeviceScan::InclusiveScan(
-        sort_temp_storage_.data(), bytes, rev, rev,
-        thrust::minimum<std::uint32_t>(), items, stream));
-  }
-
-  void build_sorted_metadata(cudaStream_t stream) {
-    RunStorage &run = runs_[sorted_run_index_];
-    build_base_rank23(run, stream);
-  }
-
-  void build_sorted_run_cache(std::size_t index, cudaStream_t stream) {
-    clear_sorted_state();
-    if (index >= runs_.size() || !runs_[index].fully_sorted ||
-        !runs_[index].unique_keys)
-      return;
-    sorted_run_index_ = index;
-    build_sorted_metadata(stream);
-  }
-
-  void ensure_sorted_run_cache(cudaStream_t stream) {
-    if (sorted_run_ready())
-      return;
-    std::size_t best = runs_.size();
-    std::size_t best_count = 0;
-    for (std::size_t r = 0; r < runs_.size(); ++r) {
-      if (!runs_[r].fully_sorted || !runs_[r].unique_keys ||
-          runs_[r].count <= best_count)
-        continue;
-      best = r;
-      best_count = runs_[r].count;
-    }
-    if (best_count >= gpulsmopt_detail::kSortedRunMinRecords)
-      build_sorted_run_cache(best, stream);
-  }
-
-  gpulsmopt_detail::RunView make_run_view(RunStorage &epoch) {
-    return {raw_or_null(epoch.keys), raw_or_null(epoch.quotient_off)};
-  }
-
-
-  void reverse_min_scan_offsets(std::uint32_t *offsets, cudaStream_t stream) {
-    constexpr int items = gpulsmopt_detail::kEpochQuotients + 1;
-    auto reverse = thrust::make_reverse_iterator(
-        thrust::device_pointer_cast(offsets + items));
-    if (metadata_scan_temp_bytes_ == 0u) {
-      CUDA_CHECK(cub::DeviceScan::InclusiveScan(
-          nullptr, metadata_scan_temp_bytes_, reverse, reverse,
-          thrust::minimum<std::uint32_t>(), items, stream));
-      ensure_sort_temp(metadata_scan_temp_bytes_);
-    }
-    std::size_t temp_bytes = metadata_scan_temp_bytes_;
-    CUDA_CHECK(cub::DeviceScan::InclusiveScan(
-        sort_temp_storage_.data(), temp_bytes, reverse, reverse,
-        thrust::minimum<std::uint32_t>(), items, stream));
-  }
-
-
-  // Builds an unresolved assignment run.
-  void create_assignment_run(bool is_insert, const std::uint32_t *keys,
-                             const std::uint32_t *values, std::size_t count,
-                             cudaStream_t stream) {
-    acquire_run_slot(is_insert, count, stream);
-    RunStorage &run = runs_.back();
-    run.count = count;
-    run.assignment = true;
-    run.assignment_class = gpulsmopt_detail::AssignmentClass::Raw;
-    run.hashed = false;
-    run.grouped = false;
-    run.nested = false;
-    run.lookup_mask_ready = false;
-    run.route_mask_ready = false;
-    run.group_child_count = 0;
-    run.parent_slot = -1;
-    run.hash_children.clear();
-    run.mixed = false;
-    run.stable_level = -1;
-    run.operation = is_insert ? gpulsmopt_detail::RunOperation::Insert
-                              : gpulsmopt_detail::RunOperation::Delete;
-    run.sequence_begin = ++run_sequence_;
-    run.sequence_end = run.sequence_begin;
-    run.fully_sorted = false;
-    run.unit_counts = false;
-    run.unique_keys = false;
-    run.keys.resize_discard(count);
-    if (is_insert) {
-      // One fused pass: stable sort + dense quotient offsets.
-      run.values.resize_discard(count);
-      run.quotient_off.resize_discard_exact(
-          gpulsmopt_detail::kEpochQuotients + 1);
-      GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
-      build_raw_assignment_run(keys, values, count, run.keys.data(),
-                               run.values.data(), run.quotient_off.data(),
-                               stream);
-    } else {
-      GPULSMOPT_PROF_PHASE(prof_delta_sort_ms_);
-      run.values.resize_discard(0);
-      // Always establish quotient order inside the data structure. The public
-      // sorted bit is only a hint and cannot compromise correctness when an
-      // adapter or caller supplies arbitrary physical order.
-      sort_delete_keys_batch(keys, count, run.keys.data(), stream);
-      {
-        GPULSMOPT_PROF_PHASE(prof_delta_ingest_ms_);
-        // Build quotient offsets from quotient-ascending deletion keys.
-        run.quotient_off.resize_discard_exact(
-            gpulsmopt_detail::kEpochQuotients + 1);
-        build_quotient_offsets(run.keys.data(),
-                               static_cast<std::uint32_t>(count),
-                               run.quotient_off.data(), stream);
-      }
-    }
-    register_lookup_owner_leaf(run);
-    publish_assignment_view(run, stream);
-    invalidate_resolved();
-    if (count_raw_runs() >= gpulsmopt_detail::kRawFoldWidth)
-      temporal_hash_fold(stream);
-  }
-
-  std::size_t count_raw_runs() const {
-    std::size_t n = 0;
-    for (const auto &run : runs_)
-      if (run.assignment && !run.nested &&
-          run.assignment_class == gpulsmopt_detail::AssignmentClass::Raw)
-        ++n;
-    return n;
-  }
-
-  // Dense quotient offsets over quotient-ascending sorted keys in one kernel:
-  // offsets[q] = lower_bound(keys, q<<16). Shared by insert and delete raw
-  // leaves; replaces the boundary + reverse-min-scan + sentinel-memset path.
-  void build_quotient_offsets(const std::uint32_t *sorted_keys,
-                              std::uint32_t count, std::uint32_t *out_off,
-                              cudaStream_t stream) {
-    constexpr std::uint32_t Q = gpulsmopt_detail::kEpochQuotients;
-    if (count == 0u) {
-      CUDA_CHECK(cudaMemsetAsync(out_off, 0,
-                                 (Q + 1u) * sizeof(std::uint32_t), stream));
-      return;
-    }
-    constexpr int block = 256;
-    const int grid = static_cast<int>((Q + 1u + block - 1) / block);
-    gpulsmopt_detail::quotient_lower_bound_kernel<<<grid, block, 0, stream>>>(
-        sorted_keys, count, out_off);
-    CUDA_CHECK(cudaGetLastError());
-  }
-
-  // One fused operation for an ordinary insert raw run: stable
-  // upper-16 sort + dense quotient offsets, no boundary kernel, no
-  // reverse-min repair, no sentinel memset, no per-insert allocation.
-  void build_raw_assignment_run(const std::uint32_t *keys,
-                                const std::uint32_t *values,
-                                std::size_t count, std::uint32_t *out_keys,
-                                std::uint32_t *out_values,
-                                std::uint32_t *out_quotient_off,
-                                cudaStream_t stream) {
-    if (count == 0u) {
-      build_quotient_offsets(out_keys, 0u, out_quotient_off, stream);
-      return;
-    }
-    // Stable sort preserves same-quotient input order (last-wins).
-    sort_run_batch(keys, values, count, out_keys, out_values, stream);
-    // Dense offsets in a single kernel over the sorted keys.
-    build_quotient_offsets(out_keys, static_cast<std::uint32_t>(count),
-                           out_quotient_off, stream);
-  }
-
-  void build_assignment_offsets(RunStorage &run, std::uint32_t count,
-                                 cudaStream_t stream) {
-    run.quotient_off.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1);
-    std::uint32_t *offsets = run.quotient_off.data();
-    if (count == 0u) {
-      CUDA_CHECK(cudaMemsetAsync(offsets, 0,
-                                 (gpulsmopt_detail::kEpochQuotients + 1u) *
-                                     sizeof(std::uint32_t),
-                                 stream));
-      return;
-    }
-    CUDA_CHECK(cudaMemsetAsync(offsets, 0xff,
-                               (gpulsmopt_detail::kEpochQuotients + 1u) *
-                                   sizeof(std::uint32_t),
+    CUDA_CHECK(cudaMemsetAsync(free_heads_.data(), 0xff,
+                               free_heads_.size() * sizeof(std::uint32_t),
                                stream));
-    constexpr int block = 256;
-    const int grid = static_cast<int>((count + block - 1) / block);
-    gpulsmopt_detail::assignment_boundary_kernel<<<grid, block, 0, stream>>>(
-        run.keys.data(), count, offsets);
-    CUDA_CHECK(cudaGetLastError());
-    reverse_min_scan_offsets(offsets, stream);
-  }
-
-  gpulsmopt_detail::AssignmentRunView
-  make_assignment_view(RunStorage &run,
-                       bool with_lookup_mask = true) {
-    const bool insert =
-        run.operation == gpulsmopt_detail::RunOperation::Insert;
-    const bool hashed = run.hashed;
-    if (hashed &&
-        (run.hash_storage.offsets.data() == nullptr ||
-         run.hash_storage.counts.data() == nullptr ||
-         run.hash_storage.child_views.data() == nullptr ||
-         run.hash_storage.child_router.data() == nullptr))
-      throw std::runtime_error("hashed run has no storage");
-    if (run.grouped &&
-        (run.parent_slot < 0 ||
-         run.parent_slot >= gpulsmopt_detail::kParentSlots))
-      throw std::runtime_error("grouped run has no parent slot");
-    std::uint32_t *keys = hashed
-        ? run.hash_storage.keys.data() : run.keys.data();
-    const std::uint32_t *offsets = hashed
-        ? run.hash_storage.offsets.data() : run.quotient_off.data();
-    const std::uint32_t *quotient_meta = hashed
-        ? run.hash_storage.counts.data() : nullptr;
-    const gpulsmopt_detail::AssignmentRunView *children = hashed
-        ? run.hash_storage.child_views.data() : nullptr;
-    const std::uint32_t *child_router = hashed
-        ? run.hash_storage.child_router.data() : nullptr;
-    const gpulsmopt_detail::AssignmentRunView *group_children = run.grouped
-        ? parent_child_views_arena_.data() +
-              static_cast<std::size_t>(run.parent_slot) *
-                  gpulsmopt_detail::kStableFanout
-        : nullptr;
-    const std::uint64_t *lookup_mask =
-        with_lookup_mask &&
-                run.assignment_class ==
-                    gpulsmopt_detail::AssignmentClass::Raw &&
-                run.lookup_mask_ready
-            ? run.lookup_mask.data()
-            : nullptr;
-    return {run.grouped ? nullptr : keys,
-            run.grouped ? nullptr :
-                (insert ? run.values.data() : nullptr),
-            run.grouped ? nullptr : offsets,
-            run.grouped ? nullptr : quotient_meta,
-            run.grouped ? nullptr :
-                (run.mixed ? run.op_words.data() : nullptr),
-            run.grouped ? nullptr : lookup_mask,
-            run.grouped ? nullptr : children,
-            run.grouped ? nullptr : child_router,
-            group_children,
-            static_cast<std::uint16_t>(
-                run.grouped ? run.group_child_count
-                            : (hashed ? run.hash_children.size() : 0u)),
-            static_cast<std::uint8_t>(insert ? 1u : 0u),
-            static_cast<std::uint8_t>(run.mixed ? 1u : 0u),
-            static_cast<std::uint8_t>(hashed ? 1u : 0u),
-            static_cast<std::uint8_t>(run.grouped ? 1u : 0u)};
-  }
-
-  // Publishes one chronological run descriptor.
-  void publish_assignment_view(RunStorage &run, cudaStream_t stream) {
-    (void)stream;
-    gpulsmopt_detail::AssignmentRunView view =
-        make_assignment_view(run);
-    const std::size_t slot = chrono_views_.size();
-    if (slot >= static_cast<std::size_t>(gpulsmopt_detail::kRunCapacity))
-      throw std::runtime_error("assignment descriptor capacity exceeded");
-    chrono_views_.push_back(view);
-    host_state_->views[slot] = view;
-    if (assignment_views_.size() < chrono_views_.size())
-      assignment_views_.resize_discard(gpulsmopt_detail::kRunCapacity);
-    // Device descriptors are materialized lazily in one batched copy right
-    // before a read consumes them (flush_pending_views). Inserts never read
-    // the device array, so this drops an H2D copy + stream op from every
-    // insert; hash folds publish directly into their arena.
-    views_dirty_ = true;
-  }
-
-  // Sync the device descriptor array with the host run views. Only the read
-  // paths (lookup/successor/range) consume it, and they call this after
-  // ensure_sorted_run_cache. host_state_->views[0..chrono_views_) always
-  // mirrors the live runs (publish writes both in lockstep; clears zero the
-  // count), so one batched copy of the current run count is exact.
-  gpulsmopt_detail::AssignmentRunView
-  make_retained_leaf_view(RetainedLeaf &leaf) {
-    const bool insert =
-        leaf.operation == gpulsmopt_detail::RunOperation::Insert;
-    return {leaf.keys.data(),
-            insert ? leaf.values.data() : nullptr,
-            leaf.quotient_off.data(),
-            nullptr,
-            nullptr,
-            leaf.lookup_mask_ready ? leaf.lookup_mask.data() : nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            0u,
-            static_cast<std::uint8_t>(insert ? 1u : 0u),
-            0u,
-            0u,
-            0u};
-  }
-
-  gpulsmopt_detail::LookupOwnerLeafView
-  make_lookup_owner_view(RunStorage &run) {
-    const bool insert =
-        run.operation == gpulsmopt_detail::RunOperation::Insert;
-    return {run.keys.data(), insert ? run.values.data() : nullptr,
-            run.quotient_off.data(), run.route_mask.data(),
-            static_cast<std::uint32_t>(run.count),
-            static_cast<std::uint8_t>(insert ? 1u : 0u)};
-  }
-
-  void register_lookup_owner_leaf(RunStorage &run) {
-    run.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
-    if (!lookup_owner_usable_)
-      return;
-    if (lookup_owner_leaf_count_ >=
-        gpulsmopt_detail::kLookupLeafCapacity) {
-      lookup_owner_usable_ = false;
-      return;
-    }
-    const std::uint32_t leaf_id = lookup_owner_leaf_count_++;
-    run.owner_leaf_id = leaf_id;
-    host_state_->owner_leaves[leaf_id] = make_lookup_owner_view(run);
-  }
-
-  void mark_lookup_owner_routes(std::uint32_t first,
-                                std::uint32_t end) {
-    for (RunStorage &run : runs_) {
-      if (run.owner_leaf_id >= first && run.owner_leaf_id < end)
-        run.route_mask_ready = true;
-      for (RetainedLeaf &leaf : run.hash_children) {
-        if (leaf.owner_leaf_id >= first && leaf.owner_leaf_id < end)
-          leaf.route_mask_ready = true;
-      }
-    }
-  }
-
-
-  bool should_use_lookup_owner(std::size_t queries) const {
-    if (!lookup_owner_usable_ || lookup_owner_leaf_count_ == 0u)
-      return false;
-    const std::size_t threshold =
-        std::max<std::size_t>(1u, batch_capacity_ / 4u);
-    return queries >= threshold;
-  }
-
-  void publish_lookup_owner_leaves(cudaStream_t stream) {
-    if (lookup_owner_published_leaf_count_ < lookup_owner_leaf_count_) {
-      const std::uint32_t first = lookup_owner_published_leaf_count_;
-      const std::uint32_t count = lookup_owner_leaf_count_ - first;
-      CUDA_CHECK(cudaMemcpyAsync(
-          lookup_owner_leaves_.data() + first,
-          host_state_->owner_leaves + first,
-          count * sizeof(gpulsmopt_detail::LookupOwnerLeafView),
-          cudaMemcpyHostToDevice, stream));
-      lookup_owner_published_leaf_count_ = lookup_owner_leaf_count_;
-    }
-  }
-
-  void prepare_lookup_owner(cudaStream_t stream) {
-    publish_lookup_owner_leaves(stream);
-    if (lookup_owner_applied_leaf_count_ >= lookup_owner_leaf_count_)
-      return;
-    const std::uint32_t first = lookup_owner_applied_leaf_count_;
-    const std::uint32_t pending = lookup_owner_leaf_count_ - first;
-    constexpr int block = 256;
-    constexpr int warps = block / 32;
-    constexpr int grid =
-        (gpulsmopt_detail::kEpochQuotients + warps - 1) / warps;
-    gpulsmopt_detail::lookup_sector_apply_kernel<<<
-        grid, block, 0, stream>>>(
-        lookup_owner_leaves_.data(), first, pending,
-        lookup_sector_buckets_.data(),
-        lookup_sector_buckets_per_quotient_,
-        lookup_sector_bucket_mask_, lookup_sector_overflow_.data(),
-        lookup_sector_stash_.data(), lookup_owner_overflow_.data(),
-        lookup_sector_ready_.data(), lookup_radix_arena_.data(),
-        lookup_radix_cursor_.data(), lookup_radix_capacity_units_,
-        lookup_radix_roots_.data(), lookup_radix_enabled_.data());
-    CUDA_CHECK(cudaGetLastError());
-    mark_lookup_owner_routes(first, first + pending);
-    lookup_owner_applied_leaf_count_ = lookup_owner_leaf_count_;
-  }
-
-  void ensure_raw_lookup_masks(cudaStream_t stream) {
-    bool changed = false;
-    constexpr int block = 256;
-    constexpr int warps = block / 32;
-    constexpr int grid =
-        (gpulsmopt_detail::kEpochQuotients + warps - 1) /
-        warps;
-    for (RunStorage &run : runs_) {
-      if (!run.assignment)
-        continue;
-      if (run.assignment_class ==
-              gpulsmopt_detail::AssignmentClass::Raw &&
-          (!run.lookup_mask_ready || !run.route_mask_ready)) {
-        run.lookup_mask.resize_discard_exact(
-            gpulsmopt_detail::kEpochQuotients);
-        run.route_mask.resize_discard_exact(
-            gpulsmopt_detail::kEpochQuotients);
-        gpulsmopt_detail::raw_quotient_masks_kernel<true><<<
-            grid, block, 0, stream>>>(
-            run.keys.data(), run.quotient_off.data(),
-            run.lookup_mask.data(), run.route_mask.data());
-        CUDA_CHECK(cudaGetLastError());
-        run.lookup_mask_ready = true;
-        run.route_mask_ready = true;
-        changed = true;
-      }
-      if (!run.hashed || run.hash_children.empty())
-        continue;
-      bool refresh = false;
-      for (RetainedLeaf &child : run.hash_children) {
-        if (!child.lookup_mask_ready || !child.route_mask_ready) {
-          child.lookup_mask.resize_discard_exact(
-              gpulsmopt_detail::kEpochQuotients);
-          child.route_mask.resize_discard_exact(
-              gpulsmopt_detail::kEpochQuotients);
-          gpulsmopt_detail::raw_quotient_masks_kernel<true><<<
-              grid, block, 0, stream>>>(
-              child.keys.data(), child.quotient_off.data(),
-              child.lookup_mask.data(), child.route_mask.data());
-          CUDA_CHECK(cudaGetLastError());
-          child.lookup_mask_ready = true;
-          child.route_mask_ready = true;
-          refresh = true;
-        }
-      }
-      if (!refresh)
-        continue;
-      for (std::size_t child = 0;
-           child < run.hash_children.size(); ++child)
-        host_state_->scratch_views[child] =
-            make_retained_leaf_view(run.hash_children[child]);
-      CUDA_CHECK(cudaMemcpyAsync(
-          run.hash_storage.child_views.data(),
-          host_state_->scratch_views,
-          run.hash_children.size() *
-              sizeof(gpulsmopt_detail::AssignmentRunView),
-          cudaMemcpyHostToDevice, stream));
-      changed = true;
-    }
-    if (changed) {
-      lookup_publication_ready_ = false;
-      rebuild_chrono_views(stream);
-    }
-  }
-
-  int prepare_lookup_leaf_views(cudaStream_t stream) {
-    if (lookup_publication_ready_)
-      return lookup_leaf_count_;
-    lookup_host_leaves_.clear();
-    int parent_count = 0;
-
-    for (RunStorage &run : runs_) {
-      if (!run.assignment || run.grouped)
-        continue;
-      if (!run.hashed) {
-        lookup_host_leaves_.push_back(
-            {run.sequence_end,
-             {make_assignment_view(run),
-              0u,
-              gpulsmopt_detail::kNoLookupParent,
-              0u}});
-        continue;
-      }
-      if (run.hash_children.empty())
-        continue;
-      if (parent_count >= gpulsmopt_detail::kColdArenaSlots)
-        throw std::runtime_error("lookup parent capacity exceeded");
-      host_state_->lookup.parents[parent_count] =
-          make_assignment_view(run);
-      host_state_->lookup.parent_ranks[parent_count] = 0u;
-      for (std::size_t child = 0;
-           child < run.hash_children.size(); ++child) {
-        RetainedLeaf &leaf = run.hash_children[child];
-        lookup_host_leaves_.push_back(
-            {leaf.sequence,
-             {make_retained_leaf_view(leaf),
-              0u,
-              static_cast<std::uint16_t>(parent_count),
-              static_cast<std::uint8_t>(
-                  child + 1u == run.hash_children.size())}});
-      }
-      ++parent_count;
-    }
-
-    std::stable_sort(
-        lookup_host_leaves_.begin(), lookup_host_leaves_.end(),
-        [](const HostLookupLeaf &left,
-           const HostLookupLeaf &right) {
-          return left.sequence < right.sequence;
-        });
-    if (lookup_host_leaves_.size() >
-        static_cast<std::size_t>(
-            gpulsmopt_detail::kLookupLeafCapacity))
-      throw std::runtime_error("lookup leaf capacity exceeded");
-
-    for (std::size_t i = 0;
-         i < lookup_host_leaves_.size(); ++i) {
-      gpulsmopt_detail::LookupLeafView view =
-          lookup_host_leaves_[i].view;
-      view.rank = static_cast<std::uint32_t>(i + 1u);
-      host_state_->lookup.leaves[i] = view;
-      if (view.parent != gpulsmopt_detail::kNoLookupParent)
-        host_state_->lookup.parent_ranks[view.parent] =
-            std::max(host_state_->lookup.parent_ranks[view.parent],
-                     view.rank);
-    }
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        lookup_publication_.data(), &host_state_->lookup,
-        sizeof(gpulsmopt_detail::LookupPublication),
-        cudaMemcpyHostToDevice, stream));
-    lookup_leaf_count_ =
-        static_cast<int>(lookup_host_leaves_.size());
-    lookup_publication_ready_ = true;
-    return lookup_leaf_count_;
-  }
-
-  void flush_pending_views(cudaStream_t stream) {
-    if (!views_dirty_)
-      return;
-    const std::size_t n = chrono_views_.size();
-    if (n != 0)
-      CUDA_CHECK(cudaMemcpyAsync(
-          assignment_views_.data(), host_state_->views,
-          n * sizeof(gpulsmopt_detail::AssignmentRunView),
-          cudaMemcpyHostToDevice, stream));
-    views_dirty_ = false;
-  }
-
-  static std::size_t checked_product(
-      std::size_t left, std::size_t right) {
-    if (right != 0u &&
-        left > std::numeric_limits<std::size_t>::max() / right)
-      throw std::overflow_error("leaf slab size overflow");
-    return left * right;
-  }
-
-  static std::size_t checked_sum(
-      std::size_t left, std::size_t right) {
-    if (left > std::numeric_limits<std::size_t>::max() - right)
-      throw std::overflow_error("leaf slab size overflow");
-    return left + right;
-  }
-
-  static std::size_t append_leaf_region(
-      std::size_t &cursor, std::size_t bytes,
-      std::size_t alignment) {
-    const std::size_t remainder = cursor % alignment;
-    if (remainder != 0u)
-      cursor = checked_sum(cursor, alignment - remainder);
-    const std::size_t offset = cursor;
-    cursor = checked_sum(cursor, bytes);
-    return offset;
-  }
-
-  static LeafSlabLayout leaf_slab_layout(
-      std::size_t count, bool with_values) {
-    count = std::max<std::size_t>(count, 1u);
-    constexpr std::size_t slots =
-        gpulsmopt_detail::kLeafSlabRuns;
-    const std::size_t records = checked_product(slots, count);
-    const std::size_t quotient_entries = checked_product(
-        slots, gpulsmopt_detail::kEpochQuotients + 1u);
-    const std::size_t mask_entries = checked_product(
-        slots, gpulsmopt_detail::kEpochQuotients);
-    LeafSlabLayout layout;
-    layout.keys_offset = append_leaf_region(
-        layout.bytes,
-        checked_product(records, sizeof(std::uint32_t)),
-        alignof(std::uint32_t));
-    if (with_values)
-      layout.values_offset = append_leaf_region(
-          layout.bytes,
-          checked_product(records, sizeof(std::uint32_t)),
-          alignof(std::uint32_t));
-    layout.quotient_offset = append_leaf_region(
-        layout.bytes,
-        checked_product(quotient_entries, sizeof(std::uint32_t)),
-        alignof(std::uint32_t));
-    layout.lookup_offset = append_leaf_region(
-        layout.bytes,
-        checked_product(mask_entries, sizeof(std::uint64_t)),
-        alignof(std::uint64_t));
-    layout.route_offset = append_leaf_region(
-        layout.bytes,
-        checked_product(mask_entries, sizeof(std::uint64_t)),
-        alignof(std::uint64_t));
-    return layout;
-  }
-
-  static void bind_leaf_slab(
-      LeafSlab &slab, const LeafSlabLayout &layout) {
-    std::uint8_t *base = slab.arena.data();
-    slab.keys = reinterpret_cast<std::uint32_t *>(
-        base + layout.keys_offset);
-    if (slab.with_values)
-      slab.values = reinterpret_cast<std::uint32_t *>(
-          base + layout.values_offset);
-    slab.quotient_off = reinterpret_cast<std::uint32_t *>(
-        base + layout.quotient_offset);
-    slab.lookup_mask = reinterpret_cast<std::uint64_t *>(
-        base + layout.lookup_offset);
-    slab.route_mask = reinterpret_cast<std::uint64_t *>(
-        base + layout.route_offset);
-  }
-
-  LeafSlab make_leaf_slab(
-      std::size_t count, bool with_values) {
-    count = std::max<std::size_t>(count, 1u);
-    const LeafSlabLayout layout =
-        leaf_slab_layout(count, with_values);
-    LeafSlab slab;
-    slab.records_per_leaf = count;
-    slab.with_values = with_values;
-    slab.arena.resize_discard_exact(layout.bytes);
-    bind_leaf_slab(slab, layout);
-    return slab;
-  }
-
-  void leaf_alloc_worker_loop() {
-    const cudaError_t device_status =
-        cudaSetDevice(leaf_alloc_device_);
-    for (;;) {
-      std::size_t bytes = 0u;
-      {
-        std::unique_lock<std::mutex> guard(leaf_alloc_mutex_);
-        leaf_alloc_cv_.wait(guard, [this] {
-          return leaf_alloc_stop_ || leaf_alloc_request_;
-        });
-        if (leaf_alloc_stop_ && !leaf_alloc_request_)
-          return;
-        bytes = leaf_alloc_request_bytes_;
-        leaf_alloc_request_ = false;
-      }
-
-      std::uint8_t *arena = nullptr;
-      cudaError_t status = device_status;
-      if (status == cudaSuccess)
-        status = cudaMallocAsync(
-            reinterpret_cast<void **>(&arena), bytes,
-            leaf_alloc_stream_);
-      if (status == cudaSuccess)
-        status = cudaEventRecord(
-            leaf_alloc_ready_, leaf_alloc_stream_);
-
-      {
-        std::lock_guard<std::mutex> guard(leaf_alloc_mutex_);
-        leaf_alloc_result_ = arena;
-        leaf_alloc_status_ = status;
-        leaf_alloc_result_ready_ = true;
-      }
-      leaf_alloc_cv_.notify_all();
-    }
-  }
-
-  void publish_leaf_slab(LeafSlab &&slab) {
-    leaf_slabs_.push_back(std::move(slab));
-    LeafSlab &owner = leaf_slabs_.back();
-    const std::size_t count = owner.records_per_leaf;
-    const bool with_values = owner.with_values;
-    auto &pool = leaf_pool(with_values);
-
-    for (std::size_t slot = 0;
-         slot < gpulsmopt_detail::kLeafSlabRuns; ++slot) {
-      RunStorage leaf;
-      leaf.keys.bind_external(owner.keys + slot * count, count);
-      if (with_values)
-        leaf.values.bind_external(
-            owner.values + slot * count, count);
-      leaf.quotient_off.bind_external(
-          owner.quotient_off + slot *
-              (gpulsmopt_detail::kEpochQuotients + 1u),
-          gpulsmopt_detail::kEpochQuotients + 1u);
-      leaf.lookup_mask.bind_external(
-          owner.lookup_mask +
-              slot * gpulsmopt_detail::kEpochQuotients,
-          gpulsmopt_detail::kEpochQuotients);
-      leaf.route_mask.bind_external(
-          owner.route_mask +
-              slot * gpulsmopt_detail::kEpochQuotients,
-          gpulsmopt_detail::kEpochQuotients);
-      pool.push_back(std::move(leaf));
-    }
-  }
-
-  void grow_leaf_pool(std::size_t count, bool with_values) {
-    publish_leaf_slab(
-        make_leaf_slab(count, with_values));
-  }
-
-  void start_pending_leaf_slab(
-      std::size_t count, bool with_values) {
-    if (pending_leaf_slab_valid_)
-      throw std::runtime_error("leaf slab request already pending");
-    count = std::max<std::size_t>(count, 1u);
-    const LeafSlabLayout layout =
-        leaf_slab_layout(count, with_values);
-    pending_leaf_slab_ = LeafSlab{};
-    pending_leaf_slab_.records_per_leaf = count;
-    pending_leaf_slab_.with_values = with_values;
-    pending_leaf_slab_bytes_ = layout.bytes;
-    {
-      std::lock_guard<std::mutex> guard(leaf_alloc_mutex_);
-      if (leaf_alloc_request_ || leaf_alloc_result_ready_)
-        throw std::runtime_error("leaf allocator is busy");
-      leaf_alloc_request_bytes_ = layout.bytes;
-      leaf_alloc_request_ = true;
-    }
-    pending_leaf_slab_valid_ = true;
-    leaf_alloc_cv_.notify_one();
-  }
-
-  bool promote_pending_leaf_slab(
-      cudaStream_t stream, bool wait) {
-    if (!pending_leaf_slab_valid_)
-      return false;
-    std::uint8_t *arena = nullptr;
-    cudaError_t allocation_status = cudaSuccess;
-    {
-      std::unique_lock<std::mutex> guard(leaf_alloc_mutex_);
-      if (!leaf_alloc_result_ready_) {
-        if (!wait)
-          return false;
-        leaf_alloc_cv_.wait(guard, [this] {
-          return leaf_alloc_result_ready_;
-        });
-      }
-      allocation_status = leaf_alloc_status_;
-      if (allocation_status == cudaSuccess) {
-        const cudaError_t ready =
-            cudaEventQuery(leaf_alloc_ready_);
-        if (ready == cudaErrorNotReady) {
-          if (!wait)
-            return false;
-          CUDA_CHECK(cudaStreamWaitEvent(
-              stream, leaf_alloc_ready_, 0));
-        } else {
-          CUDA_CHECK(ready);
-        }
-      }
-      arena = leaf_alloc_result_;
-      leaf_alloc_result_ = nullptr;
-      leaf_alloc_result_ready_ = false;
-    }
-    if (allocation_status != cudaSuccess) {
-      cudaStreamSynchronize(leaf_alloc_stream_);
-      if (arena)
-        cudaFree(arena);
-      pending_leaf_slab_ = LeafSlab{};
-      pending_leaf_slab_bytes_ = 0u;
-      pending_leaf_slab_valid_ = false;
-      CUDA_CHECK(allocation_status);
-    }
-    const LeafSlabLayout layout = leaf_slab_layout(
-        pending_leaf_slab_.records_per_leaf,
-        pending_leaf_slab_.with_values);
-    pending_leaf_slab_.arena.adopt(arena, layout.bytes);
-    bind_leaf_slab(pending_leaf_slab_, layout);
-    LeafSlab slab = std::move(pending_leaf_slab_);
-    pending_leaf_slab_ = LeafSlab{};
-    pending_leaf_slab_bytes_ = 0u;
-    pending_leaf_slab_valid_ = false;
-    publish_leaf_slab(std::move(slab));
-    return true;
-  }
-
-  static bool leaf_slot_matches(
-      const RunStorage &run, bool with_values,
-      std::size_t count) {
-    if (!run.keys.external() ||
-        run.keys.capacity() < count ||
-        !run.quotient_off.external() ||
-        run.quotient_off.capacity() <
-            gpulsmopt_detail::kEpochQuotients + 1u ||
-        !run.lookup_mask.external() ||
-        !run.route_mask.external())
-      return false;
-    if (with_values)
-      return run.values.external() &&
-             run.values.capacity() >= count;
-    return run.values.data() == nullptr;
-  }
-
-  std::vector<RunStorage> &leaf_pool(bool with_values) {
-    return with_values ? insert_leaf_pool_ : delete_leaf_pool_;
-  }
-
-  const std::vector<RunStorage> &leaf_pool(
-      bool with_values) const {
-    return with_values ? insert_leaf_pool_ : delete_leaf_pool_;
-  }
-
-  std::size_t available_leaf_slots(
-      bool with_values, std::size_t count) const {
-    const auto &pool = leaf_pool(with_values);
-    return static_cast<std::size_t>(std::count_if(
-        pool.begin(), pool.end(),
-        [with_values, count](const RunStorage &run) {
-          return leaf_slot_matches(run, with_values, count);
-        }));
-  }
-
-  RunStorage &available_insert_leaf(std::size_t count) {
-    if (!insert_leaf_pool_.empty() &&
-        leaf_slot_matches(insert_leaf_pool_.back(), true, count))
-      return insert_leaf_pool_.back();
-    auto slot = std::find_if(
-        insert_leaf_pool_.begin(), insert_leaf_pool_.end(),
-        [count](const RunStorage &run) {
-          return leaf_slot_matches(run, true, count);
-        });
-    if (slot == insert_leaf_pool_.end())
-      throw std::runtime_error("no insert leaf slab available");
-    return *slot;
-  }
-
-  void reserve_leaf_storage(
-      std::size_t count, cudaStream_t stream) {
-    if (pending_leaf_slab_valid_)
-      promote_pending_leaf_slab(stream, true);
-    const std::size_t insert_target =
-        gpulsmopt_detail::kInitialInsertLeafSlabs *
-        gpulsmopt_detail::kLeafSlabRuns;
-    const std::size_t delete_target =
-        gpulsmopt_detail::kInitialDeleteLeafSlabs *
-        gpulsmopt_detail::kLeafSlabRuns;
-    while (available_leaf_slots(true, count) < insert_target)
-      grow_leaf_pool(count, true);
-    while (available_leaf_slots(false, count) < delete_target)
-      grow_leaf_pool(count, false);
-  }
-
-  void maintain_leaf_spare(
-      std::size_t count, cudaStream_t stream) {
-    count = std::max<std::size_t>(count, 1u);
-    constexpr std::size_t low =
-        gpulsmopt_detail::kLeafSlabRuns;
-    std::size_t insert_free = available_leaf_slots(true, count);
-    std::size_t delete_free = available_leaf_slots(false, count);
-
-    if (pending_leaf_slab_valid_) {
-      const bool pending_insert =
-          pending_leaf_slab_.with_values;
-      const std::size_t pending_free =
-          pending_insert ? insert_free : delete_free;
-      const std::size_t other_free =
-          pending_insert ? delete_free : insert_free;
-      if (pending_free == 0u || other_free <= low) {
-        promote_pending_leaf_slab(stream, true);
-        insert_free = available_leaf_slots(true, count);
-        delete_free = available_leaf_slots(false, count);
-      }
-    }
-
-    if (!pending_leaf_slab_valid_) {
-      const bool insert_low = insert_free <= low;
-      const bool delete_low = delete_free <= low;
-      if (insert_low || delete_low) {
-        const bool with_values =
-            insert_low && (!delete_low || insert_free <= delete_free);
-        start_pending_leaf_slab(count, with_values);
-        const std::size_t free =
-            with_values ? insert_free : delete_free;
-        if (free == 0u)
-          promote_pending_leaf_slab(stream, true);
-      }
-    }
-  }
-
-  void acquire_run_slot(bool with_values, std::size_t count,
-                        cudaStream_t stream) {
-    auto &pool = leaf_pool(with_values);
-    if (pool.empty() ||
-        !leaf_slot_matches(pool.back(), with_values, count)) {
-      auto slot = std::find_if(
-          pool.begin(), pool.end(),
-          [with_values, count](const RunStorage &run) {
-            return leaf_slot_matches(run, with_values, count);
-          });
-      if (slot != pool.end())
-        std::iter_swap(slot, pool.end() - 1);
-    }
-    if (pool.empty() ||
-        !leaf_slot_matches(pool.back(), with_values, count)) {
-      if (pending_leaf_slab_valid_)
-        promote_pending_leaf_slab(stream, true);
-      if (pool.empty() ||
-          !leaf_slot_matches(pool.back(), with_values, count)) {
-        start_pending_leaf_slab(count, with_values);
-        promote_pending_leaf_slab(stream, true);
-      }
-    }
-    if (pool.empty() ||
-        !leaf_slot_matches(pool.back(), with_values, count))
-      throw std::runtime_error("leaf slab allocation failed");
-    runs_.push_back(std::move(pool.back()));
-    pool.pop_back();
-  }
-
-  void recycle_run_storage(RunStorage &&run) {
-    if (!run.keys.external()) {
-      run_pool_.push_back(std::move(run));
-      return;
-    }
-    if (run.values.external())
-      insert_leaf_pool_.push_back(std::move(run));
-    else
-      delete_leaf_pool_.push_back(std::move(run));
-  }
-
-  void acquire_compaction_slot() {
-    auto best = run_pool_.end();
-    for (auto it = run_pool_.begin();
-         it != run_pool_.end(); ++it) {
-      if (!it->keys.owns())
-        continue;
-      if (best == run_pool_.end() ||
-          it->keys.capacity() > best->keys.capacity())
-        best = it;
-    }
-    if (best == run_pool_.end()) {
-      runs_.emplace_back();
-      return;
-    }
-    runs_.push_back(std::move(*best));
-    run_pool_.erase(best);
-  }
-
-  void release_hash_children(RunStorage &run) {
-    for (RetainedLeaf &child : run.hash_children) {
-      RunStorage leaf;
-      leaf.operation = child.operation;
-      leaf.keys = std::move(child.keys);
-      leaf.values = std::move(child.values);
-      leaf.quotient_off = std::move(child.quotient_off);
-      leaf.op_words = std::move(child.op_words);
-      leaf.lookup_mask = std::move(child.lookup_mask);
-      leaf.route_mask = std::move(child.route_mask);
-      recycle_run_storage(std::move(leaf));
-    }
-    hash_child_pool_.push_back(
-        std::move(run.hash_children));
-  }
-
-  std::vector<RetainedLeaf> acquire_hash_children() {
-    if (hash_child_pool_.empty())
-      throw std::runtime_error("no free hash-child container");
-    std::vector<RetainedLeaf> children =
-        std::move(hash_child_pool_.back());
-    hash_child_pool_.pop_back();
-    return children;
-  }
-
-  void initialize_empty_base(cudaStream_t stream) {
-    acquire_compaction_slot();
-    RunStorage &base = runs_.back();
-    base.sequence_begin = 0u;
-    base.sequence_end = 0u;
-    base.stable_level = -1;
-    base.operation = gpulsmopt_detail::RunOperation::Insert;
-    base.assignment_class = gpulsmopt_detail::AssignmentClass::Raw;
-    base.mixed = false;
-    base.assignment = false;
-    base.hashed = false;
-    base.grouped = false;
-    base.nested = false;
-    base.lookup_mask_ready = false;
-    base.route_mask_ready = false;
-    base.group_child_count = 0;
-    base.parent_slot = -1;
-    base.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
-    base.count = 0u;
-    base.fully_sorted = true;
-    base.unit_counts = true;
-    base.unique_keys = true;
-    base.hash_children.clear();
-    base.keys.resize_discard(0);
-    base.values.resize_discard(0);
-    base.quotient_off.release();
-    base.op_words.release();
-    base.count_delta.release();
-    build_sorted_run_cache(runs_.size() - 1u, stream);
-  }
-
-  void clear_run_state() {
-    clear_sorted_state();
-    for (auto &epoch : runs_) {
-      if (epoch.hashed) {
-        release_hash_children(epoch);
-        recycle_hash_storage(epoch);
-      }
-      if (epoch.grouped && epoch.parent_slot >= 0 &&
-          epoch.parent_slot < gpulsmopt_detail::kParentSlots)
-        parent_slot_used_[epoch.parent_slot] = false;
-      epoch.hashed = false;
-      epoch.grouped = false;
-      epoch.nested = false;
-      epoch.group_child_count = 0;
-      epoch.parent_slot = -1;
-      recycle_run_storage(std::move(epoch));
-    }
-    runs_.clear();
-  }
-
-  void insert_records(const std::uint32_t *keys_in,
-                      const std::uint32_t *values_in, std::uint8_t op,
-                      std::size_t count, cudaStream_t stream) {
-    if (count == 0)
-      return;
-    const bool is_insert =
-        op == static_cast<std::uint8_t>(gpulsmopt_detail::kInsert);
-    create_assignment_run(is_insert, keys_in, is_insert ? values_in : nullptr,
-                          count, stream);
-  }
-
-  void ensure_sort_temp(std::size_t bytes) {
-    if (sort_temp_storage_.capacity() < bytes)
-      sort_temp_storage_.resize_discard(bytes);
-  }
-
-  static std::size_t range_arena_records(
-      std::size_t count) {
-    std::size_t capacity = 1u;
-    while (capacity < count) {
-      if (capacity >
-          std::numeric_limits<std::size_t>::max() / 2u)
-        throw std::overflow_error("range arena overflow");
-      capacity *= 2u;
-    }
-    return capacity;
-  }
-
-  static std::size_t range_arena_bytes(
-      std::size_t capacity) {
-    if (capacity >
-        std::numeric_limits<std::size_t>::max() / 9u)
-      throw std::overflow_error("range arena overflow");
-    return capacity * 9u;
-  }
-
-  void reserve_winner_workspace(std::size_t count) {
-    if (count > winner_workspace_capacity_) {
-      winner_workspace_capacity_ = range_arena_records(count);
-      winner_workspace_arena_.resize_discard_exact(
-          range_arena_bytes(winner_workspace_capacity_));
-      std::uint8_t *base = winner_workspace_arena_.data();
-      resolve_winner_keys_data_.bind_external(
-          reinterpret_cast<std::uint32_t *>(base),
-          winner_workspace_capacity_);
-      resolve_winner_values_.bind_external(
-          reinterpret_cast<std::uint32_t *>(
-              base + 4u * winner_workspace_capacity_),
-          winner_workspace_capacity_);
-      resolve_winner_deltas_.bind_external(
-          reinterpret_cast<std::int8_t *>(
-              base + 8u * winner_workspace_capacity_),
-          winner_workspace_capacity_);
-    }
-    resolve_winner_keys_data_.resize_discard(count);
-    resolve_winner_values_.resize_discard(count);
-    resolve_winner_deltas_.resize_discard(count);
-  }
-
-  void reserve_resolved_workspace(std::size_t count) {
-    if (count > resolved_workspace_capacity_) {
-      resolved_workspace_capacity_ = range_arena_records(count);
-      resolved_workspace_arena_.resize_discard_exact(
-          range_arena_bytes(resolved_workspace_capacity_));
-      std::uint8_t *base = resolved_workspace_arena_.data();
-      resolved_.keys.bind_external(
-          reinterpret_cast<std::uint32_t *>(base),
-          resolved_workspace_capacity_);
-      resolved_.values.bind_external(
-          reinterpret_cast<std::uint32_t *>(
-              base + 4u * resolved_workspace_capacity_),
-          resolved_workspace_capacity_);
-      resolved_.count_delta.bind_external(
-          reinterpret_cast<std::int8_t *>(
-              base + 8u * resolved_workspace_capacity_),
-          resolved_workspace_capacity_);
-    }
-    resolved_.keys.resize_discard(count);
-    resolved_.values.resize_discard(count);
-    resolved_.count_delta.resize_discard(count);
-  }
-
-  void exclusive_scan_u32(const std::uint32_t *input, std::uint32_t *output,
-                          std::size_t count, cudaStream_t stream) {
-    if (count == 0)
-      return;
-    if (count > scan_u32_count_) {
-      scan_u32_temp_bytes_ = 0;
-      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-          nullptr, scan_u32_temp_bytes_, input, output, static_cast<int>(count),
-          stream));
-      scan_u32_count_ = count;
-    }
-    std::size_t temp_bytes = scan_u32_temp_bytes_;
-    ensure_sort_temp(temp_bytes);
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(sort_temp_storage_.data(),
-                                             temp_bytes, input, output,
-                                             static_cast<int>(count), stream));
-  }
-
-  void release_build_sort_storage() {
-    direct_sort_keys_.release();
-    direct_sort_values_.release();
-    sort_temp_storage_.release();
-    direct_sort_count_ = 0;
-    direct_sort_temp_bytes_ = 0;
-    run_sort_count_ = 0;
-    run_sort_temp_bytes_ = 0;
-    delete_sort_count_ = 0;
-    delete_sort_temp_bytes_ = 0;
-    scan_u32_count_ = 0;
-    scan_u32_temp_bytes_ = 0;
-    metadata_scan_temp_bytes_ = 0;
-  }
-
-  void prepare_sort_storage(std::size_t direct_count, cudaStream_t stream) {
-    direct_sort_keys_.resize_discard(direct_count);
-    direct_sort_values_.resize_discard(direct_count);
-    RunStorage &sample = available_insert_leaf(direct_count);
-    std::size_t direct_bytes = 0;
-    if (direct_count > 0) {
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, direct_bytes, sample.keys.data(), direct_sort_keys_.data(),
-          sample.values.data(), direct_sort_values_.data(), direct_count, 0, 32,
-          stream));
-      direct_sort_count_ = direct_count;
-      direct_sort_temp_bytes_ = direct_bytes;
-    }
-    std::size_t epoch_bytes = 0;
-    std::size_t delete_bytes = 0;
-    if (direct_count > 0) {
-      CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
-          nullptr, epoch_bytes, sample.keys.data(), direct_sort_keys_.data(),
-          sample.values.data(), direct_sort_values_.data(),
-          static_cast<std::uint32_t>(direct_count), 16, 32, stream));
-      run_sort_count_ = direct_count;
-      run_sort_temp_bytes_ = epoch_bytes;
-      CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_keys(
-          nullptr, delete_bytes, sample.keys.data(), direct_sort_keys_.data(),
-          static_cast<std::uint32_t>(direct_count), 16, 32, stream));
-      delete_sort_count_ = direct_count;
-      delete_sort_temp_bytes_ = delete_bytes;
-    }
-    // Resolve staging reuses the same high-water sizing.
-    resolve_keys_.resize_discard(direct_count);
-    resolve_payload_.resize_discard(direct_count);
-    resolve_alt_keys_.resize_discard(direct_count);
-    resolve_alt_payload_.resize_discard(direct_count);
-    resolve_flags_.resize_discard(direct_count);
-    resolve_sel_vdelta_.resize_discard(direct_count);
-    resolve_count_.resize_discard(1);
-    std::size_t scan_bytes = 0;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, scan_bytes, direct_sort_keys_.data(),
-        direct_sort_values_.data(), gpulsmopt_detail::kEpochQuotients, stream));
-    scan_u32_count_ = gpulsmopt_detail::kEpochQuotients;
-    scan_u32_temp_bytes_ = scan_bytes;
-    ensure_sort_temp(
-        std::max({direct_bytes, epoch_bytes, delete_bytes, scan_bytes}));
-  }
-
-  void reserve_assignment_gather_storage() {
-    compaction_counts_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    compaction_offsets_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    resolve_quotient_lists_.resize_discard_exact(
-        4u * gpulsmopt_detail::kEpochQuotients);
-    resolve_class_counts_.resize_discard_exact(4u);
-    resolve_winner_counts_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    resolve_winner_offsets_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-  }
-
-  void reset_lookup_owner(cudaStream_t stream) {
-    lookup_owner_leaf_count_ = 0u;
-    lookup_owner_published_leaf_count_ = 0u;
-    lookup_owner_applied_leaf_count_ = 0u;
-    lookup_owner_usable_ = lookup_owner_enabled_;
-    if (!lookup_owner_enabled_)
-      return;
+    CUDA_CHECK(cudaMemsetAsync(cursor_.data(), 0, sizeof(std::uint32_t),
+                               stream));
+    CUDA_CHECK(cudaMemsetAsync(raw_offsets_.data(), 0,
+                               raw_offsets_.size() * sizeof(std::uint32_t),
+                               stream));
+    CUDA_CHECK(cudaMemsetAsync(raw_counts_.data(), 0,
+                               raw_counts_.size() * sizeof(std::uint32_t),
+                               stream));
     CUDA_CHECK(cudaMemsetAsync(
-        lookup_sector_buckets_.data(), 0,
-        lookup_sector_buckets_.size() *
-            sizeof(gpulsmopt_detail::LookupSectorBucket), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        lookup_sector_overflow_.data(), 0,
-        lookup_sector_overflow_.size() * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        lookup_sector_stash_.data(), 0,
-        lookup_sector_stash_.size() * sizeof(unsigned long long), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        lookup_owner_overflow_.data(), 0,
-        lookup_owner_overflow_.size() * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        lookup_sector_ready_.data(), 0,
-        lookup_sector_ready_.size() * sizeof(std::uint32_t), stream));
-    // The radix arena is append-only within an epoch. Rewind it here; each
-    // subsequently allocated page clears itself before its id is published.
-    // This makes ordinary folds independent of the reserved AQX capacity.
-    CUDA_CHECK(cudaMemsetAsync(
-        lookup_radix_cursor_.data(), 0, sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        lookup_radix_roots_.data(), 0,
-        lookup_radix_roots_.size() * sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        lookup_radix_enabled_.data(), 0,
-        lookup_radix_enabled_.size() * sizeof(std::uint32_t), stream));
+        raw_epoch_signatures_.data(), 0,
+        raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+    pending_batches_ = 0u;
+    pending_records_ = 0u;
+    active_levels_ = 0u;
+    stats_ = {};
   }
 
-  void seed_lookup_owner_base(cudaStream_t stream) {
-    if (!lookup_owner_usable_ || !sorted_run_ready() ||
-        sorted_run().count == 0u)
-      return;
-    constexpr int block = 256;
-    const int grid = static_cast<int>(
-        (sorted_run().count + block - 1u) / block);
-    gpulsmopt_detail::lookup_sector_seed_base_kernel<<<
-        grid, block, 0, stream>>>(
-        make_sorted_view(), lookup_sector_buckets_.data(),
-        lookup_sector_buckets_per_quotient_,
-        lookup_sector_bucket_mask_, lookup_sector_overflow_.data(),
-        lookup_sector_stash_.data(), lookup_owner_overflow_.data());
-    CUDA_CHECK(cudaGetLastError());
-    constexpr int quotient_grid =
-        (gpulsmopt_detail::kEpochQuotients + block - 1) / block;
-    gpulsmopt_detail::lookup_radix_repair_base_kernel<<<
-        quotient_grid, block, 0, stream>>>(
-        make_sorted_view(), lookup_sector_buckets_.data(),
-        lookup_sector_buckets_per_quotient_,
-        lookup_sector_bucket_mask_, lookup_owner_overflow_.data(),
-        lookup_radix_arena_.data(), lookup_radix_cursor_.data(),
-        lookup_radix_capacity_units_, lookup_radix_roots_.data(),
-        lookup_radix_enabled_.data());
-    CUDA_CHECK(cudaGetLastError());
-  }
-
-  void release_lookup_sector_storage() {
-    lookup_sector_buckets_.release();
-    lookup_sector_overflow_.release();
-    lookup_sector_stash_.release();
-    lookup_sector_ready_.release();
-    lookup_radix_arena_.release();
-    lookup_radix_cursor_.release();
-    lookup_radix_roots_.release();
-    lookup_radix_enabled_.release();
-    lookup_owner_leaves_.release();
-    lookup_owner_overflow_.release();
-    lookup_radix_capacity_units_ = 0u;
-  }
-
-  // The sidecar is optional.  If its bounded allocation cannot be satisfied,
-  // point lookup remains exact through the ordinary temporal-run path.
-  void reserve_lookup_owner_storage(cudaStream_t stream) {
-    lookup_owner_enabled_ = false;
-    lookup_owner_usable_ = false;
-    lookup_sector_enabled_ = false;
-    lookup_sector_buckets_per_quotient_ = 0u;
-    lookup_sector_bucket_mask_ = 0u;
-
-    if (max_elements_ >
-        std::numeric_limits<std::size_t>::max() / 2u) {
-      release_lookup_sector_storage();
-      return;
-    }
-    const std::size_t minimum_entries =
-        static_cast<std::size_t>(gpulsmopt_detail::kEpochQuotients) * 4u;
-    const std::size_t required_entries = std::max<std::size_t>(
-        minimum_entries, std::max<std::size_t>(1u, max_elements_) * 2u);
-    std::size_t entries = minimum_entries;
-    while (entries < required_entries &&
-           entries < gpulsmopt_detail::kLookupSectorMaxEntries)
-      entries <<= 1u;
-    if (entries < required_entries ||
-        entries > gpulsmopt_detail::kLookupSectorMaxEntries) {
-      release_lookup_sector_storage();
-      return;
-    }
-
-    const std::size_t bucket_count = entries / 4u;
-    const std::size_t buckets_per_quotient =
-        bucket_count / gpulsmopt_detail::kEpochQuotients;
-    const std::size_t overflow_words = (bucket_count + 31u) / 32u;
-    const std::size_t stash_entries =
-        static_cast<std::size_t>(gpulsmopt_detail::kEpochQuotients) *
-        gpulsmopt_detail::kLookupSectorStashSlots;
-    constexpr std::size_t quotient_count =
-        gpulsmopt_detail::kEpochQuotients;
-    constexpr std::size_t leaf_capacity =
-        gpulsmopt_detail::kLookupLeafCapacity;
-    constexpr std::size_t radix_unit_bytes =
-        gpulsmopt_detail::kLookupRadixUnitU64 *
-        sizeof(unsigned long long);
-    const std::size_t primary_bytes =
-        bucket_count * sizeof(gpulsmopt_detail::LookupSectorBucket);
-    const std::size_t radix_capacity_units = std::max<std::size_t>(
-        gpulsmopt_detail::kLookupRadixDenseUnits,
-        (primary_bytes / 4u + radix_unit_bytes - 1u) /
-            radix_unit_bytes);
-    const std::size_t radix_entries =
-        radix_capacity_units * gpulsmopt_detail::kLookupRadixUnitU64;
-    if (radix_capacity_units >
-        std::numeric_limits<std::uint32_t>::max()) {
-      release_lookup_sector_storage();
-      return;
-    }
-    const std::size_t bytes =
-        primary_bytes +
-        overflow_words * sizeof(std::uint32_t) +
-        stash_entries * sizeof(unsigned long long) +
-        4u * quotient_count * sizeof(std::uint32_t) +
-        sizeof(std::uint32_t) +
-        radix_entries * sizeof(unsigned long long) +
-        leaf_capacity *
-            sizeof(gpulsmopt_detail::LookupOwnerLeafView);
-    const bool reusable =
-        lookup_sector_buckets_.capacity() >= bucket_count &&
-        lookup_sector_overflow_.capacity() >= overflow_words &&
-        lookup_sector_stash_.capacity() >= stash_entries &&
-        lookup_sector_ready_.capacity() >= quotient_count &&
-        lookup_radix_arena_.capacity() >= radix_entries &&
-        lookup_radix_cursor_.capacity() >= 1u &&
-        lookup_radix_roots_.capacity() >= quotient_count &&
-        lookup_radix_enabled_.capacity() >= quotient_count &&
-        lookup_owner_leaves_.capacity() >= leaf_capacity &&
-        lookup_owner_overflow_.capacity() >= quotient_count;
-    if (reusable) {
-      lookup_sector_buckets_.resize_discard_exact(bucket_count);
-      lookup_sector_overflow_.resize_discard_exact(overflow_words);
-      lookup_sector_stash_.resize_discard_exact(stash_entries);
-      lookup_sector_ready_.resize_discard_exact(quotient_count);
-      lookup_radix_arena_.resize_discard_exact(radix_entries);
-      lookup_radix_cursor_.resize_discard_exact(1u);
-      lookup_radix_roots_.resize_discard_exact(quotient_count);
-      lookup_radix_enabled_.resize_discard_exact(quotient_count);
-      lookup_owner_leaves_.resize_discard_exact(leaf_capacity);
-      lookup_owner_overflow_.resize_discard_exact(quotient_count);
-    } else {
-      constexpr std::size_t memory_reserve = std::size_t{256} << 20;
-      std::size_t free_bytes = 0u;
-      std::size_t total_bytes = 0u;
-      CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-      (void)total_bytes;
-      if (bytes > free_bytes || free_bytes - bytes < memory_reserve) {
-        release_lookup_sector_storage();
-        return;
-      }
-      release_lookup_sector_storage();
-      gpulsmopt_detail::LookupSectorBucket *buckets = nullptr;
-      std::uint32_t *bucket_overflow = nullptr;
-      unsigned long long *stash = nullptr;
-      std::uint32_t *ready = nullptr;
-      unsigned long long *radix_arena = nullptr;
-      std::uint32_t *radix_cursor = nullptr;
-      std::uint32_t *radix_roots = nullptr;
-      std::uint32_t *radix_enabled = nullptr;
-      gpulsmopt_detail::LookupOwnerLeafView *leaves = nullptr;
-      std::uint32_t *quotient_overflow = nullptr;
-      cudaError_t status = cudaMalloc(
-          reinterpret_cast<void **>(&buckets),
-          bucket_count * sizeof(*buckets));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&bucket_overflow),
-            overflow_words * sizeof(*bucket_overflow));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&stash),
-            stash_entries * sizeof(*stash));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&ready),
-            quotient_count * sizeof(*ready));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&radix_arena),
-            radix_entries * sizeof(*radix_arena));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&radix_cursor),
-            sizeof(*radix_cursor));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&radix_roots),
-            quotient_count * sizeof(*radix_roots));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&radix_enabled),
-            quotient_count * sizeof(*radix_enabled));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&leaves),
-            leaf_capacity * sizeof(*leaves));
-      if (status == cudaSuccess)
-        status = cudaMalloc(
-            reinterpret_cast<void **>(&quotient_overflow),
-            quotient_count * sizeof(*quotient_overflow));
-      if (status != cudaSuccess) {
-        (void)cudaGetLastError();
-        if (buckets)
-          (void)cudaFree(buckets);
-        if (bucket_overflow)
-          (void)cudaFree(bucket_overflow);
-        if (stash)
-          (void)cudaFree(stash);
-        if (ready)
-          (void)cudaFree(ready);
-        if (radix_arena)
-          (void)cudaFree(radix_arena);
-        if (radix_cursor)
-          (void)cudaFree(radix_cursor);
-        if (radix_roots)
-          (void)cudaFree(radix_roots);
-        if (radix_enabled)
-          (void)cudaFree(radix_enabled);
-        if (leaves)
-          (void)cudaFree(leaves);
-        if (quotient_overflow)
-          (void)cudaFree(quotient_overflow);
-        return;
-      }
-      lookup_sector_buckets_.adopt(buckets, bucket_count);
-      lookup_sector_overflow_.adopt(bucket_overflow, overflow_words);
-      lookup_sector_stash_.adopt(stash, stash_entries);
-      lookup_sector_ready_.adopt(ready, quotient_count);
-      lookup_radix_arena_.adopt(radix_arena, radix_entries);
-      lookup_radix_cursor_.adopt(radix_cursor, 1u);
-      lookup_radix_roots_.adopt(radix_roots, quotient_count);
-      lookup_radix_enabled_.adopt(radix_enabled, quotient_count);
-      lookup_owner_leaves_.adopt(leaves, leaf_capacity);
-      lookup_owner_overflow_.adopt(
-          quotient_overflow, quotient_count);
-    }
-
-    lookup_sector_buckets_per_quotient_ =
-        static_cast<std::uint32_t>(buckets_per_quotient);
-    lookup_sector_bucket_mask_ =
-        lookup_sector_buckets_per_quotient_ - 1u;
-    lookup_radix_capacity_units_ =
-        static_cast<std::uint32_t>(radix_capacity_units);
-    lookup_sector_enabled_ = true;
-    lookup_owner_enabled_ = true;
-    reset_lookup_owner(stream);
-  }
-  // Reserve successor storage before timed updates.
-  void reserve_successor_storage() {
-    const std::size_t queries = std::max<std::size_t>(1, batch_capacity_);
-    succ_miss_indices_.resize_discard(queries);
-    succ_miss_count_.resize_discard(1);
-    const std::size_t base_capacity = std::max<std::size_t>(max_elements_, 1);
-    const std::size_t l0 = (base_capacity + 31u) >> 5;
-    const std::size_t l1 = (l0 + 31u) >> 5;
-    const std::size_t l2 = (l1 + 31u) >> 5;
-    const std::size_t l3 = (l2 + 31u) >> 5;
-    succ_deleted_base_words_.resize_discard(l0);
-    succ_live_word_l1_.resize_discard(l1);
-    succ_live_word_l2_.resize_discard(l2);
-    succ_live_word_l3_.resize_discard(l3);
-    succ_positive_words_.resize_discard(l0);
-    succ_positive_l1_.resize_discard(l1);
-    succ_positive_l2_.resize_discard(l2);
-    succ_positive_l3_.resize_discard(l3);
-  }
-
-  void prepare_hash_storage(HashFoldStorage &storage) {
-    storage.offsets.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    storage.counts.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    storage.child_views.resize_discard_exact(
-        gpulsmopt_detail::kRawFoldWidth);
-    storage.child_router.resize_discard_exact(
-        gpulsmopt_detail::kHashRouteWordsPerParent);
-  }
-
-  void reserve_hash_storage() {
-    while (hash_storage_pool_.size() <
-           gpulsmopt_detail::kColdArenaSlots) {
-      hash_storage_pool_.emplace_back();
-      prepare_hash_storage(hash_storage_pool_.back());
-    }
-  }
-
-  HashFoldStorage acquire_hash_storage() {
-    if (hash_storage_pool_.empty())
-      throw std::runtime_error("hash fold capacity exceeded");
-    HashFoldStorage storage =
-        std::move(hash_storage_pool_.back());
-    hash_storage_pool_.pop_back();
-    return storage;
-  }
-
-  void recycle_hash_storage(RunStorage &run) {
-    run.hash_storage.keys.release();
-    if (hash_storage_pool_.size() <
-        gpulsmopt_detail::kColdArenaSlots) {
-      hash_storage_pool_.push_back(
-          std::move(run.hash_storage));
-    } else {
-      run.hash_storage = HashFoldStorage{};
-    }
-  }
-
-  void reserve_fold_storage(std::size_t batch_count) {
-    const std::size_t batch =
-        std::max<std::size_t>(batch_count, 1u);
-    if (batch > std::numeric_limits<std::uint32_t>::max() /
-                    gpulsmopt_detail::kRawFoldWidth)
-      throw std::runtime_error("hash fold exceeds 32-bit offsets");
-    lookup_host_leaves_.reserve(
-        gpulsmopt_detail::kLookupLeafCapacity);
-    hash_heavy_capacities_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    hash_active_quotients_.resize_discard_exact(
-        gpulsmopt_detail::kEpochQuotients);
-    hash_heavy_count_.resize_discard_exact(1u);
-    hash_route_mask_views_.resize_discard_exact(
-        gpulsmopt_detail::kRawFoldWidth);
-    reserve_hash_storage();
-    lookup_publication_.resize_discard_exact(1u);
-    parent_child_views_arena_.resize_discard_exact(
-        gpulsmopt_detail::kStableFanout *
-        gpulsmopt_detail::kParentSlots);
-  }
-
-  void reset_parent_storage() {
-    for (int slot = 0; slot < gpulsmopt_detail::kParentSlots;
-         ++slot)
-      parent_slot_used_[slot] = false;
-  }
-
-  void prepare_for_insert(cudaStream_t stream) {
-    const std::size_t direct_count =
-        std::min(max_elements_,
-                 std::max<std::size_t>(1, batch_capacity_));
-    reserve_leaf_storage(direct_count, stream);
-    assignment_views_.resize_discard_exact(gpulsmopt_detail::kRunCapacity);
-    chrono_views_.reserve(gpulsmopt_detail::kRunCapacity);
-    prepare_sort_storage(direct_count, stream);
-    reserve_assignment_gather_storage();
-    reserve_successor_storage();
-    reserve_fold_storage(direct_count);
-    reset_parent_storage();
-    constexpr int lookup_block = 256;
-    const auto base = make_base_view();
-    gpulsmopt_detail::temporal_lookup_leaf_block_kernel<<<
-        1, lookup_block, 0, stream>>>(
-        lookup_publication_.data(), 0, base, nullptr, 0,
-        nullptr, nullptr);
-    gpulsmopt_detail::temporal_lookup_leaf_thread_kernel<<<
-        1, lookup_block, 0, stream>>>(
-        lookup_publication_.data(), 0, base, nullptr, 0,
-        nullptr, nullptr);
-    CUDA_CHECK(cudaGetLastError());
-    if (direct_count > 0) {
-      // Warm-up must not feed uninitialized staging records to CUB. The
-      // outputs are discarded, but initcheck correctly treats the reads as
-      // undefined behavior.
-      CUDA_CHECK(cudaMemsetAsync(direct_sort_keys_.data(), 0,
-                                 direct_count * sizeof(std::uint32_t),
-                                 stream));
-      CUDA_CHECK(cudaMemsetAsync(direct_sort_values_.data(), 0,
-                                 direct_count * sizeof(std::uint32_t),
-                                 stream));
-      RunStorage &sample = available_insert_leaf(direct_count);
-      sort_run_batch(
-          direct_sort_keys_.data(), direct_sort_values_.data(),
-          direct_count, sample.keys.data(), sample.values.data(), stream);
-      // Warm the distinct public keys-only instantiation outside the first
-      // measured deletion. Outputs are scratch and deliberately discarded.
-      sort_delete_keys_batch(direct_sort_keys_.data(), direct_count,
-                             sample.keys.data(), stream);
-    }
-  }
-
-  void sort_direct_batch(const std::uint32_t *keys, const std::uint32_t *values,
-                         std::size_t n, cudaStream_t stream) {
-    direct_sort_keys_.resize_discard(n);
-    direct_sort_values_.resize_discard(n);
-    if (n > direct_sort_count_) {
-      direct_sort_temp_bytes_ = 0;
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, direct_sort_temp_bytes_, keys, direct_sort_keys_.data(),
-          values, direct_sort_values_.data(), n, 0, 32, stream));
-      direct_sort_count_ = n;
-    }
-    std::size_t temp_bytes = direct_sort_temp_bytes_;
-    ensure_sort_temp(temp_bytes);
+  void admit(const std::uint32_t *keys, const std::uint32_t *values,
+             std::size_t count, bool tombstone, cudaStream_t stream) {
+    if (!count) return;
+    if (!keys || (!tombstone && !values) || count > batch_capacity_)
+      throw std::invalid_argument("invalid GPULSMOpt update batch");
+    begin_operation(stream);
+    const std::uint32_t n = static_cast<std::uint32_t>(count);
+    std::size_t sort_bytes{};
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        sort_temp_storage_.data(), temp_bytes, keys, direct_sort_keys_.data(),
-        values, direct_sort_values_.data(), n, 0, 32, stream));
-  }
-
-
-  void sort_run_batch(const std::uint32_t *keys, const std::uint32_t *values,
-                      std::size_t n, std::uint32_t *out_keys,
-                      std::uint32_t *out_values, cudaStream_t stream) {
-    if (n > run_sort_count_) {
-      run_sort_temp_bytes_ = 0;
-      CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
-          nullptr, run_sort_temp_bytes_, keys, out_keys, values, out_values,
-          static_cast<std::uint32_t>(n), 16, 32, stream));
-      run_sort_count_ = n;
-    }
-    std::size_t temp_bytes = run_sort_temp_bytes_;
-    ensure_sort_temp(temp_bytes);
-    CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_pairs(
-        sort_temp_storage_.data(), temp_bytes, keys, out_keys, values,
-        out_values, static_cast<std::uint32_t>(n), 16, 32, stream));
-  }
-
-  void sort_delete_keys_batch(const std::uint32_t *keys, std::size_t n,
-                              std::uint32_t *out_keys,
-                              cudaStream_t stream) {
-    if (n > delete_sort_count_) {
-      delete_sort_temp_bytes_ = 0;
-      CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_keys(
-          nullptr, delete_sort_temp_bytes_, keys, out_keys,
-          static_cast<std::uint32_t>(n), 16, 32, stream));
-      delete_sort_count_ = n;
-    }
-    std::size_t temp_bytes = delete_sort_temp_bytes_;
-    ensure_sort_temp(temp_bytes);
-    CUDA_CHECK(gpulsmopt_detail::epoch_radix_sort_keys(
-        sort_temp_storage_.data(), temp_bytes, keys, out_keys,
-        static_cast<std::uint32_t>(n), 16, 32, stream));
-  }
-
-
-  bool sparse_view_is_current() const {
-    return succ_sparse_ready_ &&
-           succ_sparse_base_generation_ == base_generation_ &&
-           succ_sparse_run_sequence_ == run_sequence_;
-  }
-
-  gpulsmopt_detail::SuccessorSparseView make_sparse_successor_view() const {
-    return {make_sorted_view(),
-            succ_deleted_base_words_.data(),
-            succ_live_word_l1_.data(),
-            succ_live_word_l2_.data(),
-            succ_live_word_l3_.data(),
-            resolved_.keys.data(),
-            resolved_.quotient_off.data(),
-            succ_positive_words_.data(),
-            succ_positive_l1_.data(),
-            succ_positive_l2_.data(),
-            succ_positive_l3_.data(),
-            static_cast<std::uint32_t>(resolved_.count),
-            succ_sparse_l0_words_,
-            succ_sparse_l3_words_,
-            succ_sparse_positive_l0_words_,
-            succ_sparse_positive_l3_words_};
-  }
-
-  // Builds sparse state only after a successor miss.
-  void ensure_sparse_successor_view(cudaStream_t stream) {
-    ensure_resolved(stream);
-    constexpr int block = 256;
-    const std::uint32_t base_count =
-        sorted_run_ready() ? static_cast<std::uint32_t>(sorted_run().count) : 0u;
-    const std::uint32_t l0 = (base_count + 31u) >> 5;
-    const std::uint32_t l1 = (l0 + 31u) >> 5;
-    const std::uint32_t l2 = (l1 + 31u) >> 5;
-    const std::uint32_t l3 = (l2 + 31u) >> 5;
-    const std::size_t corrections = resolved_.count;
-    const std::uint32_t p0 =
-        (static_cast<std::uint32_t>(corrections) + 31u) >> 5;
-    const std::uint32_t p1 = (p0 + 31u) >> 5;
-    const std::uint32_t p2 = (p1 + 31u) >> 5;
-    const std::uint32_t p3 = (p2 + 31u) >> 5;
-    succ_sparse_l0_words_ = l0;
-    succ_sparse_l3_words_ = l3;
-    succ_sparse_positive_l0_words_ = p0;
-    succ_sparse_positive_l3_words_ = p3;
-    succ_deleted_base_words_.resize_discard(std::max<std::uint32_t>(l0, 1u));
-    succ_live_word_l1_.resize_discard(std::max<std::uint32_t>(l1, 1u));
-    succ_live_word_l2_.resize_discard(std::max<std::uint32_t>(l2, 1u));
-    succ_live_word_l3_.resize_discard(std::max<std::uint32_t>(l3, 1u));
-    succ_positive_words_.resize_discard(std::max<std::uint32_t>(p0, 1u));
-    succ_positive_l1_.resize_discard(std::max<std::uint32_t>(p1, 1u));
-    succ_positive_l2_.resize_discard(std::max<std::uint32_t>(p2, 1u));
-    succ_positive_l3_.resize_discard(std::max<std::uint32_t>(p3, 1u));
-    if (l0 != 0u)
-      CUDA_CHECK(cudaMemsetAsync(succ_deleted_base_words_.data(), 0,
-                                 l0 * sizeof(std::uint32_t), stream));
-    if (p0 != 0u)
-      CUDA_CHECK(cudaMemsetAsync(succ_positive_words_.data(), 0,
-                                 p0 * sizeof(std::uint32_t), stream));
-    if (corrections > 0) {
-      const int grid = static_cast<int>((corrections + block - 1u) / block);
-      gpulsmopt_detail::successor_classify_kernel<<<grid, block, 0, stream>>>(
-          resolved_.keys.data(), resolved_.count_delta.data(), corrections,
-          make_sorted_view(), succ_positive_words_.data(),
-          succ_deleted_base_words_.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
-    if (l0 != 0u) {
-      gpulsmopt_detail::successor_tail_mask_kernel<<<1, 1, 0, stream>>>(
-          succ_deleted_base_words_.data(), l0, base_count);
-      CUDA_CHECK(cudaGetLastError());
-      gpulsmopt_detail::successor_live_level_kernel<<<
-          static_cast<int>((l1 + block - 1u) / block), block, 0, stream>>>(
-          succ_deleted_base_words_.data(), l0, succ_live_word_l1_.data(), l1, 1);
-      gpulsmopt_detail::successor_live_level_kernel<<<
-          static_cast<int>((l2 + block - 1u) / block), block, 0, stream>>>(
-          succ_live_word_l1_.data(), l1, succ_live_word_l2_.data(), l2, 0);
-      gpulsmopt_detail::successor_live_level_kernel<<<
-          static_cast<int>((l3 + block - 1u) / block), block, 0, stream>>>(
-          succ_live_word_l2_.data(), l2, succ_live_word_l3_.data(), l3, 0);
-      CUDA_CHECK(cudaGetLastError());
-    }
-    if (p0 != 0u) {
-      gpulsmopt_detail::successor_live_level_kernel<<<
-          static_cast<int>((p1 + block - 1u) / block), block, 0, stream>>>(
-          succ_positive_words_.data(), p0, succ_positive_l1_.data(), p1, 0);
-      gpulsmopt_detail::successor_live_level_kernel<<<
-          static_cast<int>((p2 + block - 1u) / block), block, 0, stream>>>(
-          succ_positive_l1_.data(), p1, succ_positive_l2_.data(), p2, 0);
-      gpulsmopt_detail::successor_live_level_kernel<<<
-          static_cast<int>((p3 + block - 1u) / block), block, 0, stream>>>(
-          succ_positive_l2_.data(), p2, succ_positive_l3_.data(), p3, 0);
-      CUDA_CHECK(cudaGetLastError());
-    }
-    succ_sparse_base_generation_ = base_generation_;
-    succ_sparse_run_sequence_ = run_sequence_;
-    succ_sparse_ready_ = true;
-  }
-
-  void invalidate_resolved() {
-    lookup_publication_ready_ = false;
-    resolved_ready_ = false;
-    // L-QVRF is not eagerly touched. Once the canonical resolver consumes the
-    // new run it advances only the affected quotient versions; cached
-    // unaffected fragments remain usable.
-  }
-
-  bool prepare_flat_normalize_leaves(
-      const std::vector<std::size_t> &idx,
-      std::uint32_t *max_count, cudaStream_t stream) {
-    flat_normalize_host_.clear();
-    *max_count = 0u;
-    std::uint32_t rank_base = 0u;
-    for (const std::size_t index : idx) {
-      RunStorage &run = runs_[index];
-      if (run.grouped)
-        return false;
-      if (run.hashed) {
-        if (run.hash_children.empty())
-          return false;
-        for (RetainedLeaf &leaf : run.hash_children) {
-          const bool insert =
-              leaf.operation ==
-              gpulsmopt_detail::RunOperation::Insert;
-          if (leaf.count >
-              std::numeric_limits<std::uint32_t>::max())
-            return false;
-          flat_normalize_host_.push_back(
-              {leaf.keys.data(),
-               insert ? leaf.values.data() : nullptr,
-               leaf.quotient_off.data(),
-               static_cast<std::uint32_t>(leaf.count),
-               rank_base,
-               static_cast<std::uint8_t>(insert ? 1u : 0u)});
-          rank_base += static_cast<std::uint32_t>(leaf.count);
-          *max_count = std::max(
-              *max_count,
-              static_cast<std::uint32_t>(leaf.count));
-        }
-        continue;
-      }
-      if (run.mixed ||
-          run.count > std::numeric_limits<std::uint32_t>::max())
-        return false;
-      const bool insert =
-          run.operation == gpulsmopt_detail::RunOperation::Insert;
-      flat_normalize_host_.push_back(
-          {run.keys.data(), insert ? run.values.data() : nullptr,
-           run.quotient_off.data(),
-           static_cast<std::uint32_t>(run.count),
-           rank_base,
-           static_cast<std::uint8_t>(insert ? 1u : 0u)});
-      rank_base += static_cast<std::uint32_t>(run.count);
-      *max_count = std::max(
-          *max_count, static_cast<std::uint32_t>(run.count));
-    }
-    if (flat_normalize_host_.empty() ||
-        flat_normalize_host_.size() > 65535u)
-      return false;
-    flat_normalize_views_.resize_discard(
-        flat_normalize_host_.size());
-    flat_normalize_bases_.resize_discard(
-        flat_normalize_host_.size() *
-        gpulsmopt_detail::kEpochQuotients);
-    CUDA_CHECK(cudaMemcpyAsync(
-        flat_normalize_views_.data(), flat_normalize_host_.data(),
-        flat_normalize_host_.size() *
-            sizeof(gpulsmopt_detail::FlatAssignmentLeafView),
-        cudaMemcpyHostToDevice, stream));
-    return true;
-  }
-
-  // Gather by quotient and sort only unseen low bits.
-  std::size_t normalize_runs_legacy(
-      const std::vector<std::size_t> &idx,
-      cudaStream_t stream) {
-    constexpr int block = 256;
-    std::uint32_t flat_max_count = 0u;
-    const bool use_flat = prepare_flat_normalize_leaves(
-        idx, &flat_max_count, stream);
-    const int flat_leaf_count = use_flat
-        ? static_cast<int>(flat_normalize_host_.size())
-        : 0;
-    if (!use_flat) {
-      normalize_views_.resize_discard(
-          gpulsmopt_detail::kRunCapacity);
-      for (std::size_t slot = 0; slot < idx.size(); ++slot)
-        host_state_->scratch_views[slot] =
-            make_assignment_view(runs_[idx[slot]]);
-      CUDA_CHECK(cudaMemcpyAsync(
-          normalize_views_.data(), host_state_->scratch_views,
-          idx.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
-          cudaMemcpyHostToDevice, stream));
-    }
-
-    compaction_counts_.resize_discard(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    compaction_offsets_.resize_discard(
-        gpulsmopt_detail::kEpochQuotients + 1u);
-    constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
-    constexpr int count_grid = (rows + block - 1) / block;
-    if (use_flat) {
-      gpulsmopt_detail::flat_assignment_count_kernel<<<
-          count_grid, block, 0, stream>>>(
-          flat_normalize_views_.data(), flat_leaf_count,
-          compaction_counts_.data());
-    } else {
-      gpulsmopt_detail::assignment_group_count_kernel<<<
-          count_grid, block, 0, stream>>>(
-          normalize_views_.data(), static_cast<int>(idx.size()),
-          compaction_counts_.data());
-    }
-    CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(
-        compaction_counts_.data(), compaction_offsets_.data(),
-        gpulsmopt_detail::kEpochQuotients + 1u, stream);
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->gathered_count,
-        compaction_offsets_.data() + gpulsmopt_detail::kEpochQuotients,
-        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const std::size_t total = host_state_->gathered_count;
-    if (total == 0)
-      return 0;
-    if (total > static_cast<std::size_t>(
-                    std::numeric_limits<int>::max()))
-      throw std::runtime_error("resolved cache exceeds CUB limits");
-
-    resolve_keys_.resize_discard(total);
-    resolve_payload_.resize_discard(total);
-    resolve_alt_keys_.resize_discard(total);
-    resolve_alt_payload_.resize_discard(total);
-    if (use_flat) {
-      gpulsmopt_detail::flat_assignment_base_kernel<<<
-          count_grid, block, 0, stream>>>(
-          flat_normalize_views_.data(), flat_leaf_count,
-          compaction_offsets_.data(), flat_normalize_bases_.data());
-      CUDA_CHECK(cudaGetLastError());
-      const dim3 gather_grid(
-          (flat_max_count + block - 1u) / block,
-          static_cast<unsigned>(flat_leaf_count));
-      gpulsmopt_detail::flat_assignment_gather_kernel<<<
-          gather_grid, block, 0, stream>>>(
-          flat_normalize_views_.data(), flat_leaf_count,
-          flat_max_count, flat_normalize_bases_.data(),
-          resolve_keys_.data(), resolve_payload_.data());
-      CUDA_CHECK(cudaGetLastError());
-    } else {
-      gpulsmopt_detail::assignment_group_gather_kernel<<<
-          gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
-          normalize_views_.data(), static_cast<int>(idx.size()),
-          compaction_offsets_.data(), resolve_keys_.data(),
-          resolve_payload_.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
-
-    if (total > resolved_sort_count_) {
-      resolved_sort_temp_bytes_ = 0u;
-      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-          nullptr, resolved_sort_temp_bytes_, resolve_keys_.data(),
-          resolve_alt_keys_.data(), resolve_payload_.data(),
-          resolve_alt_payload_.data(), static_cast<int>(total),
-          gpulsmopt_detail::kEpochQuotients,
-          compaction_offsets_.data(),
-          compaction_offsets_.data() + 1u, 0, 16, stream));
-      resolved_sort_count_ = total;
-    }
-    std::size_t sort_bytes = resolved_sort_temp_bytes_;
-    ensure_sort_temp(sort_bytes);
-    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-        sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
-        resolve_alt_keys_.data(), resolve_payload_.data(),
-        resolve_alt_payload_.data(), static_cast<int>(total),
-        gpulsmopt_detail::kEpochQuotients,
-        compaction_offsets_.data(),
-        compaction_offsets_.data() + 1u, 0, 16, stream));
-
-    norm_keys_.resize_discard(total);
-    norm_pay_.resize_discard(total);
-    const int grid =
-        static_cast<int>((total + block - 1u) / block);
-    gpulsmopt_detail::normalize_correction_kernel<<<
-        grid, block, 0, stream>>>(
-        resolve_alt_keys_.data(), resolve_alt_payload_.data(), total,
-        make_base_view(), norm_keys_.data(),
-        norm_pay_.data());
-    CUDA_CHECK(cudaGetLastError());
-    return total;
-  }
-
-  std::size_t normalize_runs(
-      const std::vector<std::size_t> &idx,
-      cudaStream_t stream) {
-    constexpr int block = 256;
-    last_normalize_fused_ = false;
-    std::uint32_t max_leaf_count = 0u;
-    const bool flat = prepare_flat_normalize_leaves(
-        idx, &max_leaf_count, stream);
-    const std::size_t leaf_count =
-        flat_normalize_host_.size();
-    if (!flat || leaf_count > static_cast<std::size_t>(
-                                  gpulsmopt_detail::kLookupLeafCapacity))
-      return normalize_runs_legacy(idx, stream);
-
-    std::size_t total = 0u;
-    for (const auto &leaf : flat_normalize_host_)
-      total += leaf.count;
-    if (total == 0u)
-      return 0u;
-    if (total > static_cast<std::size_t>(
-                    std::numeric_limits<int>::max()))
-      throw std::runtime_error("resolved cache exceeds local limits");
-
-    constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
-    constexpr int count_grid = (rows + block - 1) / block;
-    compaction_counts_.resize_discard(rows);
-    compaction_offsets_.resize_discard(rows);
-    gpulsmopt_detail::flat_assignment_count_kernel<<<
-        count_grid, block, 0, stream>>>(
-        flat_normalize_views_.data(),
-        static_cast<int>(leaf_count),
-        compaction_counts_.data());
-    CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(
-        compaction_counts_.data(), compaction_offsets_.data(),
-        rows, stream);
-
-    CUDA_CHECK(cudaMemsetAsync(
-        resolve_class_counts_.data(), 0,
-        4u * sizeof(std::uint32_t), stream));
-    gpulsmopt_detail::resolve_classify_kernel<<<
-        count_grid, block, 0, stream>>>(
-        compaction_counts_.data(),
-        resolve_quotient_lists_.data(),
-        resolve_class_counts_.data(),
-        resolve_winner_counts_.data());
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpyAsync(
-        host_state_->resolve_class_counts,
-        resolve_class_counts_.data(),
-        4u * sizeof(std::uint32_t),
-        cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const std::uint32_t small =
-        host_state_->resolve_class_counts[0];
-    const std::uint32_t medium =
-        host_state_->resolve_class_counts[1];
-    const std::uint32_t large =
-        host_state_->resolve_class_counts[2];
-    if (host_state_->resolve_class_counts[3] != 0u)
-      return normalize_runs_legacy(idx, stream);
-
-    reserve_winner_workspace(total);
-    const bool keep_zero = resolved_.count != 0u;
-    auto *lists = resolve_quotient_lists_.data();
-    if (keep_zero) {
-      if (small != 0u)
-        gpulsmopt_detail::quotient_local_resolve_kernel<
-            32, 4, true, false><<<small, 32, 0, stream>>>(
-            flat_normalize_views_.data(),
-            static_cast<int>(leaf_count), lists,
-            compaction_counts_.data(),
-            compaction_offsets_.data(), make_base_view(),
-            resolve_winner_keys_data_.data(),
-            resolve_winner_values_.data(),
-            resolve_winner_deltas_.data(),
-            resolve_winner_counts_.data());
-      if (medium != 0u)
-        gpulsmopt_detail::quotient_local_resolve_kernel<
-            128, 4, true, true><<<medium, 128, 0, stream>>>(
-            flat_normalize_views_.data(),
-            static_cast<int>(leaf_count),
-            lists + gpulsmopt_detail::kEpochQuotients,
-            compaction_counts_.data(),
-            compaction_offsets_.data(), make_base_view(),
-            resolve_winner_keys_data_.data(),
-            resolve_winner_values_.data(),
-            resolve_winner_deltas_.data(),
-            resolve_winner_counts_.data());
-      if (large != 0u)
-        gpulsmopt_detail::quotient_local_resolve_kernel<
-            256, 8, true, true><<<large, 256, 0, stream>>>(
-            flat_normalize_views_.data(),
-            static_cast<int>(leaf_count),
-            lists + 2u * gpulsmopt_detail::kEpochQuotients,
-            compaction_counts_.data(),
-            compaction_offsets_.data(), make_base_view(),
-            resolve_winner_keys_data_.data(),
-            resolve_winner_values_.data(),
-            resolve_winner_deltas_.data(),
-            resolve_winner_counts_.data());
-    } else {
-      if (small != 0u)
-        gpulsmopt_detail::quotient_local_resolve_kernel<
-            32, 4, false, false><<<small, 32, 0, stream>>>(
-            flat_normalize_views_.data(),
-            static_cast<int>(leaf_count), lists,
-            compaction_counts_.data(),
-            compaction_offsets_.data(), make_base_view(),
-            resolve_winner_keys_data_.data(),
-            resolve_winner_values_.data(),
-            resolve_winner_deltas_.data(),
-            resolve_winner_counts_.data());
-      if (medium != 0u)
-        gpulsmopt_detail::quotient_local_resolve_kernel<
-            128, 4, false, true><<<medium, 128, 0, stream>>>(
-            flat_normalize_views_.data(),
-            static_cast<int>(leaf_count),
-            lists + gpulsmopt_detail::kEpochQuotients,
-            compaction_counts_.data(),
-            compaction_offsets_.data(), make_base_view(),
-            resolve_winner_keys_data_.data(),
-            resolve_winner_values_.data(),
-            resolve_winner_deltas_.data(),
-            resolve_winner_counts_.data());
-      if (large != 0u)
-        gpulsmopt_detail::quotient_local_resolve_kernel<
-            256, 8, false, true><<<large, 256, 0, stream>>>(
-            flat_normalize_views_.data(),
-            static_cast<int>(leaf_count),
-            lists + 2u * gpulsmopt_detail::kEpochQuotients,
-            compaction_counts_.data(),
-            compaction_offsets_.data(), make_base_view(),
-            resolve_winner_keys_data_.data(),
-            resolve_winner_values_.data(),
-            resolve_winner_deltas_.data(),
-            resolve_winner_counts_.data());
-    }
-    CUDA_CHECK(cudaGetLastError());
-
-    exclusive_scan_u32(
-        resolve_winner_counts_.data(),
-        resolve_winner_offsets_.data(), rows, stream);
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->fused_winner_count,
-        resolve_winner_offsets_.data() +
-            gpulsmopt_detail::kEpochQuotients,
-        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const std::uint32_t winners =
-        host_state_->fused_winner_count;
-    last_normalize_fused_ = true;
-    if (resolved_.count != 0u && winners != 0u) {
-      norm_keys_.resize_discard(winners);
-      norm_pay_.resize_discard(winners);
-      gpulsmopt_detail::fused_resolve_pack_kernel<<<
-          gpulsmopt_detail::kEpochQuotients,
-          block, 0, stream>>>(
-          compaction_offsets_.data(),
-          resolve_winner_counts_.data(),
-          resolve_winner_offsets_.data(),
-          resolve_winner_keys_data_.data(),
-          resolve_winner_values_.data(),
-          resolve_winner_deltas_.data(),
-          norm_keys_.data(), norm_pay_.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
-    return winners;
-  }
-
-  std::uint32_t select_resolved(const std::uint64_t *keys,
-                                const std::uint64_t *pay,
-                                std::size_t total,
-                                cudaStream_t stream) {
-    if (total == 0)
-      return 0u;
-    if (total > static_cast<std::size_t>(
-                    std::numeric_limits<int>::max()))
-      throw std::runtime_error("resolved selection exceeds CUB limits");
-    constexpr int block = 256;
-    const int grid =
-        static_cast<int>((total + block - 1u) / block);
-    merge_flags_.resize_discard(total);
-    merge_sel_keys_.resize_discard(total);
-    merge_sel_pay_.resize_discard(total);
-    resolve_count_.resize_discard(1);
-    gpulsmopt_detail::resolve_merge_flag_kernel<<<
-        grid, block, 0, stream>>>(
-        keys, pay, total, merge_flags_.data());
-    CUDA_CHECK(cudaGetLastError());
-
-    std::size_t key_bytes = 0u;
-    std::size_t pay_bytes = 0u;
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, key_bytes, keys, merge_flags_.data(),
-        merge_sel_keys_.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, pay_bytes, pay, merge_flags_.data(),
-        merge_sel_pay_.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    ensure_sort_temp(std::max(key_bytes, pay_bytes));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), key_bytes, keys,
-        merge_flags_.data(), merge_sel_keys_.data(),
-        resolve_count_.data(), static_cast<int>(total), stream));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), pay_bytes, pay,
-        merge_flags_.data(), merge_sel_pay_.data(),
-        resolve_count_.data(), static_cast<int>(total), stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->resolved_count, resolve_count_.data(),
-        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    return host_state_->resolved_count;
-  }
-
-  void store_resolved(const std::uint64_t *keys,
-                      const std::uint64_t *pay,
-                      std::uint32_t changed,
-                      cudaStream_t stream) {
-    constexpr int block = 256;
-    resolved_.count = changed;
-    reserve_resolved_workspace(changed);
-    if (changed > 0) {
-      const int grid =
-          static_cast<int>((changed + block - 1u) / block);
-      gpulsmopt_detail::corr_unpack_kernel<<<
-          grid, block, 0, stream>>>(
-          keys, pay, changed, resolved_.keys.data(),
-          resolved_.values.data(), resolved_.count_delta.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
-    build_assignment_offsets(resolved_, changed, stream);
-    resolved_ready_ = true;
-  }
-
-  // Extend the cache only through unseen run sequences.
-  void ensure_resolved(cudaStream_t stream) {
-    // BaseRun changed, so rebuild from surviving runs.
-    if (resolved_base_generation_ != base_generation_) {
-      resolved_.count = 0;
-      resolved_through_sequence_ = 0;
-      resolved_base_generation_ = base_generation_;
-      resolved_ready_ = false;
-      lqvrf_latest_sequences_.resize_discard_exact(
-          gpulsmopt_detail::kEpochQuotients);
-      CUDA_CHECK(cudaMemsetAsync(
-          lqvrf_latest_sequences_.data(), 0,
-          gpulsmopt_detail::kEpochQuotients * sizeof(std::uint64_t), stream));
-    }
-    std::vector<std::size_t> nidx;
-    std::size_t upper = 0;
-    for (std::size_t r = 0; r < runs_.size(); ++r) {
-      if (runs_[r].assignment && !runs_[r].nested &&
-          runs_[r].sequence_end > resolved_through_sequence_) {
-        nidx.push_back(r);
-        upper += runs_[r].count;
-      }
-    }
-    std::sort(nidx.begin(), nidx.end(),
-              [this](std::size_t a, std::size_t b) {
-                return runs_[a].sequence_end < runs_[b].sequence_end;
-              });
-    const std::size_t total =
-        (nidx.empty() || upper == 0) ? 0 : normalize_runs(nidx, stream);
-    if (!nidx.empty() && upper != 0u) {
-      constexpr int block = 256;
-      constexpr int grid =
-          (gpulsmopt_detail::kEpochQuotients + block - 1) / block;
-      gpulsmopt_detail::lqvrf_mark_latest_sequences_kernel<<<
-          grid, block, 0, stream>>>(
-          compaction_counts_.data(), run_sequence_,
-          lqvrf_latest_sequences_.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
-    if (total == 0) {
-      resolved_through_sequence_ = run_sequence_;
-      if (!resolved_ready_) {
-        build_assignment_offsets(resolved_, resolved_.count, stream);
-        resolved_ready_ = true;
-      }
-      return;
-    }
-    if (last_normalize_fused_ && resolved_.count == 0u) {
-      const std::uint32_t changed =
-          static_cast<std::uint32_t>(total);
-      resolved_.count = changed;
-      reserve_resolved_workspace(changed);
-      resolved_.quotient_off.resize_discard_exact(
-          gpulsmopt_detail::kEpochQuotients + 1u);
-      gpulsmopt_detail::fused_resolve_unpack_kernel<<<
-          gpulsmopt_detail::kEpochQuotients,
-          256, 0, stream>>>(
-          compaction_offsets_.data(),
-          resolve_winner_counts_.data(),
-          resolve_winner_offsets_.data(),
-          resolve_winner_keys_data_.data(),
-          resolve_winner_values_.data(),
-          resolve_winner_deltas_.data(),
-          resolved_.keys.data(), resolved_.values.data(),
-          resolved_.count_delta.data(),
-          resolved_.quotient_off.data());
-      CUDA_CHECK(cudaGetLastError());
-      resolved_ready_ = true;
-      resolved_through_sequence_ = run_sequence_;
-      return;
-    }
-    const std::uint64_t *candidate_keys = norm_keys_.data();
-    const std::uint64_t *candidate_pay = norm_pay_.data();
-    std::size_t candidate_count = total;
-    if (resolved_.count > 0) {
-      const std::uint32_t old_count =
-          static_cast<std::uint32_t>(resolved_.count);
-      cache_pay_.resize_discard(old_count);
-      constexpr int block = 256;
-      const int grid =
-          static_cast<int>((old_count + block - 1u) / block);
-      gpulsmopt_detail::corr_pack_kernel<<<
-          grid, block, 0, stream>>>(
-          resolved_.values.data(), resolved_.count_delta.data(),
-          old_count, cache_pay_.data());
-      CUDA_CHECK(cudaGetLastError());
-
-      candidate_count += old_count;
-      if (candidate_count > static_cast<std::size_t>(
-                                std::numeric_limits<int>::max()))
-        throw std::runtime_error("resolved merge exceeds CUB limits");
-      merge_out_keys_.resize_discard(candidate_count);
-      merge_out_pay_.resize_discard(candidate_count);
-      using TaggedIterator = cub::TransformInputIterator<
-          std::uint64_t, gpulsmopt_detail::CacheTaggedKey,
-          const std::uint32_t *>;
-      TaggedIterator old_keys(
-          resolved_.keys.data(),
-          gpulsmopt_detail::CacheTaggedKey{});
-      std::size_t merge_bytes = 0u;
-      CUDA_CHECK(cub::DeviceMerge::MergePairs(
-          nullptr, merge_bytes, old_keys, cache_pay_.data(),
-          static_cast<int>(old_count), norm_keys_.data(),
-          norm_pay_.data(), static_cast<int>(total),
-          merge_out_keys_.data(), merge_out_pay_.data(),
-          thrust::less<std::uint64_t>{}, stream));
-      ensure_sort_temp(merge_bytes);
-      CUDA_CHECK(cub::DeviceMerge::MergePairs(
-          sort_temp_storage_.data(), merge_bytes, old_keys,
-          cache_pay_.data(), static_cast<int>(old_count),
-          norm_keys_.data(), norm_pay_.data(),
-          static_cast<int>(total), merge_out_keys_.data(),
-          merge_out_pay_.data(), thrust::less<std::uint64_t>{},
-          stream));
-      candidate_keys = merge_out_keys_.data();
-      candidate_pay = merge_out_pay_.data();
-    }
-
-    const std::uint32_t changed = select_resolved(
-        candidate_keys, candidate_pay, candidate_count, stream);
-    store_resolved(merge_sel_keys_.data(),
-                   merge_sel_pay_.data(), changed, stream);
-    resolved_through_sequence_ = run_sequence_;
-  }
-
-  // Publishes a row-only Lazy Quotient-Visible Row Fragment snapshot. The
-  // canonical resolver is reused solely to identify last-write-wins state;
-  // its algebraic deltas never reach the range query. Publication converts
-  // each live winner to its actual value and each tombstone to a Base shadow
-  // bit. Repeated ranges reuse this exact snapshot until the next mutation.
-  void ensure_lqvrf(const DeviceRangeOutputBatch &batch,
-                    cudaStream_t stream) {
-    ensure_resolved(stream);
-    constexpr std::uint32_t q_count = gpulsmopt_detail::kEpochQuotients;
-    constexpr std::uint32_t q_rows = q_count + 1u;
-    constexpr int block = 256;
-    constexpr int q_grid = static_cast<int>((q_rows + block - 1u) / block);
-    const bool new_base = lqvrf_base_generation_ != base_generation_;
-    if (lqvrf_latest_sequences_.size() != q_count) {
-      lqvrf_latest_sequences_.resize_discard_exact(q_count);
-      CUDA_CHECK(cudaMemsetAsync(lqvrf_latest_sequences_.data(), 0,
-                                 q_count * sizeof(std::uint64_t), stream));
-    }
-    if (lqvrf_materialized_quotients_.size() != q_count) {
-      lqvrf_materialized_quotients_.resize_discard_exact(q_count);
-      lqvrf_published_sequences_.resize_discard_exact(q_count);
-      CUDA_CHECK(cudaMemsetAsync(lqvrf_materialized_quotients_.data(), 0,
-                                 q_count * sizeof(std::uint8_t), stream));
-      CUDA_CHECK(cudaMemsetAsync(lqvrf_published_sequences_.data(), 0,
-                                 q_count * sizeof(std::uint64_t), stream));
-      lqvrf_ready_ = false;
-    } else if (new_base) {
-      CUDA_CHECK(cudaMemsetAsync(lqvrf_materialized_quotients_.data(), 0,
-                                 q_count * sizeof(std::uint8_t), stream));
-      CUDA_CHECK(cudaMemsetAsync(lqvrf_published_sequences_.data(), 0,
-                                 q_count * sizeof(std::uint64_t), stream));
-      lqvrf_ready_ = false;
-      lqvrf_has_effects_ = false;
-    }
-
-    lqvrf_cover_delta_.resize_discard_exact(q_rows);
-    lqvrf_coverage_.resize_discard_exact(q_rows);
-    lqvrf_new_quotient_count_.resize_discard(1u);
-    CUDA_CHECK(cudaMemsetAsync(lqvrf_cover_delta_.data(), 0,
-                               q_rows * sizeof(std::int32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(lqvrf_new_quotient_count_.data(), 0,
-                               sizeof(std::uint32_t), stream));
-    const int query_grid = static_cast<int>(
-        (batch.query_count + block - 1u) / block);
-    gpulsmopt_detail::lqvrf_mark_coverage_kernel<<<
-        query_grid, block, 0, stream>>>(
-        batch.lo, batch.hi, batch.query_count,
-        lqvrf_cover_delta_.data());
-    CUDA_CHECK(cudaGetLastError());
-    std::size_t coverage_scan_bytes = 0u;
-    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-        nullptr, coverage_scan_bytes, lqvrf_cover_delta_.data(),
-        lqvrf_coverage_.data(), static_cast<int>(q_rows), stream));
-    ensure_sort_temp(coverage_scan_bytes);
-    CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-        sort_temp_storage_.data(), coverage_scan_bytes,
-        lqvrf_cover_delta_.data(), lqvrf_coverage_.data(),
-        static_cast<int>(q_rows), stream));
-    constexpr int quotient_grid =
-        static_cast<int>((q_count + block - 1u) / block);
-    gpulsmopt_detail::lqvrf_extend_materialized_kernel<<<
-        quotient_grid, block, 0, stream>>>(
-        lqvrf_coverage_.data(), lqvrf_latest_sequences_.data(),
-        lqvrf_published_sequences_.data(),
-        lqvrf_materialized_quotients_.data(),
-        lqvrf_new_quotient_count_.data());
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->lqvrf_new_quotients,
-        lqvrf_new_quotient_count_.data(), sizeof(std::uint32_t),
-        cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (!new_base && lqvrf_ready_ &&
-        host_state_->lqvrf_new_quotients == 0u) {
-      lqvrf_run_sequence_ = run_sequence_;
-      return;
-    }
-
-    // From this point publication is destructive. Keep a failed allocation
-    // or CUDA call from making a later range treat a partial rebuild as warm.
-    lqvrf_ready_ = false;
-
-    const std::uint32_t corrections =
-        static_cast<std::uint32_t>(resolved_.count);
-    const std::uint32_t base_count =
-        sorted_run_ready() ? static_cast<std::uint32_t>(sorted_run().count)
-                           : 0u;
-
-    lqvrf_active_quotient_count_ = 0u;
-    lqvrf_has_hidden_base_ = false;
-    lqvrf_has_effects_ = false;
-    lqvrf_active_quotients_.resize_discard(0);
-    lqvrf_sorted_low16_.resize_discard(0);
-    lqvrf_sorted_values_.resize_discard(0);
-    lqvrf_packed_low8_.resize_discard(0);
-    lqvrf_packed_values_.resize_discard(0);
-    lqvrf_packed_occupancy_.resize_discard(0);
-    lqvrf_sectors_.resize_discard(0);
-    lqvrf_fragments_.resize_discard(0);
-
-    if (corrections == 0u) {
-      gpulsmopt_detail::lqvrf_publish_sequences_kernel<<<
-          quotient_grid, block, 0, stream>>>(
-          lqvrf_materialized_quotients_.data(),
-          lqvrf_latest_sequences_.data(),
-          lqvrf_published_sequences_.data());
-      CUDA_CHECK(cudaGetLastError());
-      lqvrf_base_generation_ = base_generation_;
-      lqvrf_run_sequence_ = run_sequence_;
-      lqvrf_ready_ = true;
-      return;
-    }
-
-    const std::uint32_t hidden_words =
-        std::max<std::uint32_t>((base_count + 31u) >> 5, 1u);
-    lqvrf_base_hidden_words_.resize_discard(hidden_words);
-    CUDA_CHECK(cudaMemsetAsync(lqvrf_base_hidden_words_.data(), 0,
-                               hidden_words * sizeof(std::uint32_t), stream));
-    lqvrf_hidden_flag_.resize_discard(1u);
-    CUDA_CHECK(cudaMemsetAsync(lqvrf_hidden_flag_.data(), 0,
-                               sizeof(std::uint32_t), stream));
-    lqvrf_candidate_values_.resize_discard(corrections);
-    lqvrf_live_flags_.resize_discard(corrections);
-    lqvrf_full_keys_.resize_discard(corrections);
-    lqvrf_full_values_.resize_discard(corrections);
-    lqvrf_selected_count_.resize_discard(1u);
-
-    const int correction_grid =
-        static_cast<int>((corrections + block - 1u) / block);
-    gpulsmopt_detail::lqvrf_prepare_rows_kernel<<<
-        correction_grid, block, 0, stream>>>(
-        make_sorted_view(), resolved_.keys.data(), resolved_.values.data(),
-        resolved_.count_delta.data(), corrections,
-        lqvrf_materialized_quotients_.data(),
-        lqvrf_base_hidden_words_.data(), lqvrf_candidate_values_.data(),
-        lqvrf_live_flags_.data(), lqvrf_hidden_flag_.data());
-    CUDA_CHECK(cudaGetLastError());
-
-    std::size_t key_select_bytes = 0u;
-    std::size_t value_select_bytes = 0u;
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, key_select_bytes, resolved_.keys.data(),
-        lqvrf_live_flags_.data(), lqvrf_full_keys_.data(),
-        lqvrf_selected_count_.data(), static_cast<int>(corrections), stream));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, value_select_bytes, lqvrf_candidate_values_.data(),
-        lqvrf_live_flags_.data(), lqvrf_full_values_.data(),
-        lqvrf_selected_count_.data(), static_cast<int>(corrections), stream));
-    ensure_sort_temp(std::max(key_select_bytes, value_select_bytes));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), key_select_bytes, resolved_.keys.data(),
-        lqvrf_live_flags_.data(), lqvrf_full_keys_.data(),
-        lqvrf_selected_count_.data(), static_cast<int>(corrections), stream));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), value_select_bytes,
-        lqvrf_candidate_values_.data(), lqvrf_live_flags_.data(),
-        lqvrf_full_values_.data(), lqvrf_selected_count_.data(),
-        static_cast<int>(corrections), stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->lqvrf_overlay_count, lqvrf_selected_count_.data(),
-        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->lqvrf_has_hidden_base, lqvrf_hidden_flag_.data(),
-        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    const std::uint32_t overlay_count =
-        host_state_->lqvrf_overlay_count;
-    lqvrf_has_hidden_base_ =
-        host_state_->lqvrf_has_hidden_base != 0u;
-    lqvrf_has_effects_ = lqvrf_has_hidden_base_ || overlay_count != 0u;
-    lqvrf_full_keys_.resize_discard(overlay_count);
-    lqvrf_full_values_.resize_discard(overlay_count);
-
-    if (overlay_count != 0u) {
-      lqvrf_full_q_offsets_.resize_discard_exact(q_rows);
-      gpulsmopt_detail::quotient_lower_bound_kernel<<<q_grid, block, 0,
-                                                      stream>>>(
-          lqvrf_full_keys_.data(), overlay_count,
-          lqvrf_full_q_offsets_.data());
-      CUDA_CHECK(cudaGetLastError());
-
-      lqvrf_formats_.resize_discard_exact(q_count);
-      lqvrf_sorted_counts_.resize_discard_exact(q_rows);
-      lqvrf_packed_counts_.resize_discard_exact(q_rows);
-      lqvrf_sector_counts_.resize_discard_exact(q_rows);
-      lqvrf_packed_q_counts_.resize_discard_exact(q_rows);
-      lqvrf_active_counts_.resize_discard_exact(q_rows);
-      lqvrf_sorted_offsets_.resize_discard_exact(q_rows);
-      lqvrf_packed_offsets_.resize_discard_exact(q_rows);
-      lqvrf_sector_offsets_.resize_discard_exact(q_rows);
-      lqvrf_packed_q_offsets_.resize_discard_exact(q_rows);
-      lqvrf_active_offsets_.resize_discard_exact(q_rows);
-      gpulsmopt_detail::lqvrf_classify_fragments_kernel<<<
-          q_grid, block, 0, stream>>>(
-          lqvrf_full_keys_.data(), lqvrf_full_q_offsets_.data(),
-          lqvrf_formats_.data(), lqvrf_sorted_counts_.data(),
-          lqvrf_packed_counts_.data(), lqvrf_sector_counts_.data(),
-          lqvrf_packed_q_counts_.data(), lqvrf_active_counts_.data());
-      CUDA_CHECK(cudaGetLastError());
-
-      exclusive_scan_u32(lqvrf_sorted_counts_.data(),
-                         lqvrf_sorted_offsets_.data(), q_rows, stream);
-      exclusive_scan_u32(lqvrf_packed_counts_.data(),
-                         lqvrf_packed_offsets_.data(), q_rows, stream);
-      exclusive_scan_u32(lqvrf_sector_counts_.data(),
-                         lqvrf_sector_offsets_.data(), q_rows, stream);
-      exclusive_scan_u32(lqvrf_packed_q_counts_.data(),
-                         lqvrf_packed_q_offsets_.data(), q_rows, stream);
-      exclusive_scan_u32(lqvrf_active_counts_.data(),
-                         lqvrf_active_offsets_.data(), q_rows, stream);
-      CUDA_CHECK(cudaMemcpyAsync(
-          &host_state_->lqvrf_sorted_rows,
-          lqvrf_sorted_offsets_.data() + q_count, sizeof(std::uint32_t),
-          cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          &host_state_->lqvrf_packed_rows,
-          lqvrf_packed_offsets_.data() + q_count, sizeof(std::uint32_t),
-          cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          &host_state_->lqvrf_sector_count,
-          lqvrf_sector_offsets_.data() + q_count, sizeof(std::uint32_t),
-          cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          &host_state_->lqvrf_packed_quotients,
-          lqvrf_packed_q_offsets_.data() + q_count, sizeof(std::uint32_t),
-          cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          &host_state_->lqvrf_active_quotients,
-          lqvrf_active_offsets_.data() + q_count, sizeof(std::uint32_t),
-          cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-
-      const std::uint32_t sorted_rows =
-          host_state_->lqvrf_sorted_rows;
-      const std::uint32_t packed_rows =
-          host_state_->lqvrf_packed_rows;
-      const std::uint32_t sector_count =
-          host_state_->lqvrf_sector_count;
-      const std::uint32_t packed_quotients =
-          host_state_->lqvrf_packed_quotients;
-      lqvrf_active_quotient_count_ =
-          host_state_->lqvrf_active_quotients;
-
-      lqvrf_fragments_.resize_discard_exact(q_count);
-      lqvrf_active_quotients_.resize_discard_exact(
-          lqvrf_active_quotient_count_);
-      lqvrf_sorted_low16_.resize_discard_exact(sorted_rows);
-      lqvrf_sorted_values_.resize_discard_exact(sorted_rows);
-      lqvrf_packed_low8_.resize_discard_exact(packed_rows);
-      lqvrf_packed_values_.resize_discard_exact(packed_rows);
-      lqvrf_sectors_.resize_discard_exact(sector_count);
-      lqvrf_packed_occupancy_.resize_discard_exact(
-          static_cast<std::size_t>(packed_quotients) *
-          gpulsmopt_detail::kLqvrfOccupancyWords);
-      if (packed_quotients != 0u) {
-        CUDA_CHECK(cudaMemsetAsync(
-            lqvrf_packed_occupancy_.data(), 0,
-            static_cast<std::size_t>(packed_quotients) *
-                gpulsmopt_detail::kLqvrfOccupancyWords *
-                sizeof(std::uint32_t),
-            stream));
-      }
-
-      constexpr int descriptor_grid =
-          static_cast<int>((q_count + block - 1u) / block);
-      gpulsmopt_detail::lqvrf_init_fragments_kernel<<<
-          descriptor_grid, block, 0, stream>>>(
-          lqvrf_full_q_offsets_.data(), lqvrf_formats_.data(),
-          lqvrf_sorted_offsets_.data(), lqvrf_packed_offsets_.data(),
-          lqvrf_sector_offsets_.data(), lqvrf_packed_q_offsets_.data(),
-          lqvrf_active_offsets_.data(), lqvrf_fragments_.data(),
-          lqvrf_active_quotients_.data());
-      CUDA_CHECK(cudaGetLastError());
-      gpulsmopt_detail::lqvrf_pack_rows_kernel<<<
-          lqvrf_active_quotient_count_, 128, 0, stream>>>(
-          lqvrf_full_keys_.data(), lqvrf_full_values_.data(),
-          lqvrf_full_q_offsets_.data(), lqvrf_active_quotients_.data(),
-          lqvrf_fragments_.data(), raw_or_null(lqvrf_sorted_low16_),
-          raw_or_null(lqvrf_sorted_values_), raw_or_null(lqvrf_packed_low8_),
-          raw_or_null(lqvrf_packed_values_),
-          raw_or_null(lqvrf_packed_occupancy_));
-      CUDA_CHECK(cudaGetLastError());
-      if (packed_quotients != 0u) {
-        gpulsmopt_detail::lqvrf_pack_sectors_kernel<<<
-            lqvrf_active_quotient_count_,
-            gpulsmopt_detail::kLqvrfSectorsPerQuotient, 0, stream>>>(
-            lqvrf_full_keys_.data(), lqvrf_full_q_offsets_.data(),
-            lqvrf_active_quotients_.data(), lqvrf_fragments_.data(),
-            lqvrf_packed_occupancy_.data(), lqvrf_sectors_.data());
-        CUDA_CHECK(cudaGetLastError());
-      }
-    }
-
-    gpulsmopt_detail::lqvrf_publish_sequences_kernel<<<
-        quotient_grid, block, 0, stream>>>(
-        lqvrf_materialized_quotients_.data(),
-        lqvrf_latest_sequences_.data(),
-        lqvrf_published_sequences_.data());
-    CUDA_CHECK(cudaGetLastError());
-    lqvrf_base_generation_ = base_generation_;
-    lqvrf_run_sequence_ = run_sequence_;
-    lqvrf_ready_ = true;
-  }
-
-  // Folds the base and assignments with last-wins.
-  void fold_into_base(cudaStream_t stream) {
-    std::vector<std::size_t> updates;
-    std::size_t assignment_total = 0;
-    for (std::size_t r = 0; r < runs_.size(); ++r) {
-      if (!runs_[r].assignment || runs_[r].nested)
-        continue;
-      updates.push_back(r);
-      assignment_total += runs_[r].count;
-    }
-    if (updates.empty())
-      return;
-    std::stable_sort(updates.begin(), updates.end(),
-                     [this](std::size_t a, std::size_t b) {
-                       if (runs_[a].sequence_begin !=
-                           runs_[b].sequence_begin)
-                         return runs_[a].sequence_begin <
-                                runs_[b].sequence_begin;
-                       return runs_[a].sequence_end < runs_[b].sequence_end;
-                     });
-
-    const std::size_t base_count =
-        sorted_run_ready() ? sorted_run().count : 0u;
-    const std::size_t capacity_total = base_count + assignment_total;
-    if (capacity_total == 0)
-      return;
-    if (capacity_total >
-        static_cast<std::size_t>(std::numeric_limits<int>::max()))
-      throw std::runtime_error("full consolidation exceeds CUB limits");
-
-    resolve_keys_.resize_discard(capacity_total);
-    resolve_payload_.resize_discard(capacity_total);
-    resolve_alt_keys_.resize_discard(capacity_total);
-    resolve_alt_payload_.resize_discard(capacity_total);
-    resolve_flags_.resize_discard(capacity_total);
-    resolve_sel_vdelta_.resize_discard(capacity_total);
-    resolve_count_.resize_discard(1);
-    constexpr int block = 256;
-
-    if (base_count > 0) {
-      const int base_grid =
-          static_cast<int>((base_count + block - 1u) / block);
-      gpulsmopt_detail::resolve_pack_base_kernel<<<
-          base_grid, block, 0, stream>>>(
-          make_base_view(), resolve_keys_.data(),
-          resolve_payload_.data());
-      CUDA_CHECK(cudaGetLastError());
-    }
-
-    normalize_views_.resize_discard(updates.size());
-    for (std::size_t slot = 0; slot < updates.size(); ++slot)
-      host_state_->scratch_views[slot] =
-          make_assignment_view(runs_[updates[slot]]);
-    CUDA_CHECK(cudaMemcpyAsync(
-        normalize_views_.data(), host_state_->scratch_views,
-        updates.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
-        cudaMemcpyHostToDevice, stream));
-    constexpr int quotient_rows = gpulsmopt_detail::kEpochQuotients + 1;
-    constexpr int count_grid = (quotient_rows + block - 1) / block;
-    gpulsmopt_detail::assignment_group_count_kernel<<<
-        count_grid, block, 0, stream>>>(
-        normalize_views_.data(), static_cast<int>(updates.size()),
-        compaction_counts_.data());
-    CUDA_CHECK(cudaGetLastError());
-    exclusive_scan_u32(
-        compaction_counts_.data(), compaction_offsets_.data(),
-        gpulsmopt_detail::kEpochQuotients + 1u, stream);
-    CUDA_CHECK(cudaMemcpyAsync(
-        &host_state_->gathered_count,
-        compaction_offsets_.data() + gpulsmopt_detail::kEpochQuotients,
-        sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const std::size_t total =
-        base_count + static_cast<std::size_t>(host_state_->gathered_count);
-    gpulsmopt_detail::assignment_group_gather_kernel<<<
-        gpulsmopt_detail::kEpochQuotients, block, 0, stream>>>(
-        normalize_views_.data(), static_cast<int>(updates.size()),
-        compaction_offsets_.data(), resolve_keys_.data() + base_count,
-        resolve_payload_.data() + base_count);
-    CUDA_CHECK(cudaGetLastError());
-
-    std::size_t sort_bytes = 0;
+        nullptr, sort_bytes, keys, radix_keys_.data(), radix_ids_out_.data(),
+        radix_ids_out_.data(), n, 16, 32, stream));
+    ensure_radix_workspace(sort_bytes, n, stream);
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, sort_bytes, resolve_keys_.data(), resolve_alt_keys_.data(),
-        resolve_payload_.data(), resolve_alt_payload_.data(),
-        static_cast<int>(total), 0, 32, stream));
-    ensure_sort_temp(sort_bytes);
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        sort_temp_storage_.data(), sort_bytes, resolve_keys_.data(),
-        resolve_alt_keys_.data(), resolve_payload_.data(),
-        resolve_alt_payload_.data(), static_cast<int>(total), 0, 32, stream));
-    const int grid = static_cast<int>((total + block - 1u) / block);
-    gpulsmopt_detail::resolve_live_last_kernel<<<grid, block, 0, stream>>>(
-        resolve_alt_keys_.data(), resolve_alt_payload_.data(), total,
-        resolve_sel_vdelta_.data(), resolve_flags_.data());
+        radix_workspace(), sort_bytes, keys, radix_keys_.data(),
+        radix_input_ids(), radix_ids_out_.data(), n, 16, 32, stream));
+    const std::uint32_t slot = pending_batches_;
+    pending_records_ += n;
+    gpulsmopt2_detail::gather_raw_batch_kernel<<<
+        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        radix_keys_.data(), radix_ids_out_.data(), values, n, slot, tombstone,
+        raw_assignments_.data() + std::size_t{slot} * batch_capacity_);
+    std::uint32_t *batch_offsets = raw_offsets_.data() +
+        std::size_t{slot} * (gpulsmopt2_detail::kQuotients + 1u);
+    gpulsmopt2_detail::finalize_quotient_metadata_kernel<<<
+        gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            radix_keys_.data(), n, batch_offsets, raw_counts_.data(),
+            raw_signatures_.data() +
+                std::size_t{slot} * gpulsmopt2_detail::kQuotients,
+            raw_epoch_signatures_.data());
     CUDA_CHECK(cudaGetLastError());
+    ++pending_batches_;
+    ++stats_.admitted_batches;
+    stats_.admitted_records += count;
+    if (pending_batches_ == gpulsmopt2_detail::kBatchesPerEpoch)
+      publish_epoch(stream);
+    end_operation(stream);
+  }
 
-    clear_sorted_state();
-    for (auto &run : runs_) {
-      if (run.hashed) {
-        release_hash_children(run);
-        recycle_hash_storage(run);
-      }
-      if (run.grouped && run.parent_slot >= 0 &&
-          run.parent_slot < gpulsmopt_detail::kParentSlots)
-        parent_slot_used_[run.parent_slot] = false;
-      recycle_run_storage(std::move(run));
-    }
-    runs_.clear();
-    acquire_compaction_slot();
-    RunStorage &base = runs_.back();
-    base.count = 0;
-    base.sequence_begin = 0;
-    base.sequence_end = 0;
-    base.stable_level = -1;
-    base.operation = gpulsmopt_detail::RunOperation::Insert;
-    base.assignment_class = gpulsmopt_detail::AssignmentClass::Raw;
-    base.mixed = false;
-    base.assignment = false;
-    base.fully_sorted = true;
-    base.unit_counts = true;
-    base.unique_keys = true;
-    base.hashed = false;
-    base.grouped = false;
-    base.nested = false;
-    base.group_child_count = 0;
-    base.parent_slot = -1;
-    base.owner_leaf_id = gpulsmopt_detail::kNoOwnerLeaf;
-    base.keys.resize_discard(total);
-    base.values.resize_discard(total);
-
-    std::size_t select_bytes = 0;
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, select_bytes, resolve_alt_keys_.data(),
-        resolve_flags_.data(), base.keys.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    ensure_sort_temp(select_bytes);
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), select_bytes, resolve_alt_keys_.data(),
-        resolve_flags_.data(), base.keys.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        sort_temp_storage_.data(), select_bytes, resolve_sel_vdelta_.data(),
-        resolve_flags_.data(), base.values.data(), resolve_count_.data(),
-        static_cast<int>(total), stream));
-    std::uint32_t kept = 0u;
-    CUDA_CHECK(cudaMemcpyAsync(&kept, resolve_count_.data(), sizeof(kept),
+  void publish_epoch(cudaStream_t stream) {
+    const std::uint32_t publication_levels =
+        levels_for_epochs(stats_.epochs_published + 1u);
+    if (publication_levels > gpulsmopt2_detail::kMaximumLevels)
+      throw std::runtime_error("GPULSMOpt descriptor capacity exhausted");
+    ensure_arena_for_levels(publication_levels, stream);
+    CUDA_CHECK(cudaMemsetAsync(overflow_.data(), 0, sizeof(std::uint32_t),
+                               stream));
+    gpulsmopt2_detail::plan_extents_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients), gpulsmopt2_detail::kThreads, 0,
+        stream>>>(raw_counts_.data(), arena_.data(),
+                  static_cast<std::uint32_t>(arena_.size()),
+                  descriptors_.data(), free_heads_.data(),
+                  cursor_.data(), overflow_.data(), publication_levels);
+    gpulsmopt2_detail::fused_raw_publish_kernel<<<
+        (gpulsmopt2_detail::kQuotients +
+         gpulsmopt2_detail::kWarpsPerBlock - 1u) /
+            gpulsmopt2_detail::kWarpsPerBlock,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        raw_assignments_.data(), raw_offsets_.data(),
+                  static_cast<std::uint32_t>(batch_capacity_),
+                  raw_counts_.data(), arena_.data(),
+                  descriptors_.data(), publication_levels);
+    gpulsmopt2_detail::fused_raw_merge_path_carry_kernel<<<
+        (gpulsmopt2_detail::kQuotients + 3u) / 4u, 128, 0, stream>>>(
+        raw_assignments_.data(), raw_offsets_.data(),
+        static_cast<std::uint32_t>(batch_capacity_),
+        raw_counts_.data(), arena_.data(), descriptors_.data(),
+        overflow_.data(), publication_levels);
+    gpulsmopt2_detail::fused_raw_epoch_carry_kernel<<<
+        (gpulsmopt2_detail::kQuotients +
+         gpulsmopt2_detail::kCarryWarpsPerBlock - 1u) /
+            gpulsmopt2_detail::kCarryWarpsPerBlock,
+        gpulsmopt2_detail::kCarryWarpsPerBlock * 32u, 0, stream>>>(
+        raw_assignments_.data(), raw_offsets_.data(),
+        static_cast<std::uint32_t>(batch_capacity_),
+        raw_counts_.data(), arena_.data(), descriptors_.data(),
+        publication_levels);
+    gpulsmopt2_detail::fused_raw_dense_fallback_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        raw_assignments_.data(), raw_offsets_.data(),
+        static_cast<std::uint32_t>(batch_capacity_),
+        raw_counts_.data(), arena_.data(), descriptors_.data(),
+        publication_levels);
+    gpulsmopt2_detail::publish_and_release_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients), gpulsmopt2_detail::kThreads, 0,
+        stream>>>(arena_.data(), descriptors_.data(), free_heads_.data(),
+                  publication_levels);
+    CUDA_CHECK(cudaGetLastError());
+    std::uint32_t overflow = 0u;
+    CUDA_CHECK(cudaMemcpyAsync(&overflow, overflow_.data(), sizeof(overflow),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    base.quotient_off.release();
-    base.op_words.release();
-    base.count_delta.release();
-    base.count = kept;
-    base.keys.resize_discard(kept);
-    base.values.resize_discard(kept);
-    build_sorted_run_cache(0u, stream);
-    run_sequence_ = 0;
-    chrono_views_.clear();
-    views_dirty_ = false;
-    invalidate_resolved();
-    succ_sparse_ready_ = false;
-    reset_parent_storage();
-    reset_lookup_owner(stream);
-    seed_lookup_owner_base(stream);
-    ++base_generation_;
+    if (overflow)
+      throw std::runtime_error("GPULSMOpt arena or extent capacity exhausted");
+    CUDA_CHECK(cudaMemsetAsync(raw_counts_.data(), 0,
+                               raw_counts_.size() * sizeof(std::uint32_t),
+                               stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        raw_epoch_signatures_.data(), 0,
+        raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+    pending_batches_ = 0u;
+    pending_records_ = 0u;
+    active_levels_ = publication_levels;
+    ++stats_.epochs_published;
   }
 
-  // Republishes descriptors newest-last, ordered by sequence_end.
-  void rebuild_chrono_views(cudaStream_t stream) {
-    std::vector<std::size_t> idx;
-    for (std::size_t r = 0; r < runs_.size(); ++r)
-      if (runs_[r].assignment && !runs_[r].nested)
-        idx.push_back(r);
-    std::sort(idx.begin(), idx.end(), [this](std::size_t a, std::size_t b) {
-      return runs_[a].sequence_end < runs_[b].sequence_end;
-    });
-    chrono_views_.clear();
-    for (const std::size_t r : idx)
-      publish_assignment_view(runs_[r], stream);
+  static std::size_t aligned_id_bytes(std::size_t count) {
+    return (count * sizeof(std::uint32_t) + 255u) & ~std::size_t{255u};
   }
-
-  void temporal_hash_fold(cudaStream_t stream) {
-#ifdef GPULSMOPT_PROFILE_FOLD
-    double prof_hash_publish_ms = 0.0;
-    double prof_hash_plan_ms = 0.0;
-    double prof_hash_scan_ms = 0.0;
-    double prof_hash_build_ms = 0.0;
-#endif
-    std::vector<std::size_t> raw;
-    for (std::size_t r = 0; r < runs_.size(); ++r) {
-      if (runs_[r].assignment && !runs_[r].nested &&
-          runs_[r].assignment_class ==
-              gpulsmopt_detail::AssignmentClass::Raw)
-        raw.push_back(r);
-    }
-    std::sort(raw.begin(), raw.end(), [this](std::size_t a,
-                                             std::size_t b) {
-      return runs_[a].sequence_end < runs_[b].sequence_end;
-    });
-    if (raw.size() < gpulsmopt_detail::kRawFoldWidth)
-      return;
-    raw.resize(gpulsmopt_detail::kRawFoldWidth);
-
-    HashFoldStorage hash_storage = acquire_hash_storage();
-    std::uint64_t sequence_begin = ~std::uint64_t{0};
-    std::uint64_t sequence_end = 0u;
-    std::size_t input_records = 0u;
-    int missing_route_masks = 0;
-    for (std::size_t child = 0; child < raw.size(); ++child) {
-      RunStorage &run = runs_[raw[child]];
-      sequence_begin = std::min(sequence_begin, run.sequence_begin);
-      sequence_end = std::max(sequence_end, run.sequence_end);
-      input_records += run.count;
-      host_state_->scratch_views[child] =
-          make_assignment_view(run);
-      missing_route_masks += run.route_mask_ready ? 0 : 1;
-    }
-    const bool use_route_masks =
-        missing_route_masks <=
-        gpulsmopt_detail::kHashRouteMaskBuildMax;
-    if (use_route_masks) {
-      for (std::size_t child = 0; child < raw.size(); ++child) {
-        RunStorage &run = runs_[raw[child]];
-        run.route_mask.resize_discard_exact(
-            gpulsmopt_detail::kEpochQuotients);
-        host_state_->route_masks[child] = run.route_mask.data();
-      }
-    }
-
-    auto *child_views = hash_storage.child_views.data();
-    {
-      GPULSMOPT_FOLD_PHASE(prof_hash_publish_ms);
-      CUDA_CHECK(cudaMemcpyAsync(
-          child_views, host_state_->scratch_views,
-          raw.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
-          cudaMemcpyHostToDevice, stream));
-      if (use_route_masks) {
-        CUDA_CHECK(cudaMemcpyAsync(
-            hash_route_mask_views_.data(), host_state_->route_masks,
-            raw.size() * sizeof(std::uint64_t *),
-            cudaMemcpyHostToDevice, stream));
-      }
-    }
-    std::uint32_t *counts = hash_storage.counts.data();
-    std::uint32_t *heavy_offsets = hash_storage.offsets.data();
-    constexpr int block = 256;
-    constexpr int rows = gpulsmopt_detail::kEpochQuotients + 1;
-    constexpr int grid = (rows + block - 1) / block;
-    {
-      GPULSMOPT_FOLD_PHASE(prof_hash_plan_ms);
-      CUDA_CHECK(cudaMemsetAsync(
-          hash_heavy_count_.data(), 0,
-          sizeof(std::uint32_t), stream));
-      gpulsmopt_detail::temporal_hash_plan_kernel<<<
-          grid, block, 0, stream>>>(
-          child_views, static_cast<int>(raw.size()),
-          hash_heavy_capacities_.data(), counts,
-          hash_active_quotients_.data(),
-          hash_heavy_count_.data());
+  void ensure_radix_workspace(std::size_t bytes, std::size_t count,
+                              cudaStream_t stream) {
+    ensure_radix_buffers(count);
+    const std::size_t capacity = std::max(radix_id_capacity_, count);
+    const std::size_t required = aligned_id_bytes(capacity) + bytes;
+    const bool resized = radix_temp_.size() < required;
+    if (resized) radix_temp_.resize(required);
+    if (resized || count > radix_id_capacity_) {
+      gpulsmopt2_detail::iota_kernel<<<
+          blocks(capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              reinterpret_cast<std::uint32_t *>(radix_temp_.data()),
+              static_cast<std::uint32_t>(capacity));
       CUDA_CHECK(cudaGetLastError());
     }
-    {
-      GPULSMOPT_FOLD_PHASE(prof_hash_scan_ms);
-      exclusive_scan_u32(
-          hash_heavy_capacities_.data(), heavy_offsets,
-          gpulsmopt_detail::kEpochQuotients + 1u, stream);
-      CUDA_CHECK(cudaMemcpyAsync(
-          &host_state_->hash_heavy_count,
-          hash_heavy_count_.data(), sizeof(std::uint32_t),
-          cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          &host_state_->hash_capacity,
-          heavy_offsets + gpulsmopt_detail::kEpochQuotients,
-          sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+    radix_id_capacity_ = capacity;
+  }
+  std::uint32_t *radix_input_ids() {
+    return reinterpret_cast<std::uint32_t *>(radix_temp_.data());
+  }
+  void *radix_workspace() {
+    return radix_temp_.data() + aligned_id_bytes(radix_id_capacity_);
+  }
+  template <bool HasPending, bool Tiled>
+  void launch_section_ranges(std::uint32_t maximum_tasks,
+                             cudaStream_t stream) {
+    const std::uint32_t grid =
+        Tiled ? maximum_tasks : gpulsmopt2_detail::kQuotients;
+    const auto *tasks = Tiled ? range_section_tasks_.data() : nullptr;
+    const auto *task_count = Tiled
+        ? range_section_task_offsets_.data() + gpulsmopt2_detail::kQuotients
+        : nullptr;
+    gpulsmopt2_detail::cooperative_section_owned_range_kernel<
+        gpulsmopt2_detail::SumRowsAggregate, HasPending, Tiled>
+        <<<grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
+            range_section_fragments_out_.data(),
+            range_section_offsets_.data(), tasks, task_count,
+            base_keys_.data(), base_values_.data(), base_offsets_.data(),
+            arena_.data(), descriptors_.data(), raw_assignments_.data(),
+            raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
+            HasPending ? pending_batches_ : 0u,
+            active_levels_,
+            range_fragment_partials_.data());
+  }
+  template <bool HasPending>
+  void launch_fragment_ranges(std::uint32_t fragment_count,
+                              std::uint32_t query_count,
+                              const DeviceRangeOutputBatch &batch,
+                              cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(range_overflow_count_.data(), 0,
+                               sizeof(std::uint32_t), stream));
+    gpulsmopt2_detail::warp_range_fragment_kernel<
+        gpulsmopt2_detail::SumRowsAggregate, HasPending>
+        <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
+            range_fragments_.data(), fragment_count,
+            range_fragment_offsets_.data() + query_count,
+            batch.lo, batch.hi, base_keys_.data(), base_values_.data(),
+            base_offsets_.data(), arena_.data(), descriptors_.data(),
+            raw_assignments_.data(), raw_offsets_.data(),
+            static_cast<std::uint32_t>(batch_capacity_),
+            HasPending ? pending_batches_ : 0u,
+            active_levels_,
+            range_fragment_partials_.data(),
+            range_overflow_fragments_.data(), range_overflow_count_.data());
+    gpulsmopt2_detail::overflow_range_fragment_kernel<HasPending>
+        <<<256, 128, 0, stream>>>(
+            range_overflow_fragments_.data(), range_overflow_count_.data(),
+            range_fragments_.data(), batch.lo, batch.hi,
+            base_keys_.data(), base_values_.data(), base_offsets_.data(),
+            arena_.data(), descriptors_.data(), raw_assignments_.data(),
+            raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
+            HasPending ? pending_batches_ : 0u,
+            active_levels_,
+            range_fragment_partials_.data());
+  }
+  void ensure_range_temp(std::size_t bytes) {
+    if (range_temp_.size() < bytes) range_temp_.resize(bytes);
+  }
+  void ensure_range_fragment_query_capacity(std::size_t count) {
+    if (range_fragment_counts_.size() >= count + 1u) return;
+    range_fragment_counts_.resize(count + 1u);
+    range_fragment_offsets_.resize(count + 1u);
+  }
+  void ensure_range_fragment_capacity(std::size_t count) {
+    if (range_fragments_.size() >= count) return;
+    range_fragments_.resize(count);
+    range_overflow_fragments_.resize(count);
+  }
+  void ensure_range_partial_capacity(std::size_t count) {
+    if (range_fragment_partials_.size() < count)
+      range_fragment_partials_.resize(count);
+  }
+  void ensure_range_section_capacity(std::size_t count) {
+    if (range_section_keys_in_.size() < count) {
+      range_section_keys_in_.resize(count);
+      range_section_keys_out_.resize(count);
+      range_section_fragments_in_.resize(count);
+      range_section_fragments_out_.resize(count);
     }
-    const std::uint32_t heavy_count =
-        host_state_->hash_heavy_count;
-    const std::uint32_t hash_capacity =
-        host_state_->hash_capacity;
-    hash_storage.keys.resize_discard_exact(hash_capacity);
-    {
-      GPULSMOPT_FOLD_PHASE(prof_hash_build_ms);
-      if (heavy_count != 0u) {
-        gpulsmopt_detail::temporal_hash_heavy_kernel<<<
-            heavy_count, block, 0, stream>>>(
-            child_views, static_cast<int>(raw.size()),
-            hash_active_quotients_.data(), heavy_offsets,
-            counts, hash_capacity, hash_storage.keys.data());
-        CUDA_CHECK(cudaGetLastError());
-      }
-      if (use_route_masks) {
-        constexpr int mask_block = 256;
-        constexpr int mask_warps = mask_block / 32;
-        constexpr int mask_grid =
-            (gpulsmopt_detail::kEpochQuotients +
-             mask_warps - 1) /
-            mask_warps;
-        for (const std::size_t index : raw) {
-          RunStorage &run = runs_[index];
-          if (run.route_mask_ready)
-            continue;
-          gpulsmopt_detail::raw_quotient_masks_kernel<false><<<
-              mask_grid, mask_block, 0, stream>>>(
-              run.keys.data(), run.quotient_off.data(), nullptr,
-              run.route_mask.data());
-          CUDA_CHECK(cudaGetLastError());
-          run.route_mask_ready = true;
-        }
-        gpulsmopt_detail::temporal_hash_route_mask_kernel<<<
-            gpulsmopt_detail::kEpochQuotients, 64, 0, stream>>>(
-            hash_route_mask_views_.data(),
-            static_cast<int>(raw.size()), counts,
-            hash_storage.child_router.data());
-      } else {
-        gpulsmopt_detail::temporal_hash_route_kernel<<<
-            gpulsmopt_detail::kEpochQuotients, 128, 0, stream>>>(
-            child_views, static_cast<int>(raw.size()), counts,
-            hash_storage.child_router.data());
-      }
-      CUDA_CHECK(cudaGetLastError());
-    }
-#ifdef GPULSMOPT_PROFILE_FOLD
-    printf("[hash-fold] active=%u heavy=%u publish=%.3f "
-           "plan=%.3f scan=%.3f build=%.3f ms\n",
-           heavy_count, heavy_count, prof_hash_publish_ms,
-           prof_hash_plan_ms, prof_hash_scan_ms,
-           prof_hash_build_ms);
-#endif
-
-    RunStorage folded;
-    folded.assignment = true;
-    folded.assignment_class =
-        gpulsmopt_detail::AssignmentClass::ColdStable;
-    folded.stable_level = 0;
-    folded.hashed = true;
-    folded.grouped = false;
-    folded.nested = false;
-    folded.mixed = true;
-    folded.operation = gpulsmopt_detail::RunOperation::Insert;
-    folded.sequence_begin = sequence_begin;
-    folded.sequence_end = sequence_end;
-    folded.count = input_records;
-    folded.unique_keys = false;
-    folded.fully_sorted = false;
-    folded.unit_counts = false;
-    folded.hash_storage = std::move(hash_storage);
-    folded.hash_children = acquire_hash_children();
-    for (std::size_t child_slot = 0;
-         child_slot < raw.size(); ++child_slot) {
-      const std::size_t index = raw[child_slot];
-      RunStorage &source = runs_[index];
-      RetainedLeaf &child =
-          folded.hash_children[child_slot];
-      child.keys = std::move(source.keys);
-      child.values = std::move(source.values);
-      child.quotient_off = std::move(source.quotient_off);
-      child.op_words = std::move(source.op_words);
-      child.lookup_mask = std::move(source.lookup_mask);
-      child.route_mask = std::move(source.route_mask);
-      child.count = source.count;
-      child.sequence = source.sequence_end;
-      child.operation = source.operation;
-      child.lookup_mask_ready = source.lookup_mask_ready;
-      child.route_mask_ready = source.route_mask_ready;
-      child.owner_leaf_id = source.owner_leaf_id;
-    }
-    std::sort(raw.begin(), raw.end());
-    for (auto it = raw.rbegin(); it != raw.rend(); ++it) {
-      if (sorted_run_ready() && sorted_run_index_ > *it)
-        --sorted_run_index_;
-      runs_.erase(runs_.begin() + static_cast<std::ptrdiff_t>(*it));
-    }
-    runs_.push_back(std::move(folded));
-    maintain_leaf_spare(
-        std::max<std::size_t>(batch_capacity_, 1u), stream);
-    invalidate_resolved();
-    succ_sparse_ready_ = false;
-    ++maintenance_stats_.hash_fold_count;
-    maintenance_stats_.hash_fold_input_records += input_records;
-    ++maintenance_stats_.compaction_count;
-    maintenance_stats_.compacted_input_records += input_records;
-    maintenance_stats_.compacted_output_records += input_records;
-    carry_cold_run(stream);
-    rebuild_chrono_views(stream);
+    if (range_section_offsets_.size() < gpulsmopt2_detail::kQuotients + 1u)
+      range_section_offsets_.resize(gpulsmopt2_detail::kQuotients + 1u);
+    const std::size_t maximum_tasks = gpulsmopt2_detail::kQuotients +
+        (count + gpulsmopt2_detail::kSectionTaskFragments - 1u) /
+            gpulsmopt2_detail::kSectionTaskFragments;
+    if (range_section_tasks_.size() < maximum_tasks)
+      range_section_tasks_.resize(maximum_tasks);
+    if (range_section_task_offsets_.size() <
+        gpulsmopt2_detail::kQuotients + 1u)
+      range_section_task_offsets_.resize(
+          gpulsmopt2_detail::kQuotients + 1u);
+    if (range_section_task_counts_.size() <
+        gpulsmopt2_detail::kQuotients + 1u)
+      range_section_task_counts_.resize(
+          gpulsmopt2_detail::kQuotients + 1u);
+    if (!range_section_max_fragments_.size())
+      range_section_max_fragments_.resize(1u);
+  }
+  void ensure_radix_buffers(std::size_t count) {
+    if (radix_keys_.size() >= count) return;
+    radix_keys_.resize(count);
+    radix_ids_out_.resize(count);
   }
 
-  int acquire_parent_slot() {
-    for (int slot = 0; slot < gpulsmopt_detail::kParentSlots; ++slot) {
-      if (parent_slot_used_[slot])
-        continue;
-      parent_slot_used_[slot] = true;
-      return slot;
-    }
-    throw std::runtime_error("parent descriptor capacity exceeded");
-  }
+  std::size_t batch_capacity_{};
+  std::uint32_t pending_batches_{};
+  std::uint32_t pending_records_{};
+  std::uint32_t active_levels_{};
+  std::size_t radix_id_capacity_{};
+  MaintenanceStats stats_{};
+  cudaEvent_t operation_done_{};
 
-  void make_parent_group(std::vector<std::size_t> group,
-                         int out_level,
-                         cudaStream_t stream) {
-    std::sort(group.begin(), group.end(),
-              [this](std::size_t a, std::size_t b) {
-                return runs_[a].sequence_end < runs_[b].sequence_end;
-              });
-    const int parent_slot = acquire_parent_slot();
-    std::uint64_t sequence_begin = ~std::uint64_t{0};
-    std::uint64_t sequence_end = 0u;
-    std::size_t records = 0u;
-    for (std::size_t child = 0; child < group.size(); ++child) {
-      RunStorage &run = runs_[group[child]];
-      sequence_begin = std::min(sequence_begin, run.sequence_begin);
-      sequence_end = std::max(sequence_end, run.sequence_end);
-      records += run.count;
-      host_state_->scratch_views[child] = make_assignment_view(run);
-    }
-    CUDA_CHECK(cudaMemcpyAsync(
-        parent_child_views_arena_.data() +
-            static_cast<std::size_t>(parent_slot) *
-                gpulsmopt_detail::kStableFanout,
-        host_state_->scratch_views,
-        group.size() * sizeof(gpulsmopt_detail::AssignmentRunView),
-        cudaMemcpyHostToDevice, stream));
-    for (const std::size_t child : group)
-      runs_[child].nested = true;
+  gpulsmopt2_detail::Buffer<std::uint16_t> base_keys_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> base_values_, base_offsets_;
+  gpulsmopt2_detail::Buffer<std::uint16_t> local_rank_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> arena_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> free_heads_, cursor_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> overflow_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment> raw_assignments_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_, raw_counts_;
+  gpulsmopt2_detail::Buffer<std::uint64_t> raw_signatures_;
+  gpulsmopt2_detail::Buffer<std::uint64_t> raw_epoch_signatures_;
 
-    RunStorage parent;
-    parent.assignment = true;
-    parent.assignment_class =
-        gpulsmopt_detail::AssignmentClass::ColdStable;
-    parent.stable_level = out_level;
-    parent.operation = gpulsmopt_detail::RunOperation::Insert;
-    parent.sequence_begin = sequence_begin;
-    parent.sequence_end = sequence_end;
-    parent.count = records;
-    parent.mixed = true;
-    parent.grouped = true;
-    parent.group_child_count =
-        static_cast<std::uint16_t>(group.size());
-    parent.parent_slot = parent_slot;
-    runs_.push_back(std::move(parent));
+  gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
+  gpulsmopt2_detail::Buffer<std::uint8_t> radix_temp_;
 
-    ++maintenance_stats_.cold_tier_compaction_count;
-    maintenance_stats_.cold_tier_input_records += records;
-    maintenance_stats_.cold_tier_output_records += records;
-  }
-
-  // Four children become one pointer-only parent.
-  void carry_cold_run(cudaStream_t stream) {
-    for (int level = 0; level < gpulsmopt_detail::kStableLevels - 1;
-         ++level) {
-      std::vector<std::size_t> group;
-      for (std::size_t r = 0; r < runs_.size(); ++r) {
-        const RunStorage &run = runs_[r];
-        if (!run.assignment || run.nested ||
-            run.assignment_class !=
-                gpulsmopt_detail::AssignmentClass::ColdStable ||
-            run.stable_level != level)
-          continue;
-        group.push_back(r);
-      }
-      if (group.size() <
-          static_cast<std::size_t>(gpulsmopt_detail::kStableFanout))
-        return;
-      std::sort(group.begin(), group.end(),
-                [this](std::size_t a, std::size_t b) {
-                  return runs_[a].sequence_end < runs_[b].sequence_end;
-                });
-      group.resize(gpulsmopt_detail::kStableFanout);
-      make_parent_group(group, level + 1, stream);
-    }
-  }
-
-  std::size_t max_elements_ = 0;
-  std::size_t batch_capacity_ = 0;
-  std::size_t live_count_ = 0;
-  std::size_t sorted_run_index_ = std::numeric_limits<std::size_t>::max();
-  mutable std::shared_mutex snapshot_mutex_;
-  MaintenanceStats maintenance_stats_{};
-
-  // Temporal assignment-run state.
-  std::uint64_t run_sequence_ = 0;
-  RunStorage resolved_;
-  bool resolved_ready_ = false;
-  bool last_normalize_fused_ = false;
-  // Incremental cache and merge scratch.
-  std::uint64_t resolved_through_sequence_ = 0;
-  std::uint64_t resolved_base_generation_ = ~std::uint64_t{0};
-  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
-      normalize_views_;
-  gpulsmopt_detail::RawDeviceBuffer<
-      gpulsmopt_detail::FlatAssignmentLeafView>
-      flat_normalize_views_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      flat_normalize_bases_;
-  std::vector<gpulsmopt_detail::FlatAssignmentLeafView>
-      flat_normalize_host_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> norm_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> norm_pay_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      resolve_winner_keys_data_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      resolve_winner_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::int8_t>
-      resolve_winner_deltas_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t>
-      winner_workspace_arena_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t>
-      resolved_workspace_arena_;
-  std::size_t winner_workspace_capacity_ = 0u;
-  std::size_t resolved_workspace_capacity_ = 0u;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> cache_pay_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_out_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_out_pay_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> merge_flags_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_sel_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> merge_sel_pay_;
-  std::size_t resolved_sort_count_ = 0;
-  std::size_t resolved_sort_temp_bytes_ = 0;
-  // Lazy Quotient-Visible Row Fragments. Mutations advance affected quotient
-  // versions only when the exact resolver is next needed; insertion and
-  // deletion never build or publish range state.
-  bool lqvrf_ready_ = false;
-  bool lqvrf_has_effects_ = false;
-  bool lqvrf_has_hidden_base_ = false;
-  std::uint64_t lqvrf_base_generation_ = ~std::uint64_t{0};
-  std::uint64_t lqvrf_run_sequence_ = 0u;
-  std::uint32_t lqvrf_active_quotient_count_ = 0u;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lqvrf_base_hidden_words_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_hidden_flag_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lqvrf_candidate_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> lqvrf_live_flags_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_full_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_full_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_selected_count_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_full_q_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t>
-      lqvrf_materialized_quotients_;
-  gpulsmopt_detail::RawDeviceBuffer<std::int32_t> lqvrf_cover_delta_;
-  gpulsmopt_detail::RawDeviceBuffer<std::int32_t> lqvrf_coverage_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lqvrf_new_quotient_count_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t>
-      lqvrf_latest_sequences_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t>
-      lqvrf_published_sequences_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> lqvrf_formats_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_sorted_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_packed_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_sector_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_packed_q_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_active_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_sorted_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_packed_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_sector_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_packed_q_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_active_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<
-      gpulsmopt_detail::LqvrfFragmentDescriptor> lqvrf_fragments_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint16_t>
-      lqvrf_active_quotients_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint16_t> lqvrf_sorted_low16_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_sorted_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> lqvrf_packed_low8_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> lqvrf_packed_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lqvrf_packed_occupancy_;
-  gpulsmopt_detail::RawDeviceBuffer<
-      gpulsmopt_detail::LqvrfSectorDescriptor> lqvrf_sectors_;
-  std::uint32_t lqvrf_task_target_blocks_ = 0u;
-  // Lazy successor sidecar.
-  bool succ_sparse_ready_ = false;
-  std::uint64_t succ_sparse_base_generation_ = ~std::uint64_t{0};
-  std::uint64_t succ_sparse_run_sequence_ = 0;
-  std::uint32_t succ_sparse_l0_words_ = 0;
-  std::uint32_t succ_sparse_l3_words_ = 0;
-  std::uint32_t succ_sparse_positive_l0_words_ = 0;
-  std::uint32_t succ_sparse_positive_l3_words_ = 0;
-  std::uint64_t base_generation_ = 0;
-  // Hash-fold scratch and one ready spare.
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      hash_heavy_capacities_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      hash_active_quotients_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> hash_heavy_count_;
-  gpulsmopt_detail::RawDeviceBuffer<const std::uint64_t *>
-      hash_route_mask_views_;
-  std::vector<HashFoldStorage> hash_storage_pool_;
-  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
-      parent_child_views_arena_;
-  bool parent_slot_used_[gpulsmopt_detail::kParentSlots] = {};
-  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::AssignmentRunView>
-      assignment_views_;
-  gpulsmopt_detail::RawDeviceBuffer<gpulsmopt_detail::LookupPublication>
-      lookup_publication_;
-  gpulsmopt_detail::RawDeviceBuffer<
-      gpulsmopt_detail::LookupSectorBucket> lookup_sector_buckets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lookup_sector_overflow_;
-  gpulsmopt_detail::RawDeviceBuffer<unsigned long long>
-      lookup_sector_stash_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lookup_sector_ready_;
-  gpulsmopt_detail::RawDeviceBuffer<unsigned long long>
-      lookup_radix_arena_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lookup_radix_cursor_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lookup_radix_roots_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lookup_radix_enabled_;
-  gpulsmopt_detail::RawDeviceBuffer<
-      gpulsmopt_detail::LookupOwnerLeafView>
-      lookup_owner_leaves_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      lookup_owner_overflow_;
-  std::uint32_t lookup_owner_leaf_count_ = 0u;
-  std::uint32_t lookup_owner_published_leaf_count_ = 0u;
-  std::uint32_t lookup_owner_applied_leaf_count_ = 0u;
-  bool lookup_owner_enabled_ = false;
-  bool lookup_owner_usable_ = false;
-  bool lookup_sector_enabled_ = false;
-  std::uint32_t lookup_sector_buckets_per_quotient_ = 0u;
-  std::uint32_t lookup_sector_bucket_mask_ = 0u;
-  std::uint32_t lookup_radix_capacity_units_ = 0u;
-  // Oldest-to-newest descriptor mirror.
-  std::vector<gpulsmopt_detail::AssignmentRunView> chrono_views_;
-  std::vector<HostLookupLeaf> lookup_host_leaves_;
-  // Set when a run is published; cleared when the device descriptor array is
-  // batch-synced before a read (flush_pending_views).
-  bool views_dirty_ = false;
-  bool lookup_publication_ready_ = false;
-  int lookup_leaf_count_ = 0;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> resolve_payload_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_alt_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint64_t> resolve_alt_payload_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> resolve_flags_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_sel_vdelta_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> resolve_count_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      resolve_quotient_lists_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      resolve_class_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      resolve_winner_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t>
-      resolve_winner_offsets_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_counts_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> compaction_offsets_;
-
-#ifdef GPULSMOPT_PROFILE_INSERT
-  double prof_delta_sort_ms_ = 0.0;
-  double prof_delta_ingest_ms_ = 0.0;
-  void reset_insert_prof_() {
-    prof_delta_sort_ms_ = prof_delta_ingest_ms_ = 0.0;
-  }
-#endif
-  std::vector<RunStorage> runs_;
-  std::vector<RunStorage> run_pool_;
-  std::vector<RunStorage> insert_leaf_pool_;
-  std::vector<RunStorage> delete_leaf_pool_;
-  std::vector<LeafSlab> leaf_slabs_;
-  LeafSlab pending_leaf_slab_;
-  std::size_t pending_leaf_slab_bytes_ = 0;
-  bool pending_leaf_slab_valid_ = false;
-  std::vector<std::vector<RetainedLeaf>> hash_child_pool_;
-
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_keys_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> direct_sort_values_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint8_t> sort_temp_storage_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> base_rank23_;
-  gpulsmopt_detail::PinnedHostState *host_state_ = nullptr;
-  cudaEvent_t stream_handoff_ = nullptr;
-  cudaEvent_t leaf_alloc_ready_ = nullptr;
-  cudaStream_t leaf_alloc_stream_ = nullptr;
-  std::thread leaf_alloc_worker_;
-  std::mutex leaf_alloc_mutex_;
-  std::condition_variable leaf_alloc_cv_;
-  std::uint8_t *leaf_alloc_result_ = nullptr;
-  std::size_t leaf_alloc_request_bytes_ = 0;
-  cudaError_t leaf_alloc_status_ = cudaSuccess;
-  int leaf_alloc_device_ = 0;
-  bool leaf_alloc_stop_ = false;
-  bool leaf_alloc_request_ = false;
-  bool leaf_alloc_result_ready_ = false;
-  cudaStream_t operation_stream_ = nullptr;
-  bool operation_stream_valid_ = false;
-  std::size_t direct_sort_count_ = 0;
-  std::size_t direct_sort_temp_bytes_ = 0;
-  std::size_t run_sort_count_ = 0;
-  std::size_t run_sort_temp_bytes_ = 0;
-  std::size_t delete_sort_count_ = 0;
-  std::size_t delete_sort_temp_bytes_ = 0;
-  std::size_t scan_u32_count_ = 0;
-  std::size_t scan_u32_temp_bytes_ = 0;
-  std::size_t metadata_scan_temp_bytes_ = 0;
-
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_miss_indices_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_miss_count_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_deleted_base_words_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_word_l1_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_word_l2_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_live_word_l3_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_words_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_l1_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_l2_;
-  gpulsmopt_detail::RawDeviceBuffer<std::uint32_t> succ_positive_l3_;
+  gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> range_fragment_counts_,
+      range_fragment_offsets_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RangeFragment> range_fragments_;
+  gpulsmopt2_detail::Buffer<unsigned long long> range_fragment_partials_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> range_overflow_fragments_,
+      range_overflow_count_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> range_section_keys_in_,
+      range_section_keys_out_, range_section_offsets_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::SectionRangeFragment>
+      range_section_fragments_in_, range_section_fragments_out_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::SectionRangeTask>
+      range_section_tasks_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> range_section_task_counts_,
+      range_section_task_offsets_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> range_section_max_fragments_;
+  gpulsmopt2_detail::Buffer<std::uint8_t> range_temp_;
 };

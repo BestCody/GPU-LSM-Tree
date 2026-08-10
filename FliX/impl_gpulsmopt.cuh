@@ -145,18 +145,21 @@ public:
   static constexpr operation_support can_delete = operation_support::async;
   static constexpr operation_support can_update = operation_support::async;
   static constexpr operation_support can_successor = operation_support::async;
+  static constexpr bool stores_tombstones = true;
   static std::string short_description() { return "gpulsmopt"; }
 
   static parameters_type parameters() {
     return {
         {"batch_capacity",
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
-        {"structure", "temporal_assignment_runs"},
-        {"range", "cooperative_visible_scan_sum"},
-        {"run_capacity",
-         std::to_string(static_cast<size_t>(gpulsmopt_detail::kRunCapacity))},
-        {"prewarm_leaves",
-         std::to_string(static_cast<size_t>(GPULSMOPT_PREWARM_LEAVES))},
+        {"structure", "quotient_local_binary_epochs"},
+        {"range", "visible_row_fragments"},
+        {"epoch_batches",
+         std::to_string(static_cast<size_t>(
+             gpulsmopt2_detail::kBatchesPerEpoch))},
+        {"maximum_levels",
+         std::to_string(static_cast<size_t>(
+             gpulsmopt2_detail::kMaximumLevels))},
     };
   }
 
@@ -265,7 +268,6 @@ public:
     GPULSMOpt::DeviceKeyBatch batch;
     batch.keys = reinterpret_cast<const std::uint32_t *>(update_list);
     batch.count = size;
-    batch.sorted = true;
     dictionary_->erase(batch, stream);
   }
 

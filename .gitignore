@@ -1,2 +1,4 @@
 tuning_results/
 /FliX/bench_*/
+/build/
+/results/

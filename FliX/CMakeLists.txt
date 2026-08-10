@@ -7,6 +7,8 @@ endif()
 set(CMAKE_CUDA_STANDARD 17)
 
 option(FLIX_USE_KEY_CACHE "Reuse generated benchmark key caches" OFF)
+option(FLIX_BUILD_LSMU_PAPER_SWEEP
+       "Build the standalone GPU LSM paper sweep" OFF)
 
 set(FLIX_NEEDS_OPTIX ON)
 if(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
@@ -100,6 +102,24 @@ add_executable(index_prototype
         utilities.cuh
         impl_opt_binsearch.cuh
 )
+
+if(FLIX_BUILD_LSMU_PAPER_SWEEP)
+  add_executable(lsmu_paper_sweep paper_lsmu_sweep.cu)
+  set_target_properties(lsmu_paper_sweep PROPERTIES
+          CUDA_SEPARABLE_COMPILATION ON
+          CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  target_compile_options(lsmu_paper_sweep PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:
+          --generate-line-info --extended-lambda
+          --use_fast_math --expt-relaxed-constexpr -O3
+          -Xcompiler=-fopenmp>)
+  target_link_libraries(lsmu_paper_sweep PRIVATE
+          CUDA::cudart OpenMP::OpenMP_CXX)
+  if(FLIX_NVTX_FALLBACK_INCLUDE_DIR)
+    target_include_directories(lsmu_paper_sweep PRIVATE
+            "${FLIX_NVTX_FALLBACK_INCLUDE_DIR}")
+  endif()
+endif()
 
 set_target_properties(index_prototype PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
