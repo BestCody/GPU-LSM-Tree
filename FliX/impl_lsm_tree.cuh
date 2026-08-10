@@ -1,9 +1,8 @@
-// =============================================================================
-// File: impl_lsm_tree.cuh
-// Description: GPU LSM (LSMu) following Ashkiani et al., arXiv:1707.05354v2
-// Copyright (c) 2025 Justus Henneberg, Rosina Kharal
+// GPU LSMu follows Ashkiani et al., arXiv:1707.05354v2.
+
+// Copyright (c) 2025 Justus Henneberg and Rosina Kharal
+
 // SPDX-License-Identifier: GPL-3.0-or-later
-// =============================================================================
 
 #ifndef IMPL_LSM_TREE_CUH
 #define IMPL_LSM_TREE_CUH
@@ -24,9 +23,7 @@
 #include <thrust/merge.h>
 #include <thrust/system/cuda/execution_policy.h>
 
-// The paper stores a 31-bit original key in bits [31:1] and its status in bit
-// zero. A zero status is a tombstone and a one status is a regular element.
-// CLEANUP uses a maximum-original-key tombstone as its trailing placebo.
+// Bit 0 marks regular keys; bits [31:1] hold the key.
 template <typename Key>
 struct lsm_paper_key
 {
@@ -63,8 +60,7 @@ struct lsm_paper_key
     }
 };
 
-// Section IV-A: merge on the original key only. A stable merge leaves the
-// first input (the newer batch/level) before the second input on ties.
+// Stable merges compare keys and prefer newer input.
 template <typename Key>
 struct lsm_original_key_less
 {
@@ -138,8 +134,7 @@ GLOBALQUALIFIER void lsm_encode_update_batch_kernel(
     if (tid >= batch_size)
         return;
 
-    // Section IV-A permits completing a partial batch by duplicating an
-    // arbitrary member. We duplicate its final member.
+    // Pad a short batch by repeating its last member.
     const smallsize local = tid < real_batch_size ? tid : real_batch_size - 1;
     const smallsize source = local;
     const bool deletion = source >= insert_size;
@@ -170,8 +165,7 @@ GLOBALQUALIFIER void lsm_encode_bulk_build_kernel(
     if (tid >= padded_size)
         return;
 
-    // Section IV-A: a partial final batch is padded by duplicating an
-    // arbitrary member. The bulk build then sorts all resident elements once.
+    // Bulk build pads the last batch, then sorts once.
     const smallsize source = tid < real_size ? tid : real_size - 1;
     encoded_keys[tid] = lsm_paper_key<Key>::regular(keys[source]);
     encoded_values[tid] = source;
@@ -197,7 +191,7 @@ GLOBALQUALIFIER void lsm_lookup_kernel_paper(
 
     if (query <= lsm_paper_key<Key>::max_user_key)
     {
-        // Section III-D: lower levels are newer, so stop at the first segment.
+        // Search newer, lower levels first.
         for (smallsize level = 0; level < level_count; ++level)
         {
             if ((num_batches & (std::uint64_t{1} << level)) == 0)
@@ -221,9 +215,7 @@ GLOBALQUALIFIER void lsm_lookup_kernel_paper(
     results[tid] = result;
 }
 
-// Section IV-C/D, stage 1: compute the lower/upper position and preliminary
-// candidate count for every (query, level) pair. Slots are query-major so a
-// device-wide scan makes all candidates for a query one contiguous segment.
+// Stage 1 finds every per-level candidate range.
 template <typename Key>
 GLOBALQUALIFIER void lsm_query_bounds_kernel_paper(
     const Key *level_keys,
@@ -264,9 +256,7 @@ GLOBALQUALIFIER void lsm_query_bounds_kernel_paper(
     candidate_counts[tid] = upper_index - lower_index;
 }
 
-// Section IV-C/D, stage 3: materialize all preliminary candidates. Occupied
-// levels are visited from smallest/newest to largest/oldest, preserving the
-// temporal order needed by the stable segmented radix sort in stage 4.
+// Stage 3 gathers candidates from newest to oldest.
 template <typename Key, bool GatherValues>
 GLOBALQUALIFIER void lsm_gather_query_candidates_kernel_paper(
     const Key *level_keys,
@@ -286,9 +276,7 @@ GLOBALQUALIFIER void lsm_gather_query_candidates_kernel_paper(
     if (first_query >= query_count)
         return;
 
-    // All lanes collaborate on the candidates of 32 consecutive queries.
-    // Thus the warp writes consecutive result positions coalesced, as in
-    // the paper's stage-3 implementation.
+    // Warps coalesce writes across 32 adjacent queries.
     const smallsize final_query = min(first_query + 32u, query_count);
     const smallsize first_slot = first_query * level_count;
     const smallsize final_slot = final_query * level_count;
@@ -302,8 +290,7 @@ GLOBALQUALIFIER void lsm_gather_query_candidates_kernel_paper(
         if (output >= final_output)
             continue;
 
-        // Locate the per-level range that owns this output position. Using
-        // upper-bound handles empty ranges with repeated scan offsets.
+        // Find the range owning this output slot.
         smallsize left = first_slot + 1;
         smallsize right = final_slot + 1;
         while (left < right)
@@ -337,8 +324,7 @@ GLOBALQUALIFIER void lsm_make_query_segment_offsets_kernel(
         query_offsets[tid] = candidate_offsets[tid * level_count];
 }
 
-// Section IV-C, stage 5. Each lane owns one query and 32 neighboring queries
-// collaborate through warp ballots, matching the paper's validation scheme.
+// Stage 5 validates 32 queries with warp ballots.
 template <typename Key>
 GLOBALQUALIFIER void lsm_count_sorted_candidates_kernel_paper(
     const Key *keys,
@@ -379,8 +365,7 @@ GLOBALQUALIFIER void lsm_count_sorted_candidates_kernel_paper(
         results[query] = count;
 }
 
-// RANGE follows the same candidate gathering and stable segmented sort as the
-// paper. Its repository-specific final output is the sum of valid values.
+// RANGE uses the paper pipeline but sums valid values.
 template <typename Key>
 GLOBALQUALIFIER void lsm_sum_sorted_candidates_kernel_paper(
     const Key *keys,
@@ -423,8 +408,7 @@ GLOBALQUALIFIER void lsm_sum_sorted_candidates_kernel_paper(
         results[query] = sum;
 }
 
-// Successor is an adapter extension noted as straightforward by the paper.
-// It validates a candidate against all more-recent occupied levels.
+// Successor is the paper's suggested adapter extension.
 template <typename Key>
 DEVICEQUALIFIER INLINEQUALIFIER
 bool lsm_key_occurs_in_newer_level(
@@ -540,9 +524,7 @@ void lsm_stable_merge_pairs(
     Value *output_values,
     cudaStream_t stream)
 {
-    // thrust::merge_by_key is stable by contract: equal keys from the first
-    // range precede equal keys from the second range. Passing the newer range
-    // first therefore preserves the paper's temporal ordering invariant.
+    // Stable merge puts the newer first range first.
     thrust::merge_by_key(
         thrust::cuda::par_nosync.on(stream),
         newer_keys, newer_keys + newer_size,
@@ -588,8 +570,7 @@ private:
     cuda_buffer<key_type> level_keys_buffer;
     cuda_buffer<smallsize> level_values_buffer;
 
-    // One fixed-size input buffer and two ping-pong buffers implement the
-    // paper's sort-and-stable-merge insertion path.
+    // Input and ping-pong buffers implement insertion.
     cuda_buffer<key_type> batch_keys_buffer;
     cuda_buffer<smallsize> batch_values_buffer;
     cuda_buffer<key_type> temp_keys_buffer_a;
@@ -598,8 +579,7 @@ private:
     cuda_buffer<smallsize> temp_values_buffer_b;
     cuda_buffer<std::uint8_t> primitive_temp_buffer;
 
-    // Persistent workspace for the five-stage COUNT/RANGE pipeline in
-    // Sections IV-C and IV-D. It grows to the largest query batch observed.
+    // Persistent COUNT/RANGE workspace grows on demand.
     cuda_buffer<smallsize> query_lower_indices_buffer;
     cuda_buffer<smallsize> query_upper_indices_buffer;
     cuda_buffer<smallsize> query_candidate_counts_buffer;
@@ -689,7 +669,7 @@ private:
                 current_level_size,
                 destination_keys, destination_values, stream);
 
-            // Figure 3, line 15: the carried level becomes empty.
+            // Carried levels become empty.
             cudaMemsetAsync(level_keys_buffer.ptr() + level_offset, 0,
                             current_level_size * sizeof(key_type), stream);
             cudaMemsetAsync(level_values_buffer.ptr() + level_offset, 0,
@@ -721,8 +701,7 @@ private:
         ++num_batches;
     }
 
-    // Section V-B bulk build: radix-sort the complete initial set once, then
-    // slice the sorted array into the occupied levels selected by num_batches.
+    // Bulk build sorts once, then slices occupied levels.
     void bulk_build_data(
         const key_type *keys,
         size_t size,
@@ -778,7 +757,7 @@ private:
         }
         num_batches = build_batches;
 
-        // The bulk-sort buffers are local and must outlive redistribution.
+        // Keep local sort buffers alive through copies.
         cudaStreamSynchronize(stream);
         C2EX
     }
@@ -819,8 +798,7 @@ private:
         cudaMemsetAsync(query_candidate_counts_buffer.ptr() + slot_count, 0,
                         sizeof(smallsize), stream);
 
-        // Section IV-C/D, stage 2: one device-wide exclusive scan assigns
-        // global positions to all per-level candidate ranges.
+        // Stage 2 scans candidate range sizes.
         size_t scan_bytes = 0;
         cub::DeviceScan::ExclusiveSum(
             nullptr, scan_bytes,
@@ -865,7 +843,7 @@ private:
             ensure_capacity(query_sorted_values_buffer, candidate_count);
         }
 
-        // Stage 3: gather keys (COUNT) or key-value pairs (RANGE).
+        // Stage 3 gathers keys and optional values.
         constexpr size_t warps_per_block = threads_per_block / 32;
         lsm_gather_query_candidates_kernel_paper<key_type, !CountOnly><<<
             SDIV(size, 32 * warps_per_block),
@@ -878,8 +856,7 @@ private:
                 static_cast<smallsize>(size), level_count,
                 static_cast<smallsize>(batch_size));
 
-        // Stage 4: stable segmented radix sort by bits [31:1], deliberately
-        // excluding the status bit so newest-first order is retained on ties.
+        // Stage 4 stably sorts by bits [31:1].
         size_t segmented_sort_bytes = 0;
         if constexpr (CountOnly)
         {
@@ -932,8 +909,7 @@ private:
                 1, sizeof(key_type) * 8, stream);
         }
 
-        // Stage 5: validate newest entries with warp-wide cooperation. RANGE
-        // performs the requested aggregate instead of materializing pairs.
+        // Stage 5 validates or aggregates newest entries.
         if constexpr (CountOnly)
         {
             lsm_count_sorted_candidates_kernel_paper<<<
@@ -1171,8 +1147,7 @@ public:
             throw std::invalid_argument(
                 "GPU LSM updates must contain at most the fixed batch size b");
 
-        // Figure 3 accepts one mixed batch. A short batch is completed by
-        // duplicating its last member exactly as described in Section IV-A.
+        // Pad one short mixed batch with its last member.
         lsm_encode_update_batch_kernel<<<
             SDIV(batch_size, threads_per_block),
             threads_per_block, 0, stream>>>(
@@ -1202,7 +1177,7 @@ public:
         update(nullptr, nullptr, 0, delete_list, size, stream);
     }
 
-    // Compatibility with the benchmark's equal-sized combined-update API.
+    // Adapt the equal-sized combined-update API.
     void insert_and_remove(
         const key_type *insert_list,
         const smallsize *positions,
@@ -1277,8 +1252,7 @@ public:
                 static_cast<smallsize>(batch_size));
     }
 
-    // Section IV-E CLEANUP. It is intentionally explicit, as in the paper:
-    // users choose when the cost is worthwhile.
+    // CLEANUP is an explicit user-triggered operation.
     size_t cleanup(cudaStream_t stream = 0)
     {
         const size_t resident_size = num_batches * batch_size;
@@ -1311,7 +1285,7 @@ public:
         smallsize *merged_values = cleanup_values_a.ptr();
         size_t merged_size = 0;
 
-        // Stable, newest-to-oldest iterative merge of all occupied levels.
+        // Merge occupied levels from newest to oldest.
         for (smallsize level = 0; level < level_count; ++level)
         {
             if ((num_batches & (std::uint64_t{1} << level)) == 0)
@@ -1421,7 +1395,7 @@ public:
         }
         num_batches = rebuilt_batches;
 
-        // Local cleanup buffers must remain alive through redistribution.
+        // Keep cleanup buffers alive through copies.
         cudaStreamSynchronize(stream);
         C2EX
         return valid_size;
