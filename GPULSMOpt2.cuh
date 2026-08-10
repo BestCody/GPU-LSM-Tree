@@ -111,6 +111,13 @@ struct TaggedRow {
   std::uint32_t age;
 };
 
+struct RangeFragment {
+  std::uint32_t query;
+  std::uint32_t quotient;
+};
+
+static_assert(sizeof(RangeFragment) == 8u);
+
 template <class T> class Buffer {
 public:
   Buffer() = default;
@@ -999,6 +1006,17 @@ __device__ __forceinline__ std::uint32_t lower_bound_rows(
   while (lo < hi) {
     const std::uint32_t mid = (lo + hi) >> 1u;
     if (rows[mid].key < key) lo = mid + 1u;
+    else hi = mid;
+  }
+  return lo;
+}
+
+__device__ __forceinline__ std::uint32_t upper_bound_rows(
+    const Row *rows, std::uint32_t count, std::uint32_t key) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (rows[mid].key <= key) lo = mid + 1u;
     else hi = mid;
   }
   return lo;
@@ -2053,6 +2071,358 @@ __device__ unsigned long long sum_visible_sorted_update_quotient(
   return sum;
 }
 
+__global__ void count_range_fragments_kernel(
+    const std::uint32_t *low, const std::uint32_t *high,
+    std::uint32_t query_count, std::uint32_t *counts) {
+  const std::uint32_t query = blockIdx.x * blockDim.x + threadIdx.x;
+  if (query > query_count) return;
+  if (query == query_count) {
+    counts[query] = 0u;
+    return;
+  }
+  const std::uint32_t lo = low[query], hi = high[query];
+  counts[query] = lo <= hi ? (hi >> 16u) - (lo >> 16u) + 1u : 0u;
+}
+
+// One warp emits all section fragments of one query. This handles a single
+// full-universe range without making one thread write 65,536 tasks, while
+// retaining contiguous query-major and increasing-section order.
+__global__ void emit_range_fragments_kernel(
+    const std::uint32_t *low, const std::uint32_t *high,
+    const std::uint32_t *offsets, std::uint32_t query_count,
+    RangeFragment *fragments) {
+  const std::uint32_t warp =
+      (blockIdx.x * blockDim.x + threadIdx.x) >> 5u;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  if (warp >= query_count || low[warp] > high[warp]) return;
+  const std::uint32_t first = low[warp] >> 16u;
+  const std::uint32_t count = offsets[warp + 1u] - offsets[warp];
+  for (std::uint32_t local = lane; local < count; local += 32u)
+    fragments[offsets[warp] + local] = {warp, first + local};
+}
+
+// Parallel form of the same query-major emission for one range.  A full
+// 32-bit range contains 65,536 fragments; assigning those stores to one warp
+// costs more than the visibility traversal's planning budget, whereas this
+// flat emission remains fully coalesced.  This is only a planner variant: the
+// emitted fragment representation and traversal are identical.
+__global__ void emit_single_range_fragments_kernel(
+    const std::uint32_t *low, const std::uint32_t *offsets,
+    RangeFragment *fragments) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t count = offsets[1u];
+  if (index < count)
+    fragments[index] = {0u, (low[0u] >> 16u) + index};
+}
+
+__global__ void reduce_range_fragment_partials_kernel(
+    const std::uint32_t *offsets, std::uint32_t query_count,
+    const unsigned long long *partials, std::uint32_t *out_sums) {
+  const std::uint32_t warp =
+      (blockIdx.x * blockDim.x + threadIdx.x) >> 5u;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  if (warp >= query_count) return;
+  unsigned long long local = 0ull;
+  for (std::uint32_t index = offsets[warp] + lane;
+       index < offsets[warp + 1u]; index += 32u)
+    local += partials[index];
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    local += __shfl_down_sync(0xffffffffu, local, offset);
+  if (lane == 0u) out_sums[warp] = static_cast<std::uint32_t>(local);
+}
+
+// A single wide query can have 65,536 partials.  The ordinary one-warp/query
+// reducer is ideal for narrow batched ranges but serializes that case.  These
+// two kernels retain the same ordered partial stream and perform a bounded
+// parallel reduction without reading values or precomputing an answer.
+__global__ void reduce_single_range_partials_stage1_kernel(
+    const unsigned long long *partials,
+    const std::uint32_t *device_fragment_count,
+    unsigned long long *block_partials) {
+  __shared__ unsigned long long values[256];
+  unsigned long long local = 0ull;
+  const std::uint32_t count = *device_fragment_count;
+  for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < count; index += gridDim.x * blockDim.x)
+    local += partials[index];
+  values[threadIdx.x] = local;
+  __syncthreads();
+  for (std::uint32_t stride = 128u; stride; stride >>= 1u) {
+    if (threadIdx.x < stride)
+      values[threadIdx.x] += values[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u) block_partials[blockIdx.x] = values[0u];
+}
+
+__global__ void reduce_single_range_partials_stage2_kernel(
+    const unsigned long long *block_partials, std::uint32_t *out_sum) {
+  __shared__ unsigned long long values[256];
+  values[threadIdx.x] = block_partials[threadIdx.x];
+  __syncthreads();
+  for (std::uint32_t stride = 128u; stride; stride >>= 1u) {
+    if (threadIdx.x < stride)
+      values[threadIdx.x] += values[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u)
+    out_sum[0u] = static_cast<std::uint32_t>(values[0u]);
+}
+
+// Universal batched-range schedule: one warp owns one (query, upper-16
+// section) fragment. Pending batches may be arbitrary within a section, so the
+// warp first rank-sorts their exact assignments by (full key, logical order)
+// and retains the newest equal key. Persistent classes are already sorted and
+// exact. The resolved update winners then suppress BaseRun rows by full key.
+template <class Aggregate, bool HasPending>
+__global__ void warp_range_fragment_kernel(
+    const RangeFragment *fragments, std::uint32_t fragment_count,
+    const std::uint32_t *device_fragment_count,
+    const std::uint32_t *query_low, const std::uint32_t *query_high,
+    const Row *base, const std::uint32_t *base_offsets, const Row *arena,
+    const Descriptor *descriptors, const RawAssignment *raw,
+    const std::uint32_t *raw_offsets, const std::uint32_t *batch_bases,
+    std::uint32_t pending_batches,
+    typename Aggregate::State *aggregate_partials) {
+  constexpr std::uint32_t kWarps = 4u;
+  constexpr std::uint32_t kUpdateCapacity = 128u;
+  union WarpScratch {
+    Row merged[kWarps][kUpdateCapacity];
+    TaggedRow tagged[HasPending ? kWarps : 1u]
+                    [HasPending ? kUpdateCapacity : 1u];
+  };
+  __shared__ Row current_shared[kWarps][kUpdateCapacity];
+  __shared__ WarpScratch scratch;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  const std::uint32_t fragment_index = blockIdx.x * kWarps + warp;
+  // fragment_count is normally the exact host-visible count.  A single query
+  // instead launches its safe maximum of 65,536 fragments and guards it with
+  // the scan result in device memory.  That removes a host synchronization
+  // from the wide-range path without changing the fragment traversal.
+  if (fragment_index >= fragment_count ||
+      fragment_index >= *device_fragment_count) return;
+  constexpr unsigned full_mask = 0xffffffffu;
+  // One lane performs each uniform metadata read.  Apart from avoiding 32
+  // redundant loads, this matters for wide ranges: their consecutive warps
+  // visit consecutive sections, while every lane in a warp requests the same
+  // fragment and query descriptor.
+  std::uint32_t query = 0u, q = 0u;
+  if (lane == 0u) {
+    const RangeFragment fragment = fragments[fragment_index];
+    query = fragment.query;
+    q = fragment.quotient;
+  }
+  query = __shfl_sync(full_mask, query, 0u);
+  q = __shfl_sync(full_mask, q, 0u);
+  std::uint32_t query_begin = 0u, query_end = 0u;
+  if (lane == 0u) {
+    query_begin = query_low[query];
+    query_end = query_high[query];
+  }
+  query_begin = __shfl_sync(full_mask, query_begin, 0u);
+  query_end = __shfl_sync(full_mask, query_end, 0u);
+  const std::uint32_t q_low = q << 16u;
+  const std::uint32_t q_high = q_low | 0xffffu;
+  const std::uint32_t low = max(query_begin, q_low);
+  const std::uint32_t high = min(query_end, q_high);
+  const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+  Row *current = current_shared[warp];
+  Row *merged = scratch.merged[warp];
+
+  std::uint32_t current_count = 0u;
+  if constexpr (HasPending) {
+    // Compact all in-fragment pending assignments. Their logical-position
+    // field contains batch slot and original input position, so numeric order
+    // exactly implements later-batch and later-position wins.
+    std::uint32_t pending_count = 0u;
+    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+      const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+      const std::uint32_t begin = raw_offsets[oi];
+      const std::uint32_t end = raw_offsets[oi + 1u];
+      for (std::uint32_t chunk = begin; chunk < end; chunk += 32u) {
+        const std::uint32_t position = chunk + lane;
+        RawAssignment item{};
+        const bool valid = position < end &&
+            ((item = raw[batch_bases[batch] + position]).row.key >= low) &&
+            item.row.key <= high;
+        const unsigned selected = __ballot_sync(full_mask, valid);
+        const std::uint32_t destination =
+            pending_count + __popc(selected & before);
+        if (valid && destination < kUpdateCapacity)
+          scratch.tagged[warp][destination] =
+              {item.row, item.logical_position};
+        pending_count += __popc(selected);
+      }
+    }
+    const bool pending_overflow = pending_count > kUpdateCapacity;
+    if (__shfl_sync(full_mask, pending_overflow, 0u)) {
+      if (lane == 0u)
+        aggregate_partials[fragment_index] =
+            sum_visible_quotient_with_pending(
+                q, low, high, raw, raw_offsets, batch_bases,
+                pending_batches, arena, descriptors, base, base_offsets);
+      return;
+    }
+
+    // Exact small rank sort. Typical random histories contain only a few tens
+    // of assignments per section; doing the comparisons cooperatively avoids
+    // a global open-epoch sort and preserves arbitrary update semantics.
+    for (std::uint32_t index = lane; index < pending_count; index += 32u) {
+      const TaggedRow item = scratch.tagged[warp][index];
+      std::uint32_t rank = 0u;
+      for (std::uint32_t other_index = 0u; other_index < pending_count;
+           ++other_index) {
+        const TaggedRow other = scratch.tagged[warp][other_index];
+        rank += other.row.key < item.row.key ||
+            (other.row.key == item.row.key &&
+             (other.age < item.age ||
+              (other.age == item.age && other_index < index)));
+      }
+      current[rank] = item.row;
+    }
+    __syncwarp();
+    for (std::uint32_t group = 0u; group < 4u; ++group) {
+      const std::uint32_t index = lane + group * 32u;
+      const bool winner = index < pending_count &&
+          (index + 1u == pending_count ||
+           current[index].key != current[index + 1u].key);
+      const unsigned winners = __ballot_sync(full_mask, winner);
+      if (winner)
+        merged[current_count + __popc(winners & before)] = current[index];
+      current_count += __popc(winners);
+    }
+    __syncwarp();
+    Row *temporary = current;
+    current = merged;
+    merged = temporary;
+  }
+
+  // Persistent lower-numbered classes are newer. Insert each older equal row
+  // before the current row and retain the final equal row after merging.
+  bool class_overflow = false;
+  for (std::uint32_t level = 0u; level < kLevels; ++level) {
+    unsigned long long descriptor_bits = 0ull;
+    if (lane == 0u)
+      descriptor_bits = descriptors[descriptor_index(q, level)].bits;
+    descriptor_bits = __shfl_sync(full_mask, descriptor_bits, 0u);
+    const Descriptor descriptor{descriptor_bits};
+    const Row *rows = arena + descriptor.offset();
+    std::uint32_t older_begin = 0u, older_end = 0u;
+    if (lane == 0u && descriptor.count()) {
+      // Interior fragments cover a complete upper-16 section.  Its descriptor
+      // already supplies exact boundaries, so binary searching it would add
+      // two scattered dependent-read chains for no information.  Only the two
+      // boundary fragments of an arbitrary range need searches.
+      older_begin = low == q_low
+          ? 0u
+          : lower_bound_rows(rows, descriptor.count(), low);
+      older_end = high == q_high
+          ? descriptor.count()
+          : upper_bound_rows(rows, descriptor.count(), high);
+    }
+    older_begin = __shfl_sync(full_mask, older_begin, 0u);
+    older_end = __shfl_sync(full_mask, older_end, 0u);
+    const std::uint32_t older_count = older_end - older_begin;
+    if (!older_count) continue;
+    if (current_count + older_count > kUpdateCapacity) {
+      class_overflow = true;
+      break;
+    }
+    const Row *older = rows + older_begin;
+    if (!current_count) {
+      for (std::uint32_t index = lane; index < older_count; index += 32u)
+        current[index] = older[index];
+      current_count = older_count;
+      __syncwarp();
+      continue;
+    }
+    for (std::uint32_t index = lane; index < older_count; index += 32u) {
+      const Row row = older[index];
+      std::uint32_t lo = 0u, hi = current_count;
+      while (lo < hi) {
+        const std::uint32_t mid = (lo + hi) >> 1u;
+        if (current[mid].key < row.key) lo = mid + 1u;
+        else hi = mid;
+      }
+      merged[index + lo] = row;
+    }
+    for (std::uint32_t index = lane; index < current_count; index += 32u) {
+      const Row row = current[index];
+      std::uint32_t lo = 0u, hi = older_count;
+      while (lo < hi) {
+        const std::uint32_t mid = (lo + hi) >> 1u;
+        if (older[mid].key <= row.key) lo = mid + 1u;
+        else hi = mid;
+      }
+      merged[index + lo] = row;
+    }
+    __syncwarp();
+    const std::uint32_t merged_count = current_count + older_count;
+    std::uint32_t output_count = 0u;
+    for (std::uint32_t group = 0u; group < 4u; ++group) {
+      const std::uint32_t index = lane + group * 32u;
+      const bool winner = index < merged_count &&
+          (index + 1u == merged_count ||
+           merged[index].key != merged[index + 1u].key);
+      const unsigned winners = __ballot_sync(full_mask, winner);
+      if (winner)
+        current[output_count + __popc(winners & before)] = merged[index];
+      output_count += __popc(winners);
+    }
+    current_count = output_count;
+    __syncwarp();
+  }
+  class_overflow = __shfl_sync(full_mask, class_overflow, 0u);
+  if (class_overflow) {
+    if (lane == 0u)
+      aggregate_partials[fragment_index] =
+          sum_visible_quotient_with_pending(
+              q, low, high, raw, raw_offsets, batch_bases, pending_batches,
+              arena, descriptors, base, base_offsets);
+    return;
+  }
+
+  typename Aggregate::State local = Aggregate::identity();
+  for (std::uint32_t index = lane; index < current_count; index += 32u) {
+    const Row row = current[index];
+    if ((row.flags & kTombstone) == 0u)
+      local = Aggregate::consume(local, row);
+  }
+  const std::uint32_t base_section_begin = base_offsets[q];
+  const std::uint32_t base_section_count =
+      base_offsets[q + 1u] - base_section_begin;
+  std::uint32_t base_begin = 0u, base_end = 0u;
+  if (lane == 0u && base_section_count) {
+    const Row *rows = base + base_section_begin;
+    base_begin = low == q_low
+        ? 0u
+        : lower_bound_rows(rows, base_section_count, low);
+    base_end = high == q_high
+        ? base_section_count
+        : upper_bound_rows(rows, base_section_count, high);
+  }
+  base_begin = __shfl_sync(full_mask, base_begin, 0u);
+  base_end = __shfl_sync(full_mask, base_end, 0u);
+  if (!current_count) {
+    for (std::uint32_t index = base_begin + lane; index < base_end;
+         index += 32u)
+      local = Aggregate::consume(local, base[base_section_begin + index]);
+  } else {
+    for (std::uint32_t index = base_begin + lane; index < base_end;
+         index += 32u) {
+      const Row row = base[base_section_begin + index];
+      const std::uint32_t position =
+          lower_bound_rows(current, current_count, row.key);
+      if (position == current_count || current[position].key != row.key)
+        local = Aggregate::consume(local, row);
+    }
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    local += __shfl_down_sync(full_mask, local, offset);
+  if (lane == 0u) aggregate_partials[fragment_index] = local;
+}
+
 // Four independent warp owners per block remove all CTA-wide synchronization
 // from the common range path. A warp resolves the bounded update history for
 // one quotient, then visits that quotient's BaseRun rows exactly once. Only a
@@ -2803,7 +3173,7 @@ public:
         sort_ids_out_(batch_capacity_),
         range_open_offsets_(gpulsmopt2_detail::kQuotients + 1u),
         range_compact_bases_(gpulsmopt2_detail::kBatchesPerEpoch),
-        range_partials_(gpulsmopt2_detail::kQuotients), range_sum64_(1u) {
+        range_partials_(gpulsmopt2_detail::kThreads) {
     if (batch_capacity_ >
         (std::size_t{1} << gpulsmopt2_detail::kBatchPositionBits))
       throw std::invalid_argument("GPULSMOpt2 batch capacity exceeds logical-position encoding");
@@ -2993,109 +3363,95 @@ public:
         batch.query_count > std::numeric_limits<std::uint32_t>::max())
       throw std::invalid_argument("invalid GPULSMOpt2 range input");
     begin_operation(stream);
-    if (batch.query_count == 1u) {
-      std::uint32_t low{}, high{};
-      CUDA_CHECK(cudaMemcpyAsync(&low, batch.lo, sizeof(low),
-                                 cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaMemcpyAsync(&high, batch.hi, sizeof(high),
-                                 cudaMemcpyDeviceToHost, stream));
+    const std::uint32_t query_count =
+        static_cast<std::uint32_t>(batch.query_count);
+    ensure_range_fragment_query_capacity(query_count);
+    gpulsmopt2_detail::count_range_fragments_kernel<<<
+        blocks(std::size_t{query_count} + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            batch.lo, batch.hi, query_count,
+            range_fragment_counts_.data());
+    std::size_t scan_bytes{};
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, scan_bytes, range_fragment_counts_.data(),
+        range_fragment_offsets_.data(), query_count + 1u, stream));
+    ensure_range_temp(scan_bytes);
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        range_temp_.data(), scan_bytes, range_fragment_counts_.data(),
+        range_fragment_offsets_.data(), query_count + 1u, stream));
+    std::uint32_t fragment_count{};
+    if (query_count == 1u) {
+      // The exact count is already the final scan cell on the device.  One
+      // arbitrary 32-bit range can never span more than all upper-16 sections,
+      // so reserve that small fixed maximum and let the fragment kernel guard
+      // against the device count.  This removes result-independent host
+      // synchronization from both narrow and full single-range operations.
+      fragment_count = gpulsmopt2_detail::kQuotients;
+    } else {
+      CUDA_CHECK(cudaMemcpyAsync(
+          &fragment_count, range_fragment_offsets_.data() + query_count,
+          sizeof(fragment_count), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      if (low > high) {
-        CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0, sizeof(std::uint32_t),
+      if (!fragment_count) {
+        CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
+                                   std::size_t{query_count} *
+                                       sizeof(std::uint32_t),
                                    stream));
         end_operation(stream);
         return;
       }
-      const std::uint32_t q_begin = low >> 16u;
-      const std::uint32_t q_count = (high >> 16u) - q_begin + 1u;
-      const bool sort_open_epoch =
-          pending_records_ != 0u && q_count >= 4096u;
-      if (sort_open_epoch) {
-        ensure_range_open_capacity(pending_records_);
-        std::array<std::uint32_t, gpulsmopt2_detail::kBatchesPerEpoch>
-            compact_bases{};
-        std::uint32_t compact_count = 0u;
-        for (std::uint32_t slot = 0u; slot < pending_batches_; ++slot) {
-          compact_bases[slot] = compact_count;
-          compact_count += raw_host_counts_[slot];
-        }
-        CUDA_CHECK(cudaMemcpyAsync(
-            range_compact_bases_.data(), compact_bases.data(),
-            sizeof(compact_bases), cudaMemcpyHostToDevice, stream));
-        const dim3 gather_grid(
-            blocks(batch_capacity_), pending_batches_);
-        gpulsmopt2_detail::gather_open_epoch_for_range_kernel<<<
-            gather_grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
-            raw_assignments_.data(),
-            static_cast<std::uint32_t>(batch_capacity_), raw_offsets_.data(),
-            range_compact_bases_.data(), range_open_rows_in_.data(),
-            range_open_keys_in_.data());
-        std::size_t open_sort_bytes{};
-        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-            nullptr, open_sort_bytes, range_open_keys_in_.data(),
-            range_open_keys_out_.data(), range_open_rows_in_.data(),
-            range_open_rows_out_.data(), compact_count, 0, 32, stream));
-        ensure_range_open_sort_temp(open_sort_bytes);
-        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-            range_open_sort_temp_.data(), open_sort_bytes,
-            range_open_keys_in_.data(), range_open_keys_out_.data(),
-            range_open_rows_in_.data(), range_open_rows_out_.data(),
-            compact_count, 0, 32, stream));
-        gpulsmopt2_detail::find_quotient_offsets_kernel<<<
-            blocks(gpulsmopt2_detail::kQuotients + 1u),
-            gpulsmopt2_detail::kThreads, 0, stream>>>(
-            range_open_keys_out_.data(), compact_count,
-            range_open_offsets_.data());
-      }
-      CUDA_CHECK(cudaMemsetAsync(overflow_.data(), 0, sizeof(std::uint32_t),
-                                 stream));
-      if (sort_open_epoch) {
-        gpulsmopt2_detail::warp_visible_probe_base_kernel<
-            gpulsmopt2_detail::SumRowsAggregate>
-            <<<(q_count + 3u) / 4u, 128, 0, stream>>>(
-                low, high, base_.data(), base_offsets_.data(), arena_.data(),
-                descriptors_.data(), range_open_rows_out_.data(),
-                range_open_offsets_.data(), raw_batch_bases_.data(), 1u,
-                q_begin, q_count, range_partials_.data());
-      } else if (pending_batches_ == 0u) {
-        gpulsmopt2_detail::warp_visible_probe_base_kernel<
-            gpulsmopt2_detail::SumRowsAggregate>
-            <<<(q_count + 3u) / 4u, 128, 0, stream>>>(
-                low, high, base_.data(), base_offsets_.data(), arena_.data(),
-                descriptors_.data(), raw_assignments_.data(),
-                raw_offsets_.data(), raw_batch_bases_.data(), 0u, q_begin,
-                q_count, range_partials_.data());
-      } else {
-        gpulsmopt2_detail::cooperative_visible_merge_path_kernel<
-            false, gpulsmopt2_detail::SumRowsAggregate>
-            <<<q_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
-                low, high, base_.data(), base_offsets_.data(), arena_.data(),
-                descriptors_.data(), masks_.data(), raw_assignments_.data(),
-                raw_offsets_.data(), raw_batch_bases_.data(), pending_batches_,
-                q_begin, q_count, nullptr, nullptr, nullptr, overflow_.data(),
-                range_partials_.data());
-      }
-      std::size_t reduce_bytes{};
-      CUDA_CHECK(cub::DeviceReduce::Sum(
-          nullptr, reduce_bytes, range_partials_.data(), range_sum64_.data(),
-          q_count, stream));
-      ensure_range_temp(reduce_bytes);
-      CUDA_CHECK(cub::DeviceReduce::Sum(
-          range_temp_.data(), reduce_bytes, range_partials_.data(),
-          range_sum64_.data(), q_count, stream));
-      gpulsmopt2_detail::narrow_sum_kernel<<<1, 1, 0, stream>>>(
-          range_sum64_.data(), batch.out_sums);
-      CUDA_CHECK(cudaGetLastError());
-      end_operation(stream);
-      return;
     }
-    gpulsmopt2_detail::range_sum_with_pending_kernel<<<
-        static_cast<std::uint32_t>(batch.query_count),
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
-        batch.lo, batch.hi, static_cast<std::uint32_t>(batch.query_count),
-        batch.out_sums, raw_assignments_.data(), raw_offsets_.data(),
-        raw_batch_bases_.data(), pending_batches_, arena_.data(),
-        descriptors_.data(), base_.data(), base_offsets_.data());
+    ensure_range_fragment_capacity(fragment_count);
+    if (query_count == 1u) {
+      gpulsmopt2_detail::emit_single_range_fragments_kernel<<<
+          gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              batch.lo, range_fragment_offsets_.data(),
+              range_fragments_.data());
+    } else {
+      gpulsmopt2_detail::emit_range_fragments_kernel<<<
+          (query_count + 7u) / 8u, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              batch.lo, batch.hi, range_fragment_offsets_.data(), query_count,
+              range_fragments_.data());
+    }
+    if (pending_batches_) {
+      gpulsmopt2_detail::warp_range_fragment_kernel<
+          gpulsmopt2_detail::SumRowsAggregate, true>
+          <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
+              range_fragments_.data(), fragment_count,
+              range_fragment_offsets_.data() + query_count,
+              batch.lo, batch.hi,
+              base_.data(), base_offsets_.data(), arena_.data(),
+              descriptors_.data(), raw_assignments_.data(),
+              raw_offsets_.data(), raw_batch_bases_.data(), pending_batches_,
+              range_fragment_partials_.data());
+    } else {
+      gpulsmopt2_detail::warp_range_fragment_kernel<
+          gpulsmopt2_detail::SumRowsAggregate, false>
+          <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
+              range_fragments_.data(), fragment_count,
+              range_fragment_offsets_.data() + query_count,
+              batch.lo, batch.hi,
+              base_.data(), base_offsets_.data(), arena_.data(),
+              descriptors_.data(), raw_assignments_.data(),
+              raw_offsets_.data(), raw_batch_bases_.data(), 0u,
+              range_fragment_partials_.data());
+    }
+    if (query_count == 1u) {
+      gpulsmopt2_detail::reduce_single_range_partials_stage1_kernel<<<
+          256, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_fragment_partials_.data(),
+              range_fragment_offsets_.data() + 1u,
+              range_partials_.data());
+      gpulsmopt2_detail::reduce_single_range_partials_stage2_kernel<<<
+          1, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_partials_.data(), batch.out_sums);
+    } else {
+      gpulsmopt2_detail::reduce_range_fragment_partials_kernel<<<
+          (query_count + 7u) / 8u, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_fragment_offsets_.data(), query_count,
+              range_fragment_partials_.data(), batch.out_sums);
+    }
     CUDA_CHECK(cudaGetLastError());
     end_operation(stream);
   }
@@ -3163,7 +3519,10 @@ public:
         range_compact_bases_.size() * sizeof(std::uint32_t) +
         range_open_sort_temp_.size() * sizeof(std::uint8_t) +
         range_partials_.size() * sizeof(unsigned long long) +
-        range_sum64_.size() * sizeof(unsigned long long) +
+        range_fragment_counts_.size() * sizeof(std::uint32_t) +
+        range_fragment_offsets_.size() * sizeof(std::uint32_t) +
+        range_fragments_.size() * sizeof(gpulsmopt2_detail::RangeFragment) +
+        range_fragment_partials_.size() * sizeof(unsigned long long) +
         range_temp_.size() * sizeof(std::uint8_t);
   }
 
@@ -3339,6 +3698,16 @@ private:
     if (range_open_sort_temp_.size() < bytes)
       range_open_sort_temp_.resize(bytes);
   }
+  void ensure_range_fragment_query_capacity(std::size_t count) {
+    if (range_fragment_counts_.size() >= count + 1u) return;
+    range_fragment_counts_.resize(count + 1u);
+    range_fragment_offsets_.resize(count + 1u);
+  }
+  void ensure_range_fragment_capacity(std::size_t count) {
+    if (range_fragments_.size() >= count) return;
+    range_fragments_.resize(count);
+    range_fragment_partials_.resize(count);
+  }
   void ensure_query_capacity(std::size_t count) {
     if (query_keys_.size() >= count) return;
     query_keys_.resize(count);
@@ -3386,6 +3755,10 @@ private:
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment>
       range_open_rows_in_, range_open_rows_out_;
   gpulsmopt2_detail::Buffer<std::uint8_t> range_open_sort_temp_;
-  gpulsmopt2_detail::Buffer<unsigned long long> range_partials_, range_sum64_;
+  gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> range_fragment_counts_,
+      range_fragment_offsets_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RangeFragment> range_fragments_;
+  gpulsmopt2_detail::Buffer<unsigned long long> range_fragment_partials_;
   gpulsmopt2_detail::Buffer<std::uint8_t> range_temp_;
 };
