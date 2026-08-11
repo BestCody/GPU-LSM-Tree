@@ -2586,38 +2586,52 @@ private:
                          : level_keys_.data() + destination,
             publication_selected_count_.data(), publication_age_bits_);
 
-    std::uint32_t destination_level = 0u;
-    while (level_counts_[destination_level]) {
-      const std::uint32_t old_count = level_counts_[destination_level];
-      if (std::uint64_t{current_count} + old_count > publication_capacity_)
+    const std::uint32_t destination_level = carry_levels;
+    if (carry_levels) {
+      std::uint32_t merged_count = current_count;
+      for (std::uint32_t level = 0u; level < carry_levels; ++level) {
+        merged_count += level_counts_[level];
+      }
+      if (merged_count > publication_capacity_)
         throw std::runtime_error("GPULSMOpt publication workspace exhausted");
-      workspace_bytes = publication_temp_.size();
-      CUDA_CHECK(cub::DeviceMerge::MergePairs(
-          publication_temp_.data(), workspace_bytes,
-          publication_keys_a_.data(), publication_rows_a_.data(),
-          current_count, level_keys_.data() + level_offsets_[destination_level],
-          arena_.data() + level_offsets_[destination_level], old_count,
-          publication_keys_b_.data(), publication_rows_b_.data(),
-          cuda::std::less<>{}, stream));
-      const std::uint32_t merged_count = current_count + old_count;
-      level_counts_[destination_level] = 0u;
-      const bool final_merge = destination_level + 1u == carry_levels;
-      if (final_merge) destination = allocate_level_span(merged_count);
+      bool current_is_a = true;
+      std::uint32_t raw_count = current_count;
+      for (std::uint32_t level = 0u; level < carry_levels; ++level) {
+        const std::uint32_t count = level_counts_[level];
+        workspace_bytes = publication_temp_.size();
+        CUDA_CHECK(cub::DeviceMerge::MergePairs(
+            publication_temp_.data(), workspace_bytes,
+            current_is_a ? publication_keys_a_.data()
+                         : publication_keys_b_.data(),
+            current_is_a ? publication_rows_a_.data()
+                         : publication_rows_b_.data(),
+            raw_count, level_keys_.data() + level_offsets_[level],
+            arena_.data() + level_offsets_[level], count,
+            current_is_a ? publication_keys_b_.data()
+                         : publication_keys_a_.data(),
+            current_is_a ? publication_rows_b_.data()
+                         : publication_rows_a_.data(),
+            cuda::std::less<>{}, stream));
+        raw_count += count;
+        current_is_a = !current_is_a;
+      }
+      for (std::uint32_t level = 0u; level < carry_levels; ++level)
+        level_counts_[level] = 0u;
+      destination = allocate_level_span(merged_count);
       workspace_bytes = publication_temp_.size();
       CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
           publication_temp_.data(), workspace_bytes,
-          publication_keys_b_.data(), publication_rows_b_.data(),
-          final_merge ? level_keys_.data() + destination
-                      : publication_keys_a_.data(),
-          final_merge ? arena_.data() + destination
-                      : publication_rows_a_.data(),
+          current_is_a ? publication_keys_a_.data()
+                       : publication_keys_b_.data(),
+          current_is_a ? publication_rows_a_.data()
+                       : publication_rows_b_.data(),
+          level_keys_.data() + destination, arena_.data() + destination,
           publication_selected_count_.data(), merged_count,
           cuda::std::equal_to<>{}, stream));
       CUDA_CHECK(cudaMemcpyAsync(
           &current_count, publication_selected_count_.data(),
           sizeof(current_count), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      ++destination_level;
     }
     gpulsmopt2_detail::publish_global_level_descriptors_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
