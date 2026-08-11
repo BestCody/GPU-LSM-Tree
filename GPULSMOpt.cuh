@@ -42,6 +42,8 @@ constexpr std::uint32_t kInvalidAge = 0xffffffffu;
 constexpr std::uint32_t kTombstone = 1u;
 constexpr std::uint32_t kMaximumArenaRows = 1u << 26u;
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
+constexpr std::uint32_t kDirectAdmissionMinimum = kQuotients / 8u;
+constexpr std::uint32_t kDirectAdmissionMaximum = kQuotients * 4u;
 
 struct Row {
   std::uint32_t value;
@@ -1534,6 +1536,69 @@ __device__ __forceinline__ std::uint64_t pending_signature_bits(
   return (1ull << (first >> 26u)) | (1ull << (second >> 26u));
 }
 
+__global__ void count_admission_quotients_kernel(
+    const std::uint32_t *keys, std::uint32_t count,
+    std::uint32_t *quotient_counts,
+    std::uint64_t *batch_signatures,
+    std::uint64_t *epoch_signatures) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t key = keys[i];
+  const std::uint32_t quotient = key >> 16u;
+  const unsigned active = __activemask();
+  const unsigned peers = __match_any_sync(active, quotient);
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t leader = __ffs(peers) - 1u;
+  if (lane == leader)
+    atomicAdd(quotient_counts + quotient, __popc(peers));
+  const std::uint64_t bits = pending_signature_bits(key);
+  const std::uint32_t low = __reduce_or_sync(
+      peers, static_cast<std::uint32_t>(bits));
+  const std::uint32_t high = __reduce_or_sync(
+      peers, static_cast<std::uint32_t>(bits >> 32u));
+  if (lane == leader) {
+    const unsigned long long aggregate =
+        static_cast<unsigned long long>(low) |
+        (static_cast<unsigned long long>(high) << 32u);
+    atomicOr(reinterpret_cast<unsigned long long *>(
+                 batch_signatures + quotient), aggregate);
+    atomicOr(reinterpret_cast<unsigned long long *>(
+                 epoch_signatures + quotient), aggregate);
+  }
+}
+
+__global__ void initialize_admission_cursors_kernel(
+    const std::uint32_t *offsets, std::uint32_t *cursors) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q < kQuotients) cursors[q] = offsets[q];
+}
+
+__global__ void scatter_admission_records_kernel(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    std::uint32_t count, std::uint32_t batch_slot, bool tombstone,
+    std::uint32_t *cursors, RawAssignment *destination,
+    std::uint32_t *destination_full_keys) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t key = keys[i];
+  const std::uint32_t quotient = key >> 16u;
+  const unsigned active = __activemask();
+  const unsigned peers = __match_any_sync(active, quotient);
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t leader = __ffs(peers) - 1u;
+  std::uint32_t base = 0u;
+  if (lane == leader)
+    base = atomicAdd(cursors + quotient, __popc(peers));
+  base = __shfl_sync(peers, base, leader);
+  const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+  const std::uint32_t output = base + __popc(peers & before);
+  destination[output] = {
+      make_row(key, tombstone ? 0u : values[i],
+               tombstone ? kTombstone : 0u),
+      (batch_slot << kBatchPositionBits) | i};
+  destination_full_keys[output] = key;
+}
+
 __global__ void finalize_quotient_metadata_kernel(
     const std::uint32_t *sorted_keys, std::uint32_t count,
     std::uint32_t *offsets) {
@@ -1930,6 +1995,8 @@ public:
         publication_rows_b_(publication_capacity_),
         publication_selected_count_(1u),
         publication_batch_offsets_(gpulsmopt2_detail::kBatchesPerEpoch + 1u),
+        admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
+        admission_cursors_(gpulsmopt2_detail::kQuotients),
         radix_keys_(batch_capacity_), radix_ids_out_(batch_capacity_),
         range_partials_(gpulsmopt2_detail::kThreads),
         range_overflow_count_(1u) {
@@ -1956,6 +2023,11 @@ public:
         radix_keys_.data(), radix_ids_out_.data(), radix_ids_out_.data(),
         static_cast<std::uint32_t>(batch_capacity_), 16, 32, 0));
     ensure_radix_workspace(initial_sort_bytes, batch_capacity_, 0);
+    std::size_t admission_scan_bytes{};
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, admission_scan_bytes, admission_counts_.data(),
+        raw_offsets_.data(), gpulsmopt2_detail::kQuotients + 1u, 0));
+    admission_temp_.resize(admission_scan_bytes);
     initialize_publication_workspace();
     CUDA_CHECK(cudaEventRecord(operation_done_, 0));
     reset_updates(0);
@@ -2355,6 +2427,9 @@ public:
          publication_selected_count_.size() +
          publication_batch_offsets_.size()) * sizeof(std::uint32_t) +
         publication_temp_.size() * sizeof(std::uint8_t) +
+        (admission_counts_.size() + admission_cursors_.size()) *
+            sizeof(std::uint32_t) +
+        admission_temp_.size() * sizeof(std::uint8_t) +
         radix_keys_.size() * sizeof(std::uint32_t) +
         radix_ids_out_.size() * sizeof(std::uint32_t) +
         radix_temp_.size() * sizeof(std::uint8_t) +
@@ -2487,14 +2562,6 @@ private:
       throw std::invalid_argument("invalid GPULSMOpt update batch");
     begin_operation(stream);
     const std::uint32_t n = static_cast<std::uint32_t>(count);
-    std::size_t sort_bytes{};
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, sort_bytes, keys, radix_keys_.data(), radix_ids_out_.data(),
-        radix_ids_out_.data(), n, 16, 32, stream));
-    ensure_radix_workspace(sort_bytes, n, stream);
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        radix_workspace(), sort_bytes, keys, radix_keys_.data(),
-        radix_input_ids(), radix_ids_out_.data(), n, 16, 32, stream));
     const std::uint32_t slot = pending_batches_;
     pending_records_ += n;
     std::uint64_t *batch_signatures = raw_signatures_.data() +
@@ -2502,18 +2569,58 @@ private:
     CUDA_CHECK(cudaMemsetAsync(
         batch_signatures, 0,
         gpulsmopt2_detail::kQuotients * sizeof(std::uint64_t), stream));
-    gpulsmopt2_detail::gather_raw_batch_kernel<<<
-        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
-        radix_keys_.data(), radix_ids_out_.data(), values, n, slot, tombstone,
-        raw_assignments_.data() + std::size_t{slot} * batch_capacity_,
-        raw_full_keys_.data() + std::size_t{slot} * batch_capacity_,
-        batch_signatures, raw_epoch_signatures_.data());
     std::uint32_t *batch_offsets = raw_offsets_.data() +
         std::size_t{slot} * (gpulsmopt2_detail::kQuotients + 1u);
-    gpulsmopt2_detail::finalize_quotient_metadata_kernel<<<
-        gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
-            radix_keys_.data(), n, batch_offsets);
+    const bool direct =
+        n >= gpulsmopt2_detail::kDirectAdmissionMinimum &&
+        n <= gpulsmopt2_detail::kDirectAdmissionMaximum;
+    if (direct) {
+      CUDA_CHECK(cudaMemsetAsync(
+          admission_counts_.data(), 0,
+          admission_counts_.size() * sizeof(std::uint32_t), stream));
+      gpulsmopt2_detail::count_admission_quotients_kernel<<<
+          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              keys, n, admission_counts_.data(), batch_signatures,
+              raw_epoch_signatures_.data());
+      std::size_t scan_bytes = admission_temp_.size();
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          admission_temp_.data(), scan_bytes, admission_counts_.data(),
+          batch_offsets, gpulsmopt2_detail::kQuotients + 1u, stream));
+      gpulsmopt2_detail::initialize_admission_cursors_kernel<<<
+          gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              batch_offsets, admission_cursors_.data());
+      gpulsmopt2_detail::scatter_admission_records_kernel<<<
+          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              keys, values, n, slot, tombstone,
+              admission_cursors_.data(),
+              raw_assignments_.data() +
+                  std::size_t{slot} * batch_capacity_,
+              raw_full_keys_.data() +
+                  std::size_t{slot} * batch_capacity_);
+    } else {
+      std::size_t sort_bytes{};
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          nullptr, sort_bytes, keys, radix_keys_.data(),
+          radix_ids_out_.data(), radix_ids_out_.data(), n, 16, 32, stream));
+      ensure_radix_workspace(sort_bytes, n, stream);
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          radix_workspace(), sort_bytes, keys, radix_keys_.data(),
+          radix_input_ids(), radix_ids_out_.data(), n, 16, 32, stream));
+      gpulsmopt2_detail::gather_raw_batch_kernel<<<
+          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              radix_keys_.data(), radix_ids_out_.data(), values, n, slot,
+              tombstone,
+              raw_assignments_.data() +
+                  std::size_t{slot} * batch_capacity_,
+              raw_full_keys_.data() +
+                  std::size_t{slot} * batch_capacity_,
+              batch_signatures, raw_epoch_signatures_.data());
+      gpulsmopt2_detail::finalize_quotient_metadata_kernel<<<
+          gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              radix_keys_.data(), n, batch_offsets);
+    }
     CUDA_CHECK(cudaGetLastError());
     raw_batch_counts_[slot] = n;
     ++pending_batches_;
@@ -2806,6 +2913,9 @@ private:
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> publication_rows_a_,
       publication_rows_b_;
   gpulsmopt2_detail::Buffer<std::uint8_t> publication_temp_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> admission_counts_,
+      admission_cursors_;
+  gpulsmopt2_detail::Buffer<std::uint8_t> admission_temp_;
   std::uint32_t level_counts_[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint32_t level_offsets_[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint32_t raw_batch_counts_[gpulsmopt2_detail::kBatchesPerEpoch]{};
