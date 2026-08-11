@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu_dictionary_adapter.cuh"
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
@@ -29,21 +30,40 @@
 namespace gpulsmopt2_detail {
 
 constexpr std::uint32_t kQuotients = 1u << 16u;
-constexpr std::uint32_t kMaximumLevels = 16u;
+constexpr std::uint32_t kMaximumLevels = 64u;
 constexpr std::uint32_t kBatchesPerEpoch = 16u;
 constexpr std::uint32_t kBatchPositionBits = 28u;
 constexpr std::uint32_t kLocalRankBits = 7u;
 constexpr std::uint32_t kLocalRankEntries =
     kQuotients * (1u << kLocalRankBits);
 constexpr std::uint32_t kThreads = 256u;
-constexpr std::uint32_t kWarpsPerBlock = kThreads / 32u;
+constexpr std::uint32_t kSectionRangeThreads = 128u;
+constexpr std::uint32_t kSectionRangeWarps =
+    kSectionRangeThreads / 32u;
 constexpr std::uint32_t kInvalid = 0xffffffffu;
 constexpr std::uint32_t kInvalidAge = 0xffffffffu;
 constexpr std::uint32_t kTombstone = 1u;
-constexpr std::uint32_t kMaximumArenaRows = 1u << 26u;
+constexpr std::size_t kMaximumOperationTile = std::size_t{1} << 20u;
+constexpr std::size_t kMaximumPublicationRows =
+    std::numeric_limits<std::uint32_t>::max();
+constexpr std::uint32_t kDescriptorOffsetBits = 47u;
+constexpr std::uint64_t kDescriptorOffsetMask =
+    (std::uint64_t{1} << kDescriptorOffsetBits) - 1u;
+constexpr std::uint64_t kInvalidOffset =
+    std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
 constexpr std::uint32_t kDirectAdmissionMinimum = kQuotients / 8u;
 constexpr std::uint32_t kDirectAdmissionMaximum = kQuotients * 4u;
+
+inline std::size_t initial_storage_capacity(
+    std::size_t requested, std::size_t tile_capacity) {
+  const std::size_t capacity = std::max(
+      requested, tile_capacity * kBatchesPerEpoch);
+  if (capacity > kMaximumPublicationRows)
+    throw std::invalid_argument(
+        "GPULSMOpt capacity exceeds 32-bit key space");
+  return capacity;
+}
 
 struct Row {
   std::uint32_t value;
@@ -83,18 +103,25 @@ struct RawAssignment {
 static_assert(sizeof(Row) == 8u);
 static_assert(sizeof(RawAssignment) == 12u);
 
+template <class T> inline std::size_t maximum_resident_elements() {
+  std::size_t free_bytes{}, total_bytes{};
+  CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+  (void)free_bytes;
+  return total_bytes / sizeof(T);
+}
+
 struct Descriptor {
   std::uint64_t bits{};
-  __host__ __device__ static Descriptor make(std::uint32_t offset,
+  __host__ __device__ static Descriptor make(std::uint64_t offset,
                                              std::uint32_t count) {
     return {std::uint64_t{offset} |
-            (std::uint64_t{count} << 26u)};
+            (std::uint64_t{count} << kDescriptorOffsetBits)};
   }
-  __host__ __device__ std::uint32_t offset() const {
-    return static_cast<std::uint32_t>(bits & ((1ull << 26u) - 1ull));
+  __host__ __device__ std::uint64_t offset() const {
+    return bits & kDescriptorOffsetMask;
   }
   __host__ __device__ std::uint32_t count() const {
-    return static_cast<std::uint32_t>((bits >> 26u) & ((1ull << 17u) - 1ull));
+    return static_cast<std::uint32_t>(bits >> kDescriptorOffsetBits);
   }
 };
 
@@ -142,7 +169,7 @@ struct SectionRangeTask {
 };
 
 static_assert(sizeof(SectionRangeTask) == 12u);
-constexpr std::uint32_t kSectionTaskFragments = 256u;
+constexpr std::uint32_t kSectionTaskFragments = kSectionRangeThreads;
 
 template <class T> class Buffer {
 public:
@@ -152,28 +179,198 @@ public:
   Buffer &operator=(const Buffer &) = delete;
   Buffer &operator=(Buffer &&other) noexcept {
     if (this != &other) {
-      if (pointer_) cudaFree(pointer_);
+      if (pointer_ && owns_) cudaFree(pointer_);
       pointer_ = other.pointer_;
       count_ = other.count_;
+      owns_ = other.owns_;
       other.pointer_ = nullptr;
       other.count_ = 0u;
+      other.owns_ = true;
     }
     return *this;
   }
-  ~Buffer() { if (pointer_) cudaFree(pointer_); }
+  ~Buffer() { if (pointer_ && owns_) cudaFree(pointer_); }
   void resize(std::size_t count) {
-    if (pointer_) CUDA_CHECK(cudaFree(pointer_));
+    if (pointer_ && owns_) CUDA_CHECK(cudaFree(pointer_));
     pointer_ = nullptr;
     count_ = count;
+    owns_ = true;
     if (count)
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&pointer_),
                             count * sizeof(T)));
+  }
+  void attach(T *pointer, std::size_t count) {
+    if (pointer_ && owns_) CUDA_CHECK(cudaFree(pointer_));
+    pointer_ = pointer;
+    count_ = count;
+    owns_ = false;
   }
   T *data() { return pointer_; }
   std::size_t size() const { return count_; }
 private:
   T *pointer_{};
   std::size_t count_{};
+  bool owns_{true};
+};
+
+inline void check_driver(CUresult result, const char *file, int line) {
+  if (result == CUDA_SUCCESS) return;
+  throw std::runtime_error(
+      std::string("CUDA driver error ") + std::to_string(result) + " at " +
+      file + ":" + std::to_string(line));
+}
+
+#define GPULSMOPT_CU_CHECK(call) \
+  ::gpulsmopt2_detail::check_driver((call), __FILE__, __LINE__)
+
+struct VmmFunctions {
+  decltype(&cuMemAddressReserve) reserve{};
+  decltype(&cuMemAddressFree) free_address{};
+  decltype(&cuMemCreate) create{};
+  decltype(&cuMemRelease) release{};
+  decltype(&cuMemMap) map{};
+  decltype(&cuMemUnmap) unmap{};
+  decltype(&cuMemSetAccess) set_access{};
+  decltype(&cuMemGetAllocationGranularity) granularity{};
+
+  template <class Function>
+  static Function load(const char *name) {
+    void *pointer = nullptr;
+    CUDA_CHECK(cudaGetDriverEntryPoint(
+        name, &pointer, cudaEnableDefault, nullptr));
+    if (!pointer)
+      throw std::runtime_error(std::string("missing CUDA driver entry ") +
+                               name);
+    return reinterpret_cast<Function>(pointer);
+  }
+
+  VmmFunctions()
+      : reserve(load<decltype(reserve)>("cuMemAddressReserve")),
+        free_address(load<decltype(free_address)>("cuMemAddressFree")),
+        create(load<decltype(create)>("cuMemCreate")),
+        release(load<decltype(release)>("cuMemRelease")),
+        map(load<decltype(map)>("cuMemMap")),
+        unmap(load<decltype(unmap)>("cuMemUnmap")),
+        set_access(load<decltype(set_access)>("cuMemSetAccess")),
+        granularity(load<decltype(granularity)>(
+            "cuMemGetAllocationGranularity")) {}
+};
+
+inline VmmFunctions &vmm_functions() {
+  static VmmFunctions functions;
+  return functions;
+}
+
+template <class T> class VirtualBuffer {
+public:
+  VirtualBuffer() = default;
+  VirtualBuffer(std::size_t maximum_count, std::size_t initial_count) {
+    reserve(maximum_count);
+    grow(initial_count);
+  }
+  VirtualBuffer(const VirtualBuffer &) = delete;
+  VirtualBuffer &operator=(const VirtualBuffer &) = delete;
+  VirtualBuffer(VirtualBuffer &&) = delete;
+  VirtualBuffer &operator=(VirtualBuffer &&) = delete;
+  ~VirtualBuffer() { release(); }
+
+  void grow(std::size_t requested_count) {
+    if (requested_count <= size()) return;
+    if (requested_count > maximum_count_)
+      throw std::bad_alloc();
+    std::size_t target_count = requested_count;
+    if (mapped_bytes_) {
+      const std::size_t doubled = std::min(
+          maximum_count_, size() > maximum_count_ / 2u
+              ? maximum_count_ : size() * 2u);
+      target_count = std::max(target_count, doubled);
+    }
+    std::size_t target_bytes = align_up(target_count * sizeof(T));
+    target_bytes = std::min(target_bytes, reserved_bytes_);
+    const std::size_t extension = target_bytes - mapped_bytes_;
+    auto &functions = vmm_functions();
+    CUmemGenericAllocationHandle handle{};
+    GPULSMOPT_CU_CHECK(functions.create(
+        &handle, extension, &property_, 0u));
+    bool mapped = false;
+    try {
+      GPULSMOPT_CU_CHECK(functions.map(
+          address_ + mapped_bytes_, extension, 0u, handle, 0u));
+      mapped = true;
+      CUmemAccessDesc access{};
+      access.location = property_.location;
+      access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+      GPULSMOPT_CU_CHECK(functions.set_access(
+          address_ + mapped_bytes_, extension, &access, 1u));
+    } catch (...) {
+      if (mapped)
+        functions.unmap(address_ + mapped_bytes_, extension);
+      functions.release(handle);
+      throw;
+    }
+    mappings_.push_back({mapped_bytes_, extension, handle});
+    mapped_bytes_ = target_bytes;
+  }
+
+  T *data() {
+    return reinterpret_cast<T *>(static_cast<std::uintptr_t>(address_));
+  }
+  const T *data() const {
+    return reinterpret_cast<const T *>(
+        static_cast<std::uintptr_t>(address_));
+  }
+  std::size_t size() const { return mapped_bytes_ / sizeof(T); }
+  std::size_t resident_bytes() const { return mapped_bytes_; }
+
+private:
+  struct Mapping {
+    std::size_t offset;
+    std::size_t bytes;
+    CUmemGenericAllocationHandle handle;
+  };
+
+  std::size_t align_up(std::size_t bytes) const {
+    return (bytes + granularity_ - 1u) / granularity_ * granularity_;
+  }
+
+  void reserve(std::size_t maximum_count) {
+    if (!maximum_count || maximum_count >
+            std::numeric_limits<std::size_t>::max() / sizeof(T))
+      throw std::bad_alloc();
+    CUDA_CHECK(cudaFree(nullptr));
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    property_.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    property_.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    property_.location.id = device;
+    auto &functions = vmm_functions();
+    GPULSMOPT_CU_CHECK(functions.granularity(
+        &granularity_, &property_, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+    maximum_count_ = maximum_count;
+    reserved_bytes_ = align_up(maximum_count * sizeof(T));
+    GPULSMOPT_CU_CHECK(functions.reserve(
+        &address_, reserved_bytes_, granularity_, 0u, 0u));
+  }
+
+  void release() noexcept {
+    if (!address_) return;
+    auto &functions = vmm_functions();
+    for (auto it = mappings_.rbegin(); it != mappings_.rend(); ++it) {
+      functions.unmap(address_ + it->offset, it->bytes);
+      functions.release(it->handle);
+    }
+    functions.free_address(address_, reserved_bytes_);
+    address_ = 0u;
+    mapped_bytes_ = 0u;
+  }
+
+  CUdeviceptr address_{};
+  std::size_t granularity_{};
+  std::size_t reserved_bytes_{};
+  std::size_t mapped_bytes_{};
+  std::size_t maximum_count_{};
+  CUmemAllocationProp property_{};
+  std::vector<Mapping> mappings_;
 };
 
 __global__ void iota_kernel(std::uint32_t *ids, std::uint32_t count) {
@@ -604,11 +801,12 @@ __global__ void cooperative_section_owned_range_kernel(
     std::uint32_t pending_batches, std::uint32_t active_levels,
     typename Aggregate::State *aggregate_partials) {
   constexpr std::uint32_t kCapacity = 512u;
-  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  using BlockScan =
+      cub::BlockScan<std::uint32_t, kSectionRangeThreads>;
   union Workspace {
     Row merged[kCapacity];
     TaggedRow tagged[kCapacity];
-    uint2 base_rows[kWarpsPerBlock][128u];
+    uint2 base_rows[kSectionRangeWarps][128u];
   };
   __shared__ Row current[kCapacity];
   __shared__ Workspace workspace;
@@ -621,7 +819,7 @@ __global__ void cooperative_section_owned_range_kernel(
       kSectionBaseMaskRows / 32u;
   union BaseMaskWorkspace {
     std::uint32_t section[kSectionBaseMaskWords];
-    std::uint32_t fragments[kWarpsPerBlock][kFragmentBaseMaskWords];
+    std::uint32_t fragments[kSectionRangeWarps][kFragmentBaseMaskWords];
   };
   __shared__ BaseMaskWorkspace base_mask_workspace;
   __shared__ std::uint32_t current_count_shared;
@@ -1092,9 +1290,9 @@ __global__ void cooperative_section_owned_range_kernel(
           aggregate_partials[fragment.original_index] = local;
         if constexpr (Tiled) {
           if (!dynamic_queue_shared)
-            group_begin += kWarpsPerBlock * kGroup;
+            group_begin += kSectionRangeWarps * kGroup;
         } else {
-          group_begin += kWarpsPerBlock * kGroup;
+          group_begin += kSectionRangeWarps * kGroup;
         }
       }
       return;
@@ -1205,9 +1403,9 @@ __global__ void cooperative_section_owned_range_kernel(
     if (lane == 0u)
       aggregate_partials[fragment.original_index] = local;
     if constexpr (Tiled) {
-      if (!dynamic_queue_shared) fragment_index += kWarpsPerBlock;
+      if (!dynamic_queue_shared) fragment_index += kSectionRangeWarps;
     } else {
-      fragment_index += kWarpsPerBlock;
+      fragment_index += kSectionRangeWarps;
     }
   }
 }
@@ -1657,7 +1855,7 @@ __device__ __forceinline__ std::uint32_t lower_bound_full_keys(
 
 __global__ void publish_global_level_descriptors_kernel(
     const std::uint32_t *keys, std::uint32_t count,
-    std::uint32_t arena_offset, std::uint32_t level,
+    std::uint64_t arena_offset, std::uint32_t level,
     Descriptor *descriptors) {
   __shared__ std::uint32_t boundaries[kThreads + 1u];
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1956,19 +2154,16 @@ public:
   };
 
   explicit GPULSMOpt(const DictionaryConfig &config)
-      : batch_capacity_(std::max<std::size_t>(1u, config.batch_capacity)),
-        publication_capacity_(std::min<std::size_t>(
-            gpulsmopt2_detail::kMaximumArenaRows,
-            std::max<std::size_t>(
-                config.max_elements,
-                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch))),
+      : batch_capacity_(std::min(
+            gpulsmopt2_detail::kMaximumOperationTile,
+            std::max<std::size_t>(1u, config.batch_capacity))),
+        publication_capacity_(gpulsmopt2_detail::initial_storage_capacity(
+            config.max_elements, batch_capacity_)),
         local_rank_(gpulsmopt2_detail::kLocalRankEntries),
         base_offsets_(gpulsmopt2_detail::kQuotients + 1u),
-        arena_(std::min<std::size_t>(
-            gpulsmopt2_detail::kMaximumArenaRows,
-            std::max<std::size_t>(
-                config.max_elements,
-                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch))),
+        arena_(gpulsmopt2_detail::maximum_resident_elements<
+                   gpulsmopt2_detail::Row>(),
+               publication_capacity_),
         descriptors_(std::size_t{gpulsmopt2_detail::kQuotients} *
                      gpulsmopt2_detail::kMaximumLevels),
         raw_assignments_(gpulsmopt2_detail::kBatchesPerEpoch *
@@ -1980,7 +2175,9 @@ public:
         raw_signatures_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
                         gpulsmopt2_detail::kQuotients),
         raw_epoch_signatures_(gpulsmopt2_detail::kQuotients),
-        level_keys_(publication_capacity_),
+        level_keys_(gpulsmopt2_detail::maximum_resident_elements<
+                        std::uint32_t>(),
+                    publication_capacity_),
         publication_composite_keys_a_(
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
         publication_composite_keys_b_(
@@ -1989,26 +2186,20 @@ public:
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
         publication_raw_rows_b_(
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
-        publication_keys_a_(publication_capacity_),
-        publication_keys_b_(publication_capacity_),
-        publication_rows_a_(publication_capacity_),
-        publication_rows_b_(publication_capacity_),
+        publication_keys_a_(gpulsmopt2_detail::kMaximumPublicationRows,
+                            publication_capacity_),
+        publication_keys_b_(gpulsmopt2_detail::kMaximumPublicationRows,
+                            publication_capacity_),
+        publication_rows_a_(gpulsmopt2_detail::kMaximumPublicationRows,
+                            publication_capacity_),
+        publication_rows_b_(gpulsmopt2_detail::kMaximumPublicationRows,
+                            publication_capacity_),
         publication_selected_count_(1u),
         publication_batch_offsets_(gpulsmopt2_detail::kBatchesPerEpoch + 1u),
         admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
         admission_cursors_(gpulsmopt2_detail::kQuotients),
-        radix_keys_(batch_capacity_), radix_ids_out_(batch_capacity_),
         range_partials_(gpulsmopt2_detail::kThreads),
         range_overflow_count_(1u) {
-    if (batch_capacity_ >
-        (std::size_t{1} << gpulsmopt2_detail::kBatchPositionBits) - 2u)
-      throw std::invalid_argument("GPULSMOpt batch capacity exceeds logical-position encoding");
-    if (batch_capacity_ >
-        gpulsmopt2_detail::kMaximumArenaRows /
-            gpulsmopt2_detail::kBatchesPerEpoch)
-      throw std::invalid_argument("GPULSMOpt epoch exceeds publication capacity");
-    if (config.max_elements > gpulsmopt2_detail::kMaximumArenaRows)
-      throw std::invalid_argument("GPULSMOpt arena currently supports 2^26 rows");
     std::size_t epoch_capacity =
         batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch;
     publication_age_bits_ = 1u;
@@ -2150,13 +2341,23 @@ public:
 
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
     if (!batch.count) return;
-    if (!batch.queries || !batch.out_values ||
-        batch.count > std::numeric_limits<std::uint32_t>::max())
+    if (!batch.queries || !batch.out_values)
       throw std::invalid_argument("invalid GPULSMOpt lookup");
+    if (batch.count > gpulsmopt2_detail::kMaximumOperationTile) {
+      for (std::size_t begin = 0u; begin < batch.count;
+           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+        const std::size_t count = std::min(
+            batch.count - begin,
+            gpulsmopt2_detail::kMaximumOperationTile);
+        lookup(DeviceLookupBatch{
+            batch.queries + begin, count, batch.out_values + begin,
+            batch.out_found ? batch.out_found + begin : nullptr}, stream);
+      }
+      return;
+    }
     begin_operation(stream);
     const std::uint32_t count = static_cast<std::uint32_t>(batch.count);
     if (count >= gpulsmopt2_detail::kQuotients * 4u) {
-      ensure_radix_buffers(count);
       std::size_t bytes{};
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
           nullptr, bytes, batch.queries, radix_keys_.data(),
@@ -2194,26 +2395,35 @@ public:
 
   void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
     if (!batch.query_count) return;
-    if (!batch.lo || !batch.hi || !batch.out_sums ||
-        batch.query_count > std::numeric_limits<std::uint32_t>::max())
+    if (!batch.lo || !batch.hi || !batch.out_sums)
       throw std::invalid_argument("invalid GPULSMOpt range input");
+    if (batch.query_count > gpulsmopt2_detail::kMaximumOperationTile) {
+      for (std::size_t begin = 0u; begin < batch.query_count;
+           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+        const std::size_t count = std::min(
+            batch.query_count - begin,
+            gpulsmopt2_detail::kMaximumOperationTile);
+        range(DeviceRangeOutputBatch{
+            batch.lo + begin, batch.hi + begin, count,
+            batch.out_sums + begin}, stream);
+      }
+      return;
+    }
     begin_operation(stream);
     const std::uint32_t query_count =
         static_cast<std::uint32_t>(batch.query_count);
-    ensure_range_fragment_query_capacity(query_count);
+    std::size_t scan_bytes{};
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, scan_bytes, range_fragment_counts_.data(),
+        range_fragment_offsets_.data(), query_count + 1u, stream));
+    ensure_range_fragment_query_capacity(query_count, scan_bytes);
     gpulsmopt2_detail::count_range_fragments_kernel<<<
         blocks(std::size_t{query_count} + 1u),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
             batch.lo, batch.hi, query_count,
             range_fragment_counts_.data());
-
-    std::size_t scan_bytes{};
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, scan_bytes, range_fragment_counts_.data(),
-        range_fragment_offsets_.data(), query_count + 1u, stream));
-    ensure_range_temp(scan_bytes);
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        range_temp_.data(), scan_bytes, range_fragment_counts_.data(),
+        range_query_temp_, scan_bytes, range_fragment_counts_.data(),
         range_fragment_offsets_.data(), query_count + 1u, stream));
     std::uint32_t fragment_count{};
     if (query_count == 1u) {
@@ -2233,15 +2443,26 @@ public:
       }
     }
     const bool use_section_owners = query_count > 1u &&
-        (stats_.epochs_published != 0u || pending_batches_ != 0u) &&
         std::uint64_t{fragment_count} >=
             std::uint64_t{gpulsmopt2_detail::kQuotients} *
                 gpulsmopt2_detail::kSectionOwnerMinimumReuse;
-    ensure_range_partial_capacity(fragment_count);
-    if (use_section_owners)
-      ensure_range_section_capacity(fragment_count);
-    else
+    std::size_t section_sort_bytes{}, task_scan_bytes{};
+    if (use_section_owners) {
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          nullptr, section_sort_bytes, range_section_keys_in_.data(),
+          range_section_keys_out_.data(),
+          range_section_fragments_in_.data(),
+          range_section_fragments_out_.data(), fragment_count, 0,
+          32, stream));
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          nullptr, task_scan_bytes, range_section_task_counts_.data(),
+          range_section_task_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, stream));
+      ensure_range_section_capacity(
+          fragment_count, std::max(section_sort_bytes, task_scan_bytes));
+    } else {
       ensure_range_fragment_capacity(fragment_count);
+    }
     if (query_count == 1u) {
       gpulsmopt2_detail::emit_single_range_fragments_kernel<false><<<
           gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
@@ -2275,16 +2496,8 @@ public:
                 range_fragments_.data(), nullptr, nullptr);
     }
     if (use_section_owners) {
-      std::size_t section_sort_bytes{};
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, section_sort_bytes, range_section_keys_in_.data(),
-          range_section_keys_out_.data(),
-          range_section_fragments_in_.data(),
-          range_section_fragments_out_.data(), fragment_count, 0,
-          32, stream));
-      ensure_range_temp(section_sort_bytes);
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          range_temp_.data(), section_sort_bytes,
+          range_section_temp_, section_sort_bytes,
           range_section_keys_in_.data(), range_section_keys_out_.data(),
           range_section_fragments_in_.data(),
           range_section_fragments_out_.data(), fragment_count, 0,
@@ -2319,14 +2532,8 @@ public:
             gpulsmopt2_detail::kThreads, 0, stream>>>(
                 range_section_offsets_.data(),
                 range_section_task_counts_.data());
-        std::size_t task_scan_bytes{};
         CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-            nullptr, task_scan_bytes, range_section_task_counts_.data(),
-            range_section_task_offsets_.data(),
-            gpulsmopt2_detail::kQuotients + 1u, stream));
-        ensure_range_temp(task_scan_bytes);
-        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-            range_temp_.data(), task_scan_bytes,
+            range_section_temp_, task_scan_bytes,
             range_section_task_counts_.data(),
             range_section_task_offsets_.data(),
             gpulsmopt2_detail::kQuotients + 1u, stream));
@@ -2381,9 +2588,19 @@ public:
 
   void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
     if (!batch.count) return;
-    if (!batch.queries || !batch.out_keys ||
-        batch.count > std::numeric_limits<std::uint32_t>::max())
+    if (!batch.queries || !batch.out_keys)
       throw std::invalid_argument("invalid GPULSMOpt successor input");
+    if (batch.count > gpulsmopt2_detail::kMaximumOperationTile) {
+      for (std::size_t begin = 0u; begin < batch.count;
+           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+        const std::size_t count = std::min(
+            batch.count - begin,
+            gpulsmopt2_detail::kMaximumOperationTile);
+        successor(DeviceSuccessorBatch{
+            batch.queries + begin, count, batch.out_keys + begin}, stream);
+      }
+      return;
+    }
     begin_operation(stream);
     gpulsmopt2_detail::successor_with_pending_kernel<<<
         blocks(batch.count), gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -2430,27 +2647,11 @@ public:
         (admission_counts_.size() + admission_cursors_.size()) *
             sizeof(std::uint32_t) +
         admission_temp_.size() * sizeof(std::uint8_t) +
-        radix_keys_.size() * sizeof(std::uint32_t) +
-        radix_ids_out_.size() * sizeof(std::uint32_t) +
-        radix_temp_.size() * sizeof(std::uint8_t) +
+        radix_storage_.size() * sizeof(std::uint8_t) +
         range_partials_.size() * sizeof(unsigned long long) +
-        range_fragment_counts_.size() * sizeof(std::uint32_t) +
-        range_fragment_offsets_.size() * sizeof(std::uint32_t) +
-        range_fragments_.size() * sizeof(gpulsmopt2_detail::RangeFragment) +
-        range_fragment_partials_.size() * sizeof(unsigned long long) +
-        (range_overflow_fragments_.size() + range_overflow_count_.size()) *
-            sizeof(std::uint32_t) +
-        (range_section_keys_in_.size() + range_section_keys_out_.size() +
-         range_section_offsets_.size()) * sizeof(std::uint32_t) +
-        (range_section_fragments_in_.size() +
-         range_section_fragments_out_.size()) *
-            sizeof(gpulsmopt2_detail::SectionRangeFragment) +
-        range_section_tasks_.size() *
-            sizeof(gpulsmopt2_detail::SectionRangeTask) +
-        (range_section_task_counts_.size() +
-         range_section_task_offsets_.size()) * sizeof(std::uint32_t) +
-        range_section_max_fragments_.size() * sizeof(std::uint32_t) +
-        range_temp_.size() * sizeof(std::uint8_t);
+        range_overflow_count_.size() * sizeof(std::uint32_t) +
+        range_query_storage_.size() + range_fragment_storage_.size() +
+        range_section_storage_.size();
   }
 
 private:
@@ -2504,8 +2705,32 @@ private:
                                        merge_bytes, merge_unique_bytes}));
   }
 
-  std::uint32_t allocate_level_span(std::uint32_t count) const {
-    struct Interval { std::uint32_t begin, end; };
+  void ensure_publication_capacity(std::size_t count,
+                                   cudaStream_t stream) {
+    if (count <= publication_capacity_) return;
+    if (count > gpulsmopt2_detail::kMaximumPublicationRows)
+      throw std::bad_alloc();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    publication_keys_a_.grow(count);
+    publication_keys_b_.grow(count);
+    publication_rows_a_.grow(count);
+    publication_rows_b_.grow(count);
+    publication_capacity_ = std::min(
+        {publication_keys_a_.size(), publication_keys_b_.size(),
+         publication_rows_a_.size(), publication_rows_b_.size()});
+    initialize_publication_workspace();
+  }
+
+  void ensure_arena_capacity(std::size_t count, cudaStream_t stream) {
+    if (count <= arena_.size() && count <= level_keys_.size()) return;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    arena_.grow(count);
+    level_keys_.grow(count);
+  }
+
+  std::uint64_t allocate_level_span(std::uint32_t count,
+                                    cudaStream_t stream) {
+    struct Interval { std::uint64_t begin, end; };
     std::vector<Interval> occupied;
     for (std::uint32_t level = 0u;
          level < gpulsmopt2_detail::kMaximumLevels; ++level) {
@@ -2517,14 +2742,15 @@ private:
               [](const Interval &a, const Interval &b) {
                 return a.begin < b.begin;
               });
-    std::uint32_t cursor = 0u;
+    std::uint64_t cursor = 0u;
     for (const Interval &interval : occupied) {
       if (interval.begin >= cursor && interval.begin - cursor >= count)
         return cursor;
       cursor = std::max(cursor, interval.end);
     }
-    if (std::uint64_t{cursor} + count <= arena_.size()) return cursor;
-    throw std::runtime_error("GPULSMOpt publication arena exhausted");
+    const std::size_t required = static_cast<std::size_t>(cursor) + count;
+    ensure_arena_capacity(required, stream);
+    return cursor;
   }
 
   void begin_operation(cudaStream_t stream) {
@@ -2558,10 +2784,27 @@ private:
   void admit(const std::uint32_t *keys, const std::uint32_t *values,
              std::size_t count, bool tombstone, cudaStream_t stream) {
     if (!count) return;
-    if (!keys || (!tombstone && !values) || count > batch_capacity_)
+    if (!keys || (!tombstone && !values))
       throw std::invalid_argument("invalid GPULSMOpt update batch");
     begin_operation(stream);
-    const std::uint32_t n = static_cast<std::uint32_t>(count);
+    std::size_t consumed = 0u;
+    while (consumed < count) {
+      const std::size_t remaining = count - consumed;
+      const std::uint32_t tile_count = static_cast<std::uint32_t>(
+          std::min(remaining, batch_capacity_));
+      admit_tile(keys + consumed,
+                 tombstone ? nullptr : values + consumed,
+                 tile_count, tombstone, stream);
+      consumed += tile_count;
+    }
+    ++stats_.admitted_batches;
+    stats_.admitted_records += count;
+    end_operation(stream);
+  }
+
+  void admit_tile(const std::uint32_t *keys, const std::uint32_t *values,
+                  std::uint32_t n, bool tombstone,
+                  cudaStream_t stream) {
     const std::uint32_t slot = pending_batches_;
     pending_records_ += n;
     std::uint64_t *batch_signatures = raw_signatures_.data() +
@@ -2624,29 +2867,25 @@ private:
     CUDA_CHECK(cudaGetLastError());
     raw_batch_counts_[slot] = n;
     ++pending_batches_;
-    ++stats_.admitted_batches;
-    stats_.admitted_records += count;
     if (pending_batches_ == gpulsmopt2_detail::kBatchesPerEpoch)
       publish_epoch(stream);
-    end_operation(stream);
   }
 
   void publish_epoch(cudaStream_t stream) {
     const std::uint32_t publication_levels =
         levels_for_epochs(stats_.epochs_published + 1u);
     if (publication_levels > gpulsmopt2_detail::kMaximumLevels)
-      throw std::runtime_error("GPULSMOpt descriptor capacity exhausted");
-    if (pending_records_ > publication_capacity_)
-      throw std::runtime_error("GPULSMOpt publication workspace exhausted");
+      throw std::overflow_error("GPULSMOpt epoch counter exhausted");
+    ensure_publication_capacity(pending_records_, stream);
     std::uint32_t carry_levels = 0u;
     while (carry_levels < gpulsmopt2_detail::kMaximumLevels &&
            level_counts_[carry_levels])
       ++carry_levels;
     if (carry_levels == gpulsmopt2_detail::kMaximumLevels)
-      throw std::runtime_error("GPULSMOpt descriptor capacity exhausted");
-    std::uint32_t destination = gpulsmopt2_detail::kInvalid;
+      throw std::overflow_error("GPULSMOpt epoch counter exhausted");
+    std::uint64_t destination = gpulsmopt2_detail::kInvalidOffset;
     if (carry_levels == 0u)
-      destination = allocate_level_span(pending_records_);
+      destination = allocate_level_span(pending_records_, stream);
     std::uint32_t batch_offsets[gpulsmopt2_detail::kBatchesPerEpoch + 1u]{};
     for (std::uint32_t batch = 0u;
          batch < gpulsmopt2_detail::kBatchesPerEpoch; ++batch)
@@ -2695,12 +2934,15 @@ private:
 
     const std::uint32_t destination_level = carry_levels;
     if (carry_levels) {
-      std::uint32_t merged_count = current_count;
+      std::size_t merged_size = current_count;
       for (std::uint32_t level = 0u; level < carry_levels; ++level) {
-        merged_count += level_counts_[level];
+        merged_size += level_counts_[level];
       }
-      if (merged_count > publication_capacity_)
-        throw std::runtime_error("GPULSMOpt publication workspace exhausted");
+      if (merged_size > gpulsmopt2_detail::kMaximumPublicationRows)
+        throw std::bad_alloc();
+      ensure_publication_capacity(merged_size, stream);
+      const std::uint32_t merged_count =
+          static_cast<std::uint32_t>(merged_size);
       bool current_is_a = true;
       std::uint32_t raw_count = current_count;
       for (std::uint32_t level = 0u; level < carry_levels; ++level) {
@@ -2724,7 +2966,7 @@ private:
       }
       for (std::uint32_t level = 0u; level < carry_levels; ++level)
         level_counts_[level] = 0u;
-      destination = allocate_level_span(merged_count);
+      destination = allocate_level_span(merged_count, stream);
       workspace_bytes = publication_temp_.size();
       CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
           publication_temp_.data(), workspace_bytes,
@@ -2762,26 +3004,28 @@ private:
   }
   void ensure_radix_workspace(std::size_t bytes, std::size_t count,
                               cudaStream_t stream) {
-    ensure_radix_buffers(count);
     const std::size_t capacity = std::max(radix_id_capacity_, count);
-    const std::size_t required = aligned_id_bytes(capacity) + bytes;
-    const bool resized = radix_temp_.size() < required;
-    if (resized) radix_temp_.resize(required);
+    const std::size_t ids_bytes = aligned_id_bytes(capacity);
+    const std::size_t required = ids_bytes * 3u + bytes;
+    const bool resized = radix_storage_.size() < required;
+    if (resized) radix_storage_.resize(required);
+    std::uint8_t *storage = radix_storage_.data();
+    radix_keys_.attach(reinterpret_cast<std::uint32_t *>(storage), capacity);
+    radix_ids_out_.attach(
+        reinterpret_cast<std::uint32_t *>(storage + ids_bytes), capacity);
+    radix_input_ids_ =
+        reinterpret_cast<std::uint32_t *>(storage + ids_bytes * 2u);
+    radix_workspace_ = storage + ids_bytes * 3u;
     if (resized || count > radix_id_capacity_) {
       gpulsmopt2_detail::iota_kernel<<<
           blocks(capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
-              reinterpret_cast<std::uint32_t *>(radix_temp_.data()),
-              static_cast<std::uint32_t>(capacity));
+              radix_input_ids_, static_cast<std::uint32_t>(capacity));
       CUDA_CHECK(cudaGetLastError());
     }
     radix_id_capacity_ = capacity;
   }
-  std::uint32_t *radix_input_ids() {
-    return reinterpret_cast<std::uint32_t *>(radix_temp_.data());
-  }
-  void *radix_workspace() {
-    return radix_temp_.data() + aligned_id_bytes(radix_id_capacity_);
-  }
+  std::uint32_t *radix_input_ids() { return radix_input_ids_; }
+  void *radix_workspace() { return radix_workspace_; }
   template <bool HasPending, bool Tiled>
   void launch_section_ranges(std::uint32_t maximum_tasks,
                              cudaStream_t stream) {
@@ -2793,7 +3037,7 @@ private:
         : nullptr;
     gpulsmopt2_detail::cooperative_section_owned_range_kernel<
         gpulsmopt2_detail::SumRowsAggregate, HasPending, Tiled>
-        <<<grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
+        <<<grid, gpulsmopt2_detail::kSectionRangeThreads, 0, stream>>>(
             range_section_fragments_out_.data(),
             range_section_offsets_.data(), tasks, task_count,
             base_keys_.data(), base_values_.data(), base_offsets_.data(),
@@ -2834,54 +3078,98 @@ private:
             active_levels_,
             range_fragment_partials_.data());
   }
-  void ensure_range_temp(std::size_t bytes) {
-    if (range_temp_.size() < bytes) range_temp_.resize(bytes);
+  static std::size_t aligned_range_bytes(std::size_t bytes) {
+    return (bytes + 255u) & ~std::size_t{255u};
   }
-  void ensure_range_fragment_query_capacity(std::size_t count) {
-    if (range_fragment_counts_.size() >= count + 1u) return;
-    range_fragment_counts_.resize(count + 1u);
-    range_fragment_offsets_.resize(count + 1u);
+  template <class T>
+  static void attach_range_view(gpulsmopt2_detail::Buffer<T> &view,
+                                std::uint8_t *storage,
+                                std::size_t &offset,
+                                std::size_t count) {
+    offset = aligned_range_bytes(offset);
+    view.attach(reinterpret_cast<T *>(storage + offset), count);
+    offset += count * sizeof(T);
+  }
+  void ensure_range_fragment_query_capacity(std::size_t count,
+                                            std::size_t temp_bytes) {
+    const std::size_t entries = count + 1u;
+    const std::size_t view_bytes = aligned_range_bytes(
+        entries * sizeof(std::uint32_t));
+    const std::size_t bytes = view_bytes * 2u +
+        aligned_range_bytes(temp_bytes);
+    if (range_query_storage_.size() < bytes)
+      range_query_storage_.resize(bytes);
+    std::size_t offset = 0u;
+    attach_range_view(range_fragment_counts_, range_query_storage_.data(),
+                      offset, entries);
+    attach_range_view(range_fragment_offsets_, range_query_storage_.data(),
+                      offset, entries);
+    offset = aligned_range_bytes(offset);
+    range_query_temp_ = range_query_storage_.data() + offset;
   }
   void ensure_range_fragment_capacity(std::size_t count) {
-    if (range_fragments_.size() >= count) return;
-    range_fragments_.resize(count);
-    range_overflow_fragments_.resize(count);
+    if (range_fragments_.size() >= count &&
+        range_fragment_partials_.size() >= count) return;
+    std::size_t bytes = 0u;
+    bytes += aligned_range_bytes(
+        count * sizeof(gpulsmopt2_detail::RangeFragment));
+    bytes += aligned_range_bytes(count * sizeof(std::uint32_t));
+    bytes += aligned_range_bytes(count * sizeof(unsigned long long));
+    range_fragment_storage_.resize(bytes);
+    std::size_t offset = 0u;
+    attach_range_view(range_fragments_, range_fragment_storage_.data(),
+                      offset, count);
+    attach_range_view(range_overflow_fragments_,
+                      range_fragment_storage_.data(), offset, count);
+    attach_range_view(range_fragment_partials_,
+                      range_fragment_storage_.data(), offset, count);
   }
-  void ensure_range_partial_capacity(std::size_t count) {
-    if (range_fragment_partials_.size() < count)
-      range_fragment_partials_.resize(count);
-  }
-  void ensure_range_section_capacity(std::size_t count) {
-    if (range_section_keys_in_.size() < count) {
-      range_section_keys_in_.resize(count);
-      range_section_keys_out_.resize(count);
-      range_section_fragments_in_.resize(count);
-      range_section_fragments_out_.resize(count);
-    }
-    if (range_section_offsets_.size() < gpulsmopt2_detail::kQuotients + 1u)
-      range_section_offsets_.resize(gpulsmopt2_detail::kQuotients + 1u);
+  void ensure_range_section_capacity(std::size_t count,
+                                     std::size_t temp_bytes) {
+    if (range_section_keys_in_.size() >= count &&
+        range_fragment_partials_.size() >= count &&
+        range_section_temp_bytes_ >= temp_bytes) return;
+    constexpr std::size_t sections =
+        gpulsmopt2_detail::kQuotients + 1u;
     const std::size_t maximum_tasks = gpulsmopt2_detail::kQuotients +
         (count + gpulsmopt2_detail::kSectionTaskFragments - 1u) /
             gpulsmopt2_detail::kSectionTaskFragments;
-    if (range_section_tasks_.size() < maximum_tasks)
-      range_section_tasks_.resize(maximum_tasks);
-    if (range_section_task_offsets_.size() <
-        gpulsmopt2_detail::kQuotients + 1u)
-      range_section_task_offsets_.resize(
-          gpulsmopt2_detail::kQuotients + 1u);
-    if (range_section_task_counts_.size() <
-        gpulsmopt2_detail::kQuotients + 1u)
-      range_section_task_counts_.resize(
-          gpulsmopt2_detail::kQuotients + 1u);
-    if (!range_section_max_fragments_.size())
-      range_section_max_fragments_.resize(1u);
+    std::size_t bytes = 0u;
+    bytes += aligned_range_bytes(count * sizeof(std::uint32_t)) * 2u;
+    bytes += aligned_range_bytes(
+        count * sizeof(gpulsmopt2_detail::SectionRangeFragment)) * 2u;
+    bytes += aligned_range_bytes(count * sizeof(unsigned long long));
+    bytes += aligned_range_bytes(sections * sizeof(std::uint32_t)) * 3u;
+    bytes += aligned_range_bytes(
+        maximum_tasks * sizeof(gpulsmopt2_detail::SectionRangeTask));
+    bytes += aligned_range_bytes(sizeof(std::uint32_t));
+    bytes += aligned_range_bytes(temp_bytes);
+    range_section_storage_.resize(bytes);
+    std::size_t offset = 0u;
+    attach_range_view(range_section_keys_in_, range_section_storage_.data(),
+                      offset, count);
+    attach_range_view(range_section_keys_out_, range_section_storage_.data(),
+                      offset, count);
+    attach_range_view(range_section_fragments_in_,
+                      range_section_storage_.data(), offset, count);
+    attach_range_view(range_section_fragments_out_,
+                      range_section_storage_.data(), offset, count);
+    attach_range_view(range_fragment_partials_, range_section_storage_.data(),
+                      offset, count);
+    attach_range_view(range_section_offsets_, range_section_storage_.data(),
+                      offset, sections);
+    attach_range_view(range_section_task_offsets_,
+                      range_section_storage_.data(), offset, sections);
+    attach_range_view(range_section_task_counts_,
+                      range_section_storage_.data(), offset, sections);
+    attach_range_view(range_section_tasks_, range_section_storage_.data(),
+                      offset, maximum_tasks);
+    attach_range_view(range_section_max_fragments_,
+                      range_section_storage_.data(), offset, 1u);
+    offset = aligned_range_bytes(offset);
+    range_section_temp_ = range_section_storage_.data() + offset;
+    range_section_temp_bytes_ = temp_bytes;
   }
-  void ensure_radix_buffers(std::size_t count) {
-    if (radix_keys_.size() >= count) return;
-    radix_keys_.resize(count);
-    radix_ids_out_.resize(count);
-  }
-
   std::size_t batch_capacity_{};
   std::size_t publication_capacity_{};
   std::uint32_t publication_age_bits_{};
@@ -2889,41 +3177,49 @@ private:
   std::uint32_t pending_records_{};
   std::uint32_t active_levels_{};
   std::size_t radix_id_capacity_{};
+  std::uint32_t *radix_input_ids_{};
+  void *radix_workspace_{};
+  std::uint8_t *range_query_temp_{};
+  std::uint8_t *range_section_temp_{};
+  std::size_t range_section_temp_bytes_{};
   MaintenanceStats stats_{};
   cudaEvent_t operation_done_{};
 
   gpulsmopt2_detail::Buffer<std::uint16_t> base_keys_;
   gpulsmopt2_detail::Buffer<std::uint32_t> base_values_, base_offsets_;
   gpulsmopt2_detail::Buffer<std::uint16_t> local_rank_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> arena_;
+  gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row> arena_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment> raw_assignments_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_full_keys_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_signatures_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_epoch_signatures_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> level_keys_;
+  gpulsmopt2_detail::VirtualBuffer<std::uint32_t> level_keys_;
   gpulsmopt2_detail::Buffer<std::uint64_t> publication_composite_keys_a_,
       publication_composite_keys_b_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> publication_raw_rows_a_,
       publication_raw_rows_b_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> publication_keys_a_,
-      publication_keys_b_, publication_selected_count_,
+  gpulsmopt2_detail::VirtualBuffer<std::uint32_t> publication_keys_a_,
+      publication_keys_b_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> publication_selected_count_,
       publication_batch_offsets_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> publication_rows_a_,
-      publication_rows_b_;
+  gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row>
+      publication_rows_a_, publication_rows_b_;
   gpulsmopt2_detail::Buffer<std::uint8_t> publication_temp_;
   gpulsmopt2_detail::Buffer<std::uint32_t> admission_counts_,
       admission_cursors_;
   gpulsmopt2_detail::Buffer<std::uint8_t> admission_temp_;
   std::uint32_t level_counts_[gpulsmopt2_detail::kMaximumLevels]{};
-  std::uint32_t level_offsets_[gpulsmopt2_detail::kMaximumLevels]{};
+  std::uint64_t level_offsets_[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint32_t raw_batch_counts_[gpulsmopt2_detail::kBatchesPerEpoch]{};
 
+  gpulsmopt2_detail::Buffer<std::uint8_t> radix_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
-  gpulsmopt2_detail::Buffer<std::uint8_t> radix_temp_;
 
   gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
+  gpulsmopt2_detail::Buffer<std::uint8_t> range_query_storage_,
+      range_fragment_storage_, range_section_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_fragment_counts_,
       range_fragment_offsets_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RangeFragment> range_fragments_;
@@ -2939,5 +3235,4 @@ private:
   gpulsmopt2_detail::Buffer<std::uint32_t> range_section_task_counts_,
       range_section_task_offsets_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_section_max_fragments_;
-  gpulsmopt2_detail::Buffer<std::uint8_t> range_temp_;
 };
