@@ -54,8 +54,9 @@ constexpr std::uint64_t kDescriptorOffsetMask =
 constexpr std::uint64_t kInvalidOffset =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
-constexpr std::uint32_t kDirectAdmissionMinimum = kQuotients / 8u;
-constexpr std::uint32_t kDirectAdmissionMaximum = kQuotients * 4u;
+constexpr std::uint32_t kDirectAdmissionMinimum = kQuotients / 16u;
+constexpr std::uint32_t kDirectAdmissionMaximum =
+    kQuotients * 8u;
 
 inline std::size_t initial_storage_capacity(
     std::size_t requested, std::size_t tile_capacity) {
