@@ -5,9 +5,11 @@
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_merge.cuh>
+#include <cub/device/device_reduce.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/iterator/counting_input_iterator.cuh>
+#include <thrust/iterator/transform_output_iterator.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -139,11 +141,17 @@ struct TaggedRow {
 
 static_assert(sizeof(TaggedRow) == 12u);
 
-struct SameFullKey {
-  std::uint32_t age_bits = 32u;
-  __host__ __device__ bool operator()(std::uint64_t first,
-                                      std::uint64_t second) const {
-    return (first >> age_bits) == (second >> age_bits);
+struct NewestAssignment {
+  __host__ __device__ RawAssignment operator()(
+      const RawAssignment &first, const RawAssignment &second) const {
+    return second.logical_position > first.logical_position
+        ? second : first;
+  }
+};
+
+struct AssignmentRow {
+  __host__ __device__ Row operator()(const RawAssignment &assignment) const {
+    return assignment.row;
   }
 };
 
@@ -1682,8 +1690,8 @@ __device__ __forceinline__ std::uint64_t pending_signature_bits(
 __global__ void count_admission_quotients_kernel(
     const std::uint32_t *keys, std::uint32_t count,
     std::uint32_t *quotient_counts,
-    std::uint64_t *batch_signatures,
-    std::uint64_t *epoch_signatures) {
+    std::uint32_t *reservation_ranks,
+    std::uint64_t *batch_signatures) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const std::uint32_t key = keys[i];
@@ -1692,8 +1700,12 @@ __global__ void count_admission_quotients_kernel(
   const unsigned peers = __match_any_sync(active, quotient);
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t leader = __ffs(peers) - 1u;
+  std::uint32_t base = 0u;
   if (lane == leader)
-    atomicAdd(quotient_counts + quotient, __popc(peers));
+    base = atomicAdd(quotient_counts + quotient, __popc(peers));
+  base = __shfl_sync(peers, base, leader);
+  const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+  reservation_ranks[i] = base + __popc(peers & before);
   const std::uint64_t bits = pending_signature_bits(key);
   const std::uint32_t low = __reduce_or_sync(
       peers, static_cast<std::uint32_t>(bits));
@@ -1705,36 +1717,33 @@ __global__ void count_admission_quotients_kernel(
         (static_cast<unsigned long long>(high) << 32u);
     atomicOr(reinterpret_cast<unsigned long long *>(
                  batch_signatures + quotient), aggregate);
-    atomicOr(reinterpret_cast<unsigned long long *>(
-                 epoch_signatures + quotient), aggregate);
   }
 }
 
-__global__ void initialize_admission_cursors_kernel(
-    const std::uint32_t *offsets, std::uint32_t *cursors) {
+__global__ void commit_admission_metadata_kernel(
+    std::uint32_t *counts, const std::uint64_t *batch_signatures,
+    std::uint64_t *epoch_signatures) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q < kQuotients) cursors[q] = offsets[q];
+  if (q >= kQuotients) return;
+  const std::uint64_t signature = batch_signatures[q];
+  if (signature)
+    atomicOr(reinterpret_cast<unsigned long long *>(epoch_signatures + q),
+             static_cast<unsigned long long>(signature));
+  counts[q] = 0u;
 }
 
 __global__ void scatter_admission_records_kernel(
     const std::uint32_t *keys, const std::uint32_t *values,
     std::uint32_t count, std::uint32_t batch_slot, bool tombstone,
-    std::uint32_t *cursors, RawAssignment *destination,
+    const std::uint32_t *offsets, const std::uint32_t *reservation_ranks,
+    RawAssignment *destination,
     std::uint32_t *destination_full_keys) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const std::uint32_t key = keys[i];
   const std::uint32_t quotient = key >> 16u;
-  const unsigned active = __activemask();
-  const unsigned peers = __match_any_sync(active, quotient);
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t leader = __ffs(peers) - 1u;
-  std::uint32_t base = 0u;
-  if (lane == leader)
-    base = atomicAdd(cursors + quotient, __popc(peers));
-  base = __shfl_sync(peers, base, leader);
-  const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
-  const std::uint32_t output = base + __popc(peers & before);
+  const std::uint32_t output =
+      offsets[quotient] + reservation_ranks[i];
   destination[output] = {
       make_row(key, tombstone ? 0u : values[i],
                tombstone ? kTombstone : 0u),
@@ -1761,7 +1770,7 @@ __global__ void finalize_quotient_metadata_kernel(
 __global__ void pack_publication_epoch_kernel(
     const RawAssignment *assignments, const std::uint32_t *full_keys,
     std::uint32_t batch_stride, const std::uint32_t *batch_offsets,
-    std::uint32_t age_bits, std::uint64_t *keys, Row *rows) {
+    std::uint32_t *keys, RawAssignment *output_assignments) {
   const std::uint32_t batch = blockIdx.y;
   const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t count =
@@ -1770,21 +1779,8 @@ __global__ void pack_publication_epoch_kernel(
   const std::uint32_t source = batch * batch_stride + position;
   const std::uint32_t output = batch_offsets[batch] + position;
   const RawAssignment item = assignments[source];
-  const std::uint32_t age =
-      raw_age(item.logical_position, batch_stride) - kMaximumLevels;
-  const std::uint64_t inverse_age =
-      ((std::uint64_t{1} << age_bits) - 1u) - age;
-  keys[output] =
-      (std::uint64_t{full_keys[source]} << age_bits) | inverse_age;
-  rows[output] = item.row;
-}
-
-__global__ void normalize_publication_keys_kernel(
-    const std::uint64_t *composite_keys, std::uint32_t *keys,
-    const std::uint32_t *count, std::uint32_t age_bits) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < *count)
-    keys[i] = static_cast<std::uint32_t>(composite_keys[i] >> age_bits);
+  keys[output] = full_keys[source];
+  output_assignments[output] = item;
 }
 
 __device__ __forceinline__ std::uint32_t lower_bound_full_keys(
@@ -2115,13 +2111,13 @@ public:
         level_keys_(gpulsmopt2_detail::maximum_resident_elements<
                         std::uint32_t>(),
                     publication_capacity_),
-        publication_composite_keys_a_(
+        publication_epoch_keys_a_(
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
-        publication_composite_keys_b_(
+        publication_epoch_keys_b_(
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
-        publication_raw_rows_a_(
+        publication_epoch_assignments_a_(
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
-        publication_raw_rows_b_(
+        publication_epoch_assignments_b_(
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
         publication_keys_a_(gpulsmopt2_detail::kMaximumPublicationRows,
                             publication_capacity_),
@@ -2134,14 +2130,8 @@ public:
         publication_selected_count_(1u),
         publication_batch_offsets_(gpulsmopt2_detail::kBatchesPerEpoch + 1u),
         admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
-        admission_cursors_(gpulsmopt2_detail::kQuotients),
         range_partials_(gpulsmopt2_detail::kThreads),
         range_overflow_count_(1u) {
-    std::size_t epoch_capacity =
-        batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch;
-    publication_age_bits_ = 1u;
-    while ((std::size_t{1} << publication_age_bits_) < epoch_capacity)
-      ++publication_age_bits_;
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
     std::size_t initial_sort_bytes{};
@@ -2550,17 +2540,18 @@ public:
         raw_signatures_.size() * sizeof(std::uint64_t) +
         raw_epoch_signatures_.size() * sizeof(std::uint64_t) +
         level_keys_.size() * sizeof(std::uint32_t) +
-        (publication_composite_keys_a_.size() +
-         publication_composite_keys_b_.size()) * sizeof(std::uint64_t) +
-        (publication_raw_rows_a_.size() +
-         publication_raw_rows_b_.size() + publication_rows_a_.size() +
-         publication_rows_b_.size()) * sizeof(gpulsmopt2_detail::Row) +
+        (publication_epoch_keys_a_.size() +
+         publication_epoch_keys_b_.size()) * sizeof(std::uint32_t) +
+        (publication_epoch_assignments_a_.size() +
+         publication_epoch_assignments_b_.size()) *
+            sizeof(gpulsmopt2_detail::RawAssignment) +
+        (publication_rows_a_.size() + publication_rows_b_.size()) *
+            sizeof(gpulsmopt2_detail::Row) +
         (publication_keys_a_.size() + publication_keys_b_.size() +
          publication_selected_count_.size() +
          publication_batch_offsets_.size()) * sizeof(std::uint32_t) +
         publication_temp_.size() * sizeof(std::uint8_t) +
-        (admission_counts_.size() + admission_cursors_.size()) *
-            sizeof(std::uint32_t) +
+        admission_counts_.size() * sizeof(std::uint32_t) +
         admission_temp_.size() * sizeof(std::uint8_t) +
         radix_storage_.size() * sizeof(std::uint8_t) +
         range_partials_.size() * sizeof(unsigned long long) +
@@ -2635,21 +2626,20 @@ private:
         batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
     const std::uint32_t capacity =
         static_cast<std::uint32_t>(publication_capacity_);
-    std::size_t sort_bytes{}, raw_unique_bytes{}, merge_bytes{};
+    std::size_t sort_bytes{}, raw_reduce_bytes{}, merge_bytes{};
     std::size_t merge_unique_bytes{};
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, sort_bytes, publication_composite_keys_a_.data(),
-        publication_composite_keys_b_.data(),
-        publication_raw_rows_a_.data(), publication_raw_rows_b_.data(),
-        epoch_capacity, 0, 32 + publication_age_bits_, 0));
-    CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
-        nullptr, raw_unique_bytes,
-        publication_composite_keys_b_.data(),
-        publication_raw_rows_b_.data(),
-        publication_composite_keys_a_.data(),
-        publication_rows_a_.data(), publication_selected_count_.data(),
-        epoch_capacity,
-        gpulsmopt2_detail::SameFullKey{publication_age_bits_}, 0));
+        nullptr, sort_bytes, publication_epoch_keys_a_.data(),
+        publication_epoch_keys_b_.data(),
+        publication_epoch_assignments_a_.data(),
+        publication_epoch_assignments_b_.data(), epoch_capacity, 0, 32, 0));
+    auto row_output = thrust::make_transform_output_iterator(
+        publication_rows_a_.data(), gpulsmopt2_detail::AssignmentRow{});
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+        nullptr, raw_reduce_bytes, publication_epoch_keys_b_.data(),
+        publication_keys_a_.data(), publication_epoch_assignments_b_.data(),
+        row_output, publication_selected_count_.data(),
+        gpulsmopt2_detail::NewestAssignment{}, epoch_capacity, 0));
     const std::uint32_t first = capacity / 2u;
     const std::uint32_t second = capacity - first;
     CUDA_CHECK(cub::DeviceMerge::MergePairs(
@@ -2662,7 +2652,7 @@ private:
         publication_rows_b_.data(), publication_keys_a_.data(),
         publication_rows_a_.data(), publication_selected_count_.data(),
         capacity, cuda::std::equal_to<>{}, 0));
-    publication_temp_.resize(std::max({sort_bytes, raw_unique_bytes,
+    publication_temp_.resize(std::max({sort_bytes, raw_reduce_bytes,
                                        merge_bytes, merge_unique_bytes}));
   }
 
@@ -2733,6 +2723,9 @@ private:
     CUDA_CHECK(cudaMemsetAsync(
         raw_epoch_signatures_.data(), 0,
         raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        admission_counts_.data(), 0,
+        admission_counts_.size() * sizeof(std::uint32_t), stream));
     pending_batches_ = 0u;
     pending_records_ = 0u;
     active_levels_ = 0u;
@@ -2779,25 +2772,23 @@ private:
         n >= gpulsmopt2_detail::kDirectAdmissionMinimum &&
         n <= gpulsmopt2_detail::kDirectAdmissionMaximum;
     if (direct) {
-      CUDA_CHECK(cudaMemsetAsync(
-          admission_counts_.data(), 0,
-          admission_counts_.size() * sizeof(std::uint32_t), stream));
       gpulsmopt2_detail::count_admission_quotients_kernel<<<
           blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
-              keys, n, admission_counts_.data(), batch_signatures,
-              raw_epoch_signatures_.data());
+              keys, n, admission_counts_.data(), radix_ids_out_.data(),
+              batch_signatures);
       std::size_t scan_bytes = admission_temp_.size();
       CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
           admission_temp_.data(), scan_bytes, admission_counts_.data(),
           batch_offsets, gpulsmopt2_detail::kQuotients + 1u, stream));
-      gpulsmopt2_detail::initialize_admission_cursors_kernel<<<
+      gpulsmopt2_detail::commit_admission_metadata_kernel<<<
           gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
           gpulsmopt2_detail::kThreads, 0, stream>>>(
-              batch_offsets, admission_cursors_.data());
+              admission_counts_.data(), batch_signatures,
+              raw_epoch_signatures_.data());
       gpulsmopt2_detail::scatter_admission_records_kernel<<<
           blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
               keys, values, n, slot, tombstone,
-              admission_cursors_.data(),
+              batch_offsets, radix_ids_out_.data(),
               raw_assignments_.data() +
                   std::size_t{slot} * batch_capacity_,
               raw_full_keys_.data() +
@@ -2862,38 +2853,34 @@ private:
         publication_grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
             raw_assignments_.data(), raw_full_keys_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
-            publication_batch_offsets_.data(), publication_age_bits_,
-            publication_composite_keys_a_.data(),
-            publication_raw_rows_a_.data());
+            publication_batch_offsets_.data(),
+            publication_epoch_keys_a_.data(),
+            publication_epoch_assignments_a_.data());
     std::size_t workspace_bytes = publication_temp_.size();
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         publication_temp_.data(), workspace_bytes,
-        publication_composite_keys_a_.data(),
-        publication_composite_keys_b_.data(),
-        publication_raw_rows_a_.data(), publication_raw_rows_b_.data(),
-        pending_records_, 0, 32 + publication_age_bits_, stream));
-    workspace_bytes = publication_temp_.size();
-    CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
-        publication_temp_.data(), workspace_bytes,
-        publication_composite_keys_b_.data(),
-        publication_raw_rows_b_.data(),
-        publication_composite_keys_a_.data(),
+        publication_epoch_keys_a_.data(), publication_epoch_keys_b_.data(),
+        publication_epoch_assignments_a_.data(),
+        publication_epoch_assignments_b_.data(), pending_records_, 0, 32,
+        stream));
+    auto row_output = thrust::make_transform_output_iterator(
         carry_levels ? publication_rows_a_.data()
                      : arena_.data() + destination,
-        publication_selected_count_.data(), pending_records_,
-        gpulsmopt2_detail::SameFullKey{publication_age_bits_}, stream));
+        gpulsmopt2_detail::AssignmentRow{});
+    workspace_bytes = publication_temp_.size();
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+        publication_temp_.data(), workspace_bytes,
+        publication_epoch_keys_b_.data(),
+        carry_levels ? publication_keys_a_.data()
+                     : level_keys_.data() + destination,
+        publication_epoch_assignments_b_.data(), row_output,
+        publication_selected_count_.data(),
+        gpulsmopt2_detail::NewestAssignment{}, pending_records_, stream));
     std::uint32_t current_count{};
     CUDA_CHECK(cudaMemcpyAsync(
         &current_count, publication_selected_count_.data(),
         sizeof(current_count), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    gpulsmopt2_detail::normalize_publication_keys_kernel<<<
-        blocks(current_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
-            publication_composite_keys_a_.data(),
-            carry_levels ? publication_keys_a_.data()
-                         : level_keys_.data() + destination,
-            publication_selected_count_.data(), publication_age_bits_);
-
     const std::uint32_t destination_level = carry_levels;
     if (carry_levels) {
       std::size_t merged_size = current_count;
@@ -3137,7 +3124,6 @@ private:
   }
   std::size_t batch_capacity_{};
   std::size_t publication_capacity_{};
-  std::uint32_t publication_age_bits_{};
   std::uint32_t pending_batches_{};
   std::uint32_t pending_records_{};
   std::uint32_t active_levels_{};
@@ -3159,10 +3145,10 @@ private:
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_signatures_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_epoch_signatures_;
   gpulsmopt2_detail::VirtualBuffer<std::uint32_t> level_keys_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> publication_composite_keys_a_,
-      publication_composite_keys_b_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Row> publication_raw_rows_a_,
-      publication_raw_rows_b_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> publication_epoch_keys_a_,
+      publication_epoch_keys_b_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment>
+      publication_epoch_assignments_a_, publication_epoch_assignments_b_;
   gpulsmopt2_detail::VirtualBuffer<std::uint32_t> publication_keys_a_,
       publication_keys_b_;
   gpulsmopt2_detail::Buffer<std::uint32_t> publication_selected_count_,
@@ -3170,8 +3156,7 @@ private:
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row>
       publication_rows_a_, publication_rows_b_;
   gpulsmopt2_detail::Buffer<std::uint8_t> publication_temp_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> admission_counts_,
-      admission_cursors_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> admission_counts_;
   gpulsmopt2_detail::Buffer<std::uint8_t> admission_temp_;
   std::uint32_t level_counts_[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint64_t level_offsets_[gpulsmopt2_detail::kMaximumLevels]{};
