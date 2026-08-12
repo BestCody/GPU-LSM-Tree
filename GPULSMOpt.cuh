@@ -34,7 +34,7 @@ namespace gpulsmopt2_detail {
 constexpr std::uint32_t kQuotients = 1u << 16u;
 constexpr std::uint32_t kMaximumLevels = 64u;
 constexpr std::uint32_t kBatchesPerEpoch = 16u;
-constexpr std::uint32_t kBatchPositionBits = 28u;
+constexpr std::uint32_t kBatchPositionBits = 20u;
 constexpr std::uint32_t kLocalRankBits = 7u;
 constexpr std::uint32_t kLocalRankEntries =
     kQuotients * (1u << kLocalRankBits);
@@ -46,6 +46,8 @@ constexpr std::uint32_t kInvalid = 0xffffffffu;
 constexpr std::uint32_t kInvalidAge = 0xffffffffu;
 constexpr std::uint32_t kTombstone = 1u;
 constexpr std::size_t kMaximumOperationTile = std::size_t{1} << 20u;
+static_assert(kMaximumOperationTile <=
+              (std::size_t{1} << kBatchPositionBits));
 constexpr std::size_t kMaximumPublicationRows =
     std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t kDescriptorOffsetBits = 47u;
@@ -99,12 +101,34 @@ __host__ __device__ __forceinline__ std::uint32_t raw_age(
 }
 
 struct RawAssignment {
-  Row row;
-  std::uint32_t logical_position;
+  std::uint32_t key;
+  std::uint32_t value;
+  std::uint32_t metadata;
 };
 
 static_assert(sizeof(Row) == 8u);
 static_assert(sizeof(RawAssignment) == 12u);
+
+constexpr std::uint32_t kRawTombstone = 0x80000000u;
+
+__host__ __device__ __forceinline__ RawAssignment make_raw_assignment(
+    std::uint32_t key, std::uint32_t value,
+    std::uint32_t logical_position, bool tombstone) {
+  return {key, tombstone ? 0u : value,
+          logical_position | (tombstone ? kRawTombstone : 0u)};
+}
+
+__host__ __device__ __forceinline__ std::uint32_t raw_position(
+    const RawAssignment &assignment) {
+  return assignment.metadata & ~kRawTombstone;
+}
+
+__host__ __device__ __forceinline__ Row raw_row(
+    const RawAssignment &assignment) {
+  return make_row(assignment.key, assignment.value,
+                  assignment.metadata & kRawTombstone
+                      ? kTombstone : 0u);
+}
 
 template <class T> inline std::size_t maximum_resident_elements() {
   std::size_t free_bytes{}, total_bytes{};
@@ -145,14 +169,14 @@ static_assert(sizeof(TaggedRow) == 12u);
 struct NewestAssignment {
   __host__ __device__ RawAssignment operator()(
       const RawAssignment &first, const RawAssignment &second) const {
-    return second.logical_position > first.logical_position
+    return raw_position(second) > raw_position(first)
         ? second : first;
   }
 };
 
 struct AssignmentRow {
   __host__ __device__ Row operator()(const RawAssignment &assignment) const {
-    return assignment.row;
+    return raw_row(assignment);
   }
 };
 
@@ -415,7 +439,7 @@ __device__ RawAssignment load_pending_raw_ordinal(
       return assignments[batch * batch_stride + begin + ordinal];
     ordinal -= count;
   }
-  return {{0u, 0u, 0u}, 0u};
+  return {};
 }
 
 __device__ __forceinline__ std::uint32_t lower_bound_rows(
@@ -614,7 +638,8 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
     for (std::uint32_t index = section_begin + lane; index < section_end;
          index += 32u) {
       const RawAssignment item = rows[index];
-      if (item.row.key < low_suffix || item.row.key > high_suffix) continue;
+      const Row item_row = raw_row(item);
+      if (item_row.key < low_suffix || item_row.key > high_suffix) continue;
       bool covered = false;
       for (std::uint32_t other_batch = 0u;
            other_batch < pending_batches && !covered; ++other_batch) {
@@ -624,15 +649,15 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
         const RawAssignment *other_rows = raw + other_batch * batch_stride;
         for (std::uint32_t other = nb; other < ne; ++other) {
           const RawAssignment candidate = other_rows[other];
-          if (candidate.row.key == item.row.key &&
-              candidate.logical_position > item.logical_position) {
+          if (key_suffix(candidate.key) == item_row.key &&
+              raw_position(candidate) > raw_position(item)) {
             covered = true;
             break;
           }
         }
       }
-      if (!covered && (item.row.flags & kTombstone) == 0u)
-        local += item.row.value;
+      if (!covered && (item_row.flags & kTombstone) == 0u)
+        local += item_row.value;
     }
   }
 
@@ -654,7 +679,7 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
         const std::uint32_t rb = raw_offsets[oi], re = raw_offsets[oi + 1u];
         const RawAssignment *pending_rows = raw + batch * batch_stride;
         for (std::uint32_t position = rb; position < re; ++position)
-          if (pending_rows[position].row.key == item.key) {
+          if (key_suffix(pending_rows[position].key) == item.key) {
             covered = true;
             break;
           }
@@ -846,8 +871,8 @@ __global__ void cooperative_section_owned_range_kernel(
         if (lane < pending_count) {
           const RawAssignment loaded = load_pending_raw_ordinal(
               raw, raw_offsets, batch_stride, pending_batches, q, lane);
-          item = {loaded.row,
-                  raw_age(loaded.logical_position, batch_stride)};
+          item = {raw_row(loaded),
+                  raw_age(raw_position(loaded), batch_stride)};
         }
         constexpr unsigned full_mask = 0xffffffffu;
         for (std::uint32_t width = 2u; width <= 32u; width <<= 1u) {
@@ -889,8 +914,8 @@ __global__ void cooperative_section_owned_range_kernel(
           const RawAssignment loaded = load_pending_raw_ordinal(
               raw, raw_offsets, batch_stride, pending_batches, q, ordinal);
           workspace.tagged[ordinal] =
-              {loaded.row,
-               raw_age(loaded.logical_position, batch_stride)};
+              {raw_row(loaded),
+               raw_age(raw_position(loaded), batch_stride)};
         } else {
           workspace.tagged[ordinal] = {{0u, 0u, 0u}, kInvalidAge};
         }
@@ -1421,14 +1446,14 @@ __global__ void warp_range_fragment_kernel(
         const std::uint32_t position = chunk + lane;
         RawAssignment item{};
         const bool valid = position < end &&
-            ((item = raw[batch * batch_stride + position]).row.key >=
-             low_suffix) && item.row.key <= high_suffix;
+            (key_suffix((item = raw[batch * batch_stride + position]).key) >=
+             low_suffix) && key_suffix(item.key) <= high_suffix;
         const unsigned selected = __ballot_sync(full_mask, valid);
         const std::uint32_t destination =
             pending_count + __popc(selected & before);
         if (valid && destination < kUpdateCapacity)
           scratch[warp].tagged[destination] =
-              {item.row, raw_age(item.logical_position, batch_stride)};
+              {raw_row(item), raw_age(raw_position(item), batch_stride)};
         pending_count += __popc(selected);
       }
     }
@@ -1646,17 +1671,14 @@ __global__ void gather_raw_batch_kernel(
     const std::uint32_t *sorted_keys, const std::uint32_t *sorted_ids,
     const std::uint32_t *values, std::uint32_t count, std::uint32_t batch_slot,
     bool tombstone, RawAssignment *destination,
-    std::uint32_t *destination_full_keys,
     std::uint64_t *batch_signatures,
     std::uint64_t *epoch_signatures) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const std::uint32_t original = sorted_ids[i];
-  destination[i] = {
-      make_row(sorted_keys[i], tombstone ? 0u : values[original],
-               tombstone ? kTombstone : 0u),
-      (batch_slot << kBatchPositionBits) | original};
-  destination_full_keys[i] = sorted_keys[i];
+  destination[i] = make_raw_assignment(
+      sorted_keys[i], tombstone ? 0u : values[original],
+      (batch_slot << kBatchPositionBits) | original, tombstone);
   const std::uint32_t key = sorted_keys[i];
   const std::uint32_t first = key * 0x9e3779b1u;
   const std::uint32_t second = (key ^ (key >> 16u)) * 0x85ebca6bu;
@@ -1737,19 +1759,16 @@ __global__ void scatter_admission_records_kernel(
     const std::uint32_t *keys, const std::uint32_t *values,
     std::uint32_t count, std::uint32_t batch_slot, bool tombstone,
     const std::uint32_t *offsets, const std::uint32_t *reservation_ranks,
-    RawAssignment *destination,
-    std::uint32_t *destination_full_keys) {
+    RawAssignment *destination) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const std::uint32_t key = keys[i];
   const std::uint32_t quotient = key >> 16u;
   const std::uint32_t output =
       offsets[quotient] + reservation_ranks[i];
-  destination[output] = {
-      make_row(key, tombstone ? 0u : values[i],
-               tombstone ? kTombstone : 0u),
-      (batch_slot << kBatchPositionBits) | i};
-  destination_full_keys[output] = key;
+  destination[output] = make_raw_assignment(
+      key, tombstone ? 0u : values[i],
+      (batch_slot << kBatchPositionBits) | i, tombstone);
 }
 
 __global__ void finalize_quotient_metadata_kernel(
@@ -1769,8 +1788,8 @@ __global__ void finalize_quotient_metadata_kernel(
 }
 
 __global__ void pack_publication_epoch_kernel(
-    const RawAssignment *assignments, const std::uint32_t *full_keys,
-    std::uint32_t batch_stride, const std::uint32_t *batch_offsets,
+    const RawAssignment *assignments, std::uint32_t batch_stride,
+    const std::uint32_t *batch_offsets,
     std::uint32_t *keys, RawAssignment *output_assignments) {
   const std::uint32_t batch = blockIdx.y;
   const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1780,7 +1799,7 @@ __global__ void pack_publication_epoch_kernel(
   const std::uint32_t source = batch * batch_stride + position;
   const std::uint32_t output = batch_offsets[batch] + position;
   const RawAssignment item = assignments[source];
-  keys[output] = full_keys[source];
+  keys[output] = item.key;
   output_assignments[output] = item;
 }
 
@@ -1891,10 +1910,11 @@ __global__ void lookup_with_pending_kernel(
       for (std::uint32_t position = begin; position < end; ++position) {
         const RawAssignment candidate =
             raw[batch_index * batch_stride + position];
-        if (candidate.row.key == suffix &&
-            (!matched || candidate.logical_position > newest_position)) {
-          row = candidate.row;
-          newest_position = candidate.logical_position;
+        const std::uint32_t candidate_position = raw_position(candidate);
+        if (key_suffix(candidate.key) == suffix &&
+            (!matched || candidate_position > newest_position)) {
+          row = raw_row(candidate);
+          newest_position = candidate_position;
           matched = true;
         }
       }
@@ -1986,7 +2006,7 @@ __device__ bool first_visible_in_quotient(
       for (std::uint32_t position = raw_begin[batch];
            position < raw_end[batch]; ++position) {
         const std::uint32_t key =
-            raw[batch * batch_stride + position].row.key;
+            key_suffix(raw[batch * batch_stride + position].key);
         if (key >= lower_suffix && (!have_previous || key > previous) &&
             (!found || key < minimum)) {
           minimum = key;
@@ -2013,10 +2033,11 @@ __device__ bool first_visible_in_quotient(
            position < raw_end[batch_index]; ++position) {
         const RawAssignment item =
             raw[batch_index * batch_stride + position];
-        if (item.row.key == minimum &&
-            (!matched || item.logical_position > newest_position)) {
-          candidate = item.row;
-          newest_position = item.logical_position;
+        const std::uint32_t item_position = raw_position(item);
+        if (key_suffix(item.key) == minimum &&
+            (!matched || item_position > newest_position)) {
+          candidate = raw_row(item);
+          newest_position = item_position;
           matched = true;
         }
       }
@@ -2102,8 +2123,6 @@ public:
                      gpulsmopt2_detail::kMaximumLevels),
         raw_assignments_(gpulsmopt2_detail::kBatchesPerEpoch *
                          batch_capacity_),
-        raw_full_keys_(gpulsmopt2_detail::kBatchesPerEpoch *
-                       batch_capacity_),
         raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
                      (gpulsmopt2_detail::kQuotients + 1u)),
         raw_signatures_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
@@ -2536,7 +2555,6 @@ public:
         arena_.size() * sizeof(gpulsmopt2_detail::Row) +
         descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
         raw_assignments_.size() * sizeof(gpulsmopt2_detail::RawAssignment) +
-        raw_full_keys_.size() * sizeof(std::uint32_t) +
         raw_offsets_.size() * sizeof(std::uint32_t) +
         raw_signatures_.size() * sizeof(std::uint64_t) +
         raw_epoch_signatures_.size() * sizeof(std::uint64_t) +
@@ -2791,8 +2809,6 @@ private:
               keys, values, n, slot, tombstone,
               batch_offsets, radix_ids_out_.data(),
               raw_assignments_.data() +
-                  std::size_t{slot} * batch_capacity_,
-              raw_full_keys_.data() +
                   std::size_t{slot} * batch_capacity_);
     } else {
       std::size_t sort_bytes{};
@@ -2808,8 +2824,6 @@ private:
               radix_keys_.data(), radix_ids_out_.data(), values, n, slot,
               tombstone,
               raw_assignments_.data() +
-                  std::size_t{slot} * batch_capacity_,
-              raw_full_keys_.data() +
                   std::size_t{slot} * batch_capacity_,
               batch_signatures, raw_epoch_signatures_.data());
       gpulsmopt2_detail::finalize_quotient_metadata_kernel<<<
@@ -2852,7 +2866,7 @@ private:
         blocks(batch_capacity_), gpulsmopt2_detail::kBatchesPerEpoch);
     gpulsmopt2_detail::pack_publication_epoch_kernel<<<
         publication_grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
-            raw_assignments_.data(), raw_full_keys_.data(),
+            raw_assignments_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             publication_batch_offsets_.data(),
             publication_epoch_keys_a_.data(),
@@ -3141,7 +3155,6 @@ private:
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row> arena_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment> raw_assignments_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> raw_full_keys_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_signatures_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_epoch_signatures_;
