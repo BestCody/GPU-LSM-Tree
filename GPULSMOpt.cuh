@@ -2034,81 +2034,149 @@ __device__ __forceinline__ std::uint32_t warp_lower_bound_rows(
 
 __global__ void section_owned_lookup_kernel(
     const std::uint32_t *queries, const std::uint32_t *query_offsets,
-    std::uint32_t count, const RawAssignment *raw,
-    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, const Row *arena,
+    const RawAssignment *raw, const std::uint32_t *raw_offsets,
+    std::uint32_t batch_stride, std::uint32_t pending_batches, const Row *arena,
     const Descriptor *descriptors, const std::uint16_t *local_rank,
     std::uint32_t active_levels, std::uint32_t foundation_level,
     std::uint64_t occupied_levels, const std::uint32_t *query_ids,
     std::uint32_t *final_values, std::uint8_t *final_found) {
-  __shared__ std::uint32_t
-      hash_keys[kLookupWarpsPerBlock][kLookupHashSlots];
-  __shared__ unsigned long long
-      hash_best[kLookupWarpsPerBlock][kLookupHashSlots];
+  __shared__ std::uint32_t hash_keys[kLookupWarpsPerBlock][kLookupHashSlots];
+  __shared__ unsigned long long hash_best[kLookupWarpsPerBlock]
+                                         [kLookupHashSlots];
   __shared__ std::uint32_t unique_queries[kLookupWarpsPerBlock];
   __shared__ std::uint32_t matched_queries[kLookupWarpsPerBlock];
 
   constexpr unsigned full = 0xffffffffu;
   const std::uint32_t warp = threadIdx.x >> 5u;
   const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t q =
-      blockIdx.x * kLookupWarpsPerBlock + warp;
-  if (q >= kQuotients) return;
-  const std::uint32_t query_begin = query_offsets[q];
-  const std::uint32_t query_end = query_offsets[q + 1u];
-  if (query_begin == query_end) return;
+  const std::uint32_t q = blockIdx.x * kLookupWarpsPerBlock + warp;
+  if (q >= kQuotients)
+    return;
+  const std::uint32_t section_begin = query_offsets[q];
+  const std::uint32_t section_end = query_offsets[q + 1u];
+  for (std::uint32_t query_begin = section_begin; query_begin < section_end;
+       query_begin += kLookupHashSlots) {
+    const std::uint32_t query_end =
+        min(query_begin + kLookupHashSlots, section_end);
 
-  const std::uint32_t query_count = query_end - query_begin;
-  if (query_count > kLookupHashSlots) {
-    for (std::uint32_t i = query_begin + lane;
-         i < query_end; i += 32u) {
-      const std::uint32_t key = queries[i];
-      const std::uint32_t suffix = key_suffix(key);
-      Row result{};
-      bool resolved = false;
-      for (int batch = int(pending_batches) - 1;
-           batch >= 0 && !resolved; --batch) {
-        const std::size_t oi = std::size_t{std::uint32_t(batch)} *
-            (kQuotients + 1u) + q;
-        const std::uint32_t begin = raw_offsets[oi];
-        const std::uint32_t end = raw_offsets[oi + 1u];
-        std::uint32_t newest = 0u;
-        bool matched = false;
-        for (std::uint32_t position = begin;
-             position < end; ++position) {
-          const RawAssignment item =
-              raw[std::uint32_t(batch) * batch_stride + position];
-          const std::uint32_t age = raw_position(item);
-          if (key_suffix(item.key) == suffix &&
-              (!matched || age > newest)) {
-            result = raw_row(item);
-            newest = age;
-            matched = true;
-          }
+    for (std::uint32_t slot = lane; slot < kLookupHashSlots; slot += 32u) {
+      hash_keys[warp][slot] = kEmptyLookupKey;
+      hash_best[warp][slot] = 0ull;
+    }
+    if (lane == 0u) {
+      unique_queries[warp] = 0u;
+      matched_queries[warp] = 0u;
+    }
+    __syncwarp();
+
+    for (std::uint32_t i = query_begin + lane; i < query_end; i += 32u) {
+      const std::uint32_t suffix = key_suffix(queries[i]);
+      std::uint32_t slot = mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
+      for (std::uint32_t probe = 0u; probe < kLookupHashSlots; ++probe) {
+        const std::uint32_t prior =
+            atomicCAS(&hash_keys[warp][slot], kEmptyLookupKey, suffix);
+        if (prior == kEmptyLookupKey) {
+          atomicAdd(&unique_queries[warp], 1u);
+          break;
         }
-        resolved = matched;
+        if (prior == suffix)
+          break;
+        slot = (slot + 1u) & (kLookupHashSlots - 1u);
       }
-      if (!resolved) {
-        std::uint64_t levels = occupied_levels;
-        if (foundation_level < kMaximumLevels)
-          levels &= ~(std::uint64_t{1} << foundation_level);
-        while (levels && !resolved) {
-          const std::uint32_t level =
-              static_cast<std::uint32_t>(__ffsll(levels) - 1);
-          levels &= levels - 1u;
-          const Descriptor descriptor =
-              descriptors[descriptor_index(q, level)];
-          const Row *rows = arena + descriptor.offset();
-          const std::uint32_t position =
-              lower_bound_rows(rows, descriptor.count(), suffix);
-          if (position < descriptor.count() &&
-              rows[position].key == suffix) {
-            result = rows[position];
+    }
+    __syncwarp();
+
+    for (int batch = int(pending_batches) - 1; batch >= 0; --batch) {
+      const std::size_t oi =
+          std::size_t{std::uint32_t(batch)} * (kQuotients + 1u) + q;
+      const std::uint32_t begin = raw_offsets[oi];
+      const std::uint32_t end = raw_offsets[oi + 1u];
+      for (std::uint32_t position = begin + lane; position < end;
+           position += 32u) {
+        const std::uint32_t record =
+            std::uint32_t(batch) * batch_stride + position;
+        const RawAssignment item = raw[record];
+        const std::uint32_t suffix = key_suffix(item.key);
+        std::uint32_t slot = mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
+        for (std::uint32_t probe = 0u; probe < kLookupHashSlots; ++probe) {
+          const std::uint32_t observed = hash_keys[warp][slot];
+          if (observed == kEmptyLookupKey)
+            break;
+          if (observed == suffix) {
+            const unsigned long long token =
+                (static_cast<unsigned long long>(raw_position(item) + 1u)
+                 << 32u) |
+                static_cast<unsigned long long>(record + 1u);
+            const unsigned long long prior =
+                atomicMax(&hash_best[warp][slot], token);
+            if (prior == 0ull)
+              atomicAdd(&matched_queries[warp], 1u);
+            break;
+          }
+          slot = (slot + 1u) & (kLookupHashSlots - 1u);
+        }
+      }
+      __syncwarp();
+      if (matched_queries[warp] == unique_queries[warp])
+        break;
+    }
+
+    for (std::uint32_t round = 0u; query_begin + round * 32u < query_end;
+         ++round) {
+      const std::uint32_t i = query_begin + round * 32u + lane;
+      const bool valid = i < query_end;
+      const std::uint32_t key = valid ? queries[i] : 0u;
+      const std::uint32_t suffix = key_suffix(key);
+      unsigned long long token = 0ull;
+      if (valid) {
+        std::uint32_t slot = mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
+        for (std::uint32_t probe = 0u; probe < kLookupHashSlots; ++probe) {
+          const std::uint32_t observed = hash_keys[warp][slot];
+          if (observed == suffix) {
+            token = hash_best[warp][slot];
+            break;
+          }
+          if (observed == kEmptyLookupKey)
+            break;
+          slot = (slot + 1u) & (kLookupHashSlots - 1u);
+        }
+      }
+
+      Row result{};
+      bool resolved = valid && token != 0ull;
+      if (resolved) {
+        const std::uint32_t record = static_cast<std::uint32_t>(token) - 1u;
+        result = raw[record].metadata & kRawTombstone
+                     ? make_row(key, 0u, kTombstone)
+                     : make_row(key, raw[record].value, 0u);
+      }
+
+      std::uint64_t levels = occupied_levels;
+      if (foundation_level < kMaximumLevels)
+        levels &= ~(std::uint64_t{1} << foundation_level);
+      while (levels) {
+        const std::uint32_t level =
+            static_cast<std::uint32_t>(__ffsll(levels) - 1);
+        levels &= levels - 1u;
+        unsigned long long descriptor_bits = 0ull;
+        if (lane == 0u)
+          descriptor_bits = descriptors[descriptor_index(q, level)].bits;
+        descriptor_bits = __shfl_sync(full, descriptor_bits, 0u);
+        const Descriptor descriptor{descriptor_bits};
+        const Row *rows = arena + descriptor.offset();
+        const bool search = valid && !resolved && descriptor.count();
+        const std::uint32_t position =
+            warp_lower_bound_rows(rows, descriptor.count(), suffix, search);
+        if (search && position < descriptor.count()) {
+          const Row candidate = rows[position];
+          if (candidate.key == suffix) {
+            result = candidate;
             resolved = true;
           }
         }
       }
-      if (!resolved) {
+
+      if (valid && !resolved) {
         const Descriptor foundation =
             foundation_level < active_levels
                 ? descriptors[descriptor_index(q, foundation_level)]
@@ -2118,184 +2186,29 @@ __global__ void section_owned_lookup_kernel(
         const std::size_t rank = std::size_t{q} * 128u + cell;
         const bool ranked = foundation.count() <= 0xffffu;
         const std::uint32_t begin = ranked ? local_rank[rank] : 0u;
-        const std::uint32_t end = ranked
-            ? (cell == 127u ? foundation.count()
-                            : local_rank[rank + 1u])
-            : foundation.count();
+        const std::uint32_t end =
+            ranked ? (cell == 127u ? foundation.count() : local_rank[rank + 1u])
+                   : foundation.count();
         const std::uint32_t position =
             lower_bound_rows(rows + begin, end - begin, suffix);
-        if (position < end - begin &&
-            rows[begin + position].key == suffix) {
+        if (position < end - begin && rows[begin + position].key == suffix) {
           result = rows[begin + position];
           resolved = true;
         }
       }
-      const bool live = resolved &&
-          (result.flags & kTombstone) == 0u;
-      const std::uint32_t destination = query_ids ? query_ids[i] : i;
-      final_values[destination] =
-          live ? result.value : final_found ? 0u : kInvalid;
-      if (final_found) final_found[destination] = live;
-    }
-    return;
-  }
 
-  for (std::uint32_t slot = lane; slot < kLookupHashSlots;
-       slot += 32u) {
-    hash_keys[warp][slot] = kEmptyLookupKey;
-    hash_best[warp][slot] = 0ull;
-  }
-  if (lane == 0u) {
-    unique_queries[warp] = 0u;
-    matched_queries[warp] = 0u;
-  }
-  __syncwarp();
-
-  for (std::uint32_t i = query_begin + lane;
-       i < query_end; i += 32u) {
-    const std::uint32_t suffix = key_suffix(queries[i]);
-    std::uint32_t slot =
-        mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
-    for (std::uint32_t probe = 0u;
-         probe < kLookupHashSlots; ++probe) {
-      const std::uint32_t prior = atomicCAS(
-          &hash_keys[warp][slot], kEmptyLookupKey, suffix);
-      if (prior == kEmptyLookupKey) {
-        atomicAdd(&unique_queries[warp], 1u);
-        break;
-      }
-      if (prior == suffix) break;
-      slot = (slot + 1u) & (kLookupHashSlots - 1u);
-    }
-  }
-  __syncwarp();
-
-  for (int batch = int(pending_batches) - 1;
-       batch >= 0; --batch) {
-    const std::size_t oi = std::size_t{std::uint32_t(batch)} *
-        (kQuotients + 1u) + q;
-    const std::uint32_t begin = raw_offsets[oi];
-    const std::uint32_t end = raw_offsets[oi + 1u];
-    for (std::uint32_t position = begin + lane;
-         position < end; position += 32u) {
-      const std::uint32_t record =
-          std::uint32_t(batch) * batch_stride + position;
-      const RawAssignment item = raw[record];
-      const std::uint32_t suffix = key_suffix(item.key);
-      std::uint32_t slot =
-          mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
-      for (std::uint32_t probe = 0u;
-           probe < kLookupHashSlots; ++probe) {
-        const std::uint32_t observed = hash_keys[warp][slot];
-        if (observed == kEmptyLookupKey) break;
-        if (observed == suffix) {
-          const unsigned long long token =
-              (static_cast<unsigned long long>(raw_position(item) + 1u)
-               << 32u) |
-              static_cast<unsigned long long>(record + 1u);
-          const unsigned long long prior =
-              atomicMax(&hash_best[warp][slot], token);
-          if (prior == 0ull)
-            atomicAdd(&matched_queries[warp], 1u);
-          break;
-        }
-        slot = (slot + 1u) & (kLookupHashSlots - 1u);
-      }
+      if (valid) {
+        const bool live = resolved && (result.flags & kTombstone) == 0u;
+        const std::uint32_t destination = query_ids ? query_ids[i] : i;
+        final_values[destination] = live          ? result.value
+                                    : final_found ? 0u
+                                                  : kInvalid;
+      if (final_found)
+        final_found[destination] = live;
     }
     __syncwarp();
-    if (matched_queries[warp] == unique_queries[warp]) break;
   }
-
-  for (std::uint32_t round = 0u;
-       query_begin + round * 32u < query_end; ++round) {
-    const std::uint32_t i = query_begin + round * 32u + lane;
-    const bool valid = i < query_end;
-    const std::uint32_t key = valid ? queries[i] : 0u;
-    const std::uint32_t suffix = key_suffix(key);
-    unsigned long long token = 0ull;
-    if (valid) {
-      std::uint32_t slot =
-          mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
-      for (std::uint32_t probe = 0u;
-           probe < kLookupHashSlots; ++probe) {
-        const std::uint32_t observed = hash_keys[warp][slot];
-        if (observed == suffix) {
-          token = hash_best[warp][slot];
-          break;
-        }
-        if (observed == kEmptyLookupKey) break;
-        slot = (slot + 1u) & (kLookupHashSlots - 1u);
-      }
-    }
-
-    Row result{};
-    bool resolved = valid && token != 0ull;
-    if (resolved) {
-      const std::uint32_t record =
-          static_cast<std::uint32_t>(token) - 1u;
-      result = raw[record].metadata & kRawTombstone
-          ? make_row(key, 0u, kTombstone)
-          : make_row(key, raw[record].value, 0u);
-    }
-
-    std::uint64_t levels = occupied_levels;
-    if (foundation_level < kMaximumLevels)
-      levels &= ~(std::uint64_t{1} << foundation_level);
-    while (levels) {
-      const std::uint32_t level =
-          static_cast<std::uint32_t>(__ffsll(levels) - 1);
-      levels &= levels - 1u;
-      unsigned long long descriptor_bits = 0ull;
-      if (lane == 0u)
-        descriptor_bits =
-            descriptors[descriptor_index(q, level)].bits;
-      descriptor_bits = __shfl_sync(full, descriptor_bits, 0u);
-      const Descriptor descriptor{descriptor_bits};
-      const Row *rows = arena + descriptor.offset();
-      const bool search = valid && !resolved && descriptor.count();
-      const std::uint32_t position = warp_lower_bound_rows(
-          rows, descriptor.count(), suffix, search);
-      if (search && position < descriptor.count()) {
-        const Row candidate = rows[position];
-        if (candidate.key == suffix) {
-          result = candidate;
-          resolved = true;
-        }
-      }
-    }
-
-    if (valid && !resolved) {
-      const Descriptor foundation =
-          foundation_level < active_levels
-              ? descriptors[descriptor_index(q, foundation_level)]
-              : Descriptor{};
-      const Row *rows = arena + foundation.offset();
-      const std::uint32_t cell = (key >> 9u) & 127u;
-      const std::size_t rank = std::size_t{q} * 128u + cell;
-      const bool ranked = foundation.count() <= 0xffffu;
-      const std::uint32_t begin = ranked ? local_rank[rank] : 0u;
-      const std::uint32_t end = ranked
-          ? (cell == 127u ? foundation.count()
-                          : local_rank[rank + 1u])
-          : foundation.count();
-      const std::uint32_t position =
-          lower_bound_rows(rows + begin, end - begin, suffix);
-      if (position < end - begin &&
-          rows[begin + position].key == suffix) {
-        result = rows[begin + position];
-        resolved = true;
-      }
-    }
-
-    if (valid) {
-      const bool live = resolved &&
-          (result.flags & kTombstone) == 0u;
-      const std::uint32_t destination = query_ids ? query_ids[i] : i;
-      final_values[destination] =
-          live ? result.value : final_found ? 0u : kInvalid;
-      if (final_found) final_found[destination] = live;
-    }
-  }
+}
 }
 
 __device__ bool first_visible_in_quotient(
@@ -2315,8 +2228,8 @@ __device__ bool first_visible_in_quotient(
   for (std::uint32_t level = 0u; level < active_levels; ++level) {
     const Descriptor descriptor = descriptors[descriptor_index(q, level)];
     class_end[level] = descriptor.count();
-    class_position[level] = lower_bound_rows(
-        arena + descriptor.offset(), descriptor.count(), lower_suffix);
+    class_position[level] = lower_bound_rows(arena + descriptor.offset(),
+                                             descriptor.count(), lower_suffix);
   }
   std::uint32_t previous{};
   bool have_previous = false;
@@ -2324,8 +2237,8 @@ __device__ bool first_visible_in_quotient(
     std::uint32_t minimum = kInvalid;
     bool found = false;
     for (std::uint32_t batch = 0u; batch < pending_batches; ++batch)
-      for (std::uint32_t position = raw_begin[batch];
-           position < raw_end[batch]; ++position) {
+      for (std::uint32_t position = raw_begin[batch]; position < raw_end[batch];
+           ++position) {
         const std::uint32_t key =
             key_suffix(raw[batch * batch_stride + position].key);
         if (key >= lower_suffix && (!have_previous || key > previous) &&
@@ -2339,8 +2252,11 @@ __device__ bool first_visible_in_quotient(
         const Descriptor descriptor = descriptors[descriptor_index(q, level)];
         const std::uint32_t key =
             arena[descriptor.offset() + class_position[level]].key;
-        if (!found || key < minimum) { minimum = key; found = true; }
-    }
+        if (!found || key < minimum) {
+          minimum = key;
+          found = true;
+        }
+      }
     if (!found) return false;
 
     Row winner{};
@@ -2637,7 +2553,7 @@ public:
             gpulsmopt2_detail::kQuotients /
                 gpulsmopt2_detail::kLookupWarpsPerBlock,
             gpulsmopt2_detail::kThreads, 0, stream>>>(
-            queries, lookup_quotient_offsets_.data(), count,
+            queries, lookup_quotient_offsets_.data(),
             raw_assignments_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             arena_.data(), descriptors_.data(), local_rank_.data(),
