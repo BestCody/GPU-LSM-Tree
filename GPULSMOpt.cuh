@@ -56,6 +56,9 @@ constexpr std::uint64_t kDescriptorOffsetMask =
 constexpr std::uint64_t kInvalidOffset =
     std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
+constexpr std::uint32_t kLookupWarpsPerBlock = 8u;
+constexpr std::uint32_t kLookupHashSlots = 64u;
+constexpr std::uint32_t kEmptyLookupKey = 1u << 16u;
 constexpr std::uint32_t kDirectAdmissionMinimum = kQuotients / 16u;
 constexpr std::uint32_t kDirectAdmissionMaximum =
     kQuotients * 8u;
@@ -90,6 +93,15 @@ __host__ __device__ __forceinline__ std::uint32_t full_key(
 __host__ __device__ __forceinline__ std::uint32_t key_suffix(
     std::uint32_t key) {
   return key & 0xffffu;
+}
+
+__host__ __device__ __forceinline__ std::uint32_t mix_lookup_key(
+    std::uint32_t key) {
+  key ^= key >> 16u;
+  key *= 0x7feb352du;
+  key ^= key >> 15u;
+  key *= 0x846ca68bu;
+  return key ^ (key >> 16u);
 }
 
 __host__ __device__ __forceinline__ std::uint32_t raw_age(
@@ -1787,6 +1799,25 @@ __global__ void finalize_quotient_metadata_kernel(
   if (q + 1u == kQuotients) offsets[kQuotients] = count;
 }
 
+__global__ void build_query_quotient_offsets_kernel(
+    const std::uint32_t *queries, std::uint32_t count,
+    std::uint32_t *offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients) return;
+  if (q == kQuotients) {
+    offsets[q] = count;
+    return;
+  }
+  const std::uint32_t target = q << 16u;
+  std::uint32_t low = 0u, high = count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (queries[middle] < target) low = middle + 1u;
+    else high = middle;
+  }
+  offsets[q] = low;
+}
+
 __global__ void pack_publication_epoch_kernel(
     const RawAssignment *assignments, std::uint32_t batch_stride,
     const std::uint32_t *batch_offsets,
@@ -1977,6 +2008,296 @@ __global__ void lookup_with_pending_kernel(
   if (found) found[destination] = live;
 }
 
+__device__ __forceinline__ std::uint32_t warp_lower_bound_rows(
+    const Row *rows, std::uint32_t count, std::uint32_t key,
+    bool enabled) {
+  constexpr unsigned full = 0xffffffffu;
+  std::uint32_t low = 0u, high = count;
+  while (true) {
+    const bool searching = enabled && low < high;
+    const unsigned active = __ballot_sync(full, searching);
+    if (!active) break;
+    if (searching) {
+      const std::uint32_t middle = (low + high) >> 1u;
+      const unsigned peers = __match_any_sync(active, middle);
+      const std::uint32_t leader = __ffs(peers) - 1u;
+      std::uint32_t pivot = 0u;
+      if ((threadIdx.x & 31u) == leader)
+        pivot = rows[middle].key;
+      pivot = __shfl_sync(peers, pivot, leader);
+      if (pivot < key) low = middle + 1u;
+      else high = middle;
+    }
+  }
+  return low;
+}
+
+__global__ void section_owned_lookup_kernel(
+    const std::uint32_t *queries, const std::uint32_t *query_offsets,
+    std::uint32_t count, const RawAssignment *raw,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, const Row *arena,
+    const Descriptor *descriptors, const std::uint16_t *local_rank,
+    std::uint32_t active_levels, std::uint32_t foundation_level,
+    std::uint64_t occupied_levels, const std::uint32_t *query_ids,
+    std::uint32_t *final_values, std::uint8_t *final_found) {
+  __shared__ std::uint32_t
+      hash_keys[kLookupWarpsPerBlock][kLookupHashSlots];
+  __shared__ unsigned long long
+      hash_best[kLookupWarpsPerBlock][kLookupHashSlots];
+  __shared__ std::uint32_t unique_queries[kLookupWarpsPerBlock];
+  __shared__ std::uint32_t matched_queries[kLookupWarpsPerBlock];
+
+  constexpr unsigned full = 0xffffffffu;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t q =
+      blockIdx.x * kLookupWarpsPerBlock + warp;
+  if (q >= kQuotients) return;
+  const std::uint32_t query_begin = query_offsets[q];
+  const std::uint32_t query_end = query_offsets[q + 1u];
+  if (query_begin == query_end) return;
+
+  const std::uint32_t query_count = query_end - query_begin;
+  if (query_count > kLookupHashSlots) {
+    for (std::uint32_t i = query_begin + lane;
+         i < query_end; i += 32u) {
+      const std::uint32_t key = queries[i];
+      const std::uint32_t suffix = key_suffix(key);
+      Row result{};
+      bool resolved = false;
+      for (int batch = int(pending_batches) - 1;
+           batch >= 0 && !resolved; --batch) {
+        const std::size_t oi = std::size_t{std::uint32_t(batch)} *
+            (kQuotients + 1u) + q;
+        const std::uint32_t begin = raw_offsets[oi];
+        const std::uint32_t end = raw_offsets[oi + 1u];
+        std::uint32_t newest = 0u;
+        bool matched = false;
+        for (std::uint32_t position = begin;
+             position < end; ++position) {
+          const RawAssignment item =
+              raw[std::uint32_t(batch) * batch_stride + position];
+          const std::uint32_t age = raw_position(item);
+          if (key_suffix(item.key) == suffix &&
+              (!matched || age > newest)) {
+            result = raw_row(item);
+            newest = age;
+            matched = true;
+          }
+        }
+        resolved = matched;
+      }
+      if (!resolved) {
+        std::uint64_t levels = occupied_levels;
+        if (foundation_level < kMaximumLevels)
+          levels &= ~(std::uint64_t{1} << foundation_level);
+        while (levels && !resolved) {
+          const std::uint32_t level =
+              static_cast<std::uint32_t>(__ffsll(levels) - 1);
+          levels &= levels - 1u;
+          const Descriptor descriptor =
+              descriptors[descriptor_index(q, level)];
+          const Row *rows = arena + descriptor.offset();
+          const std::uint32_t position =
+              lower_bound_rows(rows, descriptor.count(), suffix);
+          if (position < descriptor.count() &&
+              rows[position].key == suffix) {
+            result = rows[position];
+            resolved = true;
+          }
+        }
+      }
+      if (!resolved) {
+        const Descriptor foundation =
+            foundation_level < active_levels
+                ? descriptors[descriptor_index(q, foundation_level)]
+                : Descriptor{};
+        const Row *rows = arena + foundation.offset();
+        const std::uint32_t cell = (key >> 9u) & 127u;
+        const std::size_t rank = std::size_t{q} * 128u + cell;
+        const bool ranked = foundation.count() <= 0xffffu;
+        const std::uint32_t begin = ranked ? local_rank[rank] : 0u;
+        const std::uint32_t end = ranked
+            ? (cell == 127u ? foundation.count()
+                            : local_rank[rank + 1u])
+            : foundation.count();
+        const std::uint32_t position =
+            lower_bound_rows(rows + begin, end - begin, suffix);
+        if (position < end - begin &&
+            rows[begin + position].key == suffix) {
+          result = rows[begin + position];
+          resolved = true;
+        }
+      }
+      const bool live = resolved &&
+          (result.flags & kTombstone) == 0u;
+      const std::uint32_t destination = query_ids[i];
+      final_values[destination] =
+          live ? result.value : final_found ? 0u : kInvalid;
+      if (final_found) final_found[destination] = live;
+    }
+    return;
+  }
+
+  for (std::uint32_t slot = lane; slot < kLookupHashSlots;
+       slot += 32u) {
+    hash_keys[warp][slot] = kEmptyLookupKey;
+    hash_best[warp][slot] = 0ull;
+  }
+  if (lane == 0u) {
+    unique_queries[warp] = 0u;
+    matched_queries[warp] = 0u;
+  }
+  __syncwarp();
+
+  for (std::uint32_t i = query_begin + lane;
+       i < query_end; i += 32u) {
+    const std::uint32_t suffix = key_suffix(queries[i]);
+    std::uint32_t slot =
+        mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
+    for (std::uint32_t probe = 0u;
+         probe < kLookupHashSlots; ++probe) {
+      const std::uint32_t prior = atomicCAS(
+          &hash_keys[warp][slot], kEmptyLookupKey, suffix);
+      if (prior == kEmptyLookupKey) {
+        atomicAdd(&unique_queries[warp], 1u);
+        break;
+      }
+      if (prior == suffix) break;
+      slot = (slot + 1u) & (kLookupHashSlots - 1u);
+    }
+  }
+  __syncwarp();
+
+  for (int batch = int(pending_batches) - 1;
+       batch >= 0; --batch) {
+    const std::size_t oi = std::size_t{std::uint32_t(batch)} *
+        (kQuotients + 1u) + q;
+    const std::uint32_t begin = raw_offsets[oi];
+    const std::uint32_t end = raw_offsets[oi + 1u];
+    for (std::uint32_t position = begin + lane;
+         position < end; position += 32u) {
+      const std::uint32_t record =
+          std::uint32_t(batch) * batch_stride + position;
+      const RawAssignment item = raw[record];
+      const std::uint32_t suffix = key_suffix(item.key);
+      std::uint32_t slot =
+          mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
+      for (std::uint32_t probe = 0u;
+           probe < kLookupHashSlots; ++probe) {
+        const std::uint32_t observed = hash_keys[warp][slot];
+        if (observed == kEmptyLookupKey) break;
+        if (observed == suffix) {
+          const unsigned long long token =
+              (static_cast<unsigned long long>(raw_position(item) + 1u)
+               << 32u) |
+              static_cast<unsigned long long>(record + 1u);
+          const unsigned long long prior =
+              atomicMax(&hash_best[warp][slot], token);
+          if (prior == 0ull)
+            atomicAdd(&matched_queries[warp], 1u);
+          break;
+        }
+        slot = (slot + 1u) & (kLookupHashSlots - 1u);
+      }
+    }
+    __syncwarp();
+    if (matched_queries[warp] == unique_queries[warp]) break;
+  }
+
+  for (std::uint32_t round = 0u;
+       query_begin + round * 32u < query_end; ++round) {
+    const std::uint32_t i = query_begin + round * 32u + lane;
+    const bool valid = i < query_end;
+    const std::uint32_t key = valid ? queries[i] : 0u;
+    const std::uint32_t suffix = key_suffix(key);
+    unsigned long long token = 0ull;
+    if (valid) {
+      std::uint32_t slot =
+          mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
+      for (std::uint32_t probe = 0u;
+           probe < kLookupHashSlots; ++probe) {
+        const std::uint32_t observed = hash_keys[warp][slot];
+        if (observed == suffix) {
+          token = hash_best[warp][slot];
+          break;
+        }
+        if (observed == kEmptyLookupKey) break;
+        slot = (slot + 1u) & (kLookupHashSlots - 1u);
+      }
+    }
+
+    Row result{};
+    bool resolved = valid && token != 0ull;
+    if (resolved) {
+      const std::uint32_t record =
+          static_cast<std::uint32_t>(token) - 1u;
+      result = raw[record].metadata & kRawTombstone
+          ? make_row(key, 0u, kTombstone)
+          : make_row(key, raw[record].value, 0u);
+    }
+
+    std::uint64_t levels = occupied_levels;
+    if (foundation_level < kMaximumLevels)
+      levels &= ~(std::uint64_t{1} << foundation_level);
+    while (levels) {
+      const std::uint32_t level =
+          static_cast<std::uint32_t>(__ffsll(levels) - 1);
+      levels &= levels - 1u;
+      unsigned long long descriptor_bits = 0ull;
+      if (lane == 0u)
+        descriptor_bits =
+            descriptors[descriptor_index(q, level)].bits;
+      descriptor_bits = __shfl_sync(full, descriptor_bits, 0u);
+      const Descriptor descriptor{descriptor_bits};
+      const Row *rows = arena + descriptor.offset();
+      const bool search = valid && !resolved && descriptor.count();
+      const std::uint32_t position = warp_lower_bound_rows(
+          rows, descriptor.count(), suffix, search);
+      if (search && position < descriptor.count()) {
+        const Row candidate = rows[position];
+        if (candidate.key == suffix) {
+          result = candidate;
+          resolved = true;
+        }
+      }
+    }
+
+    if (valid && !resolved) {
+      const Descriptor foundation =
+          foundation_level < active_levels
+              ? descriptors[descriptor_index(q, foundation_level)]
+              : Descriptor{};
+      const Row *rows = arena + foundation.offset();
+      const std::uint32_t cell = (key >> 9u) & 127u;
+      const std::size_t rank = std::size_t{q} * 128u + cell;
+      const bool ranked = foundation.count() <= 0xffffu;
+      const std::uint32_t begin = ranked ? local_rank[rank] : 0u;
+      const std::uint32_t end = ranked
+          ? (cell == 127u ? foundation.count()
+                          : local_rank[rank + 1u])
+          : foundation.count();
+      const std::uint32_t position =
+          lower_bound_rows(rows + begin, end - begin, suffix);
+      if (position < end - begin &&
+          rows[begin + position].key == suffix) {
+        result = rows[begin + position];
+        resolved = true;
+      }
+    }
+
+    if (valid) {
+      const bool live = resolved &&
+          (result.flags & kTombstone) == 0u;
+      const std::uint32_t destination = query_ids[i];
+      final_values[destination] =
+          live ? result.value : final_found ? 0u : kInvalid;
+      if (final_found) final_found[destination] = live;
+    }
+  }
+}
+
 __device__ bool first_visible_in_quotient(
     std::uint32_t q, std::uint32_t lower, const RawAssignment *raw,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
@@ -2150,6 +2471,7 @@ public:
         publication_selected_count_(1u),
         publication_batch_offsets_(gpulsmopt2_detail::kBatchesPerEpoch + 1u),
         admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
+        lookup_quotient_offsets_(gpulsmopt2_detail::kQuotients + 1u),
         range_partials_(gpulsmopt2_detail::kThreads),
         range_overflow_count_(1u) {
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
@@ -2295,17 +2617,33 @@ public:
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
           radix_workspace(), bytes, batch.queries, radix_keys_.data(),
           radix_input_ids(), radix_ids_out_.data(), count, 16, 32, stream));
-      gpulsmopt2_detail::lookup_with_pending_kernel<<<
-          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
-          radix_keys_.data(), nullptr, nullptr, count,
-          raw_assignments_.data(), raw_offsets_.data(),
-          static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
-          raw_signatures_.data(),
-          raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
-          local_rank_.data(), active_levels_, foundation_level(),
-          occupied_level_mask(),
-          radix_ids_out_.data(),
-          batch.out_values, batch.out_found);
+      if (pending_batches_ >= 4u) {
+        gpulsmopt2_detail::build_query_quotient_offsets_kernel<<<
+            blocks(gpulsmopt2_detail::kQuotients + 1u),
+            gpulsmopt2_detail::kThreads, 0, stream>>>(
+                radix_keys_.data(), count,
+                lookup_quotient_offsets_.data());
+        gpulsmopt2_detail::section_owned_lookup_kernel<<<
+            gpulsmopt2_detail::kQuotients /
+                gpulsmopt2_detail::kLookupWarpsPerBlock,
+            gpulsmopt2_detail::kThreads, 0, stream>>>(
+            radix_keys_.data(), lookup_quotient_offsets_.data(), count,
+            raw_assignments_.data(), raw_offsets_.data(),
+            static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+            arena_.data(), descriptors_.data(), local_rank_.data(),
+            active_levels_, foundation_level(), occupied_level_mask(),
+            radix_ids_out_.data(), batch.out_values, batch.out_found);
+      } else {
+        gpulsmopt2_detail::lookup_with_pending_kernel<<<
+            blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            radix_keys_.data(), nullptr, nullptr, count,
+            raw_assignments_.data(), raw_offsets_.data(),
+            static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+            raw_signatures_.data(), raw_epoch_signatures_.data(),
+            arena_.data(), descriptors_.data(), local_rank_.data(),
+            active_levels_, foundation_level(), occupied_level_mask(),
+            radix_ids_out_.data(), batch.out_values, batch.out_found);
+      }
       CUDA_CHECK(cudaGetLastError());
     } else {
       gpulsmopt2_detail::lookup_with_pending_kernel<<<
@@ -2572,6 +2910,7 @@ public:
         publication_temp_.size() * sizeof(std::uint8_t) +
         admission_counts_.size() * sizeof(std::uint32_t) +
         admission_temp_.size() * sizeof(std::uint8_t) +
+        lookup_quotient_offsets_.size() * sizeof(std::uint32_t) +
         radix_storage_.size() * sizeof(std::uint8_t) +
         range_partials_.size() * sizeof(unsigned long long) +
         range_overflow_count_.size() * sizeof(std::uint32_t) +
@@ -3178,6 +3517,7 @@ private:
 
   gpulsmopt2_detail::Buffer<std::uint8_t> radix_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> lookup_quotient_offsets_;
 
   gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
   gpulsmopt2_detail::Buffer<std::uint8_t> range_query_storage_,
