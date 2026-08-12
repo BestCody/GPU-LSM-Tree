@@ -312,18 +312,25 @@ void key_only_sort_device_timed(const cuda_buffer<key_t> &d_keys_in,
     const int GRD = static_cast<int>((n + TPB - 1) / TPB);
     fill_seq_u32_kernel<<<GRD, TPB, 0, stream>>>(d_perm_in.ptr(), n);
 
-    // Scratch buffer size (no move-assign/copy-assign)
-    const size_t aux_needed = find_pair_sort_buffer_size<key_t, uint32_t>(n);
+    constexpr int end_bit = int(sizeof(key_t) * 8);
+#ifdef GPULSMOPT
+    constexpr int begin_bit = end_bit - 16;
+#else
+    constexpr int begin_bit = 0;
+#endif
+    size_t aux_needed = 0;
+    cub::DeviceRadixSort::SortPairs(
+        nullptr, aux_needed, d_keys_in.ptr(), d_sorted_keys.ptr(),
+        d_perm_in.ptr(), d_perm_sorted.ptr(), n, begin_bit, end_bit, stream);
     if (d_aux.size_in_bytes() < aux_needed)
     {
         d_aux.resize(aux_needed);
     }
 
-    // Timed pairs sort: (key, idx) -> (sorted_key, perm_sorted)
-    timed_pair_sort<key_t, uint32_t>(d_aux.ptr(), aux_needed,
-                                     d_keys_in.ptr(), d_sorted_keys.ptr(),
-                                     d_perm_in.ptr(), d_perm_sorted.ptr(),
-                                     n, sort_time_ms, stream);
+    scoped_cuda_timer timer(stream, sort_time_ms);
+    cub::DeviceRadixSort::SortPairs(
+        d_aux.ptr(), aux_needed, d_keys_in.ptr(), d_sorted_keys.ptr(),
+        d_perm_in.ptr(), d_perm_sorted.ptr(), n, begin_bit, end_bit, stream);
 }
 
 // Scatter: out_original[perm_sorted[i]] = in_sorted[i]
@@ -575,7 +582,16 @@ void key_only_sort_device_timed_debug(const cuda_buffer<key_t>& d_keys_in,
     CUCHECK(cudaGetLastError());
     CUCHECK(cudaStreamSynchronize(stream));
 
-    const size_t aux_needed = find_pair_sort_buffer_size<key_t, uint32_t>(n);
+    constexpr int end_bit = int(sizeof(key_t) * 8);
+#ifdef GPULSMOPT
+    constexpr int begin_bit = end_bit - 16;
+#else
+    constexpr int begin_bit = 0;
+#endif
+    size_t aux_needed = 0;
+    cub::DeviceRadixSort::SortPairs(
+        nullptr, aux_needed, d_keys_in.ptr(), d_sorted_keys.ptr(),
+        d_perm_in.ptr(), d_perm_sorted.ptr(), n, begin_bit, end_bit, stream);
     if (d_aux.size_in_bytes() < aux_needed) {
         d_aux.resize(aux_needed);
     }
@@ -583,10 +599,13 @@ void key_only_sort_device_timed_debug(const cuda_buffer<key_t>& d_keys_in,
     CUCHECK(cudaGetLastError());
     CUCHECK(cudaStreamSynchronize(stream));
 
-    timed_pair_sort<key_t, uint32_t>(d_aux.ptr(), aux_needed,
-                                     d_keys_in.ptr(), d_sorted_keys.ptr(),
-                                     d_perm_in.ptr(), d_perm_sorted.ptr(),
-                                     n, sort_time_ms, stream);
+    {
+        scoped_cuda_timer timer(stream, sort_time_ms);
+        cub::DeviceRadixSort::SortPairs(
+            d_aux.ptr(), aux_needed, d_keys_in.ptr(), d_sorted_keys.ptr(),
+            d_perm_in.ptr(), d_perm_sorted.ptr(), n, begin_bit, end_bit,
+            stream);
+    }
 
     CUCHECK(cudaGetLastError());
     CUCHECK(cudaStreamSynchronize(stream));

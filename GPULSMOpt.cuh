@@ -2132,7 +2132,7 @@ __global__ void section_owned_lookup_kernel(
       }
       const bool live = resolved &&
           (result.flags & kTombstone) == 0u;
-      const std::uint32_t destination = query_ids[i];
+      const std::uint32_t destination = query_ids ? query_ids[i] : i;
       final_values[destination] =
           live ? result.value : final_found ? 0u : kInvalid;
       if (final_found) final_found[destination] = live;
@@ -2290,7 +2290,7 @@ __global__ void section_owned_lookup_kernel(
     if (valid) {
       const bool live = resolved &&
           (result.flags & kTombstone) == 0u;
-      const std::uint32_t destination = query_ids[i];
+      const std::uint32_t destination = query_ids ? query_ids[i] : i;
       final_values[destination] =
           live ? result.value : final_found ? 0u : kInvalid;
       if (final_found) final_found[destination] = live;
@@ -2589,7 +2589,8 @@ public:
     admit(batch.keys, nullptr, batch.count, true, stream);
   }
 
-  void lookup(const DeviceLookupBatch &batch, cudaStream_t stream) {
+  void lookup(const DeviceLookupBatch &batch, cudaStream_t stream,
+              bool quotients_grouped = false) {
     if (!batch.count) return;
     if (!batch.queries || !batch.out_values)
       throw std::invalid_argument("invalid GPULSMOpt lookup");
@@ -2601,13 +2602,18 @@ public:
             gpulsmopt2_detail::kMaximumOperationTile);
         lookup(DeviceLookupBatch{
             batch.queries + begin, count, batch.out_values + begin,
-            batch.out_found ? batch.out_found + begin : nullptr}, stream);
+            batch.out_found ? batch.out_found + begin : nullptr}, stream,
+            quotients_grouped);
       }
       return;
     }
     begin_operation(stream);
     const std::uint32_t count = static_cast<std::uint32_t>(batch.count);
-    if (count >= gpulsmopt2_detail::kQuotients * 4u) {
+    const bool grouped =
+        count >= gpulsmopt2_detail::kQuotients * 4u;
+    const std::uint32_t *queries = batch.queries;
+    const std::uint32_t *query_ids = nullptr;
+    if (grouped && !quotients_grouped) {
       std::size_t bytes{};
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
           nullptr, bytes, batch.queries, radix_keys_.data(),
@@ -2617,32 +2623,36 @@ public:
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
           radix_workspace(), bytes, batch.queries, radix_keys_.data(),
           radix_input_ids(), radix_ids_out_.data(), count, 16, 32, stream));
+      queries = radix_keys_.data();
+      query_ids = radix_ids_out_.data();
+    }
+    if (grouped) {
       if (pending_batches_ >= 4u) {
         gpulsmopt2_detail::build_query_quotient_offsets_kernel<<<
             blocks(gpulsmopt2_detail::kQuotients + 1u),
             gpulsmopt2_detail::kThreads, 0, stream>>>(
-                radix_keys_.data(), count,
+                queries, count,
                 lookup_quotient_offsets_.data());
         gpulsmopt2_detail::section_owned_lookup_kernel<<<
             gpulsmopt2_detail::kQuotients /
                 gpulsmopt2_detail::kLookupWarpsPerBlock,
             gpulsmopt2_detail::kThreads, 0, stream>>>(
-            radix_keys_.data(), lookup_quotient_offsets_.data(), count,
+            queries, lookup_quotient_offsets_.data(), count,
             raw_assignments_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             arena_.data(), descriptors_.data(), local_rank_.data(),
             active_levels_, foundation_level(), occupied_level_mask(),
-            radix_ids_out_.data(), batch.out_values, batch.out_found);
+            query_ids, batch.out_values, batch.out_found);
       } else {
         gpulsmopt2_detail::lookup_with_pending_kernel<<<
             blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
-            radix_keys_.data(), nullptr, nullptr, count,
+            queries, batch.out_values, batch.out_found, count,
             raw_assignments_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             raw_signatures_.data(), raw_epoch_signatures_.data(),
             arena_.data(), descriptors_.data(), local_rank_.data(),
             active_levels_, foundation_level(), occupied_level_mask(),
-            radix_ids_out_.data(), batch.out_values, batch.out_found);
+            query_ids, nullptr, nullptr);
       }
       CUDA_CHECK(cudaGetLastError());
     } else {

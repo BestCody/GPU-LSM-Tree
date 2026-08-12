@@ -235,7 +235,11 @@ public:
     batch.count = size;
     batch.out_values = reinterpret_cast<std::uint32_t *>(result);
     batch.out_found = nullptr;
+#ifdef UNSORTED_PROBES_CHECKS
     dictionary_->lookup(batch, stream);
+#else
+    dictionary_->lookup(batch, stream, true);
+#endif
   }
 
   void multi_lookup_sum(const key_type *keys, value_type *result, size_t size,
