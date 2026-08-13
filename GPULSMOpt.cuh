@@ -122,8 +122,14 @@ struct RawAssignment {
   std::uint32_t metadata;
 };
 
+struct RawPayload {
+  std::uint32_t value;
+  std::uint32_t metadata;
+};
+
 static_assert(sizeof(Row) == 8u);
 static_assert(sizeof(RawAssignment) == 12u);
+static_assert(sizeof(RawPayload) == 8u);
 
 constexpr std::uint32_t kRawTombstone = 0x80000000u;
 
@@ -134,9 +140,20 @@ __host__ __device__ __forceinline__ RawAssignment make_raw_assignment(
           logical_position | (tombstone ? kRawTombstone : 0u)};
 }
 
+__host__ __device__ __forceinline__ RawPayload make_raw_payload(
+    std::uint32_t value, std::uint32_t logical_position, bool tombstone) {
+  return {tombstone ? 0u : value,
+          logical_position | (tombstone ? kRawTombstone : 0u)};
+}
+
 __host__ __device__ __forceinline__ std::uint32_t raw_position(
     const RawAssignment &assignment) {
   return assignment.metadata & ~kRawTombstone;
+}
+
+__host__ __device__ __forceinline__ std::uint32_t raw_position(
+    const RawPayload &payload) {
+  return payload.metadata & ~kRawTombstone;
 }
 
 __host__ __device__ __forceinline__ Row raw_row(
@@ -144,6 +161,19 @@ __host__ __device__ __forceinline__ Row raw_row(
   return make_row(assignment.key, assignment.value,
                   assignment.metadata & kRawTombstone
                       ? kTombstone : 0u);
+}
+
+__host__ __device__ __forceinline__ Row raw_row(
+    std::uint32_t key, const RawPayload &payload) {
+  return make_row(key, payload.value,
+                  payload.metadata & kRawTombstone ? kTombstone : 0u);
+}
+
+__host__ __device__ __forceinline__ RawAssignment load_raw_assignment(
+    const std::uint32_t *keys, const RawPayload *payloads,
+    std::uint32_t index) {
+  const RawPayload payload = payloads[index];
+  return {keys[index], payload.value, payload.metadata};
 }
 
 template <class T> inline std::size_t maximum_resident_elements() {
@@ -450,15 +480,19 @@ __device__ __forceinline__ bool tagged_less(const TaggedRow &a,
 }
 
 __device__ RawAssignment load_pending_raw_ordinal(
-    const RawAssignment *assignments, const std::uint32_t *offsets,
+    const std::uint32_t *keys, const RawPayload *payloads,
+    const std::uint32_t *offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches,
     std::uint32_t q, std::uint32_t ordinal) {
   for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
     const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
     const std::uint32_t begin = offsets[oi];
     const std::uint32_t count = offsets[oi + 1u] - begin;
-    if (ordinal < count)
-      return assignments[batch * batch_stride + begin + ordinal];
+    if (ordinal < count) {
+      const std::uint32_t index =
+          batch * batch_stride + begin + ordinal;
+      return load_raw_assignment(keys, payloads, index);
+    }
     ordinal -= count;
   }
   return {};
@@ -662,7 +696,8 @@ __global__ void reduce_single_range_partials_stage2_kernel(
 
 __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
     std::uint32_t q, std::uint32_t low, std::uint32_t high,
-    const RawAssignment *raw, const std::uint32_t *raw_offsets,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches,
     const Row *arena, const Descriptor *descriptors,
     std::uint32_t active_levels) {
@@ -676,10 +711,11 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
     const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
     const std::uint32_t section_begin = raw_offsets[oi];
     const std::uint32_t section_end = raw_offsets[oi + 1u];
-    const RawAssignment *rows = raw + batch * batch_stride;
     for (std::uint32_t index = section_begin + lane; index < section_end;
          index += 32u) {
-      const RawAssignment item = rows[index];
+      const std::uint32_t record = batch * batch_stride + index;
+      const RawAssignment item =
+          load_raw_assignment(raw_keys, raw_payloads, record);
       const Row item_row = raw_row(item);
       if (item_row.key < low_suffix || item_row.key > high_suffix) continue;
       bool covered = false;
@@ -688,9 +724,11 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
         const std::size_t noi =
             std::size_t{other_batch} * (kQuotients + 1u) + q;
         const std::uint32_t nb = raw_offsets[noi], ne = raw_offsets[noi + 1u];
-        const RawAssignment *other_rows = raw + other_batch * batch_stride;
         for (std::uint32_t other = nb; other < ne; ++other) {
-          const RawAssignment candidate = other_rows[other];
+          const std::uint32_t other_record =
+              other_batch * batch_stride + other;
+          const RawAssignment candidate =
+              load_raw_assignment(raw_keys, raw_payloads, other_record);
           if (key_suffix(candidate.key) == item_row.key &&
               raw_position(candidate) > raw_position(item)) {
             covered = true;
@@ -719,9 +757,9 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
         const std::size_t oi =
             std::size_t{batch} * (kQuotients + 1u) + q;
         const std::uint32_t rb = raw_offsets[oi], re = raw_offsets[oi + 1u];
-        const RawAssignment *pending_rows = raw + batch * batch_stride;
         for (std::uint32_t position = rb; position < re; ++position)
-          if (key_suffix(pending_rows[position].key) == item.key) {
+          if (key_suffix(raw_keys[batch * batch_stride + position]) ==
+              item.key) {
             covered = true;
             break;
           }
@@ -809,7 +847,8 @@ __global__ void cooperative_section_owned_range_kernel(
     const SectionRangeFragment *fragments,
     const std::uint32_t *section_offsets, const SectionRangeTask *tasks,
     const std::uint32_t *task_count, const Row *arena,
-    const Descriptor *descriptors, const RawAssignment *raw,
+    const Descriptor *descriptors, const std::uint32_t *raw_keys,
+    const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, std::uint32_t active_levels,
     std::uint32_t foundation_level,
@@ -912,7 +951,8 @@ __global__ void cooperative_section_owned_range_kernel(
         TaggedRow item{{0u, 0u, 0u}, kInvalidAge};
         if (lane < pending_count) {
           const RawAssignment loaded = load_pending_raw_ordinal(
-              raw, raw_offsets, batch_stride, pending_batches, q, lane);
+              raw_keys, raw_payloads, raw_offsets, batch_stride,
+              pending_batches, q, lane);
           item = {raw_row(loaded),
                   raw_age(raw_position(loaded), batch_stride)};
         }
@@ -954,7 +994,8 @@ __global__ void cooperative_section_owned_range_kernel(
            ordinal += blockDim.x) {
         if (ordinal < pending_count) {
           const RawAssignment loaded = load_pending_raw_ordinal(
-              raw, raw_offsets, batch_stride, pending_batches, q, ordinal);
+              raw_keys, raw_payloads, raw_offsets, batch_stride,
+              pending_batches, q, ordinal);
           workspace.tagged[ordinal] =
               {raw_row(loaded),
                raw_age(raw_position(loaded), batch_stride)};
@@ -1330,7 +1371,8 @@ __global__ void cooperative_section_owned_range_kernel(
     unsigned long long local = 0ull;
     if (overflow_shared) {
       local = warp_sum_visible_by_verification(
-          q, low, high, HasPending ? raw : nullptr,
+          q, low, high, HasPending ? raw_keys : nullptr,
+          HasPending ? raw_payloads : nullptr,
           HasPending ? raw_offsets : nullptr,
           batch_stride,
           HasPending ? pending_batches : 0u, arena, descriptors,
@@ -1432,7 +1474,8 @@ __global__ void warp_range_fragment_kernel(
     const std::uint32_t *device_fragment_count,
     const std::uint32_t *query_low, const std::uint32_t *query_high,
     const Row *arena,
-    const Descriptor *descriptors, const RawAssignment *raw,
+    const Descriptor *descriptors, const std::uint32_t *raw_keys,
+    const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, std::uint32_t active_levels,
     std::uint32_t foundation_level,
@@ -1487,9 +1530,14 @@ __global__ void warp_range_fragment_kernel(
       for (std::uint32_t chunk = begin; chunk < end; chunk += 32u) {
         const std::uint32_t position = chunk + lane;
         RawAssignment item{};
+        const std::uint32_t record = batch * batch_stride + position;
+        const std::uint32_t item_key =
+            position < end ? raw_keys[record] : 0u;
         const bool valid = position < end &&
-            (key_suffix((item = raw[batch * batch_stride + position]).key) >=
-             low_suffix) && key_suffix(item.key) <= high_suffix;
+            key_suffix(item_key) >= low_suffix &&
+            key_suffix(item_key) <= high_suffix;
+        if (valid)
+          item = load_raw_assignment(raw_keys, raw_payloads, record);
         const unsigned selected = __ballot_sync(full_mask, valid);
         const std::uint32_t destination =
             pending_count + __popc(selected & before);
@@ -1674,7 +1722,8 @@ __global__ void overflow_range_fragment_kernel(
     const RangeFragment *fragments,
     const std::uint32_t *query_low, const std::uint32_t *query_high,
     const Row *arena,
-    const Descriptor *descriptors, const RawAssignment *raw,
+    const Descriptor *descriptors, const std::uint32_t *raw_keys,
+    const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, std::uint32_t active_levels,
     unsigned long long *aggregate_partials) {
@@ -1702,7 +1751,7 @@ __global__ void overflow_range_fragment_kernel(
     const std::uint32_t low = max(query_low[query], q_low);
     const std::uint32_t high = min(query_high[query], q_high);
     const unsigned long long value = warp_sum_visible_by_verification(
-        q, low, high, raw, raw_offsets, batch_stride,
+        q, low, high, raw_keys, raw_payloads, raw_offsets, batch_stride,
         HasPending ? pending_batches : 0u, arena, descriptors,
         active_levels);
     if (lane == 0u) aggregate_partials[fragment_index] = value;
@@ -1712,14 +1761,16 @@ __global__ void overflow_range_fragment_kernel(
 __global__ void gather_raw_batch_kernel(
     const std::uint32_t *sorted_keys, const std::uint32_t *sorted_ids,
     const std::uint32_t *values, std::uint32_t count, std::uint32_t batch_slot,
-    bool tombstone, RawAssignment *destination,
+    bool tombstone, std::uint32_t *destination_keys,
+    RawPayload *destination_payloads,
     std::uint64_t *batch_signatures,
     std::uint64_t *epoch_signatures) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const std::uint32_t original = sorted_ids[i];
-  destination[i] = make_raw_assignment(
-      sorted_keys[i], tombstone ? 0u : values[original],
+  destination_keys[i] = sorted_keys[i];
+  destination_payloads[i] = make_raw_payload(
+      tombstone ? 0u : values[original],
       (batch_slot << kBatchPositionBits) | original, tombstone);
   const std::uint32_t key = sorted_keys[i];
   const std::uint32_t first = key * 0x9e3779b1u;
@@ -1801,15 +1852,16 @@ __global__ void scatter_admission_records_kernel(
     const std::uint32_t *keys, const std::uint32_t *values,
     std::uint32_t count, std::uint32_t batch_slot, bool tombstone,
     const std::uint32_t *offsets, const std::uint32_t *reservation_ranks,
-    RawAssignment *destination) {
+    std::uint32_t *destination_keys, RawPayload *destination_payloads) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const std::uint32_t key = keys[i];
   const std::uint32_t quotient = key >> 16u;
   const std::uint32_t output =
       offsets[quotient] + reservation_ranks[i];
-  destination[output] = make_raw_assignment(
-      key, tombstone ? 0u : values[i],
+  destination_keys[output] = key;
+  destination_payloads[output] = make_raw_payload(
+      tombstone ? 0u : values[i],
       (batch_slot << kBatchPositionBits) | i, tombstone);
 }
 
@@ -1849,7 +1901,8 @@ __global__ void build_query_quotient_offsets_kernel(
 }
 
 __global__ void pack_publication_epoch_kernel(
-    const RawAssignment *assignments, std::uint32_t batch_stride,
+    const std::uint32_t *pending_keys, const RawPayload *pending_payloads,
+    std::uint32_t batch_stride,
     const std::uint32_t *batch_offsets,
     std::uint32_t *keys, RawAssignment *output_assignments) {
   const std::uint32_t batch = blockIdx.y;
@@ -1859,9 +1912,11 @@ __global__ void pack_publication_epoch_kernel(
   if (position >= count) return;
   const std::uint32_t source = batch * batch_stride + position;
   const std::uint32_t output = batch_offsets[batch] + position;
-  const RawAssignment item = assignments[source];
-  keys[output] = item.key;
-  output_assignments[output] = item;
+  const RawPayload payload = pending_payloads[source];
+  const std::uint32_t key = pending_keys[source];
+  keys[output] = key;
+  output_assignments[output] =
+      {key, payload.value, payload.metadata};
 }
 
 __device__ __forceinline__ std::uint32_t lower_bound_full_keys(
@@ -1955,7 +2010,8 @@ __global__ void build_level_guide_kernel(
 __global__ void lookup_with_pending_kernel(
     const std::uint32_t *queries, std::uint32_t *out_values,
     std::uint8_t *out_found, std::uint32_t count,
-    const RawAssignment *raw, const std::uint32_t *raw_offsets,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches,
     const std::uint64_t *batch_signatures,
     const std::uint64_t *epoch_signatures,
@@ -1986,14 +2042,16 @@ __global__ void lookup_with_pending_kernel(
       std::uint32_t newest_position = 0u;
       bool matched = false;
       for (std::uint32_t position = begin; position < end; ++position) {
-        const RawAssignment candidate =
-            raw[batch_index * batch_stride + position];
-        const std::uint32_t candidate_position = raw_position(candidate);
-        if (key_suffix(candidate.key) == suffix &&
-            (!matched || candidate_position > newest_position)) {
-          row = raw_row(candidate);
-          newest_position = candidate_position;
-          matched = true;
+        const std::uint32_t record =
+            batch_index * batch_stride + position;
+        if (key_suffix(raw_keys[record]) == suffix) {
+          const RawPayload payload = raw_payloads[record];
+          const std::uint32_t candidate_position = raw_position(payload);
+          if (!matched || candidate_position > newest_position) {
+            row = raw_row(key, payload);
+            newest_position = candidate_position;
+            matched = true;
+          }
         }
       }
       if (matched) {
@@ -2085,7 +2143,8 @@ __device__ __forceinline__ std::uint32_t warp_lower_bound_rows(
 
 __global__ void section_owned_lookup_kernel(
     const std::uint32_t *queries, const std::uint32_t *query_offsets,
-    const RawAssignment *raw, const std::uint32_t *raw_offsets,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches, const Row *arena,
     const Descriptor *descriptors, const std::uint16_t *local_rank,
     const std::uint16_t *level_guides,
@@ -2147,16 +2206,16 @@ __global__ void section_owned_lookup_kernel(
            position += 32u) {
         const std::uint32_t record =
             std::uint32_t(batch) * batch_stride + position;
-        const RawAssignment item = raw[record];
-        const std::uint32_t suffix = key_suffix(item.key);
+        const std::uint32_t suffix = key_suffix(raw_keys[record]);
         std::uint32_t slot = mix_lookup_key(suffix) & (kLookupHashSlots - 1u);
         for (std::uint32_t probe = 0u; probe < kLookupHashSlots; ++probe) {
           const std::uint32_t observed = hash_keys[warp][slot];
           if (observed == kEmptyLookupKey)
             break;
           if (observed == suffix) {
+            const RawPayload payload = raw_payloads[record];
             const unsigned long long token =
-                (static_cast<unsigned long long>(raw_position(item) + 1u)
+                (static_cast<unsigned long long>(raw_position(payload) + 1u)
                  << 32u) |
                 static_cast<unsigned long long>(record + 1u);
             const unsigned long long prior =
@@ -2198,9 +2257,10 @@ __global__ void section_owned_lookup_kernel(
       bool resolved = valid && token != 0ull;
       if (resolved) {
         const std::uint32_t record = static_cast<std::uint32_t>(token) - 1u;
-        result = raw[record].metadata & kRawTombstone
+        const RawPayload payload = raw_payloads[record];
+        result = payload.metadata & kRawTombstone
                      ? make_row(key, 0u, kTombstone)
-                     : make_row(key, raw[record].value, 0u);
+                     : make_row(key, payload.value, 0u);
       }
 
       std::uint64_t levels = occupied_levels;
@@ -2268,7 +2328,8 @@ __global__ void section_owned_lookup_kernel(
 }
 
 __device__ bool first_visible_in_quotient(
-    std::uint32_t q, std::uint32_t lower, const RawAssignment *raw,
+    std::uint32_t q, std::uint32_t lower,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, const Row *arena,
     const Descriptor *descriptors, std::uint32_t active_levels,
@@ -2296,7 +2357,7 @@ __device__ bool first_visible_in_quotient(
       for (std::uint32_t position = raw_begin[batch]; position < raw_end[batch];
            ++position) {
         const std::uint32_t key =
-            key_suffix(raw[batch * batch_stride + position].key);
+            key_suffix(raw_keys[batch * batch_stride + position]);
         if (key >= lower_suffix && (!have_previous || key > previous) &&
             (!found || key < minimum)) {
           minimum = key;
@@ -2324,8 +2385,9 @@ __device__ bool first_visible_in_quotient(
       bool matched = false;
       for (std::uint32_t position = raw_begin[batch_index];
            position < raw_end[batch_index]; ++position) {
-        const RawAssignment item =
-            raw[batch_index * batch_stride + position];
+        const RawAssignment item = load_raw_assignment(
+            raw_keys, raw_payloads,
+            batch_index * batch_stride + position);
         const std::uint32_t item_position = raw_position(item);
         if (key_suffix(item.key) == minimum &&
             (!matched || item_position > newest_position)) {
@@ -2362,7 +2424,8 @@ __device__ bool first_visible_in_quotient(
 
 __global__ void successor_with_pending_kernel(
     const std::uint32_t *queries, std::uint32_t count,
-    std::uint32_t *out_keys, const RawAssignment *raw,
+    std::uint32_t *out_keys, const std::uint32_t *raw_keys,
+    const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, const Row *arena,
     const Descriptor *descriptors, std::uint32_t active_levels) {
@@ -2373,8 +2436,8 @@ __global__ void successor_with_pending_kernel(
     const std::uint32_t lower = q == (query >> 16u) ? query : q << 16u;
     std::uint32_t result{};
     if (first_visible_in_quotient(
-            q, lower, raw, raw_offsets, batch_stride, pending_batches, arena,
-            descriptors, active_levels, result)) {
+            q, lower, raw_keys, raw_payloads, raw_offsets, batch_stride,
+            pending_batches, arena, descriptors, active_levels, result)) {
       out_keys[i] = result;
       return;
     }
@@ -2418,8 +2481,8 @@ public:
                publication_capacity_),
         descriptors_(std::size_t{gpulsmopt2_detail::kQuotients} *
                      gpulsmopt2_detail::kMaximumLevels),
-        raw_assignments_(gpulsmopt2_detail::kBatchesPerEpoch *
-                         batch_capacity_),
+        raw_keys_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
+        raw_payloads_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
                      (gpulsmopt2_detail::kQuotients + 1u)),
         raw_signatures_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
@@ -2455,7 +2518,7 @@ public:
     std::size_t initial_sort_bytes{};
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, initial_sort_bytes,
-        reinterpret_cast<const std::uint32_t *>(raw_assignments_.data()),
+        raw_keys_.data(),
         radix_keys_.data(), radix_ids_out_.data(), radix_ids_out_.data(),
         static_cast<std::uint32_t>(batch_capacity_), 16, 32, 0));
     ensure_radix_workspace(initial_sort_bytes, batch_capacity_, 0);
@@ -2603,7 +2666,7 @@ public:
       query_ids = radix_ids_out_.data();
     }
     if (grouped) {
-      if (pending_batches_ >= 4u) {
+      if (pending_batches_ != 0u) {
         gpulsmopt2_detail::build_query_quotient_offsets_kernel<<<
             blocks(gpulsmopt2_detail::kQuotients + 1u),
             gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -2614,7 +2677,7 @@ public:
                 gpulsmopt2_detail::kLookupWarpsPerBlock,
             gpulsmopt2_detail::kThreads, 0, stream>>>(
             queries, lookup_quotient_offsets_.data(),
-            raw_assignments_.data(), raw_offsets_.data(),
+            raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             arena_.data(), descriptors_.data(), local_rank_.data(),
             level_guides_.data(),
@@ -2624,7 +2687,7 @@ public:
         gpulsmopt2_detail::lookup_with_pending_kernel<<<
             blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
             queries, batch.out_values, batch.out_found, count,
-            raw_assignments_.data(), raw_offsets_.data(),
+            raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             raw_signatures_.data(), raw_epoch_signatures_.data(),
             arena_.data(), descriptors_.data(), local_rank_.data(),
@@ -2637,7 +2700,7 @@ public:
       gpulsmopt2_detail::lookup_with_pending_kernel<<<
           blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
           batch.queries, batch.out_values, batch.out_found, count,
-          raw_assignments_.data(), raw_offsets_.data(),
+          raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
           static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
           raw_signatures_.data(),
           raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
@@ -2862,7 +2925,7 @@ public:
     gpulsmopt2_detail::successor_with_pending_kernel<<<
         blocks(batch.count), gpulsmopt2_detail::kThreads, 0, stream>>>(
         batch.queries, static_cast<std::uint32_t>(batch.count), batch.out_keys,
-        raw_assignments_.data(), raw_offsets_.data(),
+        raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
         static_cast<std::uint32_t>(batch_capacity_),
         pending_batches_, arena_.data(), descriptors_.data(), active_levels_);
     CUDA_CHECK(cudaGetLastError());
@@ -2882,7 +2945,8 @@ public:
         level_guides_.size() * sizeof(std::uint16_t) +
         arena_.size() * sizeof(gpulsmopt2_detail::Row) +
         descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
-        raw_assignments_.size() * sizeof(gpulsmopt2_detail::RawAssignment) +
+        raw_keys_.size() * sizeof(std::uint32_t) +
+        raw_payloads_.size() * sizeof(gpulsmopt2_detail::RawPayload) +
         raw_offsets_.size() * sizeof(std::uint32_t) +
         raw_signatures_.size() * sizeof(std::uint64_t) +
         raw_epoch_signatures_.size() * sizeof(std::uint64_t) +
@@ -3153,8 +3217,8 @@ private:
           blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
               keys, values, n, slot, tombstone,
               batch_offsets, radix_ids_out_.data(),
-              raw_assignments_.data() +
-                  std::size_t{slot} * batch_capacity_);
+              raw_keys_.data() + std::size_t{slot} * batch_capacity_,
+              raw_payloads_.data() + std::size_t{slot} * batch_capacity_);
     } else {
       std::size_t sort_bytes{};
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
@@ -3168,8 +3232,8 @@ private:
           blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
               radix_keys_.data(), radix_ids_out_.data(), values, n, slot,
               tombstone,
-              raw_assignments_.data() +
-                  std::size_t{slot} * batch_capacity_,
+              raw_keys_.data() + std::size_t{slot} * batch_capacity_,
+              raw_payloads_.data() + std::size_t{slot} * batch_capacity_,
               batch_signatures, raw_epoch_signatures_.data());
       gpulsmopt2_detail::finalize_quotient_metadata_kernel<<<
           gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
@@ -3211,7 +3275,7 @@ private:
         blocks(batch_capacity_), gpulsmopt2_detail::kBatchesPerEpoch);
     gpulsmopt2_detail::pack_publication_epoch_kernel<<<
         publication_grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
-            raw_assignments_.data(),
+            raw_keys_.data(), raw_payloads_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             publication_batch_offsets_.data(),
             publication_epoch_keys_a_.data(),
@@ -3353,7 +3417,8 @@ private:
         <<<grid, gpulsmopt2_detail::kSectionRangeThreads, 0, stream>>>(
             range_section_fragments_out_.data(),
             range_section_offsets_.data(), tasks, task_count,
-            arena_.data(), descriptors_.data(), raw_assignments_.data(),
+            arena_.data(), descriptors_.data(), raw_keys_.data(),
+            raw_payloads_.data(),
             raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
             HasPending ? pending_batches_ : 0u,
             active_levels_,
@@ -3374,7 +3439,7 @@ private:
             range_fragments_.data(), fragment_count,
             range_fragment_offsets_.data() + query_count,
             batch.lo, batch.hi, arena_.data(), descriptors_.data(),
-            raw_assignments_.data(), raw_offsets_.data(),
+            raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             HasPending ? pending_batches_ : 0u,
             active_levels_,
@@ -3386,7 +3451,8 @@ private:
         <<<256, 128, 0, stream>>>(
             range_overflow_fragments_.data(), range_overflow_count_.data(),
             range_fragments_.data(), batch.lo, batch.hi,
-            arena_.data(), descriptors_.data(), raw_assignments_.data(),
+            arena_.data(), descriptors_.data(), raw_keys_.data(),
+            raw_payloads_.data(),
             raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
             HasPending ? pending_batches_ : 0u,
             active_levels_,
@@ -3502,7 +3568,8 @@ private:
   gpulsmopt2_detail::VirtualBuffer<std::uint16_t> level_guides_;
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row> arena_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment> raw_assignments_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> raw_keys_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawPayload> raw_payloads_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_signatures_;
   gpulsmopt2_detail::Buffer<std::uint64_t> raw_epoch_signatures_;
