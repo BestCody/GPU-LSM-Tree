@@ -38,6 +38,10 @@ constexpr std::uint32_t kBatchPositionBits = 20u;
 constexpr std::uint32_t kLocalRankBits = 7u;
 constexpr std::uint32_t kLocalRankEntries =
     kQuotients * (1u << kLocalRankBits);
+constexpr std::uint32_t kGuideRegions = 16u;
+constexpr std::uint32_t kGuideSamples = kGuideRegions - 1u;
+constexpr std::size_t kGuideEntriesPerLevel =
+    std::size_t{kQuotients} * kGuideSamples;
 constexpr std::uint32_t kThreads = 256u;
 constexpr std::uint32_t kSectionRangeThreads = 128u;
 constexpr std::uint32_t kSectionRangeWarps =
@@ -169,6 +173,12 @@ static_assert(sizeof(Descriptor) == 8u);
 __host__ __device__ __forceinline__ std::size_t descriptor_index(
     std::uint32_t q, std::uint32_t level) {
   return std::size_t{q} * kMaximumLevels + level;
+}
+
+__host__ __device__ __forceinline__ std::size_t guide_index(
+    std::uint32_t q, std::uint32_t level) {
+  return std::size_t{level} * kGuideEntriesPerLevel +
+      std::size_t{q} * kGuideSamples;
 }
 
 struct TaggedRow {
@@ -463,6 +473,26 @@ __device__ __forceinline__ std::uint32_t lower_bound_rows(
     else hi = mid;
   }
   return lo;
+}
+
+__device__ __forceinline__ void guide_search_bounds(
+    const std::uint16_t *guides, std::uint32_t q,
+    std::uint32_t level, std::uint32_t count, std::uint32_t key,
+    std::uint32_t &begin, std::uint32_t &end) {
+  if (count < kGuideRegions) {
+    begin = 0u;
+    end = count;
+    return;
+  }
+  const std::uint16_t *samples = guides + guide_index(q, level);
+  std::uint32_t lo = 0u, hi = kGuideSamples;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (samples[mid] <= key) lo = mid + 1u;
+    else hi = mid;
+  }
+  begin = lo * count / kGuideRegions;
+  end = (lo + 1u) * count / kGuideRegions;
 }
 
 __device__ __forceinline__ std::uint32_t upper_bound_rows(
@@ -1906,6 +1936,22 @@ __global__ void build_foundation_rank_directory_kernel(
       static_cast<std::uint16_t>(position);
 }
 
+__global__ void build_level_guide_kernel(
+    const Row *arena, const Descriptor *descriptors,
+    std::uint32_t level, std::uint16_t *guides) {
+  const std::uint32_t index =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= kGuideEntriesPerLevel) return;
+  const std::uint32_t q = index / kGuideSamples;
+  const std::uint32_t sample = index % kGuideSamples;
+  const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+  if (descriptor.count() < kGuideRegions) return;
+  const std::uint32_t position =
+      (sample + 1u) * descriptor.count() / kGuideRegions;
+  guides[std::size_t{level} * kGuideEntriesPerLevel + index] =
+      arena[descriptor.offset() + position].key;
+}
+
 __global__ void lookup_with_pending_kernel(
     const std::uint32_t *queries, std::uint32_t *out_values,
     std::uint8_t *out_found, std::uint32_t count,
@@ -1915,6 +1961,7 @@ __global__ void lookup_with_pending_kernel(
     const std::uint64_t *epoch_signatures,
     const Row *arena, const Descriptor *descriptors,
     const std::uint16_t *local_rank,
+    const std::uint16_t *level_guides,
     std::uint32_t active_levels,
     std::uint32_t foundation_level,
     std::uint64_t occupied_levels,
@@ -1969,15 +2016,19 @@ __global__ void lookup_with_pending_kernel(
     const Descriptor descriptor = descriptors[descriptor_index(q, level)];
     if (!descriptor.count()) continue;
     const Row *rows = arena + descriptor.offset();
+    std::uint32_t begin = 0u, end = descriptor.count();
+    guide_search_bounds(level_guides, q, level, descriptor.count(), suffix,
+                        begin, end);
     const std::uint32_t position =
-        lower_bound_rows(rows, descriptor.count(), suffix);
-    if (position < descriptor.count() && rows[position].key == suffix) {
-      const bool live = (rows[position].flags & kTombstone) == 0u;
+        lower_bound_rows(rows + begin, end - begin, suffix);
+    if (position < end - begin && rows[begin + position].key == suffix) {
+      const bool live =
+          (rows[begin + position].flags & kTombstone) == 0u;
       const std::uint32_t destination = query_ids ? query_ids[i] : i;
       std::uint32_t *values = final_values ? final_values : out_values;
       std::uint8_t *found = final_found ? final_found : out_found;
       values[destination] =
-          live ? rows[position].value : found ? 0u : kInvalid;
+          live ? rows[begin + position].value : found ? 0u : kInvalid;
       if (found) found[destination] = live;
       return;
     }
@@ -2009,10 +2060,10 @@ __global__ void lookup_with_pending_kernel(
 }
 
 __device__ __forceinline__ std::uint32_t warp_lower_bound_rows(
-    const Row *rows, std::uint32_t count, std::uint32_t key,
-    bool enabled) {
+    const Row *rows, std::uint32_t begin, std::uint32_t end,
+    std::uint32_t key, bool enabled) {
   constexpr unsigned full = 0xffffffffu;
-  std::uint32_t low = 0u, high = count;
+  std::uint32_t low = begin, high = end;
   while (true) {
     const bool searching = enabled && low < high;
     const unsigned active = __ballot_sync(full, searching);
@@ -2037,6 +2088,7 @@ __global__ void section_owned_lookup_kernel(
     const RawAssignment *raw, const std::uint32_t *raw_offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches, const Row *arena,
     const Descriptor *descriptors, const std::uint16_t *local_rank,
+    const std::uint16_t *level_guides,
     std::uint32_t active_levels, std::uint32_t foundation_level,
     std::uint64_t occupied_levels, const std::uint32_t *query_ids,
     std::uint32_t *final_values, std::uint8_t *final_found) {
@@ -2165,9 +2217,13 @@ __global__ void section_owned_lookup_kernel(
         const Descriptor descriptor{descriptor_bits};
         const Row *rows = arena + descriptor.offset();
         const bool search = valid && !resolved && descriptor.count();
+        std::uint32_t begin = 0u, end = descriptor.count();
+        if (search)
+          guide_search_bounds(level_guides, q, level, descriptor.count(),
+                              suffix, begin, end);
         const std::uint32_t position =
-            warp_lower_bound_rows(rows, descriptor.count(), suffix, search);
-        if (search && position < descriptor.count()) {
+            warp_lower_bound_rows(rows, begin, end, suffix, search);
+        if (search && position < end) {
           const Row candidate = rows[position];
           if (candidate.key == suffix) {
             result = candidate;
@@ -2353,6 +2409,10 @@ public:
         publication_capacity_(gpulsmopt2_detail::initial_storage_capacity(
             config.max_elements, batch_capacity_)),
         local_rank_(gpulsmopt2_detail::kLocalRankEntries),
+        level_guides_(
+            gpulsmopt2_detail::kMaximumLevels *
+                gpulsmopt2_detail::kGuideEntriesPerLevel,
+            2u * gpulsmopt2_detail::kGuideEntriesPerLevel),
         arena_(gpulsmopt2_detail::maximum_resident_elements<
                    gpulsmopt2_detail::Row>(),
                publication_capacity_),
@@ -2557,6 +2617,7 @@ public:
             raw_assignments_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             arena_.data(), descriptors_.data(), local_rank_.data(),
+            level_guides_.data(),
             active_levels_, foundation_level(), occupied_level_mask(),
             query_ids, batch.out_values, batch.out_found);
       } else {
@@ -2567,6 +2628,7 @@ public:
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             raw_signatures_.data(), raw_epoch_signatures_.data(),
             arena_.data(), descriptors_.data(), local_rank_.data(),
+            level_guides_.data(),
             active_levels_, foundation_level(), occupied_level_mask(),
             query_ids, nullptr, nullptr);
       }
@@ -2579,7 +2641,8 @@ public:
           static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
           raw_signatures_.data(),
           raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
-          local_rank_.data(), active_levels_, foundation_level(),
+          local_rank_.data(), level_guides_.data(), active_levels_,
+          foundation_level(),
           occupied_level_mask(),
           nullptr, nullptr, nullptr);
     }
@@ -2816,6 +2879,7 @@ public:
 
   std::size_t gpu_resident_bytes() const {
     return local_rank_.size() * sizeof(std::uint16_t) +
+        level_guides_.size() * sizeof(std::uint16_t) +
         arena_.size() * sizeof(gpulsmopt2_detail::Row) +
         descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
         raw_assignments_.size() * sizeof(gpulsmopt2_detail::RawAssignment) +
@@ -2902,6 +2966,22 @@ private:
         gpulsmopt2_detail::kQuotients, 128u, 0, stream>>>(
             arena_.data(), descriptors_.data(), foundation_level(),
             local_rank_.data());
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  void rebuild_level_guide(std::uint32_t level, cudaStream_t stream) {
+    const std::size_t required =
+        (std::size_t{level} + 1u) *
+        gpulsmopt2_detail::kGuideEntriesPerLevel;
+    if (required > level_guides_.size()) {
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      level_guides_.grow(required);
+    }
+    gpulsmopt2_detail::build_level_guide_kernel<<<
+        blocks(gpulsmopt2_detail::kGuideEntriesPerLevel),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            arena_.data(), descriptors_.data(), level,
+            level_guides_.data());
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -3218,13 +3298,15 @@ private:
             destination_level, descriptors_.data());
     level_offsets_[destination_level] = destination;
     level_counts_[destination_level] = current_count;
+    refresh_active_levels();
+    if (destination_level != foundation_level())
+      rebuild_level_guide(destination_level, stream);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemsetAsync(
         raw_epoch_signatures_.data(), 0,
         raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
     pending_batches_ = 0u;
     pending_records_ = 0u;
-    refresh_active_levels();
     if (foundation_level() != old_foundation)
       rebuild_foundation_rank(stream);
     ++stats_.epochs_published;
@@ -3417,6 +3499,7 @@ private:
   cudaEvent_t operation_done_{};
 
   gpulsmopt2_detail::Buffer<std::uint16_t> local_rank_;
+  gpulsmopt2_detail::VirtualBuffer<std::uint16_t> level_guides_;
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row> arena_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment> raw_assignments_;
