@@ -12,6 +12,7 @@
 #include <thrust/iterator/transform_output_iterator.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -74,6 +75,16 @@ constexpr std::uint32_t kFoundationAgeBits = 6u;
 constexpr std::uint32_t kFoundationCells = 128u;
 constexpr std::uint32_t kFoundationCellKeys = 512u;
 constexpr std::uint32_t kFoundationCapacityGranularity = 128u;
+constexpr std::uint32_t kBalancedMergeTarget =
+    kFoundationSectionCapacity;
+constexpr std::uint32_t kBalancedMergeMaximumQuotients = 512u;
+// A quotient has at most 65 sorted sources and 65,536 distinct suffixes.
+// This upper bound is sufficient to split even that theoretical maximum into
+// on-chip jobs without imposing a fixed number of pieces on ordinary data.
+constexpr std::uint32_t kBalancedHotRanges = 2048u;
+constexpr std::uint32_t kBalancedMergeWorkspace =
+    kBalancedMergeTarget + kMaximumLevels;
+constexpr std::uint32_t kMergeSourceBits = 7u;
 
 inline std::size_t initial_storage_capacity(
     std::size_t requested, std::size_t tile_capacity) {
@@ -86,10 +97,25 @@ inline std::size_t initial_storage_capacity(
 }
 
 inline std::size_t foundation_pool_capacity(std::size_t requested) {
-  if (requested > kMaximumPublicationRows / 2u)
-    return kMaximumPublicationRows;
-  return std::max<std::size_t>(requested * 2u,
-                               std::size_t{kQuotients} * 256u);
+  constexpr std::size_t even_maximum = kMaximumPublicationRows - 1u;
+  // Two alternating banks.  Each bank needs up to 1.5x live rows for section
+  // slack plus at most one capacity-granularity rounding unit per quotient;
+  // 2x per bank is the simple distribution-independent bound.
+  const std::size_t requested_banks = requested > even_maximum / 4u
+      ? even_maximum : requested * 4u;
+  const std::size_t capacity = std::max<std::size_t>(
+      requested_banks, std::size_t{kQuotients} * 1024u);
+  return std::min(even_maximum, (capacity + 1u) & ~std::size_t{1u});
+}
+
+inline std::size_t initial_crowded_merge_sections(std::size_t capacity) {
+  const std::size_t maximum_rows = capacity > kMaximumPublicationRows / 2u
+      ? kMaximumPublicationRows : capacity * 2u;
+  return std::max<std::size_t>(
+      1u, std::min<std::size_t>(
+              kQuotients,
+              (maximum_rows + kBalancedMergeTarget) /
+                  (kBalancedMergeTarget + 1u)));
 }
 
 struct Row {
@@ -281,6 +307,21 @@ struct SectionRangeTask {
 
 static_assert(sizeof(SectionRangeTask) == 12u);
 constexpr std::uint32_t kSectionTaskFragments = kSectionRangeThreads;
+
+struct BalancedMergeJob {
+  std::uint32_t quotient_begin;
+  std::uint32_t quotient_end;
+  std::uint32_t reuse_existing_page{};
+};
+
+static_assert(sizeof(BalancedMergeJob) == 12u);
+
+struct CrowdedMergeTask {
+  std::uint32_t hot_index;
+  std::uint32_t range;
+};
+
+static_assert(sizeof(CrowdedMergeTask) == 8u);
 
 template <class T> class Buffer {
 public:
@@ -2034,15 +2075,69 @@ __global__ void publish_foundation_build_kernel(
   foundation_capacities[q] = capacities[q];
 }
 
-__global__ void classify_foundation_sections_kernel(
+__global__ void count_balanced_merge_work_kernel(
     const std::uint32_t *current_offsets, const Descriptor *descriptors,
-    std::uint32_t foundation_level, std::uint8_t *hot_flags) {
+    std::uint32_t source_level_limit, std::uint32_t *raw_counts) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= kQuotients) return;
   std::uint32_t count = current_offsets[q + 1u] - current_offsets[q];
-  for (std::uint32_t level = 0u; level <= foundation_level; ++level)
+  for (std::uint32_t level = 0u; level <= source_level_limit; ++level)
     count += descriptors[descriptor_index(q, level)].count();
-  hot_flags[q] = count > kFoundationSectionCapacity;
+  raw_counts[q] = count;
+}
+
+__device__ __forceinline__ std::uint32_t balanced_merge_prefix_count(
+    std::uint32_t q, std::uint32_t suffix,
+    const Row *current_rows, const std::uint32_t *current_offsets,
+    const Row *arena, const Descriptor *descriptors,
+    std::uint32_t source_level_limit) {
+  const std::uint32_t current_begin = current_offsets[q];
+  std::uint32_t result = lower_bound_rows(
+      current_rows + current_begin,
+      current_offsets[q + 1u] - current_begin, suffix);
+  for (std::uint32_t level = 0u; level <= source_level_limit; ++level) {
+    const Descriptor descriptor = descriptors[descriptor_index(q, level)];
+    result += lower_bound_rows(arena + descriptor.offset(),
+                               descriptor.count(), suffix);
+  }
+  return result;
+}
+
+__global__ void plan_crowded_merge_ranges_kernel(
+    const std::uint32_t *hot_sections, std::uint32_t hot_count,
+    const std::uint32_t *raw_counts, const Row *current_rows,
+    const std::uint32_t *current_offsets, const Row *arena,
+    const Descriptor *descriptors, std::uint32_t source_level_limit,
+    const std::uint32_t *range_counts,
+    const std::uint32_t *range_bases,
+    std::uint32_t *range_boundaries) {
+  const std::uint32_t hot_index = blockIdx.x;
+  if (hot_index >= hot_count) return;
+  const std::uint32_t q = hot_sections[hot_index];
+  const std::uint32_t raw = raw_counts[q];
+  const std::uint32_t ranges = range_counts[hot_index];
+  const std::size_t base = range_bases[hot_index];
+  if (threadIdx.x == 0u) {
+    range_boundaries[base] = 0u;
+    range_boundaries[base + ranges] = 1u << 16u;
+  }
+  for (std::uint32_t range = threadIdx.x + 1u;
+       range < ranges; range += blockDim.x) {
+    const std::uint32_t target = static_cast<std::uint32_t>(
+        (std::uint64_t{raw} * range + ranges - 1u) / ranges);
+    std::uint32_t low = 1u;
+    std::uint32_t high = 1u << 16u;
+    while (low < high) {
+      const std::uint32_t middle = (low + high) >> 1u;
+      if (balanced_merge_prefix_count(
+              q, middle, current_rows, current_offsets, arena,
+              descriptors, source_level_limit) < target)
+        low = middle + 1u;
+      else
+        high = middle;
+    }
+    range_boundaries[base + range] = low;
+  }
 }
 
 __device__ __forceinline__ Row load_foundation_candidate(
@@ -2082,7 +2177,8 @@ __device__ __forceinline__ std::uint32_t foundation_raw_count(
 __device__ __forceinline__ std::uint32_t warp_merge_foundation_sources(
     const Row *candidates, const std::uint32_t *source_offsets,
     std::uint32_t sources, std::uint32_t low, std::uint32_t high,
-    std::uint16_t *resolved_indices, std::uint32_t output_base) {
+    bool keep_tombstones, std::uint16_t *resolved_indices,
+    std::uint32_t output_base) {
   constexpr unsigned mask = 0xffffffffu;
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t source_a = lane;
@@ -2108,25 +2204,26 @@ __device__ __forceinline__ std::uint32_t warp_merge_foundation_sources(
     const std::uint32_t key_b = cursor_b < end_b
         ? candidates[cursor_b].key : 0x10000u;
     const std::uint32_t tagged_a = key_a < 0x10000u
-        ? (key_a << kFoundationAgeBits) | source_a : kInvalid;
+        ? (key_a << kMergeSourceBits) | source_a : kInvalid;
     const std::uint32_t tagged_b = key_b < 0x10000u
-        ? (key_b << kFoundationAgeBits) | source_b : kInvalid;
+        ? (key_b << kMergeSourceBits) | source_b : kInvalid;
     std::uint32_t winner = min(tagged_a, tagged_b);
     for (std::uint32_t offset = 16u; offset; offset >>= 1u)
       winner = min(winner, __shfl_down_sync(mask, winner, offset));
     winner = __shfl_sync(mask, winner, 0u);
     if (winner == kInvalid) break;
 
-    const std::uint32_t winner_key = winner >> kFoundationAgeBits;
+    const std::uint32_t winner_key = winner >> kMergeSourceBits;
     const std::uint32_t winner_source =
-        winner & ((1u << kFoundationAgeBits) - 1u);
+        winner & ((1u << kMergeSourceBits) - 1u);
     std::uint32_t winner_index = kInvalid;
     if (source_a == winner_source) winner_index = cursor_a;
     if (source_b == winner_source) winner_index = cursor_b;
     winner_index =
         __shfl_sync(mask, winner_index, winner_source & 31u);
     const Row row = candidates[winner_index];
-    if (lane == 0u && (row.flags & kTombstone) == 0u) {
+    if (lane == 0u &&
+        (keep_tombstones || (row.flags & kTombstone) == 0u)) {
       resolved_indices[output_base + output_count] =
           static_cast<std::uint16_t>(winner_index);
       ++output_count;
@@ -2140,128 +2237,803 @@ __device__ __forceinline__ std::uint32_t warp_merge_foundation_sources(
 }
 
 __global__ void compact_normal_foundation_sections_kernel(
+    const BalancedMergeJob *jobs, std::uint32_t job_count,
+    const std::uint32_t *raw_counts,
     const Row *current_rows, const std::uint32_t *current_offsets,
     Row *arena, const Descriptor *descriptors,
-    std::uint32_t foundation_level, const std::uint8_t *hot_flags,
+    std::uint32_t source_level_limit,
+    bool keep_tombstones, bool reuse_existing_sections,
     const std::uint32_t *foundation_capacities,
-    unsigned long long *foundation_next_offset,
-    unsigned long long foundation_pool_capacity,
+    unsigned long long *next_output_offset,
+    unsigned long long output_limit,
     Descriptor *next_descriptors, std::uint32_t *next_capacities,
     std::uint32_t *section_output_counts,
     std::uint32_t *total_output_count, std::uint32_t *overflow_flag) {
   constexpr std::uint32_t kWarps = kFoundationCompactionThreads / 32u;
-  constexpr std::uint32_t kWarpSuffixes = (1u << 16u) / kWarps;
+  constexpr unsigned mask = 0xffffffffu;
   __shared__ Row candidates[kFoundationSectionCapacity];
   __shared__ std::uint16_t resolved_indices[kFoundationSectionCapacity];
-  __shared__ std::uint32_t source_offsets[kMaximumLevels + 2u];
-  __shared__ std::uint32_t warp_raw_offsets[kWarps];
-  __shared__ std::uint32_t warp_counts[kWarps], warp_offsets[kWarps];
-  __shared__ Descriptor output_descriptor;
-  __shared__ std::uint32_t output_capacity;
-  __shared__ std::uint32_t output_count_shared;
-  __shared__ std::uint32_t raw_count_shared;
+  __shared__ std::uint32_t quotient_offsets[
+      kBalancedMergeMaximumQuotients + 1u];
+  __shared__ std::uint32_t quotient_warp_counts[kWarps];
+  __shared__ std::uint32_t quotient_first_warp[kWarps];
+  __shared__ std::uint32_t warp_quotients[kWarps];
+  __shared__ std::uint32_t warp_bands[kWarps];
+  __shared__ std::uint32_t warp_raw_counts[kWarps];
+  __shared__ std::uint32_t warp_raw_bases[kWarps];
+  __shared__ std::uint32_t warp_output_counts[kWarps];
+  __shared__ std::uint32_t warp_output_bases[kWarps];
+  __shared__ std::uint64_t quotient_output_bits[kWarps];
 
-  const std::uint32_t q = blockIdx.x;
-  if (q >= kQuotients || hot_flags[q]) return;
+  const std::uint32_t job_index = blockIdx.x;
+  if (job_index >= job_count) return;
+  const BalancedMergeJob job = jobs[job_index];
+  const std::uint32_t quotient_count =
+      job.quotient_end - job.quotient_begin;
   if (threadIdx.x == 0u) {
-    source_offsets[0u] = 0u;
-    source_offsets[1u] =
-        current_offsets[q + 1u] - current_offsets[q];
-    for (std::uint32_t level = 0u; level <= foundation_level; ++level)
-      source_offsets[level + 2u] = source_offsets[level + 1u] +
-          descriptors[descriptor_index(q, level)].count();
-    raw_count_shared = source_offsets[foundation_level + 2u];
+    quotient_offsets[0u] = 0u;
+    for (std::uint32_t local = 0u; local < quotient_count; ++local)
+      quotient_offsets[local + 1u] = quotient_offsets[local] +
+          raw_counts[job.quotient_begin + local];
   }
   __syncthreads();
-  const std::uint32_t raw_count = raw_count_shared;
-  if (!raw_count) {
-    if (threadIdx.x == 0u) {
-      next_descriptors[q] = {};
-      next_capacities[q] = 0u;
-      section_output_counts[q] = 0u;
+  const std::uint32_t task_rows = quotient_offsets[quotient_count];
+  for (std::uint32_t index = threadIdx.x; index < task_rows;
+       index += blockDim.x) {
+    std::uint32_t low = 0u, high = quotient_count;
+    while (low + 1u < high) {
+      const std::uint32_t middle = (low + high) >> 1u;
+      if (quotient_offsets[middle] <= index)
+        low = middle;
+      else
+        high = middle;
     }
-    return;
-  }
-  for (std::uint32_t ordinal = threadIdx.x; ordinal < raw_count;
-       ordinal += blockDim.x) {
+    const std::uint32_t q = job.quotient_begin + low;
     std::uint32_t age{};
-    candidates[ordinal] = load_foundation_candidate(
-        q, ordinal, current_rows, current_offsets, arena, descriptors,
-        foundation_level, age);
+    candidates[index] = load_foundation_candidate(
+        q, index - quotient_offsets[low], current_rows, current_offsets,
+        arena, descriptors, source_level_limit, age);
   }
   __syncthreads();
 
   const std::uint32_t warp = threadIdx.x >> 5u;
   const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t low = warp * kWarpSuffixes;
-  const std::uint32_t high = low + kWarpSuffixes;
-  const std::uint32_t sources = foundation_level + 2u;
-  if (lane == 0u) {
-    std::uint32_t band_raw_count = 0u;
-    for (std::uint32_t source = 0u; source < sources; ++source) {
-      const std::uint32_t base = source_offsets[source];
-      const std::uint32_t count = source_offsets[source + 1u] - base;
-      band_raw_count += lower_bound_rows(candidates + base, count, high) -
-          lower_bound_rows(candidates + base, count, low);
-    }
-    warp_raw_offsets[warp] = band_raw_count;
-  }
-  __syncthreads();
-  if (threadIdx.x == 0u) {
-    std::uint32_t raw_before = 0u;
-    for (std::uint32_t index = 0u; index < kWarps; ++index) {
-      const std::uint32_t count = warp_raw_offsets[index];
-      warp_raw_offsets[index] = raw_before;
-      raw_before += count;
-    }
-  }
-  __syncthreads();
-  const std::uint32_t local_count = warp_merge_foundation_sources(
-      candidates, source_offsets, sources, low, high, resolved_indices,
-      warp_raw_offsets[warp]);
-  if (lane == 0u) warp_counts[warp] = local_count;
-  __syncthreads();
-
-  if (threadIdx.x == 0u) {
-    std::uint32_t total_live = 0u;
-    for (std::uint32_t index = 0u; index < kWarps; ++index) {
-      warp_offsets[index] = total_live;
-      total_live += warp_counts[index];
-    }
-    output_count_shared = total_live;
-    const Descriptor old_descriptor =
-        descriptors[descriptor_index(q, foundation_level)];
-    const std::uint32_t old_capacity = foundation_capacities[q];
-    if (!total_live) {
-      output_descriptor = {};
-      output_capacity = 0u;
-    } else if (total_live <= old_capacity) {
-      output_descriptor = Descriptor::make(old_descriptor.offset(), total_live);
-      output_capacity = old_capacity;
-    } else {
-      output_capacity = foundation_section_capacity(total_live);
-      const unsigned long long offset = atomicAdd(
-          foundation_next_offset,
-          static_cast<unsigned long long>(output_capacity));
-      if (offset + output_capacity > foundation_pool_capacity) {
-        atomicExch(overflow_flag, 1u);
-        output_descriptor = {};
-      } else {
-        output_descriptor = Descriptor::make(offset, total_live);
+  const std::uint32_t sources = source_level_limit + 2u;
+  if (quotient_count <= kWarps) {
+    if (threadIdx.x == 0u) {
+      for (std::uint32_t local = 0u; local < quotient_count; ++local)
+        quotient_warp_counts[local] = 1u;
+      for (std::uint32_t remaining = kWarps - quotient_count;
+           remaining; --remaining) {
+        std::uint32_t best = 0u;
+        for (std::uint32_t local = 1u; local < quotient_count; ++local) {
+          const std::uint32_t best_rows =
+              quotient_offsets[best + 1u] - quotient_offsets[best];
+          const std::uint32_t local_rows =
+              quotient_offsets[local + 1u] - quotient_offsets[local];
+          if (std::uint64_t{local_rows} * quotient_warp_counts[best] >
+              std::uint64_t{best_rows} * quotient_warp_counts[local])
+            best = local;
+        }
+        ++quotient_warp_counts[best];
+      }
+      std::uint32_t next_warp = 0u;
+      for (std::uint32_t local = 0u; local < quotient_count; ++local) {
+        quotient_first_warp[local] = next_warp;
+        for (std::uint32_t band = 0u;
+             band < quotient_warp_counts[local]; ++band) {
+          warp_quotients[next_warp] = local;
+          warp_bands[next_warp] = band;
+          ++next_warp;
+        }
       }
     }
-    next_descriptors[q] = output_descriptor;
-    next_capacities[q] = output_capacity;
-    section_output_counts[q] = total_live;
-    atomicAdd(total_output_count, total_live);
+    __syncthreads();
+    const std::uint32_t local = warp_quotients[warp];
+    const std::uint32_t q = job.quotient_begin + local;
+    const std::uint32_t q_base = quotient_offsets[local];
+    const std::uint32_t bands = quotient_warp_counts[local];
+    const std::uint32_t band = warp_bands[warp];
+    const std::uint32_t suffix_low = static_cast<std::uint32_t>(
+        (std::uint64_t{1u << 16u} * band) / bands);
+    const std::uint32_t suffix_high = static_cast<std::uint32_t>(
+        (std::uint64_t{1u << 16u} * (band + 1u)) / bands);
+    if (lane == 0u) {
+      std::uint32_t band_rows = 0u;
+      for (std::uint32_t source = 0u; source < sources; ++source) {
+        std::uint32_t source_base = q_base;
+        if (source) {
+          source_base += current_offsets[q + 1u] - current_offsets[q];
+          for (std::uint32_t level = 0u; level + 1u < source; ++level)
+            source_base +=
+                descriptors[descriptor_index(q, level)].count();
+        }
+        const std::uint32_t count = source == 0u
+            ? current_offsets[q + 1u] - current_offsets[q]
+            : descriptors[descriptor_index(q, source - 1u)].count();
+        band_rows += lower_bound_rows(
+            candidates + source_base, count, suffix_high) -
+            lower_bound_rows(candidates + source_base, count, suffix_low);
+      }
+      warp_raw_counts[warp] = band_rows;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      for (std::uint32_t local_q = 0u; local_q < quotient_count;
+           ++local_q) {
+        std::uint32_t raw_base = 0u;
+        const std::uint32_t first = quotient_first_warp[local_q];
+        for (std::uint32_t index = 0u;
+             index < quotient_warp_counts[local_q]; ++index) {
+          warp_raw_bases[first + index] = raw_base;
+          raw_base += warp_raw_counts[first + index];
+        }
+      }
+    }
+    __syncthreads();
+
+    const std::uint32_t source_a = lane;
+    const std::uint32_t source_b = lane + 32u;
+    std::uint32_t cursor_a = q_base, end_a = q_base;
+    std::uint32_t cursor_b = q_base, end_b = q_base;
+    if (source_a < sources) {
+      std::uint32_t source_base = q_base;
+      if (source_a) {
+        source_base += current_offsets[q + 1u] - current_offsets[q];
+        for (std::uint32_t level = 0u; level + 1u < source_a; ++level)
+          source_base += descriptors[descriptor_index(q, level)].count();
+      }
+      const std::uint32_t count = source_a == 0u
+          ? current_offsets[q + 1u] - current_offsets[q]
+          : descriptors[descriptor_index(q, source_a - 1u)].count();
+      cursor_a = source_base + lower_bound_rows(
+          candidates + source_base, count, suffix_low);
+      end_a = source_base + lower_bound_rows(
+          candidates + source_base, count, suffix_high);
+    }
+    if (source_b < sources) {
+      std::uint32_t source_base = q_base +
+          current_offsets[q + 1u] - current_offsets[q];
+      for (std::uint32_t level = 0u; level + 1u < source_b; ++level)
+        source_base += descriptors[descriptor_index(q, level)].count();
+      const std::uint32_t count =
+          descriptors[descriptor_index(q, source_b - 1u)].count();
+      cursor_b = source_base + lower_bound_rows(
+          candidates + source_base, count, suffix_low);
+      end_b = source_base + lower_bound_rows(
+          candidates + source_base, count, suffix_high);
+    }
+    std::uint32_t output_count = 0u;
+    while (true) {
+      const std::uint32_t key_a = cursor_a < end_a
+          ? candidates[cursor_a].key : 0x10000u;
+      const std::uint32_t key_b = cursor_b < end_b
+          ? candidates[cursor_b].key : 0x10000u;
+      const std::uint32_t tagged_a = key_a < 0x10000u
+          ? (key_a << kMergeSourceBits) | source_a : kInvalid;
+      const std::uint32_t tagged_b = key_b < 0x10000u
+          ? (key_b << kMergeSourceBits) | source_b : kInvalid;
+      std::uint32_t winner = min(tagged_a, tagged_b);
+      for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+        winner = min(winner, __shfl_down_sync(mask, winner, offset));
+      winner = __shfl_sync(mask, winner, 0u);
+      if (winner == kInvalid) break;
+      const std::uint32_t winner_key = winner >> kMergeSourceBits;
+      const std::uint32_t winner_source =
+          winner & ((1u << kMergeSourceBits) - 1u);
+      std::uint32_t winner_index = kInvalid;
+      if (source_a == winner_source) winner_index = cursor_a;
+      if (source_b == winner_source) winner_index = cursor_b;
+      winner_index =
+          __shfl_sync(mask, winner_index, winner_source & 31u);
+      const Row row = candidates[winner_index];
+      if (lane == 0u &&
+          (keep_tombstones || (row.flags & kTombstone) == 0u))
+        resolved_indices[q_base + warp_raw_bases[warp] + output_count++] =
+            static_cast<std::uint16_t>(winner_index);
+      if (cursor_a < end_a && key_a == winner_key) ++cursor_a;
+      if (cursor_b < end_b && key_b == winner_key) ++cursor_b;
+    }
+    if (lane == 0u) warp_output_counts[warp] = output_count;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      for (std::uint32_t local_q = 0u; local_q < quotient_count;
+           ++local_q) {
+        const std::uint32_t first = quotient_first_warp[local_q];
+        std::uint32_t total = 0u;
+        for (std::uint32_t index = 0u;
+             index < quotient_warp_counts[local_q]; ++index) {
+          warp_output_bases[first + index] = total;
+          total += warp_output_counts[first + index];
+        }
+        const std::uint32_t output_q = job.quotient_begin + local_q;
+        Descriptor output_descriptor{};
+        std::uint32_t output_capacity = 0u;
+        const std::uint32_t old_capacity = reuse_existing_sections
+            ? foundation_capacities[output_q] : 0u;
+        if (total && reuse_existing_sections && total <= old_capacity) {
+          const Descriptor old_descriptor = descriptors[
+              descriptor_index(output_q, source_level_limit)];
+          output_descriptor =
+              Descriptor::make(old_descriptor.offset(), total);
+          output_capacity = old_capacity;
+        } else if (total) {
+          output_capacity = reuse_existing_sections
+              ? foundation_section_capacity(total) : total;
+          const unsigned long long offset = atomicAdd(
+              next_output_offset,
+              static_cast<unsigned long long>(output_capacity));
+          if (offset + output_capacity > output_limit)
+            atomicExch(overflow_flag, 1u);
+          else
+            output_descriptor = Descriptor::make(offset, total);
+        }
+        quotient_output_bits[local_q] = output_descriptor.bits;
+        next_descriptors[output_q] = output_descriptor;
+        next_capacities[output_q] = output_capacity;
+        section_output_counts[output_q] = total;
+        atomicAdd(total_output_count, total);
+      }
+    }
+    __syncthreads();
+    const Descriptor output_descriptor{quotient_output_bits[local]};
+    if (output_descriptor.count()) {
+      const std::uint16_t *indices = resolved_indices + q_base +
+          warp_raw_bases[warp];
+      Row *output = arena + output_descriptor.offset() +
+          warp_output_bases[warp];
+      for (std::uint32_t index = lane;
+           index < warp_output_counts[warp]; index += 32u)
+        output[index] = candidates[indices[index]];
+    }
+    return;
+  }
+  for (std::uint32_t local = warp; local < quotient_count;
+       local += kWarps) {
+    const std::uint32_t q = job.quotient_begin + local;
+    const std::uint32_t q_base = quotient_offsets[local];
+    const std::uint32_t q_end = quotient_offsets[local + 1u];
+    if (q_base == q_end) continue;
+
+    const std::uint32_t source_a = lane;
+    const std::uint32_t source_b = lane + 32u;
+    std::uint32_t cursor_a = q_base, end_a = q_base;
+    std::uint32_t cursor_b = q_base, end_b = q_base;
+    if (source_a < sources) {
+      std::uint32_t base = q_base;
+      if (source_a) {
+        base += current_offsets[q + 1u] - current_offsets[q];
+        for (std::uint32_t level = 0u; level + 1u < source_a; ++level)
+          base += descriptors[descriptor_index(q, level)].count();
+      }
+      const std::uint32_t count = source_a == 0u
+          ? current_offsets[q + 1u] - current_offsets[q]
+          : descriptors[descriptor_index(q, source_a - 1u)].count();
+      cursor_a = base;
+      end_a = base + count;
+    }
+    if (source_b < sources) {
+      std::uint32_t base = q_base +
+          current_offsets[q + 1u] - current_offsets[q];
+      for (std::uint32_t level = 0u; level + 1u < source_b; ++level)
+        base += descriptors[descriptor_index(q, level)].count();
+      const std::uint32_t count =
+          descriptors[descriptor_index(q, source_b - 1u)].count();
+      cursor_b = base;
+      end_b = base + count;
+    }
+
+    std::uint32_t output_count = 0u;
+    while (true) {
+      const std::uint32_t key_a = cursor_a < end_a
+          ? candidates[cursor_a].key : 0x10000u;
+      const std::uint32_t key_b = cursor_b < end_b
+          ? candidates[cursor_b].key : 0x10000u;
+      const std::uint32_t tagged_a = key_a < 0x10000u
+          ? (key_a << kMergeSourceBits) | source_a : kInvalid;
+      const std::uint32_t tagged_b = key_b < 0x10000u
+          ? (key_b << kMergeSourceBits) | source_b : kInvalid;
+      std::uint32_t winner = min(tagged_a, tagged_b);
+      for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+        winner = min(winner, __shfl_down_sync(mask, winner, offset));
+      winner = __shfl_sync(mask, winner, 0u);
+      if (winner == kInvalid) break;
+      const std::uint32_t winner_key = winner >> kMergeSourceBits;
+      const std::uint32_t winner_source =
+          winner & ((1u << kMergeSourceBits) - 1u);
+      std::uint32_t winner_index = kInvalid;
+      if (source_a == winner_source) winner_index = cursor_a;
+      if (source_b == winner_source) winner_index = cursor_b;
+      winner_index =
+          __shfl_sync(mask, winner_index, winner_source & 31u);
+      const Row row = candidates[winner_index];
+      if (lane == 0u &&
+          (keep_tombstones || (row.flags & kTombstone) == 0u))
+        resolved_indices[q_base + output_count++] =
+            static_cast<std::uint16_t>(winner_index);
+      if (cursor_a < end_a && key_a == winner_key) ++cursor_a;
+      if (cursor_b < end_b && key_b == winner_key) ++cursor_b;
+    }
+    output_count = __shfl_sync(mask, output_count, 0u);
+
+    std::uint64_t output_bits = 0u;
+    if (lane == 0u) {
+      std::uint32_t output_capacity = 0u;
+      Descriptor output_descriptor{};
+      const Descriptor old_descriptor = reuse_existing_sections
+          ? descriptors[descriptor_index(q, source_level_limit)]
+          : Descriptor{};
+      const std::uint32_t old_capacity = reuse_existing_sections
+          ? foundation_capacities[q] : 0u;
+      if (output_count && reuse_existing_sections &&
+          output_count <= old_capacity) {
+        output_descriptor =
+            Descriptor::make(old_descriptor.offset(), output_count);
+        output_capacity = old_capacity;
+      } else if (output_count) {
+        output_capacity = reuse_existing_sections
+            ? foundation_section_capacity(output_count) : output_count;
+        const unsigned long long offset = atomicAdd(
+            next_output_offset,
+            static_cast<unsigned long long>(output_capacity));
+        if (offset + output_capacity > output_limit) {
+          atomicExch(overflow_flag, 1u);
+        } else {
+          output_descriptor = Descriptor::make(offset, output_count);
+        }
+      }
+      next_descriptors[q] = output_descriptor;
+      next_capacities[q] = output_capacity;
+      section_output_counts[q] = output_count;
+      atomicAdd(total_output_count, output_count);
+      output_bits = output_descriptor.bits;
+    }
+    const std::uint32_t output_low = __shfl_sync(
+        mask, static_cast<std::uint32_t>(output_bits), 0u);
+    const std::uint32_t output_high = __shfl_sync(
+        mask, static_cast<std::uint32_t>(output_bits >> 32u), 0u);
+    output_bits = std::uint64_t{output_low} |
+        (std::uint64_t{output_high} << 32u);
+    const Descriptor output_descriptor{output_bits};
+    if (output_descriptor.count()) {
+      Row *output = arena + output_descriptor.offset();
+      for (std::uint32_t index = lane; index < output_count; index += 32u)
+        output[index] = candidates[resolved_indices[q_base + index]];
+    }
+  }
+}
+
+__device__ __forceinline__ std::uint32_t pull_candidate_order_key(
+    const Row &row) {
+  const std::uint32_t local_q = row.flags >> kMergeSourceBits;
+  const std::uint32_t age =
+      row.flags & ((1u << kMergeSourceBits) - 1u);
+  return (local_q << (16u + kMergeSourceBits)) |
+      (std::uint32_t{row.key} << kMergeSourceBits) | age;
+}
+
+__device__ __forceinline__ bool pull_index_less(
+    std::uint16_t left, std::uint16_t right, const Row *candidates) {
+  return pull_candidate_order_key(candidates[left]) <
+      pull_candidate_order_key(candidates[right]);
+}
+
+__device__ __forceinline__ std::uint32_t pull_merge_partition(
+    const std::uint16_t *left, std::uint32_t left_count,
+    const std::uint16_t *right, std::uint32_t right_count,
+    std::uint32_t diagonal, const Row *candidates) {
+  std::uint32_t low = diagonal > right_count
+      ? diagonal - right_count : 0u;
+  std::uint32_t high = min(diagonal, left_count);
+  while (low <= high) {
+    const std::uint32_t left_index = (low + high) >> 1u;
+    const std::uint32_t right_index = diagonal - left_index;
+    if (left_index && right_index < right_count &&
+        pull_index_less(right[right_index], left[left_index - 1u],
+                        candidates)) {
+      high = left_index - 1u;
+    } else if (right_index && left_index < left_count &&
+               pull_index_less(left[left_index], right[right_index - 1u],
+                               candidates)) {
+      low = left_index + 1u;
+    } else {
+      return left_index;
+    }
+  }
+  return low;
+}
+
+__global__ void compact_balanced_merge_jobs_kernel(
+    const BalancedMergeJob *jobs, std::uint32_t job_count,
+    const std::uint32_t *raw_counts,
+    const Row *current_rows, const std::uint32_t *current_offsets,
+    Row *arena, const Descriptor *descriptors,
+    std::uint32_t source_level_limit,
+    bool keep_tombstones, bool reuse_existing_sections,
+    const std::uint32_t *foundation_capacities,
+    unsigned long long *next_output_offset,
+    unsigned long long output_limit,
+    Descriptor *next_descriptors, std::uint32_t *next_capacities,
+    std::uint32_t *section_output_counts,
+    std::uint32_t *total_output_count, std::uint32_t *overflow_flag) {
+  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
+  constexpr std::uint32_t kItemsPerThread =
+      (kBalancedMergeTarget + kThreads - 1u) / kThreads;
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  __shared__ typename BlockScan::TempStorage block_scan_storage;
+  __shared__ Row candidates[kBalancedMergeTarget];
+  // These arrays first hold pull-slice boundaries/tags.  After every input
+  // row has been pulled, they become the two ping-pong merge-index planes.
+  __shared__ std::uint16_t merge_indices_a[kBalancedMergeTarget + 1u];
+  __shared__ std::uint16_t merge_indices_b[kBalancedMergeTarget + 1u];
+  __shared__ std::uint32_t tombstone_words[
+      (kBalancedMergeTarget + 31u) / 32u];
+  __shared__ std::uint16_t quotient_offsets[
+      kBalancedMergeMaximumQuotients + 1u];
+  __shared__ std::uint32_t quotient_output_counts[
+      kBalancedMergeMaximumQuotients];
+  __shared__ std::uint32_t quotient_output_offsets[
+      kBalancedMergeMaximumQuotients];
+  __shared__ std::uint64_t quotient_output_bits[
+      kBalancedMergeMaximumQuotients];
+  __shared__ std::uint32_t source_offsets[kMaximumLevels + 2u];
+  __shared__ std::uint16_t run_offsets[kMaximumLevels + 1u];
+  __shared__ std::uint16_t run_lengths[kMaximumLevels + 1u];
+  __shared__ std::uint16_t run_sources[kMaximumLevels + 1u];
+  __shared__ std::uint32_t slice_count_shared;
+  __shared__ std::uint32_t run_count_shared;
+  __shared__ std::uint32_t small_count_shared;
+  __shared__ std::uint32_t largest_source_shared;
+  __shared__ std::uint32_t largest_count_shared;
+
+  const std::uint32_t job_index = blockIdx.x;
+  if (job_index >= job_count) return;
+  const BalancedMergeJob job = jobs[job_index];
+  const std::uint32_t quotient_count =
+      job.quotient_end - job.quotient_begin;
+  const std::uint32_t sources = source_level_limit + 2u;
+  if (threadIdx.x == 0u) {
+    quotient_offsets[0u] = 0u;
+    for (std::uint32_t local = 0u; local < quotient_count; ++local)
+      quotient_offsets[local + 1u] = static_cast<std::uint16_t>(
+          quotient_offsets[local] +
+          raw_counts[job.quotient_begin + local]);
+
+    // Build the exact source slices owned by this destination range.  The
+    // resulting candidate layout is source-major, so every source remains a
+    // sorted run and no record has to rediscover its source while merging.
+    std::uint32_t slice_count = 0u;
+    std::uint32_t candidate_count = 0u;
+    source_offsets[0u] = 0u;
+    for (std::uint32_t source = 0u; source < sources; ++source) {
+      for (std::uint32_t local = 0u; local < quotient_count; ++local) {
+        const std::uint32_t q = job.quotient_begin + local;
+        const std::uint32_t count = source == 0u
+            ? current_offsets[q + 1u] - current_offsets[q]
+            : descriptors[descriptor_index(q, source - 1u)].count();
+        if (!count) continue;
+        merge_indices_a[slice_count] =
+            static_cast<std::uint16_t>(candidate_count);
+        merge_indices_b[slice_count] = static_cast<std::uint16_t>(
+            (source << 9u) | local);
+        candidate_count += count;
+        ++slice_count;
+      }
+      source_offsets[source + 1u] =
+          static_cast<std::uint16_t>(candidate_count);
+    }
+    merge_indices_a[slice_count] =
+        static_cast<std::uint16_t>(candidate_count);
+    slice_count_shared = slice_count;
+
+    std::uint32_t largest_source = 0u;
+    std::uint32_t largest_count = 0u;
+    for (std::uint32_t source = 0u; source < sources; ++source) {
+      const std::uint32_t count =
+          source_offsets[source + 1u] - source_offsets[source];
+      if (count > largest_count) {
+        largest_count = count;
+        largest_source = source;
+      }
+    }
+    largest_source_shared = largest_source;
+    largest_count_shared = largest_count;
+  }
+  for (std::uint32_t local = threadIdx.x; local < quotient_count;
+       local += blockDim.x)
+    quotient_output_counts[local] = 0u;
+  for (std::uint32_t word = threadIdx.x;
+       word < (kBalancedMergeTarget + 31u) / 32u;
+       word += blockDim.x)
+    tombstone_words[word] = 0u;
+  __syncthreads();
+
+  const std::uint32_t task_rows = quotient_offsets[quotient_count];
+  for (std::uint32_t index = threadIdx.x; index < task_rows;
+       index += blockDim.x) {
+    std::uint32_t low = 0u, high = slice_count_shared;
+    while (low + 1u < high) {
+      const std::uint32_t middle = (low + high) >> 1u;
+      if (merge_indices_a[middle] <= index)
+        low = middle;
+      else
+        high = middle;
+    }
+    const std::uint32_t slice_tag = merge_indices_b[low];
+    const std::uint32_t local = slice_tag & 0x1ffu;
+    const std::uint32_t source = slice_tag >> 9u;
+    const std::uint32_t q = job.quotient_begin + local;
+    const std::uint32_t source_index =
+        index - merge_indices_a[low];
+    Row row{};
+    if (source == 0u) {
+      row = current_rows[current_offsets[q] + source_index];
+    } else {
+      const Descriptor descriptor =
+          descriptors[descriptor_index(q, source - 1u)];
+      row = arena[descriptor.offset() + source_index];
+    }
+    if (row.flags & kTombstone)
+      atomicOr(tombstone_words + (index >> 5u),
+               1u << (index & 31u));
+    row.flags = static_cast<std::uint16_t>(
+        (local << kMergeSourceBits) | source);
+    candidates[index] = row;
   }
   __syncthreads();
-  if (output_count_shared && output_descriptor.count()) {
-    const std::uint16_t *warp_indices =
-        resolved_indices + warp_raw_offsets[warp];
-    Row *output = arena + output_descriptor.offset() + warp_offsets[warp];
-    for (std::uint32_t index = lane; index < warp_counts[warp]; index += 32u)
-      output[index] = candidates[warp_indices[index]];
+
+  // Pack all smaller source runs first and reserve the largest source at the
+  // end of both index planes.  The smaller runs merge into one aggregate;
+  // the largest source participates only in the final round.
+  if (threadIdx.x == 0u) {
+    std::uint32_t run_count = 0u;
+    std::uint32_t packed = 0u;
+    for (std::uint32_t source = 0u; source < sources; ++source) {
+      const std::uint32_t count =
+          source_offsets[source + 1u] - source_offsets[source];
+      if (!count || source == largest_source_shared) continue;
+      run_offsets[run_count] = static_cast<std::uint16_t>(packed);
+      run_lengths[run_count] = static_cast<std::uint16_t>(count);
+      run_sources[run_count] = static_cast<std::uint16_t>(source);
+      packed += count;
+      ++run_count;
+    }
+    run_count_shared = run_count;
+    small_count_shared = packed;
+  }
+  __syncthreads();
+
+  for (std::uint32_t run = 0u; run < run_count_shared; ++run) {
+    const std::uint32_t count = run_lengths[run];
+    const std::uint32_t destination = run_offsets[run];
+    const std::uint32_t source = run_sources[run];
+    const std::uint32_t candidate_begin = source_offsets[source];
+    for (std::uint32_t index = threadIdx.x; index < count;
+         index += blockDim.x)
+      merge_indices_a[destination + index] =
+          static_cast<std::uint16_t>(candidate_begin + index);
+  }
+  for (std::uint32_t index = threadIdx.x;
+       index < largest_count_shared; index += blockDim.x) {
+    const std::uint16_t candidate = static_cast<std::uint16_t>(
+        source_offsets[largest_source_shared] + index);
+    merge_indices_a[small_count_shared + index] = candidate;
+    merge_indices_b[small_count_shared + index] = candidate;
+  }
+  __syncthreads();
+
+  bool input_is_a = true;
+  while (run_count_shared > 1u) {
+    const std::uint16_t *input =
+        input_is_a ? merge_indices_a : merge_indices_b;
+    std::uint16_t *output =
+        input_is_a ? merge_indices_b : merge_indices_a;
+    std::uint32_t position = threadIdx.x * kItemsPerThread;
+    const std::uint32_t thread_end = min(
+        position + kItemsPerThread, small_count_shared);
+    while (position < thread_end) {
+      std::uint32_t pair = 0u;
+      while (pair * 2u < run_count_shared) {
+        const std::uint32_t first = pair * 2u;
+        const std::uint32_t pair_count = run_lengths[first] +
+            (first + 1u < run_count_shared
+                 ? run_lengths[first + 1u] : 0u);
+        if (position < run_offsets[first] + pair_count) break;
+        ++pair;
+      }
+      const std::uint32_t first = pair * 2u;
+      const std::uint32_t pair_begin = run_offsets[first];
+      const std::uint32_t left_count = run_lengths[first];
+      const std::uint32_t right_count = first + 1u < run_count_shared
+          ? run_lengths[first + 1u] : 0u;
+      const std::uint32_t pair_end =
+          pair_begin + left_count + right_count;
+      const std::uint32_t output_end = min(thread_end, pair_end);
+      if (!right_count) {
+        while (position < output_end) {
+          output[position] = input[position];
+          ++position;
+        }
+        continue;
+      }
+      const std::uint16_t *left = input + pair_begin;
+      const std::uint16_t *right = left + left_count;
+      const std::uint32_t diagonal = position - pair_begin;
+      std::uint32_t left_index = pull_merge_partition(
+          left, left_count, right, right_count, diagonal, candidates);
+      std::uint32_t right_index = diagonal - left_index;
+      while (position < output_end) {
+        const bool choose_left = right_index >= right_count ||
+            (left_index < left_count &&
+             pull_index_less(left[left_index], right[right_index],
+                             candidates));
+        output[position++] = choose_left
+            ? left[left_index++] : right[right_index++];
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      const std::uint32_t old_run_count = run_count_shared;
+      const std::uint32_t next_run_count =
+          (old_run_count + 1u) >> 1u;
+      for (std::uint32_t next = 0u; next < next_run_count; ++next) {
+        const std::uint32_t first = next * 2u;
+        run_offsets[next] = run_offsets[first];
+        run_lengths[next] = static_cast<std::uint16_t>(
+            run_lengths[first] +
+            (first + 1u < old_run_count ? run_lengths[first + 1u] : 0u));
+      }
+      run_count_shared = next_run_count;
+    }
+    input_is_a = !input_is_a;
+    __syncthreads();
+  }
+
+  // Merge the aggregate of every smaller source with the largest source.
+  // This is also the only merge round in the common two-source carry.
+  if (small_count_shared && largest_count_shared) {
+    const std::uint16_t *input =
+        input_is_a ? merge_indices_a : merge_indices_b;
+    std::uint16_t *output =
+        input_is_a ? merge_indices_b : merge_indices_a;
+    const std::uint16_t *left = input;
+    const std::uint16_t *right = input + small_count_shared;
+    std::uint32_t position = threadIdx.x * kItemsPerThread;
+    const std::uint32_t output_end = min(
+        position + kItemsPerThread, task_rows);
+    if (position < output_end) {
+      std::uint32_t left_index = pull_merge_partition(
+          left, small_count_shared, right, largest_count_shared,
+          position, candidates);
+      std::uint32_t right_index = position - left_index;
+      while (position < output_end) {
+        const bool choose_left = right_index >= largest_count_shared ||
+            (left_index < small_count_shared &&
+             pull_index_less(left[left_index], right[right_index],
+                             candidates));
+        output[position++] = choose_left
+            ? left[left_index++] : right[right_index++];
+      }
+    }
+    input_is_a = !input_is_a;
+    __syncthreads();
+  }
+
+  const std::uint16_t *sorted_indices =
+      input_is_a ? merge_indices_a : merge_indices_b;
+  bool live[kItemsPerThread]{};
+  std::uint32_t local_live = 0u;
+#pragma unroll
+  for (std::uint32_t item = 0u; item < kItemsPerThread; ++item) {
+    const std::uint32_t index = threadIdx.x * kItemsPerThread + item;
+    if (index >= task_rows) continue;
+    const std::uint16_t candidate_index = sorted_indices[index];
+    const Row row = candidates[candidate_index];
+    const std::uint32_t full_local_key =
+        pull_candidate_order_key(row) >> kMergeSourceBits;
+    const bool first = index == 0u || full_local_key !=
+        (pull_candidate_order_key(candidates[sorted_indices[index - 1u]]) >>
+         kMergeSourceBits);
+    const bool tombstone =
+        (tombstone_words[candidate_index >> 5u] &
+         (1u << (candidate_index & 31u))) != 0u;
+    live[item] = first && (keep_tombstones || !tombstone);
+    if (live[item]) {
+      ++local_live;
+      const std::uint32_t local_q = row.flags >> kMergeSourceBits;
+      atomicAdd(quotient_output_counts + local_q, 1u);
+    }
+  }
+  __syncthreads();
+
+  std::uint32_t thread_output_base{}, task_output_count{};
+  BlockScan(block_scan_storage).ExclusiveSum(
+      local_live, thread_output_base, task_output_count);
+  if (threadIdx.x == 0u) {
+    std::uint32_t task_output_offset = 0u;
+    std::uint32_t page_capacity = 0u;
+    for (std::uint32_t local = 0u; local < quotient_count; ++local) {
+      const std::uint32_t output_count = quotient_output_counts[local];
+      quotient_output_offsets[local] = task_output_offset;
+      task_output_offset += output_count;
+      if (output_count)
+        page_capacity += reuse_existing_sections
+            ? foundation_section_capacity(output_count) : output_count;
+    }
+
+    // Reuse is legal only when the planner kept an existing page intact and
+    // every routed quotient still fits its reserved slice.  Otherwise this
+    // complete adaptive destination receives one new contiguous extent.
+    bool reuse_page = reuse_existing_sections;
+    if (reuse_page)
+      for (std::uint32_t local = 0u; local < quotient_count; ++local) {
+        const std::uint32_t q = job.quotient_begin + local;
+        if (quotient_output_counts[local] > foundation_capacities[q]) {
+          reuse_page = false;
+          break;
+        }
+      }
+    unsigned long long page_offset = 0u;
+    if (!reuse_page && page_capacity) {
+      page_offset = atomicAdd(
+          next_output_offset,
+          static_cast<unsigned long long>(page_capacity));
+      if (page_offset + page_capacity > output_limit)
+        atomicExch(overflow_flag, 1u);
+    }
+
+    std::uint32_t capacity_offset = 0u;
+    for (std::uint32_t local = 0u; local < quotient_count; ++local) {
+      const std::uint32_t output_q = job.quotient_begin + local;
+      const std::uint32_t output_count = quotient_output_counts[local];
+      const std::uint32_t output_capacity = output_count
+          ? (reuse_page
+                 ? foundation_capacities[output_q]
+                 : (reuse_existing_sections
+                        ? foundation_section_capacity(output_count)
+                        : output_count))
+          : 0u;
+      Descriptor output_descriptor{};
+      if (output_count) {
+        if (reuse_page) {
+          const Descriptor old_descriptor = descriptors[
+              descriptor_index(output_q, source_level_limit)];
+          output_descriptor =
+              Descriptor::make(old_descriptor.offset(), output_count);
+        } else if (page_offset + page_capacity <= output_limit) {
+          output_descriptor = Descriptor::make(
+              page_offset + capacity_offset, output_count);
+        }
+      }
+      if (!reuse_page) capacity_offset += output_capacity;
+      quotient_output_bits[local] = output_descriptor.bits;
+      next_descriptors[output_q] = output_descriptor;
+      next_capacities[output_q] = output_capacity;
+      section_output_counts[output_q] = output_count;
+    }
+    atomicAdd(total_output_count, task_output_count);
+  }
+  __syncthreads();
+
+  std::uint32_t local_rank = 0u;
+#pragma unroll
+  for (std::uint32_t item = 0u; item < kItemsPerThread; ++item) {
+    if (!live[item]) continue;
+    const std::uint32_t index = threadIdx.x * kItemsPerThread + item;
+    const std::uint16_t candidate_index = sorted_indices[index];
+    Row row = candidates[candidate_index];
+    const std::uint32_t local_q = row.flags >> kMergeSourceBits;
+    const bool tombstone =
+        (tombstone_words[candidate_index >> 5u] &
+         (1u << (candidate_index & 31u))) != 0u;
+    row.flags = tombstone ? kTombstone : 0u;
+    const Descriptor output_descriptor{quotient_output_bits[local_q]};
+    if (output_descriptor.count()) {
+      const std::uint32_t task_rank = thread_output_base + local_rank;
+      arena[output_descriptor.offset() + task_rank -
+            quotient_output_offsets[local_q]] = row;
+    }
+    ++local_rank;
   }
 }
 
@@ -2352,32 +3124,446 @@ __global__ void resolve_hot_foundation_cells_kernel(
   }
 }
 
+template <bool Emit>
+__global__ void resolve_crowded_onchip_ranges_kernel(
+    const std::uint32_t *hot_sections, std::uint32_t hot_count,
+    const CrowdedMergeTask *tasks, std::uint32_t task_count,
+    const std::uint32_t *range_counts,
+    const std::uint32_t *range_bases,
+    const std::uint32_t *range_boundaries,
+    const Row *current_rows, const std::uint32_t *current_offsets,
+    const Row *arena, const Descriptor *descriptors,
+    std::uint32_t source_level_limit, bool keep_tombstones,
+    const std::uint32_t *staging_offsets,
+    std::uint32_t staging_capacity,
+    const std::uint32_t *range_offsets,
+    std::uint32_t *survivor_counts, Row *staging_rows,
+    std::uint8_t *streaming_flags) {
+  constexpr std::uint32_t kItemsPerThread =
+      (kBalancedMergeWorkspace + kFoundationCompactionThreads - 1u) /
+      kFoundationCompactionThreads;
+  using BlockScan = cub::BlockScan<std::uint32_t,
+                                   kFoundationCompactionThreads>;
+  __shared__ typename BlockScan::TempStorage block_scan_storage;
+  __shared__ Row candidates[kBalancedMergeWorkspace];
+  __shared__ std::uint16_t merge_indices_a[kBalancedMergeWorkspace + 1u];
+  __shared__ std::uint16_t merge_indices_b[kBalancedMergeWorkspace + 1u];
+  __shared__ std::uint32_t tombstone_words[
+      (kBalancedMergeWorkspace + 31u) / 32u];
+  __shared__ std::uint32_t source_offsets[kMaximumLevels + 2u];
+  __shared__ std::uint32_t source_begins[kMaximumLevels + 1u];
+  __shared__ std::uint16_t run_offsets[kMaximumLevels + 1u];
+  __shared__ std::uint16_t run_lengths[kMaximumLevels + 1u];
+  __shared__ std::uint16_t run_sources[kMaximumLevels + 1u];
+  __shared__ std::uint32_t raw_count_shared;
+  __shared__ std::uint32_t run_count_shared;
+  __shared__ std::uint32_t small_count_shared;
+  __shared__ std::uint32_t largest_source_shared;
+  __shared__ std::uint32_t largest_count_shared;
+
+  const std::uint32_t slot = blockIdx.x;
+  if (slot >= task_count) return;
+  const CrowdedMergeTask task = tasks[slot];
+  const std::uint32_t hot_index = task.hot_index;
+  const std::uint32_t range = task.range;
+  if (hot_index >= hot_count || range >= range_counts[hot_index]) return;
+  const std::uint32_t q = hot_sections[hot_index];
+  const std::size_t base = range_bases[hot_index];
+  const std::uint32_t low = range_boundaries[base + range];
+  const std::uint32_t high = range_boundaries[base + range + 1u];
+  const std::uint32_t sources = source_level_limit + 2u;
+
+  if (threadIdx.x == 0u) {
+    source_offsets[0u] = 0u;
+    for (std::uint32_t source = 0u; source < sources; ++source) {
+      const Row *rows = nullptr;
+      std::uint32_t count = 0u;
+      if (source == 0u) {
+        const std::uint32_t begin = current_offsets[q];
+        rows = current_rows + begin;
+        count = current_offsets[q + 1u] - begin;
+      } else {
+        const Descriptor descriptor =
+            descriptors[descriptor_index(q, source - 1u)];
+        rows = arena + descriptor.offset();
+        count = descriptor.count();
+      }
+      const std::uint32_t begin = lower_bound_rows(rows, count, low);
+      const std::uint32_t end = lower_bound_rows(rows, count, high);
+      source_begins[source] = begin;
+      source_offsets[source + 1u] =
+          source_offsets[source] + end - begin;
+    }
+    raw_count_shared = source_offsets[sources];
+    streaming_flags[slot] =
+        raw_count_shared > kBalancedMergeWorkspace;
+    std::uint32_t largest_source = 0u;
+    std::uint32_t largest_count = 0u;
+    for (std::uint32_t source = 0u; source < sources; ++source) {
+      const std::uint32_t count =
+          source_offsets[source + 1u] - source_offsets[source];
+      if (count > largest_count) {
+        largest_count = count;
+        largest_source = source;
+      }
+    }
+    largest_source_shared = largest_source;
+    largest_count_shared = largest_count;
+  }
+  for (std::uint32_t word = threadIdx.x;
+       word < (kBalancedMergeWorkspace + 31u) / 32u;
+       word += blockDim.x)
+    tombstone_words[word] = 0u;
+  __syncthreads();
+  const std::uint32_t raw_count = raw_count_shared;
+  if (raw_count > kBalancedMergeWorkspace) return;
+
+  for (std::uint32_t ordinal = threadIdx.x; ordinal < raw_count;
+       ordinal += blockDim.x) {
+    std::uint32_t source = 0u;
+    while (source_offsets[source + 1u] <= ordinal) ++source;
+    const std::uint32_t source_index =
+        source_begins[source] + ordinal - source_offsets[source];
+    if (source == 0u) {
+      candidates[ordinal] = current_rows[
+          current_offsets[q] + source_index];
+    } else {
+      const Descriptor descriptor =
+          descriptors[descriptor_index(q, source - 1u)];
+      candidates[ordinal] = arena[descriptor.offset() + source_index];
+    }
+    if (candidates[ordinal].flags & kTombstone)
+      atomicOr(tombstone_words + (ordinal >> 5u),
+               1u << (ordinal & 31u));
+    // This range belongs to one quotient, so the temporary ordering tag only
+    // needs the source age.  The persistent tombstone bit is restored later.
+    candidates[ordinal].flags = static_cast<std::uint16_t>(source);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0u) {
+    std::uint32_t run_count = 0u;
+    std::uint32_t packed = 0u;
+    for (std::uint32_t source = 0u; source < sources; ++source) {
+      const std::uint32_t count =
+          source_offsets[source + 1u] - source_offsets[source];
+      if (!count || source == largest_source_shared) continue;
+      run_offsets[run_count] = static_cast<std::uint16_t>(packed);
+      run_lengths[run_count] = static_cast<std::uint16_t>(count);
+      run_sources[run_count] = static_cast<std::uint16_t>(source);
+      packed += count;
+      ++run_count;
+    }
+    run_count_shared = run_count;
+    small_count_shared = packed;
+  }
+  __syncthreads();
+
+  for (std::uint32_t run = 0u; run < run_count_shared; ++run) {
+    const std::uint32_t count = run_lengths[run];
+    const std::uint32_t destination = run_offsets[run];
+    const std::uint32_t source = run_sources[run];
+    const std::uint32_t candidate_begin = source_offsets[source];
+    for (std::uint32_t index = threadIdx.x; index < count;
+         index += blockDim.x)
+      merge_indices_a[destination + index] =
+          static_cast<std::uint16_t>(candidate_begin + index);
+  }
+  for (std::uint32_t index = threadIdx.x;
+       index < largest_count_shared; index += blockDim.x) {
+    const std::uint16_t candidate = static_cast<std::uint16_t>(
+        source_offsets[largest_source_shared] + index);
+    merge_indices_a[small_count_shared + index] = candidate;
+    merge_indices_b[small_count_shared + index] = candidate;
+  }
+  __syncthreads();
+
+  bool input_is_a = true;
+  while (run_count_shared > 1u) {
+    const std::uint16_t *input =
+        input_is_a ? merge_indices_a : merge_indices_b;
+    std::uint16_t *output =
+        input_is_a ? merge_indices_b : merge_indices_a;
+    std::uint32_t position = threadIdx.x * kItemsPerThread;
+    const std::uint32_t thread_end = min(
+        position + kItemsPerThread, small_count_shared);
+    while (position < thread_end) {
+      std::uint32_t pair = 0u;
+      while (pair * 2u < run_count_shared) {
+        const std::uint32_t first = pair * 2u;
+        const std::uint32_t pair_count = run_lengths[first] +
+            (first + 1u < run_count_shared
+                 ? run_lengths[first + 1u] : 0u);
+        if (position < run_offsets[first] + pair_count) break;
+        ++pair;
+      }
+      const std::uint32_t first = pair * 2u;
+      const std::uint32_t pair_begin = run_offsets[first];
+      const std::uint32_t left_count = run_lengths[first];
+      const std::uint32_t right_count = first + 1u < run_count_shared
+          ? run_lengths[first + 1u] : 0u;
+      const std::uint32_t pair_end =
+          pair_begin + left_count + right_count;
+      const std::uint32_t output_end = min(thread_end, pair_end);
+      if (!right_count) {
+        while (position < output_end) {
+          output[position] = input[position];
+          ++position;
+        }
+        continue;
+      }
+      const std::uint16_t *left = input + pair_begin;
+      const std::uint16_t *right = left + left_count;
+      const std::uint32_t diagonal = position - pair_begin;
+      std::uint32_t left_index = pull_merge_partition(
+          left, left_count, right, right_count, diagonal, candidates);
+      std::uint32_t right_index = diagonal - left_index;
+      while (position < output_end) {
+        const bool choose_left = right_index >= right_count ||
+            (left_index < left_count &&
+             pull_index_less(left[left_index], right[right_index],
+                             candidates));
+        output[position++] = choose_left
+            ? left[left_index++] : right[right_index++];
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      const std::uint32_t old_run_count = run_count_shared;
+      const std::uint32_t next_run_count =
+          (old_run_count + 1u) >> 1u;
+      for (std::uint32_t next = 0u; next < next_run_count; ++next) {
+        const std::uint32_t first = next * 2u;
+        run_offsets[next] = run_offsets[first];
+        run_lengths[next] = static_cast<std::uint16_t>(
+            run_lengths[first] +
+            (first + 1u < old_run_count ? run_lengths[first + 1u] : 0u));
+      }
+      run_count_shared = next_run_count;
+    }
+    input_is_a = !input_is_a;
+    __syncthreads();
+  }
+
+  if (small_count_shared && largest_count_shared) {
+    const std::uint16_t *input =
+        input_is_a ? merge_indices_a : merge_indices_b;
+    std::uint16_t *output =
+        input_is_a ? merge_indices_b : merge_indices_a;
+    const std::uint16_t *left = input;
+    const std::uint16_t *right = input + small_count_shared;
+    std::uint32_t position = threadIdx.x * kItemsPerThread;
+    const std::uint32_t output_end = min(
+        position + kItemsPerThread, raw_count);
+    if (position < output_end) {
+      std::uint32_t left_index = pull_merge_partition(
+          left, small_count_shared, right, largest_count_shared,
+          position, candidates);
+      std::uint32_t right_index = position - left_index;
+      while (position < output_end) {
+        const bool choose_left = right_index >= largest_count_shared ||
+            (left_index < small_count_shared &&
+             pull_index_less(left[left_index], right[right_index],
+                             candidates));
+        output[position++] = choose_left
+            ? left[left_index++] : right[right_index++];
+      }
+    }
+    input_is_a = !input_is_a;
+    __syncthreads();
+  }
+
+  const std::uint16_t *sorted_indices =
+      input_is_a ? merge_indices_a : merge_indices_b;
+  bool live[kItemsPerThread]{};
+  std::uint32_t local_live = 0u;
+#pragma unroll
+  for (std::uint32_t item = 0u; item < kItemsPerThread; ++item) {
+    const std::uint32_t index = threadIdx.x * kItemsPerThread + item;
+    if (index >= raw_count) continue;
+    const std::uint16_t candidate_index = sorted_indices[index];
+    const Row row = candidates[candidate_index];
+    const bool first = index == 0u || row.key !=
+        candidates[sorted_indices[index - 1u]].key;
+    const bool tombstone =
+        (tombstone_words[candidate_index >> 5u] &
+         (1u << (candidate_index & 31u))) != 0u;
+    live[item] = first && (keep_tombstones || !tombstone);
+    local_live += live[item];
+  }
+  std::uint32_t thread_base{}, total{};
+  BlockScan(block_scan_storage).ExclusiveSum(
+      local_live, thread_base, total);
+  if (threadIdx.x == 0u && !Emit)
+    survivor_counts[base + range] = total;
+  if constexpr (Emit) {
+    const std::uint32_t output_base = staging_offsets[hot_index] +
+        range_offsets[base + range] + thread_base;
+    std::uint32_t local_rank = 0u;
+#pragma unroll
+    for (std::uint32_t item = 0u; item < kItemsPerThread; ++item) {
+      if (!live[item]) continue;
+      const std::uint32_t index = threadIdx.x * kItemsPerThread + item;
+      const std::uint16_t candidate_index = sorted_indices[index];
+      Row row = candidates[candidate_index];
+      const bool tombstone =
+          (tombstone_words[candidate_index >> 5u] &
+           (1u << (candidate_index & 31u))) != 0u;
+      row.flags = tombstone ? kTombstone : 0u;
+      const std::uint32_t output = output_base + local_rank++;
+      if (output < staging_capacity) staging_rows[output] = row;
+    }
+  }
+}
+
+template <bool Emit>
+__global__ void resolve_crowded_merge_ranges_kernel(
+    const std::uint32_t *hot_sections, std::uint32_t hot_count,
+    const CrowdedMergeTask *tasks, std::uint32_t task_count,
+    const std::uint32_t *range_counts,
+    const std::uint32_t *range_bases,
+    const std::uint32_t *range_boundaries,
+    const Row *current_rows, const std::uint32_t *current_offsets,
+    const Row *arena, const Descriptor *descriptors,
+    std::uint32_t source_level_limit, bool keep_tombstones,
+    const std::uint32_t *staging_offsets,
+    std::uint32_t staging_capacity,
+    const std::uint32_t *range_offsets,
+    std::uint32_t *survivor_counts, Row *staging_rows,
+    const std::uint8_t *streaming_flags) {
+  constexpr std::uint32_t kWarpsPerBlock = 4u;
+  constexpr unsigned mask = 0xffffffffu;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  const std::uint32_t slot = blockIdx.x * kWarpsPerBlock + warp;
+  if (slot >= task_count) return;
+  const CrowdedMergeTask task = tasks[slot];
+  const std::uint32_t hot_index = task.hot_index;
+  const std::uint32_t range = task.range;
+  if (hot_index >= hot_count || range >= range_counts[hot_index] ||
+      !streaming_flags[slot]) return;
+  const std::uint32_t q = hot_sections[hot_index];
+  const std::size_t base = range_bases[hot_index];
+  const std::uint32_t low = range_boundaries[base + range];
+  const std::uint32_t high = range_boundaries[base + range + 1u];
+  const std::uint32_t sources = source_level_limit + 2u;
+  const std::uint32_t source_a = lane;
+  const std::uint32_t source_b = lane + 32u;
+
+  const Row *rows_a = nullptr, *rows_b = nullptr;
+  std::uint32_t cursor_a = 0u, end_a = 0u;
+  std::uint32_t cursor_b = 0u, end_b = 0u;
+  if (source_a < sources) {
+    std::uint32_t count = 0u;
+    if (source_a == 0u) {
+      cursor_a = current_offsets[q];
+      count = current_offsets[q + 1u] - cursor_a;
+      rows_a = current_rows + cursor_a;
+      cursor_a = 0u;
+    } else {
+      const Descriptor descriptor =
+          descriptors[descriptor_index(q, source_a - 1u)];
+      rows_a = arena + descriptor.offset();
+      count = descriptor.count();
+    }
+    cursor_a = lower_bound_rows(rows_a, count, low);
+    end_a = lower_bound_rows(rows_a, count, high);
+  }
+  if (source_b < sources) {
+    std::uint32_t count = 0u;
+    if (source_b == 0u) {
+      cursor_b = current_offsets[q];
+      count = current_offsets[q + 1u] - cursor_b;
+      rows_b = current_rows + cursor_b;
+      cursor_b = 0u;
+    } else {
+      const Descriptor descriptor =
+          descriptors[descriptor_index(q, source_b - 1u)];
+      rows_b = arena + descriptor.offset();
+      count = descriptor.count();
+    }
+    cursor_b = lower_bound_rows(rows_b, count, low);
+    end_b = lower_bound_rows(rows_b, count, high);
+  }
+
+  std::uint32_t output_count = 0u;
+  while (true) {
+    const std::uint32_t key_a = cursor_a < end_a
+        ? rows_a[cursor_a].key : 0x10000u;
+    const std::uint32_t key_b = cursor_b < end_b
+        ? rows_b[cursor_b].key : 0x10000u;
+    const std::uint32_t tagged_a = key_a < 0x10000u
+        ? (key_a << kMergeSourceBits) | source_a : kInvalid;
+    const std::uint32_t tagged_b = key_b < 0x10000u
+        ? (key_b << kMergeSourceBits) | source_b : kInvalid;
+    std::uint32_t winner = min(tagged_a, tagged_b);
+    for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+      winner = min(winner, __shfl_down_sync(mask, winner, offset));
+    winner = __shfl_sync(mask, winner, 0u);
+    if (winner == kInvalid) break;
+
+    const std::uint32_t winner_key = winner >> kMergeSourceBits;
+    const std::uint32_t winner_source =
+        winner & ((1u << kMergeSourceBits) - 1u);
+    std::uint32_t winner_index = kInvalid;
+    if (source_a == winner_source) winner_index = cursor_a;
+    if (source_b == winner_source) winner_index = cursor_b;
+    winner_index =
+        __shfl_sync(mask, winner_index, winner_source & 31u);
+    if (lane == 0u) {
+      Row row{};
+      if (winner_source == 0u) {
+        const std::uint32_t begin = current_offsets[q];
+        row = current_rows[begin + winner_index];
+      } else {
+        const Descriptor descriptor =
+            descriptors[descriptor_index(q, winner_source - 1u)];
+        row = arena[descriptor.offset() + winner_index];
+      }
+      if (keep_tombstones || (row.flags & kTombstone) == 0u) {
+        if constexpr (Emit) {
+          const std::uint32_t output = staging_offsets[hot_index] +
+              range_offsets[base + range] + output_count;
+          if (output < staging_capacity) staging_rows[output] = row;
+        }
+        ++output_count;
+      }
+    }
+    if (cursor_a < end_a && key_a == winner_key) ++cursor_a;
+    if (cursor_b < end_b && key_b == winner_key) ++cursor_b;
+  }
+  if constexpr (!Emit) {
+    if (lane == 0u) survivor_counts[base + range] = output_count;
+  }
+}
+
 __global__ void scan_and_allocate_hot_foundation_kernel(
     const std::uint32_t *hot_sections, std::uint32_t hot_count,
+    const std::uint32_t *range_counts,
+    const std::uint32_t *range_bases,
     std::uint32_t *cell_counts, std::uint32_t *cell_offsets,
-    const Descriptor *descriptors, std::uint32_t foundation_level,
+    const Descriptor *descriptors, std::uint32_t source_level_limit,
+    bool reuse_existing_sections,
     const std::uint32_t *foundation_capacities,
-    unsigned long long *foundation_next_offset,
-    unsigned long long foundation_pool_capacity,
+    unsigned long long *next_output_offset,
+    unsigned long long output_limit,
     std::uint32_t *hot_staging_next,
     std::uint32_t hot_staging_capacity,
     std::uint32_t *hot_staging_offsets,
     Descriptor *next_descriptors, std::uint32_t *next_capacities,
     std::uint32_t *section_output_counts,
     std::uint32_t *total_output_count, std::uint32_t *overflow_flag) {
-  using BlockScan = cub::BlockScan<std::uint32_t, kFoundationCells>;
-  __shared__ typename BlockScan::TempStorage scan_storage;
   const std::uint32_t hot_index = blockIdx.x;
-  if (hot_index >= hot_count) return;
+  if (hot_index >= hot_count || threadIdx.x) return;
   const std::uint32_t q = hot_sections[hot_index];
-  const std::size_t base =
-      std::size_t{hot_index} * (kFoundationCells + 1u);
-  const std::uint32_t count = cell_counts[base + threadIdx.x];
-  std::uint32_t offset{}, total{};
-  BlockScan(scan_storage).ExclusiveSum(count, offset, total);
-  cell_offsets[base + threadIdx.x] = offset;
-  if (threadIdx.x == 0u) {
-    cell_offsets[base + kFoundationCells] = total;
+  const std::size_t base = range_bases[hot_index];
+  const std::uint32_t ranges = range_counts[hot_index];
+  std::uint32_t total = 0u;
+  for (std::uint32_t range = 0u; range < ranges; ++range) {
+    cell_offsets[base + range] = total;
+    total += cell_counts[base + range];
+  }
+  cell_offsets[base + ranges] = total;
     section_output_counts[q] = total;
     atomicAdd(total_output_count, total);
     if (!total) {
@@ -2395,19 +3581,22 @@ __global__ void scan_and_allocate_hot_foundation_kernel(
       return;
     }
 
-    const Descriptor old_descriptor =
-        descriptors[descriptor_index(q, foundation_level)];
-    const std::uint32_t old_capacity = foundation_capacities[q];
-    if (total <= old_capacity) {
+    const Descriptor old_descriptor = reuse_existing_sections
+        ? descriptors[descriptor_index(q, source_level_limit)]
+        : Descriptor{};
+    const std::uint32_t old_capacity = reuse_existing_sections
+        ? foundation_capacities[q] : 0u;
+    if (reuse_existing_sections && total <= old_capacity) {
       next_descriptors[q] =
           Descriptor::make(old_descriptor.offset(), total);
       next_capacities[q] = old_capacity;
     } else {
-      const std::uint32_t capacity = foundation_section_capacity(total);
+      const std::uint32_t capacity = reuse_existing_sections
+          ? foundation_section_capacity(total) : total;
       const unsigned long long physical = atomicAdd(
-          foundation_next_offset,
+          next_output_offset,
           static_cast<unsigned long long>(capacity));
-      if (physical + capacity > foundation_pool_capacity) {
+      if (physical + capacity > output_limit) {
         atomicExch(overflow_flag, 1u);
         next_descriptors[q] = {};
       } else {
@@ -2415,22 +3604,25 @@ __global__ void scan_and_allocate_hot_foundation_kernel(
       }
       next_capacities[q] = capacity;
     }
-  }
 }
 
 __global__ void copy_hot_foundation_cells_kernel(
     const std::uint32_t *hot_sections, std::uint32_t hot_count,
+    const CrowdedMergeTask *tasks, std::uint32_t task_count,
+    const std::uint32_t *range_counts,
+    const std::uint32_t *range_bases,
     const std::uint32_t *hot_staging_offsets,
     const std::uint32_t *cell_offsets,
     const Descriptor *next_descriptors, const Row *staging_rows,
     Row *arena) {
-  const std::uint32_t task = blockIdx.x;
-  const std::uint32_t hot_index = task / kFoundationCells;
-  const std::uint32_t cell = task % kFoundationCells;
-  if (hot_index >= hot_count) return;
+  const std::uint32_t task_index = blockIdx.x;
+  if (task_index >= task_count) return;
+  const CrowdedMergeTask task = tasks[task_index];
+  const std::uint32_t hot_index = task.hot_index;
+  const std::uint32_t cell = task.range;
+  if (hot_index >= hot_count || cell >= range_counts[hot_index]) return;
   const std::uint32_t q = hot_sections[hot_index];
-  const std::size_t base =
-      std::size_t{hot_index} * (kFoundationCells + 1u);
+  const std::size_t base = range_bases[hot_index];
   const std::uint32_t begin = cell_offsets[base + cell];
   const std::uint32_t end = cell_offsets[base + cell + 1u];
   const std::uint32_t staging = hot_staging_offsets[hot_index];
@@ -2445,13 +3637,15 @@ __global__ void finalize_foundation_descriptors_kernel(
     const Descriptor *next_descriptors,
     const std::uint32_t *next_capacities,
     std::uint32_t destination_level, Descriptor *descriptors,
-    std::uint32_t *foundation_capacities) {
+    std::uint32_t *foundation_capacities,
+    bool destination_is_foundation) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= kQuotients) return;
   for (std::uint32_t level = 0u; level < destination_level; ++level)
     descriptors[descriptor_index(q, level)] = {};
   descriptors[descriptor_index(q, destination_level)] = next_descriptors[q];
-  foundation_capacities[q] = next_capacities[q];
+  if (destination_is_foundation)
+    foundation_capacities[q] = next_capacities[q];
 }
 
 __global__ void build_foundation_rank_directory_kernel(
@@ -2998,18 +4192,23 @@ public:
         foundation_next_capacities_(gpulsmopt2_detail::kQuotients),
         foundation_next_descriptors_(gpulsmopt2_detail::kQuotients),
         foundation_section_output_counts_(gpulsmopt2_detail::kQuotients),
+        balanced_merge_raw_counts_(gpulsmopt2_detail::kQuotients),
+        balanced_merge_jobs_(gpulsmopt2_detail::kQuotients),
+        balanced_merge_job_count_(1u),
         foundation_hot_flags_(gpulsmopt2_detail::kQuotients),
         foundation_hot_sections_(gpulsmopt2_detail::kQuotients),
         foundation_hot_selected_count_(1u),
+        foundation_hot_range_counts_(gpulsmopt2_detail::kQuotients),
+        foundation_hot_range_bases_(gpulsmopt2_detail::kQuotients + 1u),
+        foundation_hot_tasks_(1u),
         foundation_hot_staging_offsets_(gpulsmopt2_detail::kQuotients),
         foundation_hot_staging_next_(1u),
-        foundation_hot_cell_counts_(
-            std::size_t{gpulsmopt2_detail::kQuotients} *
-            (gpulsmopt2_detail::kFoundationCells + 1u)),
-        foundation_hot_cell_offsets_(
-            std::size_t{gpulsmopt2_detail::kQuotients} *
-            (gpulsmopt2_detail::kFoundationCells + 1u)),
+        foundation_hot_cell_counts_(1u),
+        foundation_hot_cell_offsets_(1u),
+        foundation_hot_range_boundaries_(1u),
+        foundation_hot_streaming_flags_(1u),
         foundation_next_offset_(1u),
+        balanced_merge_next_offset_(1u),
         foundation_total_output_count_(1u),
         foundation_overflow_flag_(1u),
         admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
@@ -3132,8 +4331,13 @@ public:
         &foundation_physical_count,
         foundation_physical_offsets_.data() + gpulsmopt2_detail::kQuotients,
         sizeof(foundation_physical_count), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        foundation_capacities_host_.data(),
+        foundation_build_capacities_.data(),
+        gpulsmopt2_detail::kQuotients * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (foundation_physical_count > foundation_pool_capacity_)
+    if (foundation_physical_count > foundation_pool_capacity_ / 2u)
       throw std::bad_alloc();
     gpulsmopt2_detail::scatter_foundation_build_kernel<<<
         blocks(base_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -3155,6 +4359,11 @@ public:
     level_offsets_[level] = 0u;
     level_span_sizes_[level] = 0u;
     level_counts_[level] = base_count;
+    auto &initial_locations = level_locations_[level];
+    initial_locations.clear();
+    initial_locations.reserve(gpulsmopt2_detail::kQuotients);
+    for (std::uint32_t q = 0u; q < gpulsmopt2_detail::kQuotients; ++q)
+      initial_locations.push_back({q, q + 1u, 1u});
     refresh_active_levels();
     rebuild_foundation_rank(stream);
     end_operation(stream);
@@ -3507,18 +4716,29 @@ public:
          foundation_capacities_.size() +
          foundation_next_capacities_.size() +
          foundation_section_output_counts_.size() +
+         balanced_merge_raw_counts_.size() +
+         balanced_merge_job_count_.size() +
          foundation_hot_sections_.size() +
          foundation_hot_selected_count_.size() +
+         foundation_hot_range_counts_.size() +
+         foundation_hot_range_bases_.size() +
          foundation_hot_staging_offsets_.size() +
          foundation_hot_staging_next_.size() +
          foundation_hot_cell_counts_.size() +
          foundation_hot_cell_offsets_.size() +
+         foundation_hot_range_boundaries_.size() +
          foundation_total_output_count_.size() +
          foundation_overflow_flag_.size()) * sizeof(std::uint32_t) +
+        balanced_merge_jobs_.size() *
+            sizeof(gpulsmopt2_detail::BalancedMergeJob) +
+        foundation_hot_tasks_.size() *
+            sizeof(gpulsmopt2_detail::CrowdedMergeTask) +
         foundation_next_descriptors_.size() *
             sizeof(gpulsmopt2_detail::Descriptor) +
         foundation_hot_flags_.size() * sizeof(std::uint8_t) +
-        foundation_next_offset_.size() * sizeof(std::uint64_t) +
+        foundation_hot_streaming_flags_.size() * sizeof(std::uint8_t) +
+        (foundation_next_offset_.size() +
+         balanced_merge_next_offset_.size()) * sizeof(std::uint64_t) +
         foundation_temp_.size() * sizeof(std::uint8_t) +
         publication_temp_.size() * sizeof(std::uint8_t) +
         admission_counts_.size() * sizeof(std::uint32_t) +
@@ -3658,6 +4878,23 @@ private:
     foundation_temp_.resize(std::max(scan_bytes, select_bytes));
   }
 
+  void ensure_crowded_merge_workspace(std::uint32_t task_count,
+                                      std::uint32_t boundary_slots,
+                                      cudaStream_t stream) {
+    if (boundary_slots <= foundation_hot_cell_counts_.size() &&
+        boundary_slots <= foundation_hot_cell_offsets_.size() &&
+        boundary_slots <= foundation_hot_range_boundaries_.size() &&
+        task_count <= foundation_hot_streaming_flags_.size() &&
+        task_count <= foundation_hot_tasks_.size())
+      return;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    foundation_hot_cell_counts_.resize(std::max(1u, boundary_slots));
+    foundation_hot_cell_offsets_.resize(std::max(1u, boundary_slots));
+    foundation_hot_range_boundaries_.resize(std::max(1u, boundary_slots));
+    foundation_hot_streaming_flags_.resize(std::max(1u, task_count));
+    foundation_hot_tasks_.resize(std::max(1u, task_count));
+  }
+
   void ensure_publication_capacity(std::size_t count,
                                    cudaStream_t stream) {
     if (count <= publication_capacity_) return;
@@ -3733,9 +4970,13 @@ private:
     pending_batches_ = 0u;
     pending_records_ = 0u;
     active_levels_ = 0u;
+    foundation_bank_ = 0u;
     std::fill_n(level_counts_, gpulsmopt2_detail::kMaximumLevels, 0u);
     std::fill_n(level_offsets_, gpulsmopt2_detail::kMaximumLevels, 0u);
     std::fill_n(level_span_sizes_, gpulsmopt2_detail::kMaximumLevels, 0u);
+    for (auto &locations : level_locations_) locations.clear();
+    std::fill(foundation_capacities_host_.begin(),
+              foundation_capacities_host_.end(), 0u);
     CUDA_CHECK(cudaMemsetAsync(
         foundation_capacities_.data(), 0,
         foundation_capacities_.size() * sizeof(std::uint32_t), stream));
@@ -3831,32 +5072,40 @@ private:
       publish_epoch(stream);
   }
 
-  std::uint32_t publish_foundation_sections(
+  std::uint32_t publish_balanced_merge(
       const std::uint32_t *current_keys,
       const gpulsmopt2_detail::Row *current_rows,
-      std::uint32_t current_count, std::uint32_t old_foundation,
-      std::uint32_t destination_level, cudaStream_t stream) {
+      std::uint32_t current_count, std::uint32_t source_level_limit,
+      std::uint32_t destination_level, bool destination_is_foundation,
+      std::uint64_t destination_span, std::uint32_t destination_capacity,
+      cudaStream_t stream) {
     gpulsmopt2_detail::build_query_quotient_offsets_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients + 1u),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
             current_keys, current_count,
             foundation_source_offsets_.data());
-    gpulsmopt2_detail::classify_foundation_sections_kernel<<<
+    gpulsmopt2_detail::count_balanced_merge_work_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
             foundation_source_offsets_.data(), descriptors_.data(),
-            old_foundation, foundation_hot_flags_.data());
-    cub::CountingInputIterator<std::uint32_t> sections(0u);
-    std::size_t select_bytes = foundation_temp_.size();
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        foundation_temp_.data(), select_bytes, sections,
-        foundation_hot_flags_.data(), foundation_hot_sections_.data(),
-        foundation_hot_selected_count_.data(),
-        gpulsmopt2_detail::kQuotients, stream));
-    std::uint32_t hot_count{};
+            source_level_limit, balanced_merge_raw_counts_.data());
     CUDA_CHECK(cudaMemcpyAsync(
-        &hot_count, foundation_hot_selected_count_.data(),
-        sizeof(hot_count), cudaMemcpyDeviceToHost, stream));
+        balanced_merge_raw_counts_host_.data(),
+        balanced_merge_raw_counts_.data(),
+        gpulsmopt2_detail::kQuotients * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        foundation_next_descriptors_.data(), 0,
+        foundation_next_descriptors_.size() *
+            sizeof(gpulsmopt2_detail::Descriptor), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        foundation_next_capacities_.data(), 0,
+        foundation_next_capacities_.size() * sizeof(std::uint32_t),
+        stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        foundation_section_output_counts_.data(), 0,
+        foundation_section_output_counts_.size() * sizeof(std::uint32_t),
+        stream));
     CUDA_CHECK(cudaMemsetAsync(
         foundation_total_output_count_.data(), 0, sizeof(std::uint32_t),
         stream));
@@ -3867,44 +5116,259 @@ private:
         stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    gpulsmopt2_detail::compact_normal_foundation_sections_kernel<<<
-        gpulsmopt2_detail::kQuotients,
-        gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+    std::uint32_t normal_job_count = 0u, hot_count = 0u;
+    std::uint32_t job_begin = 0u, job_end = 0u, job_work = 0u;
+    bool open_job = false;
+    bool job_reuses_page = false;
+    auto flush_job = [&]() {
+      if (!open_job) return;
+      balanced_merge_jobs_host_[normal_job_count++] =
+          {job_begin, job_end, job_reuses_page ? 1u : 0u};
+      open_job = false;
+      job_work = 0u;
+      job_reuses_page = false;
+    };
+    auto append_quotient = [&](std::uint32_t q) {
+      const std::uint32_t work = balanced_merge_raw_counts_host_[q];
+      if (work > gpulsmopt2_detail::kBalancedMergeTarget) {
+        flush_job();
+        foundation_hot_sections_host_[hot_count++] = q;
+      } else if (work) {
+        if (!open_job) {
+          job_begin = q;
+          job_end = q + 1u;
+          job_work = work;
+          open_job = true;
+          job_reuses_page = false;
+        } else if (job_work + work <=
+                       gpulsmopt2_detail::kBalancedMergeTarget &&
+                   q - job_begin <
+                       gpulsmopt2_detail::kBalancedMergeMaximumQuotients) {
+          job_end = q + 1u;
+          job_work += work;
+        } else {
+          flush_job();
+          job_begin = q;
+          job_end = q + 1u;
+          job_work = work;
+          open_job = true;
+          job_reuses_page = false;
+        }
+      }
+    };
+    auto process_starting_location =
+        [&](const gpulsmopt2_detail::BalancedMergeJob &location) {
+      std::uint32_t work = 0u;
+      for (std::uint32_t q = location.quotient_begin;
+           q < location.quotient_end; ++q)
+        work += balanced_merge_raw_counts_host_[q];
+      if (!work) return;
+      const std::uint32_t span =
+          location.quotient_end - location.quotient_begin;
+      if (work <= gpulsmopt2_detail::kBalancedMergeTarget &&
+          span <= gpulsmopt2_detail::kBalancedMergeMaximumQuotients) {
+        if (open_job &&
+            job_work + work <= gpulsmopt2_detail::kBalancedMergeTarget &&
+            location.quotient_end - job_begin <=
+                gpulsmopt2_detail::kBalancedMergeMaximumQuotients) {
+          job_end = location.quotient_end;
+          job_work += work;
+          job_reuses_page = false;
+        } else {
+          flush_job();
+          job_begin = location.quotient_begin;
+          job_end = location.quotient_end;
+          job_work = work;
+          open_job = true;
+          job_reuses_page = true;
+        }
+        return;
+      }
+      flush_job();
+      for (std::uint32_t q = location.quotient_begin;
+           q < location.quotient_end; ++q)
+        append_quotient(q);
+      flush_job();
+    };
+
+    const auto &starting_locations = level_locations_[source_level_limit];
+    if (starting_locations.empty())
+      process_starting_location(
+          {0u, gpulsmopt2_detail::kQuotients});
+    else
+      for (const auto &location : starting_locations)
+        process_starting_location(location);
+    flush_job();
+    if (normal_job_count)
+      CUDA_CHECK(cudaMemcpyAsync(
+          balanced_merge_jobs_.data(), balanced_merge_jobs_host_.data(),
+          std::size_t{normal_job_count} *
+              sizeof(gpulsmopt2_detail::BalancedMergeJob),
+          cudaMemcpyHostToDevice, stream));
+    std::uint32_t hot_task_count = 0u;
+    std::uint32_t hot_boundary_slots = 0u;
+    if (hot_count) {
+      foundation_hot_tasks_host_.clear();
+      for (std::uint32_t hot_index = 0u; hot_index < hot_count;
+           ++hot_index) {
+        const std::uint32_t q = foundation_hot_sections_host_[hot_index];
+        const std::uint32_t raw = balanced_merge_raw_counts_host_[q];
+        const std::uint32_t ranges = std::max(
+            1u, (raw + gpulsmopt2_detail::kBalancedMergeTarget - 1u) /
+                    gpulsmopt2_detail::kBalancedMergeTarget);
+        if (ranges > gpulsmopt2_detail::kBalancedHotRanges)
+          throw std::overflow_error(
+              "GPULSMOpt crowded range exceeds key-space bound");
+        foundation_hot_range_counts_host_[hot_index] = ranges;
+        foundation_hot_range_bases_host_[hot_index] = hot_boundary_slots;
+        hot_boundary_slots += ranges + 1u;
+        for (std::uint32_t range = 0u; range < ranges; ++range)
+          foundation_hot_tasks_host_.push_back({hot_index, range});
+      }
+      foundation_hot_range_bases_host_[hot_count] = hot_boundary_slots;
+      hot_task_count = static_cast<std::uint32_t>(
+          foundation_hot_tasks_host_.size());
+      ensure_crowded_merge_workspace(
+          hot_task_count, hot_boundary_slots, stream);
+      CUDA_CHECK(cudaMemcpyAsync(
+          foundation_hot_sections_.data(),
+          foundation_hot_sections_host_.data(),
+          std::size_t{hot_count} * sizeof(std::uint32_t),
+          cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          foundation_hot_range_counts_.data(),
+          foundation_hot_range_counts_host_.data(),
+          std::size_t{hot_count} * sizeof(std::uint32_t),
+          cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          foundation_hot_range_bases_.data(),
+          foundation_hot_range_bases_host_.data(),
+          std::size_t{hot_count + 1u} * sizeof(std::uint32_t),
+          cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          foundation_hot_tasks_.data(), foundation_hot_tasks_host_.data(),
+          std::size_t{hot_task_count} *
+              sizeof(gpulsmopt2_detail::CrowdedMergeTask),
+          cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          foundation_hot_cell_counts_.data(), 0,
+          std::size_t{hot_boundary_slots} * sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          foundation_hot_cell_offsets_.data(), 0,
+          std::size_t{hot_boundary_slots} * sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          foundation_hot_streaming_flags_.data(), 0,
+          std::size_t{hot_task_count} * sizeof(std::uint8_t), stream));
+      gpulsmopt2_detail::plan_crowded_merge_ranges_kernel<<<
+          hot_count, gpulsmopt2_detail::kFoundationCompactionThreads,
+          0, stream>>>(
+              foundation_hot_sections_.data(), hot_count,
+              balanced_merge_raw_counts_.data(), current_rows,
+              foundation_source_offsets_.data(), arena_.data(),
+              descriptors_.data(), source_level_limit,
+              foundation_hot_range_counts_.data(),
+              foundation_hot_range_bases_.data(),
+              foundation_hot_range_boundaries_.data());
+    }
+
+    bool foundation_in_place = destination_is_foundation;
+    if (foundation_in_place)
+      for (std::uint32_t q = 0u;
+           q < gpulsmopt2_detail::kQuotients; ++q)
+        if (balanced_merge_raw_counts_host_[q] >
+            foundation_capacities_host_[q]) {
+          foundation_in_place = false;
+          break;
+        }
+
+    unsigned long long *next_output_offset =
+        reinterpret_cast<unsigned long long *>(
+            destination_is_foundation
+                ? foundation_next_offset_.data()
+                : balanced_merge_next_offset_.data());
+    const std::uint64_t foundation_bank_capacity =
+        foundation_pool_capacity_ / 2u;
+    const std::uint32_t next_foundation_bank = destination_is_foundation
+        ? (foundation_in_place ? foundation_bank_ : 1u - foundation_bank_)
+        : foundation_bank_;
+    const std::uint64_t initial_output_offset = destination_is_foundation
+        ? std::uint64_t{next_foundation_bank} * foundation_bank_capacity
+        : destination_span;
+    const unsigned long long output_limit = destination_is_foundation
+        ? initial_output_offset + foundation_bank_capacity
+        : static_cast<unsigned long long>(destination_span) +
+              destination_capacity;
+    CUDA_CHECK(cudaMemcpyAsync(
+        destination_is_foundation
+            ? foundation_next_offset_.data()
+            : balanced_merge_next_offset_.data(),
+        &initial_output_offset, sizeof(initial_output_offset),
+        cudaMemcpyHostToDevice, stream));
+
+    if (normal_job_count)
+      gpulsmopt2_detail::compact_balanced_merge_jobs_kernel<<<
+          normal_job_count,
+          gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+            balanced_merge_jobs_.data(), normal_job_count,
+            balanced_merge_raw_counts_.data(),
             current_rows, foundation_source_offsets_.data(), arena_.data(),
-            descriptors_.data(), old_foundation,
-            foundation_hot_flags_.data(), foundation_capacities_.data(),
-            reinterpret_cast<unsigned long long *>(
-                foundation_next_offset_.data()),
-            static_cast<unsigned long long>(foundation_pool_capacity_),
+            descriptors_.data(), source_level_limit,
+            !destination_is_foundation, foundation_in_place,
+            foundation_capacities_.data(),
+            next_output_offset, output_limit,
             foundation_next_descriptors_.data(),
             foundation_next_capacities_.data(),
             foundation_section_output_counts_.data(),
             foundation_total_output_count_.data(),
             foundation_overflow_flag_.data());
     if (hot_count) {
-      const std::uint32_t hot_tasks =
-          hot_count * gpulsmopt2_detail::kFoundationCells;
-      gpulsmopt2_detail::resolve_hot_foundation_cells_kernel<false><<<
+      const std::uint32_t hot_tasks = hot_task_count;
+      constexpr std::uint32_t hot_warps_per_block = 4u;
+      const std::uint32_t hot_blocks =
+          (hot_tasks + hot_warps_per_block - 1u) / hot_warps_per_block;
+      gpulsmopt2_detail::resolve_crowded_onchip_ranges_kernel<false><<<
           hot_tasks, gpulsmopt2_detail::kFoundationCompactionThreads,
           0, stream>>>(
-              foundation_hot_sections_.data(), hot_count, current_rows,
+              foundation_hot_sections_.data(), hot_count,
+              foundation_hot_tasks_.data(), hot_tasks,
+              foundation_hot_range_counts_.data(),
+              foundation_hot_range_bases_.data(),
+              foundation_hot_range_boundaries_.data(), current_rows,
               foundation_source_offsets_.data(), arena_.data(),
-              descriptors_.data(), old_foundation,
+              descriptors_.data(), source_level_limit,
+              !destination_is_foundation,
               foundation_hot_staging_offsets_.data(),
               static_cast<std::uint32_t>(publication_rows_b_.size()),
               foundation_hot_cell_offsets_.data(),
               foundation_hot_cell_counts_.data(),
-              publication_rows_b_.data());
-      gpulsmopt2_detail::scan_and_allocate_hot_foundation_kernel<<<
-          hot_count, gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+              publication_rows_b_.data(),
+              foundation_hot_streaming_flags_.data());
+      gpulsmopt2_detail::resolve_crowded_merge_ranges_kernel<false><<<
+          hot_blocks, hot_warps_per_block * 32u, 0, stream>>>(
               foundation_hot_sections_.data(), hot_count,
+              foundation_hot_tasks_.data(), hot_tasks,
+              foundation_hot_range_counts_.data(),
+              foundation_hot_range_bases_.data(),
+              foundation_hot_range_boundaries_.data(), current_rows,
+              foundation_source_offsets_.data(), arena_.data(),
+              descriptors_.data(), source_level_limit,
+              !destination_is_foundation,
+              foundation_hot_staging_offsets_.data(),
+              static_cast<std::uint32_t>(publication_rows_b_.size()),
+              foundation_hot_cell_offsets_.data(),
+              foundation_hot_cell_counts_.data(),
+              publication_rows_b_.data(),
+              foundation_hot_streaming_flags_.data());
+      gpulsmopt2_detail::scan_and_allocate_hot_foundation_kernel<<<
+          hot_count, 1u, 0, stream>>>(
+              foundation_hot_sections_.data(), hot_count,
+              foundation_hot_range_counts_.data(),
+              foundation_hot_range_bases_.data(),
               foundation_hot_cell_counts_.data(),
               foundation_hot_cell_offsets_.data(),
-              descriptors_.data(), old_foundation,
-              foundation_capacities_.data(),
-              reinterpret_cast<unsigned long long *>(
-                  foundation_next_offset_.data()),
-              static_cast<unsigned long long>(foundation_pool_capacity_),
+              descriptors_.data(), source_level_limit,
+              foundation_in_place, foundation_capacities_.data(),
+              next_output_offset, output_limit,
               foundation_hot_staging_next_.data(),
               static_cast<std::uint32_t>(publication_rows_b_.size()),
               foundation_hot_staging_offsets_.data(),
@@ -3913,21 +5377,46 @@ private:
               foundation_section_output_counts_.data(),
               foundation_total_output_count_.data(),
               foundation_overflow_flag_.data());
-      gpulsmopt2_detail::resolve_hot_foundation_cells_kernel<true><<<
+      gpulsmopt2_detail::resolve_crowded_onchip_ranges_kernel<true><<<
           hot_tasks, gpulsmopt2_detail::kFoundationCompactionThreads,
           0, stream>>>(
-              foundation_hot_sections_.data(), hot_count, current_rows,
+              foundation_hot_sections_.data(), hot_count,
+              foundation_hot_tasks_.data(), hot_tasks,
+              foundation_hot_range_counts_.data(),
+              foundation_hot_range_bases_.data(),
+              foundation_hot_range_boundaries_.data(), current_rows,
               foundation_source_offsets_.data(), arena_.data(),
-              descriptors_.data(), old_foundation,
+              descriptors_.data(), source_level_limit,
+              !destination_is_foundation,
               foundation_hot_staging_offsets_.data(),
               static_cast<std::uint32_t>(publication_rows_b_.size()),
               foundation_hot_cell_offsets_.data(),
               foundation_hot_cell_counts_.data(),
-              publication_rows_b_.data());
+              publication_rows_b_.data(),
+              foundation_hot_streaming_flags_.data());
+      gpulsmopt2_detail::resolve_crowded_merge_ranges_kernel<true><<<
+          hot_blocks, hot_warps_per_block * 32u, 0, stream>>>(
+              foundation_hot_sections_.data(), hot_count,
+              foundation_hot_tasks_.data(), hot_tasks,
+              foundation_hot_range_counts_.data(),
+              foundation_hot_range_bases_.data(),
+              foundation_hot_range_boundaries_.data(), current_rows,
+              foundation_source_offsets_.data(), arena_.data(),
+              descriptors_.data(), source_level_limit,
+              !destination_is_foundation,
+              foundation_hot_staging_offsets_.data(),
+              static_cast<std::uint32_t>(publication_rows_b_.size()),
+              foundation_hot_cell_offsets_.data(),
+              foundation_hot_cell_counts_.data(),
+              publication_rows_b_.data(),
+              foundation_hot_streaming_flags_.data());
       gpulsmopt2_detail::copy_hot_foundation_cells_kernel<<<
           hot_tasks, gpulsmopt2_detail::kFoundationCompactionThreads,
           0, stream>>>(
               foundation_hot_sections_.data(), hot_count,
+              foundation_hot_tasks_.data(), hot_tasks,
+              foundation_hot_range_counts_.data(),
+              foundation_hot_range_bases_.data(),
               foundation_hot_staging_offsets_.data(),
               foundation_hot_cell_offsets_.data(),
               foundation_next_descriptors_.data(),
@@ -3938,7 +5427,8 @@ private:
         gpulsmopt2_detail::kThreads, 0, stream>>>(
             foundation_next_descriptors_.data(),
             foundation_next_capacities_.data(), destination_level,
-            descriptors_.data(), foundation_capacities_.data());
+            descriptors_.data(), foundation_capacities_.data(),
+            destination_is_foundation);
     std::uint32_t total_count{}, overflow{};
     CUDA_CHECK(cudaMemcpyAsync(
         &total_count, foundation_total_output_count_.data(),
@@ -3946,17 +5436,43 @@ private:
     CUDA_CHECK(cudaMemcpyAsync(
         &overflow, foundation_overflow_flag_.data(), sizeof(overflow),
         cudaMemcpyDeviceToHost, stream));
+    if (destination_is_foundation)
+      CUDA_CHECK(cudaMemcpyAsync(
+          foundation_capacities_host_.data(),
+          foundation_next_capacities_.data(),
+          gpulsmopt2_detail::kQuotients * sizeof(std::uint32_t),
+          cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (overflow)
-      throw std::overflow_error("GPULSMOpt foundation pool exhausted");
+      throw std::overflow_error("GPULSMOpt balanced merge output exhausted");
+    if (destination_is_foundation)
+      foundation_bank_ = next_foundation_bank;
+    std::vector<gpulsmopt2_detail::BalancedMergeJob> next_locations;
+    next_locations.reserve(normal_job_count + hot_count);
+    for (std::uint32_t index = 0u; index < normal_job_count; ++index)
+      next_locations.push_back({
+          balanced_merge_jobs_host_[index].quotient_begin,
+          balanced_merge_jobs_host_[index].quotient_end, 1u});
+    for (std::uint32_t index = 0u; index < hot_count; ++index) {
+      const std::uint32_t q = foundation_hot_sections_host_[index];
+      next_locations.push_back({q, q + 1u, 1u});
+    }
+    std::sort(next_locations.begin(), next_locations.end(),
+              [](const auto &left, const auto &right) {
+                return left.quotient_begin < right.quotient_begin;
+              });
     for (std::uint32_t level = 0u; level < destination_level; ++level) {
       level_counts_[level] = 0u;
       level_offsets_[level] = 0u;
       level_span_sizes_[level] = 0u;
+      level_locations_[level].clear();
     }
+    level_locations_[destination_level] = std::move(next_locations);
     level_counts_[destination_level] = total_count;
-    level_offsets_[destination_level] = 0u;
-    level_span_sizes_[destination_level] = 0u;
+    level_offsets_[destination_level] =
+        destination_is_foundation ? 0u : destination_span;
+    level_span_sizes_[destination_level] =
+        destination_is_foundation ? 0u : destination_capacity;
     return total_count;
   }
 
@@ -4022,20 +5538,6 @@ private:
     const bool foundation_carry =
         old_foundation < gpulsmopt2_detail::kMaximumLevels &&
         old_foundation < carry_levels;
-    if (foundation_carry) {
-      current_count = publish_foundation_sections(
-          publication_keys_a_.data(), publication_rows_a_.data(),
-          current_count, old_foundation, destination_level, stream);
-      refresh_active_levels();
-      CUDA_CHECK(cudaMemsetAsync(
-          raw_epoch_signatures_.data(), 0,
-          raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
-      pending_batches_ = 0u;
-      pending_records_ = 0u;
-      rebuild_foundation_rank(stream);
-      ++stats_.epochs_published;
-      return;
-    }
     if (carry_levels) {
       std::size_t merged_size = current_count;
       for (std::uint32_t level = 0u; level < carry_levels; ++level) {
@@ -4046,47 +5548,26 @@ private:
       ensure_publication_capacity(merged_size, stream);
       const std::uint32_t merged_count =
           static_cast<std::uint32_t>(merged_size);
-      bool current_is_a = true;
-      std::uint32_t raw_count = current_count;
-      for (std::uint32_t level = 0u; level < carry_levels; ++level) {
-        const std::uint32_t count = level_counts_[level];
-        workspace_bytes = publication_temp_.size();
-        CUDA_CHECK(cub::DeviceMerge::MergePairs(
-            publication_temp_.data(), workspace_bytes,
-            current_is_a ? publication_keys_a_.data()
-                         : publication_keys_b_.data(),
-            current_is_a ? publication_rows_a_.data()
-                         : publication_rows_b_.data(),
-            raw_count, level_keys_.data() + level_offsets_[level],
-            arena_.data() + level_offsets_[level], count,
-            current_is_a ? publication_keys_b_.data()
-                         : publication_keys_a_.data(),
-            current_is_a ? publication_rows_b_.data()
-                         : publication_rows_a_.data(),
-            cuda::std::less<>{}, stream));
-        raw_count += count;
-        current_is_a = !current_is_a;
-      }
-      for (std::uint32_t level = 0u; level < carry_levels; ++level) {
-        level_counts_[level] = 0u;
-        level_offsets_[level] = 0u;
-        level_span_sizes_[level] = 0u;
-      }
-      destination = allocate_level_span(merged_count, stream);
-      workspace_bytes = publication_temp_.size();
-      CUDA_CHECK(cub::DeviceSelect::UniqueByKey(
-          publication_temp_.data(), workspace_bytes,
-          current_is_a ? publication_keys_a_.data()
-                       : publication_keys_b_.data(),
-          current_is_a ? publication_rows_a_.data()
-                       : publication_rows_b_.data(),
-          level_keys_.data() + destination, arena_.data() + destination,
-          publication_selected_count_.data(), merged_count,
-          cuda::std::equal_to<>{}, stream));
-      CUDA_CHECK(cudaMemcpyAsync(
-          &current_count, publication_selected_count_.data(),
-          sizeof(current_count), cudaMemcpyDeviceToHost, stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (!foundation_carry)
+        destination = allocate_level_span(merged_count, stream);
+      current_count = publish_balanced_merge(
+          publication_keys_a_.data(), publication_rows_a_.data(),
+          current_count, carry_levels - 1u, destination_level,
+          foundation_carry,
+          foundation_carry ? 0u : destination, merged_count, stream);
+      refresh_active_levels();
+      if (foundation_carry)
+        rebuild_foundation_rank(stream);
+      else
+        rebuild_level_guide(destination_level, stream);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaMemsetAsync(
+          raw_epoch_signatures_.data(), 0,
+          raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+      pending_batches_ = 0u;
+      pending_records_ = 0u;
+      ++stats_.epochs_published;
+      return;
     }
     gpulsmopt2_detail::publish_global_level_descriptors_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
@@ -4096,6 +5577,8 @@ private:
     level_offsets_[destination_level] = destination;
     level_span_sizes_[destination_level] = current_count;
     level_counts_[destination_level] = current_count;
+    level_locations_[destination_level] = {
+        {0u, gpulsmopt2_detail::kQuotients, 1u}};
     refresh_active_levels();
     if (destination_level != foundation_level())
       rebuild_level_guide(destination_level, stream);
@@ -4287,6 +5770,7 @@ private:
   std::size_t batch_capacity_{};
   std::size_t publication_capacity_{};
   std::size_t foundation_pool_capacity_{};
+  std::uint32_t foundation_bank_{};
   std::uint32_t pending_batches_{};
   std::uint32_t pending_records_{};
   std::uint32_t active_levels_{};
@@ -4320,15 +5804,24 @@ private:
   gpulsmopt2_detail::Buffer<std::uint32_t> foundation_source_offsets_,
       foundation_build_capacities_, foundation_physical_offsets_,
       foundation_capacities_, foundation_next_capacities_,
-      foundation_section_output_counts_, foundation_hot_sections_,
-      foundation_hot_selected_count_, foundation_hot_staging_offsets_,
-      foundation_hot_staging_next_, foundation_hot_cell_counts_,
-      foundation_hot_cell_offsets_;
+      foundation_section_output_counts_, balanced_merge_raw_counts_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::BalancedMergeJob>
+      balanced_merge_jobs_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::CrowdedMergeTask>
+      foundation_hot_tasks_;
+  gpulsmopt2_detail::Buffer<std::uint32_t>
+      balanced_merge_job_count_, foundation_hot_sections_,
+      foundation_hot_selected_count_, foundation_hot_range_counts_,
+      foundation_hot_range_bases_,
+      foundation_hot_staging_offsets_, foundation_hot_staging_next_,
+      foundation_hot_cell_counts_, foundation_hot_cell_offsets_,
+      foundation_hot_range_boundaries_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor>
       foundation_next_descriptors_;
   gpulsmopt2_detail::Buffer<std::uint8_t> foundation_hot_flags_,
-      foundation_temp_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> foundation_next_offset_;
+      foundation_hot_streaming_flags_, foundation_temp_;
+  gpulsmopt2_detail::Buffer<std::uint64_t> foundation_next_offset_,
+      balanced_merge_next_offset_;
   gpulsmopt2_detail::Buffer<std::uint32_t> foundation_total_output_count_,
       foundation_overflow_flag_;
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row>
@@ -4340,6 +5833,24 @@ private:
   std::uint64_t level_offsets_[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint64_t level_span_sizes_[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint32_t raw_batch_counts_[gpulsmopt2_detail::kBatchesPerEpoch]{};
+  std::array<std::vector<gpulsmopt2_detail::BalancedMergeJob>,
+             gpulsmopt2_detail::kMaximumLevels> level_locations_{};
+  std::vector<std::uint32_t> balanced_merge_raw_counts_host_ =
+      std::vector<std::uint32_t>(gpulsmopt2_detail::kQuotients);
+  std::vector<std::uint32_t> foundation_capacities_host_ =
+      std::vector<std::uint32_t>(gpulsmopt2_detail::kQuotients);
+  std::vector<gpulsmopt2_detail::BalancedMergeJob>
+      balanced_merge_jobs_host_ =
+          std::vector<gpulsmopt2_detail::BalancedMergeJob>(
+              gpulsmopt2_detail::kQuotients);
+  std::vector<std::uint32_t> foundation_hot_sections_host_ =
+      std::vector<std::uint32_t>(gpulsmopt2_detail::kQuotients);
+  std::vector<std::uint32_t> foundation_hot_range_counts_host_ =
+      std::vector<std::uint32_t>(gpulsmopt2_detail::kQuotients);
+  std::vector<std::uint32_t> foundation_hot_range_bases_host_ =
+      std::vector<std::uint32_t>(gpulsmopt2_detail::kQuotients + 1u);
+  std::vector<gpulsmopt2_detail::CrowdedMergeTask>
+      foundation_hot_tasks_host_;
 
   gpulsmopt2_detail::Buffer<std::uint8_t> radix_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
