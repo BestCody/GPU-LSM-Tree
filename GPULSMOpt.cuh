@@ -77,11 +77,12 @@ constexpr std::uint32_t kFoundationCompactionThreads = 256u;
 constexpr std::uint32_t kFoundationAgeBits = 6u;
 constexpr std::uint32_t kFoundationCells = 128u;
 constexpr std::uint32_t kFoundationCellKeys = 512u;
+constexpr std::uint32_t kDenseCellRankMinimumRows = kFoundationCells;
 constexpr std::uint32_t kCellOwnedQuotients = 2u;
 constexpr std::uint32_t kCellOwnedCells =
     kCellOwnedQuotients * kFoundationCells;
 constexpr std::uint32_t kCellOwnedWarpMaximum = 32u;
-constexpr std::uint16_t kCellOwnedTombstone = 0x8000u;
+constexpr std::uint32_t kCellOwnedCostBuckets = 8u;
 constexpr std::uint32_t kBalancedMergeMaximumQuotients = 512u;
 constexpr std::uint32_t kPlanningTiles = 128u;
 constexpr std::uint32_t kPlanningTileQuotients =
@@ -164,12 +165,69 @@ inline std::size_t preassigned_level_pool_capacity(
   return result;
 }
 
+inline std::size_t preassigned_level_rank_blocks(
+    std::size_t maximum_raw_rows, std::size_t epoch_capacity) {
+  std::size_t result = 0u;
+  std::size_t capacity = std::min(maximum_raw_rows, epoch_capacity);
+  for (std::uint32_t level = 0u; level < kMaximumLevels; ++level) {
+    const std::size_t blocks = std::min<std::size_t>(
+        kQuotients,
+        (capacity + kDenseCellRankMinimumRows - 1u) /
+            kDenseCellRankMinimumRows);
+    if (result > std::numeric_limits<std::size_t>::max() - blocks)
+      throw std::bad_alloc();
+    result += blocks;
+    if (capacity == maximum_raw_rows) break;
+    capacity = capacity > maximum_raw_rows / 2u
+        ? maximum_raw_rows : capacity * 2u;
+  }
+  return result;
+}
+
 
 struct Row {
   std::uint32_t value;
   std::uint16_t key;
   std::uint16_t flags;
 };
+
+// The publication merge never compares values.  Keep only the complete
+// comparison key in shared memory and recover the winning value from its
+// source after visibility has been resolved.  The layout exactly matches the
+// former (local quotient, suffix, source age) ordering:
+//
+//   [ local quotient : 9 ][ suffix : 16 ][ source age : 7 ]
+//
+// Tombstones remain orthogonal and are held in a compact bitmap.
+using CandidateToken = std::uint32_t;
+
+__host__ __device__ __forceinline__ CandidateToken make_candidate_token(
+    std::uint32_t local_quotient, std::uint32_t suffix,
+    std::uint32_t source_age) {
+  return (local_quotient << (16u + kMergeSourceBits)) |
+      ((suffix & 0xffffu) << kMergeSourceBits) |
+      (source_age & ((1u << kMergeSourceBits) - 1u));
+}
+
+__host__ __device__ __forceinline__ std::uint16_t candidate_token_key(
+    CandidateToken token) {
+  return static_cast<std::uint16_t>(token >> kMergeSourceBits);
+}
+
+__host__ __device__ __forceinline__ std::uint32_t
+candidate_token_local_quotient(CandidateToken token) {
+  return token >> (16u + kMergeSourceBits);
+}
+
+__host__ __device__ __forceinline__ std::uint32_t candidate_token_source(
+    CandidateToken token) {
+  return token & ((1u << kMergeSourceBits) - 1u);
+}
+
+__host__ __device__ __forceinline__ std::uint32_t
+candidate_token_logical_key(CandidateToken token) {
+  return token >> kMergeSourceBits;
+}
 
 __host__ __device__ __forceinline__ Row make_row(
     std::uint32_t key, std::uint32_t value, std::uint32_t flags) {
@@ -219,12 +277,12 @@ inline std::size_t balanced_merge_dynamic_shared_bytes(
   constexpr std::size_t cell_words =
       (kCellOwnedCells + 2u) + kCellOwnedCells +
       kCellOwnedCells + kCellOwnedCells + (kCellOwnedCells + 1u);
-  const std::size_t auxiliary_bytes = std::max(
-      std::size_t{(capacity + 31u) / 32u} * sizeof(std::uint32_t),
-      cell_words * sizeof(std::uint16_t));
-  return std::size_t{capacity} * sizeof(Row) +
+  const std::size_t tombstone_bytes =
+      std::size_t{(capacity + 31u) / 32u} * sizeof(std::uint32_t);
+  const std::size_t cell_bytes = cell_words * sizeof(std::uint16_t);
+  return std::size_t{capacity} * sizeof(CandidateToken) +
       std::size_t{capacity + 1u} * sizeof(std::uint16_t) * 2u +
-      auxiliary_bytes;
+      tombstone_bytes + cell_bytes;
 }
 
 constexpr std::uint32_t kRawTombstone = 0x80000000u;
@@ -341,6 +399,15 @@ struct LevelStorageSpan {
   std::uint64_t capacity{};
 };
 
+// Dense non-foundation sections receive one exact 128-cell boundary block.
+// Blocks are compacted inside each preassigned level span so sparse levels do
+// not pay for a full 65,536-section directory.
+struct LevelRankSpan {
+  std::uint64_t begin_block{};
+  std::uint32_t capacity_blocks{};
+  std::uint32_t reserved{};
+};
+
 enum ResidentPublicationStatus : std::uint32_t {
   kPublicationSuccess = 0u,
   kPublicationJobOverflow = 1u << 0u,
@@ -365,6 +432,7 @@ struct ResidentPublicationPlan {
   std::uint32_t boundary_count{};
   std::uint32_t route_count{};
   std::uint32_t slice_count{};
+  std::uint32_t rank_block_count{};
   std::uint32_t status{};
   std::uint32_t job_capacity{};
   std::uint64_t output_begin{};
@@ -466,6 +534,73 @@ __host__ __device__ __forceinline__ std::size_t guide_index(
     std::uint32_t q, std::uint32_t level) {
   return std::size_t{level} * kGuideEntriesPerLevel +
       std::size_t{q} * kGuideSamples;
+}
+
+struct CellInputSlice {
+  std::uint32_t begin{};
+  std::uint32_t count{};
+};
+
+__device__ __forceinline__ bool exact_cell_input_slice(
+    std::uint32_t q, std::uint32_t level, std::uint32_t cell,
+    std::uint32_t foundation_level, std::uint32_t section_count,
+    const std::uint16_t *local_rank,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks, CellInputSlice &slice) {
+  if (section_count > (1u << 16u)) return false;
+  const std::uint16_t *ranks = nullptr;
+  if (level == foundation_level) {
+    ranks = local_rank + std::size_t{q} * kFoundationCells;
+  } else {
+    const std::uint32_t block =
+        level_cell_rank_blocks[descriptor_index(q, level)];
+    if (block == kInvalid) return false;
+    ranks = level_cell_ranks +
+        std::size_t{block} * kFoundationCells;
+  }
+  const std::uint32_t begin = ranks[cell];
+  const std::uint32_t end = cell + 1u < kFoundationCells
+      ? ranks[cell + 1u] : section_count;
+  slice = {begin, end - begin};
+  return true;
+}
+
+__device__ __forceinline__ CellInputSlice resident_candidate_cell_slice(
+    std::uint32_t q, std::uint32_t level, std::uint32_t cell,
+    std::uint32_t foundation_level, std::uint32_t section_count,
+    std::uint32_t candidate_begin, const CandidateToken *candidate_tokens,
+    const std::uint16_t *local_rank,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks) {
+  CellInputSlice slice{};
+  if (!exact_cell_input_slice(
+          q, level, cell, foundation_level, section_count, local_rank,
+          level_cell_rank_blocks, level_cell_ranks, slice)) {
+    const std::uint32_t low_suffix = cell * kFoundationCellKeys;
+    const std::uint32_t high_suffix = low_suffix + kFoundationCellKeys;
+    std::uint32_t low = 0u, high = section_count;
+    while (low < high) {
+      const std::uint32_t middle = (low + high) >> 1u;
+      if (candidate_token_key(candidate_tokens[candidate_begin + middle]) <
+          low_suffix)
+        low = middle + 1u;
+      else
+        high = middle;
+    }
+    const std::uint32_t begin = low;
+    high = section_count;
+    while (low < high) {
+      const std::uint32_t middle = (low + high) >> 1u;
+      if (candidate_token_key(candidate_tokens[candidate_begin + middle]) <
+          high_suffix)
+        low = middle + 1u;
+      else
+        high = middle;
+    }
+    slice = {begin, low - begin};
+  }
+  slice.begin += candidate_begin;
+  return slice;
 }
 
 struct TaggedRow {
@@ -3057,15 +3192,47 @@ __global__ void resolve_resident_job_boundaries_kernel(
 
 __global__ void count_resident_route_slots_kernel(
     const std::uint64_t *raw_counts,
-    const ResidentPublicationPlan *plan,
-    std::uint32_t *route_counts) {
+    const LevelRankSpan *rank_spans, ResidentPublicationPlan *plan,
+    std::uint32_t *route_counts,
+    std::uint32_t *level_cell_rank_blocks) {
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ std::uint32_t block_base;
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t destination = plan->destination_level;
+  const std::uint64_t raw = q < kQuotients
+      ? resident_work_count(raw_counts[q]) : 0u;
+  const std::uint32_t requested =
+      !plan->status && destination < kMaximumLevels &&
+      !plan->destination_is_foundation && q < kQuotients &&
+      raw >= kDenseCellRankMinimumRows && raw <= (1u << 16u);
+  std::uint32_t local{}, block_count{};
+  BlockScan(scan_storage).ExclusiveSum(requested, local, block_count);
+  if (threadIdx.x == 0u)
+    block_base = atomicAdd(&plan->rank_block_count, block_count);
+  __syncthreads();
+
+  if (q < kQuotients && destination < kMaximumLevels) {
+    const std::size_t mapping = descriptor_index(q, destination);
+    if (!requested) {
+      level_cell_rank_blocks[mapping] = kInvalid;
+    } else {
+      const LevelRankSpan span = rank_spans[destination];
+      const std::uint32_t relative = block_base + local;
+      if (relative < span.capacity_blocks) {
+        level_cell_rank_blocks[mapping] =
+            static_cast<std::uint32_t>(span.begin_block + relative);
+      } else {
+        level_cell_rank_blocks[mapping] = kInvalid;
+        atomicOr(&plan->status, kPublicationOutputOverflow);
+      }
+    }
+  }
   if (q > kQuotients) return;
   if (q == kQuotients || plan->status) {
     route_counts[q] = 0u;
     return;
   }
-  const std::uint64_t raw = resident_work_count(raw_counts[q]);
   if (!raw) {
     route_counts[q] = 0u;
   } else if (raw <= plan->job_capacity) {
@@ -3400,7 +3567,9 @@ __global__ void build_resident_query_metadata_kernel(
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
-    std::uint16_t *local_rank, std::uint16_t *level_guides) {
+    const std::uint32_t *level_cell_rank_blocks,
+    std::uint16_t *level_cell_ranks, std::uint16_t *local_rank,
+    std::uint16_t *level_guides) {
   const std::uint32_t q = blockIdx.x;
   if (q >= kQuotients || plan->status) return;
   const std::uint32_t level = plan->destination_level;
@@ -3420,7 +3589,22 @@ __global__ void build_resident_query_metadata_kernel(
       local_rank[std::size_t{q} * 128u + cell] =
           static_cast<std::uint16_t>(position);
     }
-  } else if (header.count && descriptor.count() >= kGuideRegions) {
+  } else {
+    const std::uint32_t rank_block =
+        level_cell_rank_blocks[descriptor_index(q, level)];
+    if (rank_block != kInvalid) {
+      for (std::uint32_t cell = threadIdx.x; cell < kFoundationCells;
+           cell += blockDim.x) {
+        const std::uint32_t position = logical_section_bound(
+            q, level, cell * kFoundationCellKeys, false, arena,
+            route_headers, route_slices, route_logical_begins,
+            level_q_logical_offsets);
+        level_cell_ranks[
+            std::size_t{rank_block} * kFoundationCells + cell] =
+            static_cast<std::uint16_t>(position);
+      }
+    }
+    if (header.count && descriptor.count() >= kGuideRegions) {
     for (std::uint32_t sample = threadIdx.x; sample < kGuideSamples;
          sample += blockDim.x) {
       const std::uint32_t position =
@@ -3429,6 +3613,7 @@ __global__ void build_resident_query_metadata_kernel(
           logical_section_row(
               q, level, position, arena, route_headers, route_slices,
               route_logical_begins, level_q_logical_offsets).key;
+    }
     }
   }
 }
@@ -3439,7 +3624,9 @@ __global__ void build_split_resident_query_metadata_kernel(
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
-    std::uint16_t *local_rank, std::uint16_t *level_guides) {
+    const std::uint32_t *level_cell_rank_blocks,
+    std::uint16_t *level_cell_ranks, std::uint16_t *local_rank,
+    std::uint16_t *level_guides) {
   if (plan->status) return;
   const std::uint32_t level = plan->destination_level;
   for (std::uint32_t q = blockIdx.x; q < kQuotients; q += gridDim.x) {
@@ -3459,7 +3646,22 @@ __global__ void build_split_resident_query_metadata_kernel(
       local_rank[std::size_t{q} * 128u + cell] =
           static_cast<std::uint16_t>(position);
     }
-  } else if (descriptor.count() >= kGuideRegions) {
+  } else {
+    const std::uint32_t rank_block =
+        level_cell_rank_blocks[descriptor_index(q, level)];
+    if (rank_block != kInvalid) {
+      for (std::uint32_t cell = threadIdx.x; cell < kFoundationCells;
+           cell += blockDim.x) {
+        const std::uint32_t position = logical_section_bound(
+            q, level, cell * kFoundationCellKeys, false, arena,
+            route_headers, route_slices, route_logical_begins,
+            level_q_logical_offsets);
+        level_cell_ranks[
+            std::size_t{rank_block} * kFoundationCells + cell] =
+            static_cast<std::uint16_t>(position);
+      }
+    }
+    if (descriptor.count() >= kGuideRegions) {
     for (std::uint32_t sample = threadIdx.x; sample < kGuideSamples;
          sample += blockDim.x) {
       const std::uint32_t position =
@@ -3468,6 +3670,7 @@ __global__ void build_split_resident_query_metadata_kernel(
           logical_section_row(
               q, level, position, arena, route_headers, route_slices,
               route_logical_begins, level_q_logical_offsets).key;
+    }
     }
   }
   }
@@ -3506,6 +3709,8 @@ __global__ void publish_resident_manifest_kernel(
     state.flags = plan->keep_tombstones ? kLevelKeepsTombstones : 0u;
     state.flags |= plan->destination_is_foundation
         ? (kLevelHasRank | kLevelIsFoundation) : kLevelHasGuide;
+    if (!plan->destination_is_foundation && plan->rank_block_count)
+      state.flags |= kLevelHasRank;
     next->levels[destination] = state;
     if (plan->survivor_count)
       next->occupied_level_mask |= std::uint64_t{1} << destination;
@@ -4038,27 +4243,25 @@ __device__ __forceinline__ std::uint32_t direct_raw_metadata(
                       raw_offsets[offset] + local].metadata;
 }
 
-__device__ __forceinline__ bool direct_epoch_candidate_less(
-    std::uint16_t left, std::uint16_t right, const Row *candidates,
-    std::uint32_t raw_count, std::uint32_t q,
+__device__ __forceinline__ std::uint32_t direct_raw_metadata_known_batch(
+    std::uint16_t candidate, std::uint32_t batch, std::uint32_t q,
     const std::uint32_t *raw_candidate_offsets,
     const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
-    std::uint32_t batch_stride, std::uint32_t pending_batches) {
-  const Row a = candidates[left];
-  const Row b = candidates[right];
+    std::uint32_t batch_stride) {
+  const std::uint32_t local = candidate - raw_candidate_offsets[batch];
+  const std::size_t offset =
+      std::size_t{batch} * (kQuotients + 1u) + q;
+  return raw_payloads[std::size_t{batch} * batch_stride +
+                      raw_offsets[offset] + local].metadata;
+}
+
+__device__ __forceinline__ bool direct_epoch_candidate_less(
+    std::uint16_t left, std::uint16_t right,
+    const CandidateToken *candidate_tokens) {
   const std::uint32_t a_key =
-      (static_cast<std::uint32_t>(a.flags >> kMergeSourceBits) << 16u) |
-      a.key;
+      candidate_token_logical_key(candidate_tokens[left]);
   const std::uint32_t b_key =
-      (static_cast<std::uint32_t>(b.flags >> kMergeSourceBits) << 16u) |
-      b.key;
-  (void)raw_count;
-  (void)q;
-  (void)raw_candidate_offsets;
-  (void)raw_payloads;
-  (void)raw_offsets;
-  (void)batch_stride;
-  (void)pending_batches;
+      candidate_token_logical_key(candidate_tokens[right]);
   // Candidate IDs make equal-key merge-path partitions unique.  Timestamp
   // selection remains in the one-time duplicate-resolution pass below.
   return a_key != b_key ? a_key < b_key : left < right;
@@ -4067,11 +4270,7 @@ __device__ __forceinline__ bool direct_epoch_candidate_less(
 __device__ __forceinline__ std::uint32_t direct_epoch_merge_partition(
     const std::uint16_t *left, std::uint32_t left_count,
     const std::uint16_t *right, std::uint32_t right_count,
-    std::uint32_t diagonal, const Row *candidates,
-    std::uint32_t raw_count, std::uint32_t q,
-    const std::uint32_t *raw_candidate_offsets,
-    const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
-    std::uint32_t batch_stride, std::uint32_t pending_batches) {
+    std::uint32_t diagonal, const CandidateToken *candidate_tokens) {
   std::uint32_t low = diagonal > right_count
       ? diagonal - right_count : 0u;
   std::uint32_t high = min(diagonal, left_count);
@@ -4079,14 +4278,10 @@ __device__ __forceinline__ std::uint32_t direct_epoch_merge_partition(
     const std::uint32_t li = (low + high) >> 1u;
     const std::uint32_t ri = diagonal - li;
     if (li && ri < right_count && direct_epoch_candidate_less(
-            right[ri], left[li - 1u], candidates, raw_count, q,
-            raw_candidate_offsets, raw_payloads, raw_offsets,
-            batch_stride, pending_batches)) {
+            right[ri], left[li - 1u], candidate_tokens)) {
       high = li - 1u;
     } else if (ri && li < left_count && direct_epoch_candidate_less(
-                   left[li], right[ri - 1u], candidates, raw_count, q,
-                   raw_candidate_offsets, raw_payloads, raw_offsets,
-                   batch_stride, pending_batches)) {
+                   left[li], right[ri - 1u], candidate_tokens)) {
       low = li + 1u;
     } else {
       return li;
@@ -4096,16 +4291,18 @@ __device__ __forceinline__ std::uint32_t direct_epoch_merge_partition(
 }
 
 __device__ __forceinline__ bool cell_owned_candidate_less(
-    std::uint16_t left, std::uint16_t right, const Row *candidates) {
-  const std::uint16_t left_key = candidates[left].key;
-  const std::uint16_t right_key = candidates[right].key;
+    std::uint16_t left, std::uint16_t right,
+    const CandidateToken *candidate_tokens) {
+  const std::uint16_t left_key = candidate_token_key(candidate_tokens[left]);
+  const std::uint16_t right_key =
+      candidate_token_key(candidate_tokens[right]);
   return left_key != right_key ? left_key < right_key : left < right;
 }
 
 __device__ __forceinline__ std::uint32_t cell_owned_merge_partition(
     const std::uint16_t *left, std::uint32_t left_count,
     const std::uint16_t *right, std::uint32_t right_count,
-    std::uint32_t diagonal, const Row *candidates) {
+    std::uint32_t diagonal, const CandidateToken *candidate_tokens) {
   std::uint32_t low = diagonal > right_count
       ? diagonal - right_count : 0u;
   std::uint32_t high = min(diagonal, left_count);
@@ -4113,10 +4310,10 @@ __device__ __forceinline__ std::uint32_t cell_owned_merge_partition(
     const std::uint32_t li = (low + high) >> 1u;
     const std::uint32_t ri = diagonal - li;
     if (li && ri < right_count && cell_owned_candidate_less(
-            right[ri], left[li - 1u], candidates)) {
+            right[ri], left[li - 1u], candidate_tokens)) {
       high = li - 1u;
     } else if (ri && li < left_count && cell_owned_candidate_less(
-                   left[li], right[ri - 1u], candidates)) {
+                   left[li], right[ri - 1u], candidate_tokens)) {
       low = li + 1u;
     } else {
       return li;
@@ -4127,7 +4324,7 @@ __device__ __forceinline__ std::uint32_t cell_owned_merge_partition(
 
 __device__ __forceinline__ bool cell_owned_candidate_is_newer(
     std::uint16_t candidate, std::uint16_t current,
-    const Row *candidates, std::uint32_t raw_count,
+    const CandidateToken *candidate_tokens, std::uint32_t raw_count,
     bool updates_are_resolved, std::uint32_t q_begin,
     const std::uint32_t *raw_candidate_offsets,
     const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
@@ -4137,24 +4334,138 @@ __device__ __forceinline__ bool cell_owned_candidate_is_newer(
   if (candidate_raw != current_raw) return candidate_raw;
   if (candidate_raw) {
     if (updates_are_resolved) return candidate < current;
-    const std::uint32_t candidate_age = direct_raw_metadata(
-        candidate, q_begin, raw_candidate_offsets, raw_payloads,
-        raw_offsets, batch_stride, pending_batches) & ~kRawTombstone;
-    const std::uint32_t current_age = direct_raw_metadata(
-        current, q_begin, raw_candidate_offsets, raw_payloads,
-        raw_offsets, batch_stride, pending_batches) & ~kRawTombstone;
+    const std::uint32_t candidate_batch =
+        candidate_token_source(candidate_tokens[candidate]);
+    const std::uint32_t current_batch =
+        candidate_token_source(candidate_tokens[current]);
+    if (candidate_batch != current_batch)
+      return candidate_batch > current_batch;
+    const std::uint32_t candidate_age = direct_raw_metadata_known_batch(
+        candidate, candidate_batch, q_begin, raw_candidate_offsets,
+        raw_payloads, raw_offsets, batch_stride) & ~kRawTombstone;
+    const std::uint32_t current_age = direct_raw_metadata_known_batch(
+        current, current_batch, q_begin, raw_candidate_offsets,
+        raw_payloads, raw_offsets, batch_stride) & ~kRawTombstone;
     return candidate_age > current_age;
   }
   const std::uint32_t candidate_age =
-      candidates[candidate].flags & ((1u << kMergeSourceBits) - 1u);
+      candidate_token_source(candidate_tokens[candidate]);
   const std::uint32_t current_age =
-      candidates[current].flags & ((1u << kMergeSourceBits) - 1u);
+      candidate_token_source(candidate_tokens[current]);
   return candidate_age < current_age;
 }
 
 __device__ __forceinline__ bool cell_owned_candidate_is_tombstone(
-    std::uint16_t candidate, const Row *candidates) {
-  return (candidates[candidate].flags & kCellOwnedTombstone) != 0u;
+    std::uint16_t candidate, const std::uint32_t *tombstone_words) {
+  return (tombstone_words[candidate >> 5u] &
+          (1u << (candidate & 31u))) != 0u;
+}
+
+// A normal cell remains single-thread owned.  Grouping cells with similar
+// amounts of serial work into the same warp avoids making short cells execute
+// under the mask of an unrelated long cell.  The raw term accounts for the
+// insertion sort; the total term approximates the subsequent sorted merges.
+// Eight coarse buckets are deliberate: their queue can be built inside the
+// two cell scans the kernel already performs, without a sorting pass.
+__device__ __forceinline__ std::uint32_t cell_owned_cost_bucket(
+    std::uint32_t total_count, std::uint32_t raw_count) {
+  const std::uint32_t raw_sort_work =
+      raw_count * (raw_count ? raw_count - 1u : 0u) / 2u;
+  const std::uint32_t score = total_count + raw_sort_work;
+  const std::uint32_t bucket = score >> 1u;
+  return bucket < kCellOwnedCostBuckets
+      ? bucket : kCellOwnedCostBuckets - 1u;
+}
+
+__device__ __forceinline__ void record_candidate_tombstone(
+    std::uint32_t candidate, bool tombstone,
+    std::uint32_t *tombstone_words) {
+  const unsigned active = __activemask();
+  const std::uint32_t word = candidate >> 5u;
+  const unsigned peers = __match_any_sync(active, word);
+  const std::uint32_t bit = tombstone
+      ? 1u << (candidate & 31u) : 0u;
+  const std::uint32_t bits = __reduce_or_sync(peers, bit);
+  const std::uint32_t leader = __ffs(peers) - 1u;
+  if ((threadIdx.x & 31u) == leader && bits)
+    atomicOr(tombstone_words + word, bits);
+}
+
+__device__ __forceinline__ bool candidate_token_index_less(
+    std::uint16_t left, std::uint16_t right,
+    const CandidateToken *candidate_tokens) {
+  const CandidateToken a = candidate_tokens[left];
+  const CandidateToken b = candidate_tokens[right];
+  return a != b ? a < b : left < right;
+}
+
+__device__ __forceinline__ std::uint32_t candidate_token_merge_partition(
+    const std::uint16_t *left, std::uint32_t left_count,
+    const std::uint16_t *right, std::uint32_t right_count,
+    std::uint32_t diagonal, const CandidateToken *candidate_tokens) {
+  std::uint32_t low = diagonal > right_count
+      ? diagonal - right_count : 0u;
+  std::uint32_t high = min(diagonal, left_count);
+  while (low <= high) {
+    const std::uint32_t li = (low + high) >> 1u;
+    const std::uint32_t ri = diagonal - li;
+    if (li && ri < right_count && candidate_token_index_less(
+            right[ri], left[li - 1u], candidate_tokens)) {
+      high = li - 1u;
+    } else if (ri && li < left_count && candidate_token_index_less(
+                   left[li], right[ri - 1u], candidate_tokens)) {
+      low = li + 1u;
+    } else {
+      return li;
+    }
+  }
+  return low;
+}
+
+__device__ __forceinline__ std::uint32_t load_candidate_value(
+    std::uint16_t candidate, CandidateToken token,
+    std::uint32_t raw_count, bool raw_source_is_encoded,
+    bool staged_epoch, bool crowded_piece,
+    std::uint32_t raw_storage_begin, std::uint32_t q_begin,
+    const std::uint32_t *source_offsets,
+    const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
+    std::uint32_t batch_stride, std::uint32_t pending_batches,
+    const Row *staged_rows, const Row *arena,
+    const RouteHeader *route_headers, const RouteSlice *route_slices,
+    const std::uint32_t *route_logical_begins,
+    const std::uint32_t *level_q_logical_offsets,
+    const std::uint16_t *crowded_level_begins) {
+  if (candidate < raw_count) {
+    if (staged_epoch || crowded_piece)
+      return staged_rows[raw_storage_begin + candidate].value;
+    const std::uint32_t batch = raw_source_is_encoded
+        ? candidate_token_source(token)
+        : direct_raw_batch_for_candidate(
+              candidate, source_offsets, pending_batches);
+    const std::uint32_t local = candidate - source_offsets[batch];
+    const std::size_t offset =
+        std::size_t{batch} * (kQuotients + 1u) + q_begin;
+    return raw_payloads[
+        std::size_t{batch} * batch_stride + raw_offsets[offset] + local]
+        .value;
+  }
+
+  const std::uint32_t level = candidate_token_source(token) - 1u;
+  const std::uint32_t q =
+      q_begin + candidate_token_local_quotient(token);
+  std::uint32_t position =
+      candidate - source_offsets[kBatchesPerEpoch + level];
+  if (crowded_piece) {
+    position += crowded_level_begins[level];
+  } else {
+    const std::size_t level_base =
+        std::size_t{level} * (kQuotients + 1u);
+    position -= level_q_logical_offsets[level_base + q] -
+        level_q_logical_offsets[level_base + q_begin];
+  }
+  return logical_section_row(
+      q, level, position, arena, route_headers, route_slices,
+      route_logical_begins, level_q_logical_offsets).value;
 }
 
 // Common publication path.  A CTA owns an adaptive consecutive range of
@@ -4175,20 +4486,25 @@ __global__ void compact_direct_epoch_jobs_kernel(
     const std::uint32_t *level_q_logical_offsets,
     const RouteHeader *next_route_headers, RouteSlice *next_route_slices,
     std::uint32_t *section_output_counts, std::uint32_t *overflow_flag,
-    std::uint16_t *local_rank, std::uint16_t *level_guides) {
+    std::uint32_t *level_cell_rank_blocks,
+    std::uint16_t *level_cell_ranks, std::uint16_t *local_rank,
+    std::uint16_t *level_guides) {
   constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
   using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
   __shared__ typename BlockScan::TempStorage block_scan_storage;
   extern __shared__ __align__(16) unsigned char merge_workspace[];
   const std::uint32_t capacity = plan->job_capacity;
-  Row *candidates = reinterpret_cast<Row *>(merge_workspace);
+  CandidateToken *candidate_tokens =
+      reinterpret_cast<CandidateToken *>(merge_workspace);
   std::uint16_t *indices_a = reinterpret_cast<std::uint16_t *>(
-      candidates + capacity);
+      candidate_tokens + capacity);
   std::uint16_t *indices_b = indices_a + capacity + 1u;
   std::uint32_t *tombstone_words = reinterpret_cast<std::uint32_t *>(
       indices_b + capacity + 1u);
+  const std::uint32_t tombstone_word_capacity = (capacity + 31u) / 32u;
   std::uint16_t *cell_input_offsets =
-      reinterpret_cast<std::uint16_t *>(tombstone_words);
+      reinterpret_cast<std::uint16_t *>(
+          tombstone_words + tombstone_word_capacity);
   std::uint16_t *cell_raw_counts =
       cell_input_offsets + kCellOwnedCells + 2u;
   std::uint16_t *cell_output_counts =
@@ -4213,6 +4529,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
   __shared__ std::uint32_t metadata_begin_shared;
   __shared__ std::uint32_t metadata_count_shared;
   __shared__ std::uint32_t large_cell_count_shared;
+  __shared__ std::uint32_t raw_storage_begin_shared;
   if (plan->status) return;
   const DeviceManifestSnapshot manifest = load_active_manifest(
       manifests, active_manifest);
@@ -4243,15 +4560,18 @@ __global__ void compact_direct_epoch_jobs_kernel(
         const std::uint32_t end = lower_bound_rows(
             staged_rows + hot_begin, hot_count, suffix_end);
         source_offsets[0] = 0u;
+        raw_storage_begin_shared = hot_begin + begin;
         total = end - begin;
         for (std::uint32_t batch = 1u; batch <= kBatchesPerEpoch; ++batch)
           source_offsets[batch] = total;
       } else if (staged_epoch) {
         source_offsets[0] = 0u;
+        raw_storage_begin_shared = staged_offsets[q_begin];
         total = staged_offsets[q_end] - staged_offsets[q_begin];
         for (std::uint32_t batch = 1u; batch <= kBatchesPerEpoch; ++batch)
           source_offsets[batch] = total;
       } else {
+        raw_storage_begin_shared = 0u;
         for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
           source_offsets[batch] = total;
           const std::size_t base =
@@ -4311,80 +4631,146 @@ __global__ void compact_direct_epoch_jobs_kernel(
 
     const std::uint32_t lane = threadIdx.x & 31u;
     const std::uint32_t warp = threadIdx.x >> 5u;
-    const std::uint32_t words = (task_rows + 31u) / 32u;
-    for (std::uint32_t word = warp; word < words;
-         word += blockDim.x / 32u) {
-      const std::uint32_t candidate = word * 32u + lane;
-      bool tombstone = false;
-      if (candidate < task_rows) {
-        Row row{};
-        if (candidate < raw_count) {
-          if (crowded_piece) {
-            const std::uint32_t suffix_begin =
-                static_cast<std::uint32_t>(job.key_begin & 0xffffu);
-            const std::uint32_t hot_begin = staged_offsets[q_begin];
-            const std::uint32_t hot_count =
-                staged_offsets[q_begin + 1u] - hot_begin;
-            const std::uint32_t begin = lower_bound_rows(
-                staged_rows + hot_begin, hot_count, suffix_begin);
-            row = staged_rows[hot_begin + begin + candidate];
-            tombstone = (row.flags & kTombstone) != 0u;
-            row.flags = 0u;
-          } else if (staged_epoch) {
-            const std::uint32_t source =
-                staged_offsets[q_begin] + candidate;
-            const std::uint32_t key = staged_keys[source];
-            row = staged_rows[source];
-            tombstone = (row.flags & kTombstone) != 0u;
-            row.flags = static_cast<std::uint16_t>(
-                ((key >> 16u) - q_begin) << kMergeSourceBits);
-          } else {
-          const std::uint32_t batch = direct_raw_batch_for_candidate(
-              static_cast<std::uint16_t>(candidate),
-              source_offsets, pending_batches);
-          const std::uint32_t local =
-              candidate - source_offsets[batch];
-          const std::size_t base =
-              std::size_t{batch} * (kQuotients + 1u);
-          const std::size_t source = std::size_t{batch} * batch_stride +
-              raw_offsets[base + q_begin] + local;
+    if (cell_owned && !staged_epoch && !crowded_piece) {
+      const std::uint32_t words = (task_rows + 31u) / 32u;
+      for (std::uint32_t word = threadIdx.x; word < words;
+           word += blockDim.x)
+        tombstone_words[word] = 0u;
+      __syncthreads();
+
+      // The raw intervals are already concatenated batch-by-batch.  Give
+      // each warp complete batch intervals so the batch number is known
+      // without a 15-way search for every record.  Eight warps naturally
+      // cover the sixteen batches in two balanced rounds.
+      for (std::uint32_t batch = warp; batch < pending_batches;
+           batch += blockDim.x / 32u) {
+        const std::uint32_t batch_begin = source_offsets[batch];
+        const std::uint32_t batch_end = source_offsets[batch + 1u];
+        const std::size_t base =
+            std::size_t{batch} * (kQuotients + 1u);
+        const std::size_t source_begin =
+            std::size_t{batch} * batch_stride +
+            raw_offsets[base + q_begin];
+        for (std::uint32_t candidate = batch_begin + lane;
+             candidate < batch_end; candidate += 32u) {
+          const std::size_t source =
+              source_begin + candidate - batch_begin;
+          const std::uint32_t key = raw_keys[source];
           const RawPayload payload = raw_payloads[source];
-          row = raw_row(raw_keys[source], payload);
-          tombstone = (payload.metadata & kRawTombstone) != 0u;
-          row.flags = static_cast<std::uint16_t>(
-              ((raw_keys[source] >> 16u) - q_begin) << kMergeSourceBits);
-          }
-        } else {
-          std::uint32_t level = 0u;
-          while (level <= plan->source_level_limit &&
-                 candidate >=
-                     source_offsets[kBatchesPerEpoch + level + 1u])
-            ++level;
-          std::uint32_t position = candidate -
-              source_offsets[kBatchesPerEpoch + level];
-          std::uint32_t q = q_begin;
-          if (crowded_piece) {
-            position += run_offsets[level];
-          } else while (q < q_end) {
-            const std::uint32_t count =
-                descriptors[descriptor_index(q, level)].count();
-            if (position < count) break;
-            position -= count;
-            ++q;
-          }
-          row = logical_section_row(
-              q, level, position, arena, route_headers, route_slices,
-              route_logical_begins, level_q_logical_offsets);
-          tombstone = (row.flags & kTombstone) != 0u;
-          row.flags = static_cast<std::uint16_t>(
-              ((q - q_begin) << kMergeSourceBits) | (level + 1u));
+          candidate_tokens[candidate] = make_candidate_token(
+              (key >> 16u) - q_begin, key, batch);
+          indices_a[candidate] = static_cast<std::uint16_t>(candidate);
+          record_candidate_tombstone(
+              candidate, (payload.metadata & kRawTombstone) != 0u,
+              tombstone_words);
         }
-        if (cell_owned && tombstone) row.flags |= kCellOwnedTombstone;
-        candidates[candidate] = row;
-        indices_a[candidate] = static_cast<std::uint16_t>(candidate);
       }
-      const std::uint32_t mask = __ballot_sync(0xffffffffu, tombstone);
-      if (lane == 0u) tombstone_words[word] = mask;
+
+      // Resident rows remain source-major and are therefore loaded in one
+      // consecutive CTA-wide pass.  Their source age is encoded directly.
+      for (std::uint32_t candidate = raw_count + threadIdx.x;
+           candidate < task_rows; candidate += blockDim.x) {
+        std::uint32_t level = 0u;
+        while (level <= plan->source_level_limit &&
+               candidate >=
+                   source_offsets[kBatchesPerEpoch + level + 1u])
+          ++level;
+        std::uint32_t position = candidate -
+            source_offsets[kBatchesPerEpoch + level];
+        std::uint32_t q = q_begin;
+        while (q < q_end) {
+          const std::uint32_t count =
+              descriptors[descriptor_index(q, level)].count();
+          if (position < count) break;
+          position -= count;
+          ++q;
+        }
+        Row row = logical_section_row(
+            q, level, position, arena, route_headers, route_slices,
+            route_logical_begins, level_q_logical_offsets);
+        const bool tombstone = (row.flags & kTombstone) != 0u;
+        candidate_tokens[candidate] = make_candidate_token(
+            q - q_begin, row.key, level + 1u);
+        indices_a[candidate] = static_cast<std::uint16_t>(candidate);
+        record_candidate_tombstone(
+            candidate, tombstone, tombstone_words);
+      }
+    } else {
+      const std::uint32_t words = (task_rows + 31u) / 32u;
+      for (std::uint32_t word = warp; word < words;
+           word += blockDim.x / 32u) {
+        const std::uint32_t candidate = word * 32u + lane;
+        bool tombstone = false;
+        if (candidate < task_rows) {
+          CandidateToken token{};
+          if (candidate < raw_count) {
+            if (crowded_piece) {
+              const std::uint32_t suffix_begin =
+                  static_cast<std::uint32_t>(job.key_begin & 0xffffu);
+              const std::uint32_t hot_begin = staged_offsets[q_begin];
+              const std::uint32_t hot_count =
+                  staged_offsets[q_begin + 1u] - hot_begin;
+              const std::uint32_t begin = lower_bound_rows(
+                  staged_rows + hot_begin, hot_count, suffix_begin);
+              const Row row = staged_rows[hot_begin + begin + candidate];
+              tombstone = (row.flags & kTombstone) != 0u;
+              token = make_candidate_token(0u, row.key, 0u);
+            } else if (staged_epoch) {
+              const std::uint32_t source =
+                  staged_offsets[q_begin] + candidate;
+              const std::uint32_t key = staged_keys[source];
+              const Row row = staged_rows[source];
+              tombstone = (row.flags & kTombstone) != 0u;
+              token = make_candidate_token(
+                  (key >> 16u) - q_begin, key, 0u);
+            } else {
+              const std::uint32_t batch = direct_raw_batch_for_candidate(
+                  static_cast<std::uint16_t>(candidate),
+                  source_offsets, pending_batches);
+              const std::uint32_t local =
+                  candidate - source_offsets[batch];
+              const std::size_t base =
+                  std::size_t{batch} * (kQuotients + 1u);
+              const std::size_t source =
+                  std::size_t{batch} * batch_stride +
+                  raw_offsets[base + q_begin] + local;
+              const RawPayload payload = raw_payloads[source];
+              const std::uint32_t key = raw_keys[source];
+              tombstone = (payload.metadata & kRawTombstone) != 0u;
+              token = make_candidate_token(
+                  (key >> 16u) - q_begin, key, batch);
+            }
+          } else {
+            std::uint32_t level = 0u;
+            while (level <= plan->source_level_limit &&
+                   candidate >=
+                       source_offsets[kBatchesPerEpoch + level + 1u])
+              ++level;
+            std::uint32_t position = candidate -
+                source_offsets[kBatchesPerEpoch + level];
+            std::uint32_t q = q_begin;
+            if (crowded_piece) {
+              position += run_offsets[level];
+            } else while (q < q_end) {
+              const std::uint32_t count =
+                  descriptors[descriptor_index(q, level)].count();
+              if (position < count) break;
+              position -= count;
+              ++q;
+            }
+            const Row row = logical_section_row(
+                q, level, position, arena, route_headers, route_slices,
+                route_logical_begins, level_q_logical_offsets);
+            tombstone = (row.flags & kTombstone) != 0u;
+            token = make_candidate_token(
+                q - q_begin, row.key, level + 1u);
+          }
+          candidate_tokens[candidate] = token;
+          indices_a[candidate] = static_cast<std::uint16_t>(candidate);
+        }
+        const std::uint32_t mask = __ballot_sync(0xffffffffu, tombstone);
+        if (lane == 0u) tombstone_words[word] = mask;
+      }
     }
     __syncthreads();
 
@@ -4394,32 +4780,55 @@ __global__ void compact_direct_epoch_jobs_kernel(
       std::uint32_t *cell_cursors =
           reinterpret_cast<std::uint32_t *>(indices_b);
 
+      // Stored inputs are already sorted.  Let each destination cell pull
+      // its own interval from every source: dense sections use their exact
+      // persisted boundaries, while sparse sections pay two short searches.
+      // This replaces the old per-resident-row histogram entirely.
       for (std::uint32_t cell = threadIdx.x; cell < total_cells;
            cell += blockDim.x) {
-        cell_cursors[cell] = 0u;
+        const std::uint32_t local_q = cell / kFoundationCells;
+        const std::uint32_t q = q_begin + local_q;
+        const std::uint32_t local_cell =
+            cell & (kFoundationCells - 1u);
+        std::uint32_t resident_count = 0u;
+        for (std::uint32_t level = 0u;
+             level <= plan->source_level_limit; ++level) {
+          const std::uint32_t level_begin =
+              source_offsets[kBatchesPerEpoch + level];
+          const std::uint32_t level_end =
+              source_offsets[kBatchesPerEpoch + level + 1u];
+          if (level_begin == level_end) continue;
+          std::uint32_t q_begin_in_level = level_begin;
+          for (std::uint32_t previous = q_begin; previous < q; ++previous)
+            q_begin_in_level +=
+                descriptors[descriptor_index(previous, level)].count();
+          const std::uint32_t q_count =
+              descriptors[descriptor_index(q, level)].count();
+          resident_count += resident_candidate_cell_slice(
+              q, level, local_cell, manifest.foundation_level, q_count,
+              q_begin_in_level, candidate_tokens, local_rank,
+              level_cell_rank_blocks, level_cell_ranks).count;
+        }
+        cell_cursors[cell] = resident_count;
       }
       __syncthreads();
 
-      // Count every candidate once, but remember raw counts separately.  The
-      // resident sources are already sorted, so only raw IDs need the later
-      // scatter; resident slices are copied directly into their cells.
-      for (std::uint32_t candidate = threadIdx.x; candidate < task_rows;
+      // Only unsorted raw updates need histogramming and scattering.  The
+      // upper half of the packed counter records that raw prefix length.
+      for (std::uint32_t candidate = threadIdx.x; candidate < raw_count;
            candidate += blockDim.x) {
-        const Row row = candidates[candidate];
+        const CandidateToken token = candidate_tokens[candidate];
         const std::uint32_t local_q =
-            (row.flags & ~kCellOwnedTombstone) >> kMergeSourceBits;
+            candidate_token_local_quotient(token);
         const std::uint32_t cell =
-            local_q * kFoundationCells + row.key / kFoundationCellKeys;
+            local_q * kFoundationCells +
+            candidate_token_key(token) / kFoundationCellKeys;
         const unsigned active = __activemask();
         const unsigned peers = __match_any_sync(active, cell);
-        const unsigned raw_mask = __ballot_sync(
-            active, candidate < raw_count);
         const std::uint32_t leader = __ffs(peers) - 1u;
-        if (lane == leader) {
-          const unsigned raw_peers = peers & raw_mask;
+        if (lane == leader)
           atomicAdd(cell_cursors + cell,
-                    __popc(peers) | (__popc(raw_peers) << 16u));
-        }
+                    __popc(peers) | (__popc(peers) << 16u));
       }
       __syncthreads();
 
@@ -4440,11 +4849,12 @@ __global__ void compact_direct_epoch_jobs_kernel(
 
       for (std::uint32_t candidate = threadIdx.x; candidate < raw_count;
            candidate += blockDim.x) {
-        const Row row = candidates[candidate];
+        const CandidateToken token = candidate_tokens[candidate];
         const std::uint32_t local_q =
-            (row.flags & ~kCellOwnedTombstone) >> kMergeSourceBits;
+            candidate_token_local_quotient(token);
         const std::uint32_t cell =
-            local_q * kFoundationCells + row.key / kFoundationCellKeys;
+            local_q * kFoundationCells +
+            candidate_token_key(token) / kFoundationCellKeys;
         const unsigned active = __activemask();
         const unsigned peers = __match_any_sync(active, cell);
         const std::uint32_t leader = __ffs(peers) - 1u;
@@ -4470,9 +4880,6 @@ __global__ void compact_direct_epoch_jobs_kernel(
         const std::uint32_t q = q_begin + local_q;
         const std::uint32_t local_cell =
             cell & (kFoundationCells - 1u);
-        const std::uint32_t low_suffix =
-            local_cell * kFoundationCellKeys;
-        const std::uint32_t high_suffix = low_suffix + kFoundationCellKeys;
         std::uint32_t destination =
             cell_input_offsets[cell] + cell_raw_counts[cell];
         for (std::uint32_t level = 0u;
@@ -4488,43 +4895,75 @@ __global__ void compact_direct_epoch_jobs_kernel(
                 descriptors[descriptor_index(previous, level)].count();
           const std::uint32_t q_count =
               descriptors[descriptor_index(q, level)].count();
-          std::uint32_t low = 0u, high = q_count;
-          while (low < high) {
-            const std::uint32_t middle = (low + high) >> 1u;
-            if (candidates[q_begin_in_level + middle].key < low_suffix)
-              low = middle + 1u;
-            else
-              high = middle;
-          }
-          const std::uint32_t first = low;
-          high = q_count;
-          while (low < high) {
-            const std::uint32_t middle = (low + high) >> 1u;
-            if (candidates[q_begin_in_level + middle].key < high_suffix)
-              low = middle + 1u;
-            else
-              high = middle;
-          }
-          for (std::uint32_t position = first; position < low; ++position)
+          const CellInputSlice slice = resident_candidate_cell_slice(
+              q, level, local_cell, manifest.foundation_level, q_count,
+              q_begin_in_level, candidate_tokens, local_rank,
+              level_cell_rank_blocks, level_cell_ranks);
+          for (std::uint32_t position = 0u; position < slice.count;
+               ++position)
             indices_a[destination++] = static_cast<std::uint16_t>(
-                q_begin_in_level + position);
+                slice.begin + position);
         }
         }
       }
       __syncthreads();
 
+      const std::uint32_t bucket_slots =
+          quotient_count * kCellOwnedCostBuckets;
+      // The secondary index plane is scratch until cell resolution begins.
+      // Reuse its first few words for a parallel bucket histogram and queue
+      // cursors, avoiding the serial 256-cell queue construction.
+      for (std::uint32_t slot = threadIdx.x; slot <= bucket_slots;
+           slot += blockDim.x)
+        cell_cursors[slot] = 0u;
       for (std::uint32_t cell = threadIdx.x; cell < total_cells;
            cell += blockDim.x)
         cell_output_counts[cell] = 0u;
-      if (threadIdx.x == 0u) {
-        std::uint32_t large_count = 0u;
-        for (std::uint32_t cell = 0u; cell < total_cells; ++cell) {
-          const std::uint32_t count =
-              cell_input_offsets[cell + 1u] - cell_input_offsets[cell];
-          if (count > kCellOwnedWarpMaximum)
-            cell_queue[large_count++] = static_cast<std::uint16_t>(cell);
+      __syncthreads();
+
+      const bool owns_queue_cell = threadIdx.x < total_cells;
+      std::uint32_t queue_slot = bucket_slots;
+      if (owns_queue_cell) {
+        const std::uint32_t cell = threadIdx.x;
+        const std::uint32_t total_count =
+            cell_input_offsets[cell + 1u] - cell_input_offsets[cell];
+        if (total_count <= kCellOwnedWarpMaximum) {
+          const std::uint32_t local_q = cell / kFoundationCells;
+          queue_slot = local_q * kCellOwnedCostBuckets +
+              cell_owned_cost_bucket(total_count, cell_raw_counts[cell]);
         }
-        large_cell_count_shared = large_count;
+      }
+      const unsigned queue_active = __ballot_sync(
+          0xffffffffu, owns_queue_cell);
+      if (owns_queue_cell) {
+        const unsigned peers = __match_any_sync(queue_active, queue_slot);
+        const std::uint32_t leader = __ffs(peers) - 1u;
+        if (lane == leader)
+          atomicAdd(cell_cursors + queue_slot, __popc(peers));
+      }
+      __syncthreads();
+
+      if (threadIdx.x == 0u) {
+        std::uint32_t prefix = 0u;
+        for (std::uint32_t slot = 0u; slot <= bucket_slots; ++slot) {
+          const std::uint32_t count = cell_cursors[slot];
+          cell_cursors[slot] = prefix;
+          prefix += count;
+          if (slot == bucket_slots) large_cell_count_shared = count;
+        }
+      }
+      __syncthreads();
+
+      if (owns_queue_cell) {
+        const unsigned peers = __match_any_sync(queue_active, queue_slot);
+        const std::uint32_t leader = __ffs(peers) - 1u;
+        std::uint32_t base = 0u;
+        if (lane == leader)
+          base = atomicAdd(cell_cursors + queue_slot, __popc(peers));
+        base = __shfl_sync(peers, base, leader);
+        const std::uint32_t rank =
+            base + __popc(peers & ((1u << lane) - 1u));
+        cell_queue[rank] = static_cast<std::uint16_t>(threadIdx.x);
       }
       __syncthreads();
 
@@ -4533,7 +4972,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
       // continuation, task queue, or extra data movement.
       for (std::uint32_t large_index = 0u;
            large_index < large_cell_count_shared; ++large_index) {
-        const std::uint32_t cell = cell_queue[large_index];
+        const std::uint32_t cell = cell_queue[
+            total_cells - large_cell_count_shared + large_index];
         const std::uint32_t cell_begin = cell_input_offsets[cell];
         const std::uint32_t cell_count =
             cell_input_offsets[cell + 1u] - cell_begin;
@@ -4569,12 +5009,13 @@ __global__ void compact_direct_epoch_jobs_kernel(
             const std::uint16_t *right = input + cell_begin + right_begin;
             const std::uint32_t diagonal = position - pair_begin;
             std::uint32_t li = cell_owned_merge_partition(
-                left, left_count, right, right_count, diagonal, candidates);
+                left, left_count, right, right_count, diagonal,
+                candidate_tokens);
             std::uint32_t ri = diagonal - li;
             while (position < output_end) {
               const bool take_left = ri >= right_count ||
                   (li < left_count && cell_owned_candidate_less(
-                       left[li], right[ri], candidates));
+                       left[li], right[ri], candidate_tokens));
               output[cell_begin + position++] =
                   take_left ? left[li++] : right[ri++];
             }
@@ -4595,17 +5036,19 @@ __global__ void compact_direct_epoch_jobs_kernel(
           if (index >= cell_count) continue;
           const std::uint16_t candidate = sorted[cell_begin + index];
           const bool first = index == 0u ||
-              candidates[sorted[cell_begin + index - 1u]].key !=
-                  candidates[candidate].key;
+              candidate_token_key(candidate_tokens[
+                  sorted[cell_begin + index - 1u]]) !=
+                  candidate_token_key(candidate_tokens[candidate]);
           if (!first) continue;
           std::uint16_t winner = candidate;
           std::uint32_t next = index + 1u;
           while (next < cell_count &&
-                 candidates[sorted[cell_begin + next]].key ==
-                     candidates[candidate].key) {
+                 candidate_token_key(candidate_tokens[
+                     sorted[cell_begin + next]]) ==
+                     candidate_token_key(candidate_tokens[candidate])) {
             const std::uint16_t other = sorted[cell_begin + next++];
             if (cell_owned_candidate_is_newer(
-                    other, winner, candidates, raw_count,
+                    other, winner, candidate_tokens, raw_count,
                     updates_are_resolved, q_begin, source_offsets,
                     raw_payloads, raw_offsets, batch_stride,
                     pending_batches)) {
@@ -4613,7 +5056,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
             }
           }
           if (!plan->keep_tombstones &&
-              cell_owned_candidate_is_tombstone(winner, candidates))
+              cell_owned_candidate_is_tombstone(
+                  winner, tombstone_words))
             continue;
           resolved[cell_begin + index] = winner;
           winner_mask |= 1u << item;
@@ -4644,20 +5088,24 @@ __global__ void compact_direct_epoch_jobs_kernel(
       // Ordinary cells sort only their unsorted raw updates.  Resident slices
       // are already ordered, so the cell pulls and merges them directly from
       // newest level to oldest instead of scattering and sorting them again.
-      const std::uint32_t owned_cell = threadIdx.x;
-      if (owned_cell < total_cells) {
-        const std::uint32_t cell_begin = cell_input_offsets[owned_cell];
+      // The queue changes only execution ownership; every result remains in
+      // its original cell slice.
+      const std::uint32_t processing_cell = threadIdx.x < total_cells
+          ? cell_queue[threadIdx.x] : total_cells;
+      if (processing_cell < total_cells) {
+        const std::uint32_t cell_begin =
+            cell_input_offsets[processing_cell];
         const std::uint32_t cell_count =
-            cell_input_offsets[owned_cell + 1u] - cell_begin;
+            cell_input_offsets[processing_cell + 1u] - cell_begin;
         if (cell_count && cell_count <= kCellOwnedWarpMaximum) {
           const std::uint32_t raw_cell_count =
-              cell_raw_counts[owned_cell];
+              cell_raw_counts[processing_cell];
           for (std::uint32_t i = 1u; i < raw_cell_count; ++i) {
             const std::uint16_t value = indices_a[cell_begin + i];
             std::uint32_t j = i;
             while (j && cell_owned_candidate_less(
                             value, indices_a[cell_begin + j - 1u],
-                            candidates)) {
+                            candidate_tokens)) {
               indices_a[cell_begin + j] = indices_a[cell_begin + j - 1u];
               --j;
             }
@@ -4668,11 +5116,12 @@ __global__ void compact_direct_epoch_jobs_kernel(
             std::uint16_t winner = indices_a[cell_begin + i];
             std::uint32_t next = i + 1u;
             while (next < raw_cell_count &&
-                   candidates[indices_a[cell_begin + next]].key ==
-                       candidates[winner].key) {
+                   candidate_token_key(candidate_tokens[
+                       indices_a[cell_begin + next]]) ==
+                       candidate_token_key(candidate_tokens[winner])) {
               const std::uint16_t other = indices_a[cell_begin + next++];
               if (cell_owned_candidate_is_newer(
-                      other, winner, candidates, raw_count,
+                      other, winner, candidate_tokens, raw_count,
                       updates_are_resolved, q_begin, source_offsets,
                       raw_payloads, raw_offsets, batch_stride,
                       pending_batches)) {
@@ -4685,14 +5134,11 @@ __global__ void compact_direct_epoch_jobs_kernel(
             i = next;
           }
           bool current_is_a = true;
-          const std::uint32_t local_q = owned_cell / kFoundationCells;
+          const std::uint32_t local_q =
+              processing_cell / kFoundationCells;
           const std::uint32_t q = q_begin + local_q;
           const std::uint32_t local_cell =
-              owned_cell & (kFoundationCells - 1u);
-          const std::uint32_t low_suffix =
-              local_cell * kFoundationCellKeys;
-          const std::uint32_t high_suffix =
-              low_suffix + kFoundationCellKeys;
+              processing_cell & (kFoundationCells - 1u);
           for (std::uint32_t level = 0u;
                level <= plan->source_level_limit; ++level) {
             const std::uint32_t level_begin =
@@ -4707,24 +5153,11 @@ __global__ void compact_direct_epoch_jobs_kernel(
                   descriptors[descriptor_index(previous, level)].count();
             const std::uint32_t q_count =
                 descriptors[descriptor_index(q, level)].count();
-            std::uint32_t low = 0u, high = q_count;
-            while (low < high) {
-              const std::uint32_t middle = (low + high) >> 1u;
-              if (candidates[q_begin_in_level + middle].key < low_suffix)
-                low = middle + 1u;
-              else
-                high = middle;
-            }
-            const std::uint32_t resident_begin = low;
-            high = q_count;
-            while (low < high) {
-              const std::uint32_t middle = (low + high) >> 1u;
-              if (candidates[q_begin_in_level + middle].key < high_suffix)
-                low = middle + 1u;
-              else
-                high = middle;
-            }
-            const std::uint32_t resident_count = low - resident_begin;
+            const CellInputSlice resident = resident_candidate_cell_slice(
+                q, level, local_cell, manifest.foundation_level, q_count,
+                q_begin_in_level, candidate_tokens, local_rank,
+                level_cell_rank_blocks, level_cell_ranks);
+            const std::uint32_t resident_count = resident.count;
             if (!resident_count) continue;
             const std::uint16_t *current =
                 current_is_a ? indices_a : indices_b;
@@ -4741,8 +5174,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
               }
               const std::uint16_t resident_candidate =
                   static_cast<std::uint16_t>(
-                      q_begin_in_level + resident_begin +
-                      resident_position);
+                      resident.begin + resident_position);
               if (current_position == current_count) {
                 next_run[cell_begin + merged++] = resident_candidate;
                 ++resident_position;
@@ -4751,9 +5183,9 @@ __global__ void compact_direct_epoch_jobs_kernel(
               const std::uint16_t current_candidate =
                   current[cell_begin + current_position];
               const std::uint16_t current_key =
-                  candidates[current_candidate].key;
+                  candidate_token_key(candidate_tokens[current_candidate]);
               const std::uint16_t resident_key =
-                  candidates[resident_candidate].key;
+                  candidate_token_key(candidate_tokens[resident_candidate]);
               if (current_key <= resident_key) {
                 next_run[cell_begin + merged++] = current_candidate;
                 ++current_position;
@@ -4772,10 +5204,11 @@ __global__ void compact_direct_epoch_jobs_kernel(
           for (std::uint32_t i = 0u; i < current_count; ++i) {
             const std::uint16_t candidate = final_run[cell_begin + i];
             if (plan->keep_tombstones ||
-                !cell_owned_candidate_is_tombstone(candidate, candidates))
+                !cell_owned_candidate_is_tombstone(
+                    candidate, tombstone_words))
               indices_a[cell_begin + output++] = candidate;
           }
-          cell_output_counts[owned_cell] =
+          cell_output_counts[processing_cell] =
               static_cast<std::uint16_t>(output);
         }
       }
@@ -4802,24 +5235,36 @@ __global__ void compact_direct_epoch_jobs_kernel(
       }
       __syncthreads();
 
-      // Write with the same adaptive ownership used for resolution.  The
-      // second index plane becomes one compact logical survivor list for
-      // guide creation, while rows go directly to their reserved output.
-      if (owned_cell < total_cells) {
-        const std::uint32_t input_begin = cell_input_offsets[owned_cell];
+      // Restore key-order ownership for output.  The second index plane
+      // becomes one compact logical survivor list for guide creation, while
+      // adjacent workers write adjacent cell ranges.
+      const std::uint32_t output_cell = threadIdx.x;
+      if (output_cell < total_cells) {
+        const std::uint32_t input_begin = cell_input_offsets[output_cell];
         const std::uint32_t input_count =
-            cell_input_offsets[owned_cell + 1u] - input_begin;
+            cell_input_offsets[output_cell + 1u] - input_begin;
         if (input_count <= kCellOwnedWarpMaximum) {
           const std::uint32_t output_begin =
-              cell_output_offsets[owned_cell];
+              cell_output_offsets[output_cell];
           const std::uint32_t output_count =
-              cell_output_counts[owned_cell];
+              cell_output_counts[output_cell];
           for (std::uint32_t i = 0u; i < output_count; ++i) {
             const std::uint16_t candidate = indices_a[input_begin + i];
             indices_b[output_begin + i] = candidate;
-            Row row = candidates[candidate];
-            row.flags = cell_owned_candidate_is_tombstone(
-                candidate, candidates) ? kTombstone : 0u;
+            const bool tombstone = cell_owned_candidate_is_tombstone(
+                candidate, tombstone_words);
+            const CandidateToken token = candidate_tokens[candidate];
+            const std::uint32_t value = tombstone ? 0u :
+                load_candidate_value(
+                    candidate, token, raw_count, true, staged_epoch,
+                    false, raw_storage_begin_shared, q_begin,
+                    source_offsets, raw_payloads, raw_offsets, batch_stride,
+                    pending_batches, staged_rows, arena, route_headers,
+                    route_slices, route_logical_begins,
+                    level_q_logical_offsets, run_offsets);
+            const Row row{value, candidate_token_key(token),
+                          static_cast<std::uint16_t>(
+                              tombstone ? kTombstone : 0u)};
             if (output_valid_shared)
               arena[job.existing_offset + output_begin + i] = row;
           }
@@ -4828,7 +5273,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
       __syncthreads();
       for (std::uint32_t large_index = 0u;
            large_index < large_cell_count_shared; ++large_index) {
-        const std::uint32_t cell = cell_queue[large_index];
+        const std::uint32_t cell = cell_queue[
+            total_cells - large_cell_count_shared + large_index];
         const std::uint32_t input_begin = cell_input_offsets[cell];
         const std::uint32_t output_begin = cell_output_offsets[cell];
         const std::uint32_t output_count = cell_output_counts[cell];
@@ -4836,9 +5282,20 @@ __global__ void compact_direct_epoch_jobs_kernel(
              i += blockDim.x) {
           const std::uint16_t candidate = indices_a[input_begin + i];
           indices_b[output_begin + i] = candidate;
-          Row row = candidates[candidate];
-          row.flags = cell_owned_candidate_is_tombstone(
-              candidate, candidates) ? kTombstone : 0u;
+          const bool tombstone = cell_owned_candidate_is_tombstone(
+              candidate, tombstone_words);
+          const CandidateToken token = candidate_tokens[candidate];
+          const std::uint32_t value = tombstone ? 0u :
+              load_candidate_value(
+                  candidate, token, raw_count, true, staged_epoch,
+                  false, raw_storage_begin_shared, q_begin,
+                  source_offsets, raw_payloads, raw_offsets, batch_stride,
+                  pending_batches, staged_rows, arena, route_headers,
+                  route_slices, route_logical_begins,
+                  level_q_logical_offsets, run_offsets);
+          const Row row{value, candidate_token_key(token),
+                        static_cast<std::uint16_t>(
+                            tombstone ? kTombstone : 0u)};
           if (output_valid_shared)
             arena[job.existing_offset + output_begin + i] = row;
         }
@@ -4879,6 +5336,18 @@ __global__ void compact_direct_epoch_jobs_kernel(
                      (threadIdx.x & (kFoundationCells - 1u))] =
               static_cast<std::uint16_t>(
                   cell_output_offsets[threadIdx.x] - q_output_begin);
+        } else {
+          const std::uint32_t rank_block = level_cell_rank_blocks[
+              descriptor_index(q, plan->destination_level)];
+          if (rank_block != kInvalid) {
+            const std::uint32_t q_output_begin =
+                cell_output_offsets[local_q * kFoundationCells];
+            level_cell_ranks[
+                std::size_t{rank_block} * kFoundationCells +
+                (threadIdx.x & (kFoundationCells - 1u))] =
+                static_cast<std::uint16_t>(
+                    cell_output_offsets[threadIdx.x] - q_output_begin);
+          }
         }
       }
       if (!plan->destination_is_foundation) {
@@ -4898,7 +5367,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                 (sample + 1u) * q_output_count / kGuideRegions;
             level_guides[guide_index(
                 q_begin + local_q, plan->destination_level) + sample] =
-                candidates[indices_b[position]].key;
+                candidate_token_key(candidate_tokens[indices_b[position]]);
           }
         }
       }
@@ -4941,16 +5410,13 @@ __global__ void compact_direct_epoch_jobs_kernel(
         const std::uint16_t *right = input + right_begin;
         const std::uint32_t diagonal = position - pair_begin;
         std::uint32_t left_index = direct_epoch_merge_partition(
-            left, left_count, right, right_count, diagonal, candidates,
-            raw_count, q_begin, source_offsets, raw_payloads, raw_offsets,
-            batch_stride, pending_batches);
+            left, left_count, right, right_count, diagonal,
+            candidate_tokens);
         std::uint32_t right_index = diagonal - left_index;
         while (position < output_end) {
           const bool take_left = right_index >= right_count ||
               (left_index < left_count && direct_epoch_candidate_less(
-                  left[left_index], right[right_index], candidates,
-                  raw_count, q_begin, source_offsets, raw_payloads,
-                  raw_offsets, batch_stride, pending_batches));
+                  left[left_index], right[right_index], candidate_tokens));
           output[position++] = take_left
               ? left[left_index++] : right[right_index++];
         }
@@ -4978,10 +5444,9 @@ __global__ void compact_direct_epoch_jobs_kernel(
         continue;
       }
       const bool first = index == 0u ||
-          pull_candidate_order_key(candidates[raw_sorted[index - 1u]]) >>
-                  kMergeSourceBits !=
-              pull_candidate_order_key(candidates[candidate]) >>
-                  kMergeSourceBits;
+          candidate_token_logical_key(
+              candidate_tokens[raw_sorted[index - 1u]]) !=
+              candidate_token_logical_key(candidate_tokens[candidate]);
       if (!first) continue;
       std::uint16_t winner = candidate;
       std::uint32_t newest = direct_raw_metadata(
@@ -4989,10 +5454,10 @@ __global__ void compact_direct_epoch_jobs_kernel(
           batch_stride, pending_batches) & ~kRawTombstone;
       std::uint32_t next = index + 1u;
       while (next < raw_count &&
-             (pull_candidate_order_key(candidates[raw_sorted[next]]) >>
-              kMergeSourceBits) ==
-                 (pull_candidate_order_key(candidates[candidate]) >>
-                  kMergeSourceBits)) {
+             candidate_token_logical_key(
+                 candidate_tokens[raw_sorted[next]]) ==
+                 candidate_token_logical_key(
+                     candidate_tokens[candidate])) {
         const std::uint16_t other = raw_sorted[next++];
         const std::uint32_t age = direct_raw_metadata(
             other, q_begin, source_offsets, raw_payloads, raw_offsets,
@@ -5014,8 +5479,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
       if (!(winner_mask & (1u << item))) continue;
       const std::uint32_t index = threadIdx.x * items_per_thread + item;
       const std::uint16_t winner = raw_resolved[index];
-      candidates[winner].flags = static_cast<std::uint16_t>(
-          candidates[winner].flags & ~((1u << kMergeSourceBits) - 1u));
+      if (task_rows != raw_count)
+        candidate_tokens[winner] &= ~((1u << kMergeSourceBits) - 1u);
       const_cast<std::uint16_t *>(raw_sorted)[
           thread_base + local_rank_in_thread++] = winner;
     }
@@ -5163,13 +5628,15 @@ __global__ void compact_direct_epoch_jobs_kernel(
         const std::uint16_t *left = input + begin;
         const std::uint16_t *right = left + left_count;
         const std::uint32_t diagonal = position - begin;
-        std::uint32_t li = pull_merge_partition(
-            left, left_count, right, right_count, diagonal, candidates);
+        std::uint32_t li = candidate_token_merge_partition(
+            left, left_count, right, right_count, diagonal,
+            candidate_tokens);
         std::uint32_t ri = diagonal - li;
         while (position < output_end) {
           const bool take_left = ri >= right_count ||
               (li < left_count &&
-               pull_index_less(left[li], right[ri], candidates));
+               candidate_token_index_less(
+                   left[li], right[ri], candidate_tokens));
           output[position++] = take_left ? left[li++] : right[ri++];
         }
       }
@@ -5217,9 +5684,9 @@ __global__ void compact_direct_epoch_jobs_kernel(
       if (small_count_shared && largest_count_shared) {
         const std::uint16_t *left = merge_input;
         const std::uint16_t *right = merge_input + small_count_shared;
-        std::uint32_t left_index = pull_merge_partition(
+        std::uint32_t left_index = candidate_token_merge_partition(
             left, small_count_shared, right, largest_count_shared,
-            position, candidates);
+            position, candidate_tokens);
         std::uint32_t right_index = position - left_index;
         if (position) {
           std::uint16_t previous;
@@ -5230,24 +5697,23 @@ __global__ void compact_direct_epoch_jobs_kernel(
           } else {
             const std::uint16_t left_previous = left[left_index - 1u];
             const std::uint16_t right_previous = right[right_index - 1u];
-            previous = pull_index_less(
-                left_previous, right_previous, candidates)
+            previous = candidate_token_index_less(
+                left_previous, right_previous, candidate_tokens)
                 ? right_previous : left_previous;
           }
-          previous_key =
-              pull_candidate_order_key(candidates[previous]) >>
-              kMergeSourceBits;
+          previous_key = candidate_token_logical_key(
+              candidate_tokens[previous]);
         }
         while (position < thread_end) {
           const bool take_left = right_index >= largest_count_shared ||
               (left_index < small_count_shared &&
-               pull_index_less(left[left_index], right[right_index],
-                               candidates));
+               candidate_token_index_less(
+                   left[left_index], right[right_index],
+                   candidate_tokens));
           const std::uint16_t candidate = take_left
               ? left[left_index++] : right[right_index++];
-          const std::uint32_t key =
-              pull_candidate_order_key(candidates[candidate]) >>
-              kMergeSourceBits;
+          const std::uint32_t key = candidate_token_logical_key(
+              candidate_tokens[candidate]);
           const bool first = position == 0u || key != previous_key;
           const bool tombstone =
               (tombstone_words[candidate >> 5u] &
@@ -5262,13 +5728,12 @@ __global__ void compact_direct_epoch_jobs_kernel(
         }
       } else {
         if (position)
-          previous_key = pull_candidate_order_key(
-              candidates[merge_input[position - 1u]]) >> kMergeSourceBits;
+          previous_key = candidate_token_logical_key(
+              candidate_tokens[merge_input[position - 1u]]);
         while (position < thread_end) {
           const std::uint16_t candidate = merge_input[position];
-          const std::uint32_t key =
-              pull_candidate_order_key(candidates[candidate]) >>
-              kMergeSourceBits;
+          const std::uint32_t key = candidate_token_logical_key(
+              candidate_tokens[candidate]);
           const bool first = position == 0u || key != previous_key;
           const bool tombstone =
               (tombstone_words[candidate >> 5u] &
@@ -5305,11 +5770,19 @@ __global__ void compact_direct_epoch_jobs_kernel(
       const std::uint16_t candidate = live_scratch[index];
       const std::uint32_t rank = thread_base + local_rank_in_thread++;
       survivors[rank] = candidate;
-      Row row = candidates[candidate];
       const bool tombstone =
           (tombstone_words[candidate >> 5u] &
            (1u << (candidate & 31u))) != 0u;
-      row.flags = tombstone ? kTombstone : 0u;
+      const CandidateToken token = candidate_tokens[candidate];
+      const std::uint32_t value = tombstone ? 0u : load_candidate_value(
+          candidate, token, raw_count, task_rows == raw_count,
+          staged_epoch, crowded_piece, raw_storage_begin_shared, q_begin,
+          source_offsets, raw_payloads, raw_offsets, batch_stride,
+          pending_batches, staged_rows, arena, route_headers, route_slices,
+          route_logical_begins, level_q_logical_offsets, run_offsets);
+      const Row row{value, candidate_token_key(token),
+                    static_cast<std::uint16_t>(
+                        tombstone ? kTombstone : 0u)};
       if (output_valid_shared) arena[job.existing_offset + rank] = row;
     }
     __syncthreads();
@@ -5337,8 +5810,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
       std::uint32_t begin = 0u, end = published_count;
       while (begin < end) {
         const std::uint32_t middle = (begin + end) >> 1u;
-        if ((candidates[survivors[middle]].flags >> kMergeSourceBits) <
-            local_q)
+        if (candidate_token_local_quotient(
+                candidate_tokens[survivors[middle]]) < local_q)
           begin = middle + 1u;
         else
           end = middle;
@@ -5347,8 +5820,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
       end = published_count;
       while (begin < end) {
         const std::uint32_t middle = (begin + end) >> 1u;
-        if ((candidates[survivors[middle]].flags >> kMergeSourceBits) <=
-            local_q)
+        if (candidate_token_local_quotient(
+                candidate_tokens[survivors[middle]]) <= local_q)
           begin = middle + 1u;
         else
           end = middle;
@@ -5385,7 +5858,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
         std::uint32_t high = q_output_begin + q_output_count;
         while (low < high) {
           const std::uint32_t middle = (low + high) >> 1u;
-          if (candidates[survivors[middle]].key < target)
+          if (candidate_token_key(
+                  candidate_tokens[survivors[middle]]) < target)
             low = middle + 1u;
           else
             high = middle;
@@ -5393,13 +5867,36 @@ __global__ void compact_direct_epoch_jobs_kernel(
         local_rank[std::size_t{q} * 128u + cell] = static_cast<std::uint16_t>(
             low - q_output_begin);
         }
-      } else if (q_output_count >= kGuideRegions) {
-        for (std::uint32_t sample = threadIdx.x;
-             sample < kGuideSamples; sample += blockDim.x) {
-        const std::uint32_t position = q_output_begin +
-            (sample + 1u) * q_output_count / kGuideRegions;
-        level_guides[guide_index(q, plan->destination_level) + sample] =
-            candidates[survivors[position]].key;
+      } else {
+        const std::uint32_t rank_block = level_cell_rank_blocks[
+            descriptor_index(q, plan->destination_level)];
+        if (rank_block != kInvalid) {
+          for (std::uint32_t cell = threadIdx.x;
+               cell < kFoundationCells; cell += blockDim.x) {
+            const std::uint32_t target = cell * kFoundationCellKeys;
+            std::uint32_t low = q_output_begin;
+            std::uint32_t high = q_output_begin + q_output_count;
+            while (low < high) {
+              const std::uint32_t middle = (low + high) >> 1u;
+              if (candidate_token_key(
+                      candidate_tokens[survivors[middle]]) < target)
+                low = middle + 1u;
+              else
+                high = middle;
+            }
+            level_cell_ranks[
+                std::size_t{rank_block} * kFoundationCells + cell] =
+                static_cast<std::uint16_t>(low - q_output_begin);
+          }
+        }
+        if (q_output_count >= kGuideRegions) {
+          for (std::uint32_t sample = threadIdx.x;
+               sample < kGuideSamples; sample += blockDim.x) {
+            const std::uint32_t position = q_output_begin +
+                (sample + 1u) * q_output_count / kGuideRegions;
+            level_guides[guide_index(q, plan->destination_level) + sample] =
+                candidate_token_key(candidate_tokens[survivors[position]]);
+          }
         }
       }
       __syncthreads();
@@ -5418,7 +5915,11 @@ inline std::uint32_t select_balanced_merge_capacity() {
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &maximum_blocks, compact_direct_epoch_jobs_kernel,
       kFoundationCompactionThreads, 0u));
-  const int desired_blocks = std::max(1, std::min(3, maximum_blocks));
+  // Compact candidate tokens make four resident merge CTAs possible on
+  // devices with sufficient registers and shared memory.  Preserve that
+  // latency-hiding gain instead of spending the reclaimed memory on larger
+  // jobs.  Less capable devices retain their highest supported occupancy.
+  const int desired_blocks = std::max(1, std::min(4, maximum_blocks));
   // The cell histogram temporarily overlays one 32-bit cursor per possible
   // cell on the 16-bit secondary index plane.
   const std::uint32_t minimum_capacity = std::max(
@@ -5877,6 +6378,10 @@ public:
             gpulsmopt2_detail::preassigned_level_pool_capacity(
                 publication_capacity_,
                 batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
+        level_rank_block_capacity_(
+            gpulsmopt2_detail::preassigned_level_rank_blocks(
+                publication_capacity_,
+                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
         resident_merge_capacity_(
             gpulsmopt2_detail::select_balanced_merge_capacity()),
         resident_merge_workspace_bytes_(
@@ -5919,6 +6424,13 @@ public:
         staged_epoch_mode_(1u),
         resident_plan_(1u),
         level_storage_spans_(gpulsmopt2_detail::kMaximumLevels),
+        level_rank_spans_(gpulsmopt2_detail::kMaximumLevels),
+        level_cell_rank_blocks_(
+            std::size_t{gpulsmopt2_detail::kQuotients} *
+            gpulsmopt2_detail::kMaximumLevels),
+        level_cell_ranks_(
+            level_rank_block_capacity_ *
+            gpulsmopt2_detail::kFoundationCells),
         raw_keys_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_payloads_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
@@ -6367,6 +6879,10 @@ public:
             sizeof(gpulsmopt2_detail::ResidentPublicationPlan) +
         level_storage_spans_.size() *
             sizeof(gpulsmopt2_detail::LevelStorageSpan) +
+        level_rank_spans_.size() *
+            sizeof(gpulsmopt2_detail::LevelRankSpan) +
+        level_cell_rank_blocks_.size() * sizeof(std::uint32_t) +
+        level_cell_ranks_.size() * sizeof(std::uint16_t) +
         raw_keys_.size() * sizeof(std::uint32_t) +
         raw_payloads_.size() * sizeof(gpulsmopt2_detail::RawPayload) +
         raw_offsets_.size() * sizeof(std::uint32_t) +
@@ -6488,13 +7004,24 @@ private:
   void initialize_resident_workspace() {
     std::array<gpulsmopt2_detail::LevelStorageSpan,
                gpulsmopt2_detail::kMaximumLevels> spans{};
+    std::array<gpulsmopt2_detail::LevelRankSpan,
+               gpulsmopt2_detail::kMaximumLevels> rank_spans{};
     std::uint64_t cursor = foundation_pool_capacity_;
+    std::uint64_t rank_cursor = 0u;
     std::size_t capacity = std::min(
         publication_capacity_,
         batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
     for (std::uint32_t level = 0u;
          level < gpulsmopt2_detail::kMaximumLevels; ++level) {
       spans[level] = {cursor, capacity};
+      const std::uint32_t rank_blocks = static_cast<std::uint32_t>(
+          std::min<std::size_t>(
+              gpulsmopt2_detail::kQuotients,
+              (capacity +
+               gpulsmopt2_detail::kDenseCellRankMinimumRows - 1u) /
+                  gpulsmopt2_detail::kDenseCellRankMinimumRows));
+      rank_spans[level] = {rank_cursor, rank_blocks, 0u};
+      rank_cursor += rank_blocks;
       cursor += capacity;
       if (capacity == publication_capacity_) break;
       capacity = capacity > publication_capacity_ / 2u
@@ -6502,9 +7029,17 @@ private:
     }
     if (cursor > foundation_pool_capacity_ + level_pool_capacity_)
       throw std::logic_error("GPULSMOpt preassigned level spans overflow");
+    if (rank_cursor > level_rank_block_capacity_)
+      throw std::logic_error("GPULSMOpt preassigned rank spans overflow");
     CUDA_CHECK(cudaMemcpy(
         level_storage_spans_.data(), spans.data(), sizeof(spans),
         cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        level_rank_spans_.data(), rank_spans.data(), sizeof(rank_spans),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(
+        level_cell_rank_blocks_.data(), 0xff,
+        level_cell_rank_blocks_.size() * sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMemset(route_logical_begins_.data(), 0,
                           route_logical_begins_.size() *
                               sizeof(std::uint32_t)));
@@ -6717,8 +7252,9 @@ private:
     gpulsmopt2_detail::count_resident_route_slots_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients + 1u),
         gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
-            balanced_merge_raw_counts_.data(), resident_plan_.data(),
-            resident_route_counts_.data());
+            balanced_merge_raw_counts_.data(), level_rank_spans_.data(),
+            resident_plan_.data(), resident_route_counts_.data(),
+            level_cell_rank_blocks_.data());
     scan_bytes = resident_scan_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         resident_scan_temp_.data(), scan_bytes,
@@ -6756,8 +7292,9 @@ private:
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
             foundation_next_route_headers_.data(), route_slices_.data(),
             foundation_section_output_counts_.data(),
-            foundation_overflow_flag_.data(), local_rank_.data(),
-            level_guides_.data());
+            foundation_overflow_flag_.data(),
+            level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
+            local_rank_.data(), level_guides_.data());
     gpulsmopt2_detail::fold_resident_merge_status_kernel<<<
         1, 1, 0, capture_stream>>>(
             resident_plan_.data(), foundation_overflow_flag_.data());
@@ -6786,6 +7323,7 @@ private:
             resident_plan_.data(), arena_.data(), descriptors_.data(),
             route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
+            level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
             local_rank_.data(), level_guides_.data());
     gpulsmopt2_detail::publish_resident_manifest_kernel<<<
         1, gpulsmopt2_detail::kMaximumLevels, 0, capture_stream>>>(
@@ -7222,6 +7760,7 @@ private:
   std::size_t publication_capacity_{};
   std::size_t foundation_pool_capacity_{};
   std::size_t level_pool_capacity_{};
+  std::size_t level_rank_block_capacity_{};
   std::uint32_t resident_merge_capacity_{};
   std::size_t resident_merge_workspace_bytes_{};
   std::size_t maximum_resident_jobs_{};
@@ -7265,6 +7804,10 @@ private:
       resident_plan_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::LevelStorageSpan>
       level_storage_spans_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::LevelRankSpan>
+      level_rank_spans_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> level_cell_rank_blocks_;
+  gpulsmopt2_detail::Buffer<std::uint16_t> level_cell_ranks_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_keys_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawPayload> raw_payloads_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
