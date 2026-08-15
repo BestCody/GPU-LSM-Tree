@@ -4514,76 +4514,101 @@ __global__ void compact_direct_epoch_jobs_kernel(
       __syncthreads();
     }
 
-    // Each worker partitions once, then emits a short consecutive interval
-    // while merging the aggregate of the smaller runs with the largest run.
-    if (small_count_shared && largest_count_shared) {
-      const std::uint16_t *input = input_is_a ? indices_a : indices_b;
-      std::uint16_t *output = input_is_a ? indices_b : indices_a;
-      const std::uint16_t *left = input;
-      const std::uint16_t *right = input + small_count_shared;
-      const std::uint32_t merged_count =
-          small_count_shared + largest_count_shared;
-      const std::uint32_t items =
-          (merged_count + kThreads - 1u) / kThreads;
-      std::uint32_t position = threadIdx.x * items;
-      const std::uint32_t output_end = min(position + items, merged_count);
-      if (position < output_end) {
+    const std::uint32_t merged_count =
+        task_rows - raw_count + resolved_raw_count_shared;
+    // The aggregate of the smaller runs and the largest run remain in the
+    // input plane.  Each worker merges one consecutive interval and resolves
+    // visibility immediately.  Live IDs are first written sparsely at their
+    // merged positions in the other plane; after the block scan they are
+    // compacted back into the now-dead input plane while their rows are
+    // written to the final arena.  This preserves the sorted survivor plane
+    // required by metadata without materializing and rereading the complete
+    // merged-ID array.
+    std::uint16_t *merge_input = input_is_a ? indices_a : indices_b;
+    std::uint16_t *live_scratch = input_is_a ? indices_b : indices_a;
+    std::uint16_t *survivors = merge_input;
+    const std::uint32_t merged_items_per_thread =
+        (merged_count + kThreads - 1u) / kThreads;
+    std::uint32_t live_mask = 0u, local_live = 0u;
+    const std::uint32_t thread_begin =
+        threadIdx.x * merged_items_per_thread;
+    const std::uint32_t thread_end = min(
+        thread_begin + merged_items_per_thread, merged_count);
+    if (thread_begin < thread_end) {
+      std::uint32_t position = thread_begin;
+      std::uint32_t previous_key = 0u;
+      if (small_count_shared && largest_count_shared) {
+        const std::uint16_t *left = merge_input;
+        const std::uint16_t *right = merge_input + small_count_shared;
         std::uint32_t left_index = pull_merge_partition(
             left, small_count_shared, right, largest_count_shared,
             position, candidates);
         std::uint32_t right_index = position - left_index;
-        while (position < output_end) {
+        if (position) {
+          std::uint16_t previous;
+          if (!left_index) {
+            previous = right[right_index - 1u];
+          } else if (!right_index) {
+            previous = left[left_index - 1u];
+          } else {
+            const std::uint16_t left_previous = left[left_index - 1u];
+            const std::uint16_t right_previous = right[right_index - 1u];
+            previous = pull_index_less(
+                left_previous, right_previous, candidates)
+                ? right_previous : left_previous;
+          }
+          previous_key =
+              pull_candidate_order_key(candidates[previous]) >>
+              kMergeSourceBits;
+        }
+        while (position < thread_end) {
           const bool take_left = right_index >= largest_count_shared ||
               (left_index < small_count_shared &&
                pull_index_less(left[left_index], right[right_index],
                                candidates));
-          output[position++] = take_left
+          const std::uint16_t candidate = take_left
               ? left[left_index++] : right[right_index++];
+          const std::uint32_t key =
+              pull_candidate_order_key(candidates[candidate]) >>
+              kMergeSourceBits;
+          const bool first = position == 0u || key != previous_key;
+          const bool tombstone =
+              (tombstone_words[candidate >> 5u] &
+               (1u << (candidate & 31u))) != 0u;
+          if (first && (plan->keep_tombstones || !tombstone)) {
+            live_scratch[position] = candidate;
+            live_mask |= 1u << (position - thread_begin);
+            ++local_live;
+          }
+          previous_key = key;
+          ++position;
         }
-      }
-      input_is_a = !input_is_a;
-      __syncthreads();
-    }
-
-    const std::uint32_t merged_count =
-        task_rows - raw_count + resolved_raw_count_shared;
-    const std::uint16_t *sorted = input_is_a ? indices_a : indices_b;
-    std::uint16_t *survivors = input_is_a ? indices_b : indices_a;
-    const std::uint32_t merged_items_per_thread =
-        (merged_count + kThreads - 1u) / kThreads;
-    std::uint32_t live_mask = 0u, local_live = 0u;
-    for (std::uint32_t item = 0u; item < merged_items_per_thread; ++item) {
-      const std::uint32_t index =
-          threadIdx.x * merged_items_per_thread + item;
-      if (index >= merged_count) continue;
-      const std::uint16_t candidate = sorted[index];
-      const std::uint32_t key =
-          pull_candidate_order_key(candidates[candidate]) >>
-          kMergeSourceBits;
-      const bool first = index == 0u || key !=
-          (pull_candidate_order_key(candidates[sorted[index - 1u]]) >>
-           kMergeSourceBits);
-      const bool tombstone =
-          (tombstone_words[candidate >> 5u] &
-           (1u << (candidate & 31u))) != 0u;
-      const bool live = first && (plan->keep_tombstones || !tombstone);
-      if (live) {
-        live_mask |= 1u << item;
-        ++local_live;
+      } else {
+        if (position)
+          previous_key = pull_candidate_order_key(
+              candidates[merge_input[position - 1u]]) >> kMergeSourceBits;
+        while (position < thread_end) {
+          const std::uint16_t candidate = merge_input[position];
+          const std::uint32_t key =
+              pull_candidate_order_key(candidates[candidate]) >>
+              kMergeSourceBits;
+          const bool first = position == 0u || key != previous_key;
+          const bool tombstone =
+              (tombstone_words[candidate >> 5u] &
+               (1u << (candidate & 31u))) != 0u;
+          if (first && (plan->keep_tombstones || !tombstone)) {
+            live_scratch[position] = candidate;
+            live_mask |= 1u << (position - thread_begin);
+            ++local_live;
+          }
+          previous_key = key;
+          ++position;
+        }
       }
     }
     std::uint32_t output_count{};
     BlockScan(block_scan_storage).ExclusiveSum(
         local_live, thread_base, output_count);
-    local_rank_in_thread = 0u;
-    for (std::uint32_t item = 0u; item < merged_items_per_thread; ++item) {
-      if (!(live_mask & (1u << item))) continue;
-      const std::uint32_t index =
-          threadIdx.x * merged_items_per_thread + item;
-      survivors[thread_base + local_rank_in_thread++] = sorted[index];
-    }
-    __syncthreads();
-
     if (threadIdx.x == 0u) {
       const bool valid = output_count <= job.existing_capacity &&
           job.existing_offset + job.existing_capacity <=
@@ -4591,70 +4616,42 @@ __global__ void compact_direct_epoch_jobs_kernel(
       if (!valid) atomicExch(overflow_flag, 1u);
       task_output_count_shared = output_count;
       output_valid_shared = valid;
-      for (std::uint32_t q = q_begin; q < q_end; ++q) {
-        const RouteHeader route = next_route_headers[q];
-        if (job.route_ordinal < route.count) {
-          const std::uint32_t suffix_begin = q == q_begin
-              ? static_cast<std::uint32_t>(job.key_begin & 0xffffu) : 0u;
-          const std::uint32_t suffix_end = q + 1u == q_end
-              ? static_cast<std::uint32_t>(
-                    job.key_end - (std::uint64_t{q} << 16u))
-              : 1u << 16u;
-          next_route_slices[route.begin + job.route_ordinal] = {
-              Descriptor{}, suffix_begin, suffix_end};
-        }
-      }
       jobs[job_index].output_count = output_count;
     }
     __syncthreads();
 
     const std::uint32_t published_count = task_output_count_shared;
-    for (std::uint32_t rank = threadIdx.x; rank < published_count;
-         rank += blockDim.x) {
-      const std::uint16_t candidate = survivors[rank];
+    local_rank_in_thread = 0u;
+    for (std::uint32_t item = 0u; item < merged_items_per_thread; ++item) {
+      if (!(live_mask & (1u << item))) continue;
+      const std::uint32_t index = thread_begin + item;
+      const std::uint16_t candidate = live_scratch[index];
+      const std::uint32_t rank = thread_base + local_rank_in_thread++;
+      survivors[rank] = candidate;
       Row row = candidates[candidate];
       const bool tombstone =
           (tombstone_words[candidate >> 5u] &
            (1u << (candidate & 31u))) != 0u;
       row.flags = tombstone ? kTombstone : 0u;
       if (output_valid_shared) arena[job.existing_offset + rank] = row;
-      const std::uint32_t local_q =
-          candidates[candidate].flags >> kMergeSourceBits;
-      const bool last = rank + 1u == published_count ||
-          (candidates[survivors[rank + 1u]].flags >> kMergeSourceBits) !=
-              local_q;
-      if (last) {
-        std::uint32_t low = 0u, high = rank;
-        while (low < high) {
-          const std::uint32_t middle = (low + high) >> 1u;
-          if ((candidates[survivors[middle]].flags >> kMergeSourceBits) <
-              local_q)
-            low = middle + 1u;
-          else
-            high = middle;
-        }
-        const std::uint32_t count = rank - low + 1u;
-        const std::uint32_t q = q_begin + local_q;
-        if (crowded_piece)
-          atomicAdd(section_output_counts + q, count);
-        else
-          section_output_counts[q] = count;
-        const RouteHeader route = next_route_headers[q];
-        if (job.route_ordinal < route.count) {
-          const std::uint32_t suffix_begin = q == q_begin
-              ? static_cast<std::uint32_t>(job.key_begin & 0xffffu) : 0u;
-          const std::uint32_t suffix_end = q + 1u == q_end
-              ? static_cast<std::uint32_t>(
-                    job.key_end - (std::uint64_t{q} << 16u))
-              : 1u << 16u;
-          next_route_slices[route.begin + job.route_ordinal] = {
-              output_valid_shared
-                  ? Descriptor::make(job.existing_offset + low, count)
-                  : Descriptor{}, suffix_begin, suffix_end};
-        }
-      }
     }
     __syncthreads();
+
+    if (crowded_piece && threadIdx.x == 0u) {
+      const std::uint32_t q = q_begin;
+      atomicAdd(section_output_counts + q, published_count);
+      const RouteHeader route = next_route_headers[q];
+      if (job.route_ordinal < route.count) {
+        const std::uint32_t suffix_begin = static_cast<std::uint32_t>(
+            job.key_begin & 0xffffu);
+        const std::uint32_t suffix_end = static_cast<std::uint32_t>(
+            job.key_end - (std::uint64_t{q} << 16u));
+        next_route_slices[route.begin + job.route_ordinal] = {
+            output_valid_shared
+                ? Descriptor::make(job.existing_offset, published_count)
+                : Descriptor{}, suffix_begin, suffix_end};
+      }
+    }
 
     // Metadata is emitted while the complete quotient is still resident.
     for (std::uint32_t local_q = 0u;
@@ -4681,6 +4678,23 @@ __global__ void compact_direct_epoch_jobs_kernel(
       }
       metadata_begin_shared = q_output_begin;
       metadata_count_shared = begin - q_output_begin;
+      const std::uint32_t q = q_begin + local_q;
+      section_output_counts[q] = metadata_count_shared;
+      const RouteHeader route = next_route_headers[q];
+      if (job.route_ordinal < route.count) {
+        const std::uint32_t suffix_begin = q == q_begin
+            ? static_cast<std::uint32_t>(job.key_begin & 0xffffu) : 0u;
+        const std::uint32_t suffix_end = q + 1u == q_end
+            ? static_cast<std::uint32_t>(
+                  job.key_end - (std::uint64_t{q} << 16u))
+            : 1u << 16u;
+        next_route_slices[route.begin + job.route_ordinal] = {
+            output_valid_shared
+                ? Descriptor::make(
+                      job.existing_offset + q_output_begin,
+                      metadata_count_shared)
+                : Descriptor{}, suffix_begin, suffix_end};
+      }
       }
       __syncthreads();
       const std::uint32_t q_output_begin = metadata_begin_shared;
