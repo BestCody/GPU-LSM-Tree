@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -61,20 +60,14 @@ constexpr std::size_t kMaximumPublicationRows =
 constexpr std::uint32_t kDescriptorOffsetBits = 47u;
 constexpr std::uint64_t kDescriptorOffsetMask =
     (std::uint64_t{1} << kDescriptorOffsetBits) - 1u;
-constexpr std::uint64_t kInvalidOffset =
-    std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
 constexpr std::uint32_t kRangeThreadWork = 8u;
 constexpr std::uint32_t kRangeSubgroupWork = 512u;
-constexpr std::uint32_t kLookupWarpsPerBlock = 8u;
-constexpr std::uint32_t kLookupHashSlots = 64u;
-constexpr std::uint32_t kEmptyLookupKey = 1u << 16u;
 constexpr std::uint32_t kAdmissionCtaGroupMaximum = 64u;
 constexpr std::uint32_t kAdmissionCtaHashSlots = 128u;
 static_assert((kAdmissionCtaHashSlots &
                (kAdmissionCtaHashSlots - 1u)) == 0u);
 constexpr std::uint32_t kFoundationCompactionThreads = 256u;
-constexpr std::uint32_t kFoundationAgeBits = 6u;
 constexpr std::uint32_t kFoundationCells = 128u;
 constexpr std::uint32_t kFoundationCellKeys = 512u;
 constexpr std::uint32_t kDenseCellRankMinimumRows = kFoundationCells;
@@ -83,7 +76,6 @@ constexpr std::uint32_t kCellOwnedCells =
     kCellOwnedQuotients * kFoundationCells;
 constexpr std::uint32_t kCellOwnedWarpMaximum = 32u;
 constexpr std::uint32_t kCellOwnedCostBuckets = 8u;
-constexpr std::uint32_t kBalancedMergeMaximumQuotients = 512u;
 constexpr std::uint32_t kPlanningTiles = 128u;
 constexpr std::uint32_t kPlanningTileQuotients =
     kQuotients / kPlanningTiles;
@@ -93,7 +85,6 @@ constexpr std::uint32_t kBalancedMergeCapacityCeiling =
 // A quotient has at most 65 sorted sources and 65,536 distinct suffixes.
 // This upper bound is sufficient to split even that theoretical maximum into
 // on-chip jobs without imposing a fixed number of pieces on ordinary data.
-constexpr std::uint32_t kBalancedHotRanges = 2048u;
 constexpr std::uint32_t kMergeSourceBits = 7u;
 constexpr std::uint64_t kResidentWorkFlag = std::uint64_t{1} << 63u;
 
@@ -366,23 +357,8 @@ struct RouteSlice {
 static_assert(sizeof(RouteHeader) == 8u);
 static_assert(sizeof(RouteSlice) == 16u);
 
-enum DeviceLevelFlags : std::uint32_t {
-  kLevelKeepsTombstones = 1u << 0u,
-  kLevelHasGuide = 1u << 1u,
-  kLevelHasRank = 1u << 2u,
-  kLevelIsFoundation = 1u << 3u,
-};
-
 struct DeviceLevelState {
-  std::uint64_t logical_rows{};
-  std::uint64_t data_begin{};
-  std::uint64_t data_capacity{};
-  std::uint32_t route_begin{};
-  std::uint32_t route_count{};
   std::uint32_t storage_generation{};
-  std::uint32_t guide_generation{};
-  std::uint32_t flags{};
-  std::uint32_t reserved{};
 };
 
 struct DeviceManifest {
@@ -390,7 +366,6 @@ struct DeviceManifest {
   std::uint32_t active_levels{};
   std::uint32_t foundation_level{kMaximumLevels};
   std::uint32_t generation{};
-  std::uint32_t reserved{};
   DeviceLevelState levels[kMaximumLevels]{};
 };
 
@@ -412,10 +387,8 @@ enum ResidentPublicationStatus : std::uint32_t {
   kPublicationSuccess = 0u,
   kPublicationJobOverflow = 1u << 0u,
   kPublicationRouteOverflow = 1u << 1u,
-  kPublicationSliceOverflow = 1u << 2u,
   kPublicationOutputOverflow = 1u << 3u,
   kPublicationJobTooLarge = 1u << 4u,
-  kPublicationCursorMismatch = 1u << 5u,
 };
 
 struct ResidentPublicationPlan {
@@ -429,9 +402,7 @@ struct ResidentPublicationPlan {
   std::uint32_t keep_tombstones{};
   std::uint32_t output_generation{};
   std::uint32_t job_count{};
-  std::uint32_t boundary_count{};
   std::uint32_t route_count{};
-  std::uint32_t slice_count{};
   std::uint32_t rank_block_count{};
   std::uint32_t status{};
   std::uint32_t job_capacity{};
@@ -439,15 +410,7 @@ struct ResidentPublicationPlan {
   std::uint64_t output_capacity{};
   std::uint64_t raw_reservation{};
   std::uint64_t survivor_count{};
-  std::uint64_t source_level_mask{};
 };
-
-struct BoundaryCursor {
-  std::uint32_t logical_rank{};
-  std::uint32_t route_ordinal{};
-};
-
-static_assert(sizeof(BoundaryCursor) == 8u);
 
 struct DeviceManifestSnapshot {
   std::uint64_t occupied_level_mask{};
@@ -663,29 +626,14 @@ struct BalancedMergeJob {
   std::uint64_t existing_offset{};
   std::uint32_t quotient_begin;
   std::uint32_t quotient_end;
-  std::uint32_t boundary_begin{};
   std::uint32_t existing_capacity{};
   std::uint32_t output_count{};
-  std::uint32_t slice_begin{};
-  std::uint32_t slice_count{};
   std::uint32_t route_ordinal{};
   std::uint16_t hot_piece{};
   std::uint16_t hot_pieces{};
 };
 
-static_assert(sizeof(BalancedMergeJob) == 64u);
-
-// One exact, contiguous input interval owned by a destination job.  Slots are
-// source-major and quotient-minor.  Empty slots remain present so the source
-// and quotient are recoverable without storing expanded per-record metadata.
-struct PullSlice {
-  std::uint64_t offset;
-  std::uint32_t count;
-  std::uint16_t candidate_begin;
-  std::uint16_t tag;
-};
-
-static_assert(sizeof(PullSlice) == 16u);
+static_assert(sizeof(BalancedMergeJob) == 48u);
 
 template <class T> class Buffer {
 public:
@@ -2781,10 +2729,8 @@ __global__ void validate_direct_epoch_plan_kernel(
     std::uint32_t maximum_jobs, std::uint32_t route_capacity) {
   if (blockIdx.x || threadIdx.x || plan->status) return;
   plan->job_count = tile_job_offsets[kPlanningTiles];
-  plan->boundary_count = 0u;
   plan->raw_reservation = job_output_offsets[maximum_jobs];
   plan->route_count = route_offsets[kQuotients];
-  plan->slice_count = 0u;
   if (plan->job_count > maximum_jobs)
     plan->status |= kPublicationJobOverflow;
   if (plan->route_count > route_capacity)
@@ -2821,10 +2767,6 @@ __global__ void choose_resident_publication_path_kernel(
   // Every publication uses the same quotient-owned planner and merger.
   next.source_level_limit = destination ? destination - 1u : 0u;
   next.source_count = destination ? destination + 1u : 1u;
-  next.source_level_mask = occupied;
-  if (next.source_level_limit + 1u < 64u)
-    next.source_level_mask &=
-        (std::uint64_t{1} << (next.source_level_limit + 1u)) - 1u;
   next.destination_is_foundation =
       destination < kMaximumLevels &&
       (manifest->foundation_level == kMaximumLevels ||
@@ -2937,9 +2879,8 @@ __global__ void count_resident_planning_jobs_kernel(
 }
 
 __device__ __forceinline__ void emit_resident_job(
-    BalancedMergeJob *jobs, std::uint64_t *boundary_keys,
-    std::uint64_t *job_raw_reservations,
-    std::uint32_t tile, std::uint32_t global_index,
+    BalancedMergeJob *jobs, std::uint64_t *job_raw_reservations,
+    std::uint32_t global_index,
     std::uint64_t key_begin, std::uint64_t key_end,
     std::uint32_t q_begin, std::uint32_t q_end,
     std::uint64_t raw_count, std::uint16_t hot_piece,
@@ -2949,13 +2890,10 @@ __device__ __forceinline__ void emit_resident_job(
   job.key_end = key_end;
   job.quotient_begin = q_begin;
   job.quotient_end = q_end;
-  job.boundary_begin = global_index + tile;
   job.route_ordinal = hot_pieces ? hot_piece : 0u;
   job.hot_piece = hot_piece;
   job.hot_pieces = hot_pieces;
   jobs[global_index] = job;
-  boundary_keys[job.boundary_begin] = key_begin;
-  boundary_keys[job.boundary_begin + 1u] = key_end;
   job_raw_reservations[global_index] = raw_count;
 }
 
@@ -2963,8 +2901,7 @@ __global__ void emit_resident_planning_jobs_kernel(
     const std::uint64_t *raw_counts,
     const std::uint32_t *tile_job_offsets,
     ResidentPublicationPlan *plan, std::uint32_t maximum_jobs,
-    BalancedMergeJob *jobs, std::uint64_t *boundary_keys,
-    std::uint64_t *job_raw_reservations) {
+    BalancedMergeJob *jobs, std::uint64_t *job_raw_reservations) {
   __shared__ std::uint64_t counts[kPlanningTileQuotients];
   const std::uint32_t tile = blockIdx.x;
   if (tile >= kPlanningTiles) return;
@@ -2978,7 +2915,6 @@ __global__ void emit_resident_planning_jobs_kernel(
   const std::uint32_t total_jobs = tile_job_offsets[kPlanningTiles];
   if (tile == 0u) {
     plan->job_count = total_jobs;
-    plan->boundary_count = total_jobs + kPlanningTiles;
     if (total_jobs > maximum_jobs)
       atomicOr(&plan->status, kPublicationJobOverflow);
   }
@@ -2996,7 +2932,7 @@ __global__ void emit_resident_planning_jobs_kernel(
     if (resident || count > plan->job_capacity) {
       if (raw_work) {
         emit_resident_job(
-            jobs, boundary_keys, job_raw_reservations, tile, global++,
+            jobs, job_raw_reservations, global++,
             std::uint64_t{raw_begin} << 16u, std::uint64_t{q} << 16u,
             raw_begin, q, raw_work, 0u, 0u);
         raw_work = 0u;
@@ -3006,7 +2942,7 @@ __global__ void emit_resident_planning_jobs_kernel(
             (count + safe - 1u) / safe);
         for (std::uint32_t piece = 0u; piece < pieces; ++piece) {
           emit_resident_job(
-              jobs, boundary_keys, job_raw_reservations, tile, global++,
+              jobs, job_raw_reservations, global++,
               std::uint64_t{q} << 16u, std::uint64_t{q + 1u} << 16u,
               q, q + 1u, 0u, static_cast<std::uint16_t>(piece),
               static_cast<std::uint16_t>(pieces));
@@ -3027,7 +2963,7 @@ __global__ void emit_resident_planning_jobs_kernel(
           }
         }
         emit_resident_job(
-            jobs, boundary_keys, job_raw_reservations, tile, global++,
+            jobs, job_raw_reservations, global++,
             std::uint64_t{begin} << 16u, std::uint64_t{end} << 16u,
             begin, end, work, 0u, 0u);
       }
@@ -3036,7 +2972,7 @@ __global__ void emit_resident_planning_jobs_kernel(
       if (!raw_work) raw_begin = q;
       if (raw_work && raw_work + count > plan->job_capacity) {
         emit_resident_job(
-            jobs, boundary_keys, job_raw_reservations, tile, global++,
+            jobs, job_raw_reservations, global++,
             std::uint64_t{raw_begin} << 16u, std::uint64_t{q} << 16u,
             raw_begin, q, raw_work, 0u, 0u);
         raw_begin = q;
@@ -3054,7 +2990,7 @@ __global__ void emit_resident_planning_jobs_kernel(
     // The loop above stops one past the final nonempty raw quotient.
     if (raw_end == raw_begin) raw_end = first + kPlanningTileQuotients;
     emit_resident_job(
-        jobs, boundary_keys, job_raw_reservations, tile, global,
+        jobs, job_raw_reservations, global,
         std::uint64_t{raw_begin} << 16u, std::uint64_t{raw_end} << 16u,
         raw_begin, raw_end, raw_work, 0u, 0u);
   }
@@ -3115,8 +3051,7 @@ __device__ __forceinline__ std::uint32_t resident_hot_boundary_warp(
 }
 
 __global__ void resolve_resident_job_boundaries_kernel(
-    BalancedMergeJob *jobs, std::uint64_t *boundary_keys,
-    std::uint64_t *job_raw_reservations,
+    BalancedMergeJob *jobs, std::uint64_t *job_raw_reservations,
     const ResidentPublicationPlan *plan,
     const Row *current_rows, const std::uint32_t *current_offsets,
     const Row *arena, const RouteHeader *route_headers,
@@ -3181,8 +3116,6 @@ __global__ void resolve_resident_job_boundaries_kernel(
     job.key_end = (std::uint64_t{q} << 16u) + high;
     job_raw_reservations[job_index] = exact;
     jobs[job_index] = job;
-    boundary_keys[job.boundary_begin] = job.key_begin;
-    boundary_keys[job.boundary_begin + 1u] = job.key_end;
     if (exact > plan->job_capacity)
       atomicOr(const_cast<std::uint32_t *>(&plan->status),
                kPublicationJobTooLarge);
@@ -3257,265 +3190,6 @@ __global__ void prepare_resident_route_headers_kernel(
       route_counts[q]};
 }
 
-__global__ void construct_boundary_cursors_kernel(
-    const std::uint64_t *boundary_keys,
-    const ResidentPublicationPlan *plan,
-    const std::uint32_t *current_keys,
-    const std::uint32_t *current_offsets,
-    const Row *arena, const RouteHeader *route_headers,
-    const RouteSlice *route_slices,
-    const std::uint32_t *route_logical_begins,
-    const std::uint32_t *level_q_logical_offsets,
-    std::uint32_t route_stride, BoundaryCursor *cursors) {
-  const std::uint64_t cursor_count =
-      std::uint64_t{plan->boundary_count} * plan->source_count;
-  if (plan->status) return;
-  for (std::uint64_t cursor_index =
-           std::uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
-       cursor_index < cursor_count;
-       cursor_index += std::uint64_t{gridDim.x} * blockDim.x) {
-  const std::uint32_t boundary = static_cast<std::uint32_t>(
-      cursor_index / plan->source_count);
-  const std::uint32_t source = static_cast<std::uint32_t>(
-      cursor_index - std::uint64_t{boundary} * plan->source_count);
-  const std::uint64_t key = boundary_keys[boundary];
-  BoundaryCursor cursor{};
-  if (key == (std::uint64_t{1} << 32u)) {
-    if (source == 0u) {
-      cursor.logical_rank = current_offsets[kQuotients];
-      cursor.route_ordinal = kQuotients;
-    } else {
-      const std::uint32_t level = source - 1u;
-      cursor.logical_rank = level_q_logical_offsets[
-          std::size_t{level} * (kQuotients + 1u) + kQuotients];
-      cursor.route_ordinal = level * route_stride + route_stride;
-    }
-  } else {
-    const std::uint32_t q = static_cast<std::uint32_t>(key >> 16u);
-    const std::uint32_t suffix = static_cast<std::uint32_t>(key & 0xffffu);
-    if (source == 0u) {
-      const std::uint32_t begin = current_offsets[q];
-      const std::uint32_t count = current_offsets[q + 1u] - begin;
-      cursor.logical_rank = begin + lower_bound_full_keys(
-          current_keys + begin, count, static_cast<std::uint32_t>(key));
-      cursor.route_ordinal = q;
-    } else {
-      const std::uint32_t level = source - 1u;
-      const RouteHeader header =
-          route_headers[descriptor_index(q, level)];
-      std::uint32_t low = 0u, high = header.count;
-      while (low < high) {
-        const std::uint32_t middle = (low + high) >> 1u;
-        if (route_slices[header.begin + middle].suffix_end <= suffix)
-          low = middle + 1u;
-        else
-          high = middle;
-      }
-      cursor.route_ordinal = header.begin + low;
-      if (low == header.count) {
-        cursor.logical_rank = level_q_logical_offsets[
-            std::size_t{level} * (kQuotients + 1u) + q + 1u];
-      } else {
-        const std::uint32_t route = header.begin + low;
-        const RouteSlice slice = route_slices[route];
-        cursor.logical_rank = route_logical_begins[route] +
-            lower_bound_rows(arena + slice.rows.offset(),
-                             slice.rows.count(), suffix);
-      }
-    }
-  }
-  cursors[std::size_t{boundary} * kMaximumMergeSources + source] = cursor;
-  }
-}
-
-__global__ void count_cursor_pull_slices_kernel(
-    BalancedMergeJob *jobs, const ResidentPublicationPlan *plan,
-    const BoundaryCursor *cursors,
-    const std::uint32_t *current_offsets,
-    const RouteHeader *route_headers,
-    const RouteSlice *route_slices,
-    const std::uint32_t *route_logical_begins,
-    std::uint32_t route_stride,
-    std::uint32_t *source_slice_offsets,
-    std::uint16_t *source_candidate_offsets,
-    std::uint32_t *slice_reservations) {
-  __shared__ std::uint32_t slice_counts[kMaximumMergeSources];
-  __shared__ std::uint32_t row_counts[kMaximumMergeSources];
-  if (plan->status) return;
-  for (std::uint32_t job_index = blockIdx.x;
-       job_index < plan->job_count; job_index += gridDim.x) {
-  const BalancedMergeJob job = jobs[job_index];
-  const std::uint32_t source = threadIdx.x;
-  if (source < plan->source_count) {
-    const BoundaryCursor left = cursors[
-        std::size_t{job.boundary_begin} * kMaximumMergeSources + source];
-    const BoundaryCursor right = cursors[
-        std::size_t{job.boundary_begin + 1u} * kMaximumMergeSources + source];
-    row_counts[source] = right.logical_rank - left.logical_rank;
-    std::uint32_t slices = 0u;
-    if (source == 0u) {
-      for (std::uint32_t q = job.quotient_begin;
-           q < job.quotient_end; ++q) {
-        const std::uint32_t begin = max(left.logical_rank,
-                                        current_offsets[q]);
-        const std::uint32_t end = min(right.logical_rank,
-                                      current_offsets[q + 1u]);
-        slices += begin < end;
-      }
-    } else {
-      const std::uint32_t level = source - 1u;
-      const RouteHeader last_header =
-          route_headers[descriptor_index(kQuotients - 1u, level)];
-      const std::uint32_t route_limit =
-          last_header.begin + last_header.count;
-      for (std::uint32_t route = left.route_ordinal;
-           route <= right.route_ordinal && route < route_limit; ++route) {
-        const RouteSlice rows = route_slices[route];
-        const std::uint32_t logical = route_logical_begins[route];
-        const std::uint32_t begin = max(left.logical_rank, logical);
-        const std::uint32_t end = min(
-            right.logical_rank, logical + rows.rows.count());
-        slices += begin < end;
-      }
-    }
-    slice_counts[source] = slices;
-  }
-  __syncthreads();
-  if (threadIdx.x == 0u) {
-    const std::size_t base =
-        std::size_t{job_index} * (kMaximumMergeSources + 1u);
-    std::uint32_t slices = 0u, rows = 0u;
-    for (std::uint32_t source_index = 0u;
-         source_index < plan->source_count; ++source_index) {
-      source_slice_offsets[base + source_index] = slices;
-      source_candidate_offsets[base + source_index] =
-          static_cast<std::uint16_t>(rows);
-      slices += slice_counts[source_index];
-      rows += row_counts[source_index];
-    }
-    source_slice_offsets[base + plan->source_count] = slices;
-    source_candidate_offsets[base + plan->source_count] =
-        static_cast<std::uint16_t>(rows);
-    jobs[job_index].slice_count = slices;
-    slice_reservations[job_index] = slices + 1u;
-    if (rows > plan->job_capacity)
-      atomicOr(const_cast<std::uint32_t *>(&plan->status),
-               kPublicationJobTooLarge);
-  }
-  __syncthreads();
-  }
-}
-
-__global__ void materialize_cursor_pull_slices_kernel(
-    BalancedMergeJob *jobs, const ResidentPublicationPlan *plan,
-    const BoundaryCursor *cursors,
-    const std::uint32_t *current_offsets,
-    const RouteHeader *route_headers,
-    const RouteSlice *route_slices,
-    const std::uint32_t *route_logical_begins,
-    const std::uint16_t *route_quotients,
-    std::uint32_t route_stride,
-    const std::uint32_t *source_slice_offsets,
-    const std::uint16_t *source_candidate_offsets,
-    const std::uint32_t *slice_offsets, PullSlice *slices) {
-  if (plan->status) return;
-  for (std::uint32_t job_index = blockIdx.x;
-       job_index < plan->job_count; job_index += gridDim.x) {
-  BalancedMergeJob job = jobs[job_index];
-  const std::size_t source_base =
-      std::size_t{job_index} * (kMaximumMergeSources + 1u);
-  if (threadIdx.x == 0u) {
-    job.slice_begin = slice_offsets[job_index];
-    jobs[job_index].slice_begin = job.slice_begin;
-  }
-  __syncthreads();
-  job.slice_begin = slice_offsets[job_index];
-  const std::uint32_t source = threadIdx.x;
-  if (source < plan->source_count) {
-    const BoundaryCursor left = cursors[
-        std::size_t{job.boundary_begin} * kMaximumMergeSources + source];
-    const BoundaryCursor right = cursors[
-        std::size_t{job.boundary_begin + 1u} * kMaximumMergeSources + source];
-    std::uint32_t slot = job.slice_begin +
-        source_slice_offsets[source_base + source];
-    std::uint32_t candidate =
-        source_candidate_offsets[source_base + source];
-    if (source == 0u) {
-      for (std::uint32_t q = job.quotient_begin;
-           q < job.quotient_end; ++q) {
-        const std::uint32_t begin = max(left.logical_rank,
-                                        current_offsets[q]);
-        const std::uint32_t end = min(right.logical_rank,
-                                      current_offsets[q + 1u]);
-        if (begin == end) continue;
-        slices[slot++] = {
-            begin, end - begin, static_cast<std::uint16_t>(candidate),
-            static_cast<std::uint16_t>(q - job.quotient_begin)};
-        candidate += end - begin;
-      }
-    } else {
-      const std::uint32_t level = source - 1u;
-      const RouteHeader last_header =
-          route_headers[descriptor_index(kQuotients - 1u, level)];
-      const std::uint32_t route_limit =
-          last_header.begin + last_header.count;
-      for (std::uint32_t route = left.route_ordinal;
-           route <= right.route_ordinal && route < route_limit; ++route) {
-        const RouteSlice input = route_slices[route];
-        const std::uint32_t logical = route_logical_begins[route];
-        const std::uint32_t begin = max(left.logical_rank, logical);
-        const std::uint32_t end = min(
-            right.logical_rank, logical + input.rows.count());
-        if (begin == end) continue;
-        const std::uint32_t q = route_quotients[route];
-        const std::uint16_t tag = static_cast<std::uint16_t>(
-            (source << 9u) | (q - job.quotient_begin));
-        slices[slot++] = {
-            input.rows.offset() + begin - logical, end - begin,
-            static_cast<std::uint16_t>(candidate), tag};
-        candidate += end - begin;
-      }
-    }
-  }
-  __syncthreads();
-  if (threadIdx.x == 0u) {
-    const std::uint32_t total_rows =
-        source_candidate_offsets[source_base + plan->source_count];
-    slices[job.slice_begin + job.slice_count] = {
-        0u, 0u, static_cast<std::uint16_t>(total_rows), 0u};
-    if (total_rows != job.existing_capacity)
-      atomicOr(const_cast<std::uint32_t *>(&plan->status),
-               kPublicationCursorMismatch);
-  }
-  __syncthreads();
-  }
-}
-
-__global__ void validate_resident_plan_kernel(
-    ResidentPublicationPlan *plan,
-    const std::uint32_t *tile_job_offsets,
-    const std::uint64_t *job_output_offsets,
-    const std::uint32_t *route_offsets,
-    const std::uint32_t *slice_offsets,
-    std::uint32_t maximum_jobs, std::uint32_t maximum_boundaries,
-    std::uint32_t route_capacity, std::uint32_t slice_capacity) {
-  if (blockIdx.x || threadIdx.x) return;
-  plan->job_count = tile_job_offsets[kPlanningTiles];
-  plan->boundary_count = plan->job_count + kPlanningTiles;
-  plan->raw_reservation = job_output_offsets[maximum_jobs];
-  plan->route_count = route_offsets[kQuotients];
-  plan->slice_count = slice_offsets[maximum_jobs];
-  if (plan->job_count > maximum_jobs ||
-      plan->boundary_count > maximum_boundaries)
-    plan->status |= kPublicationJobOverflow;
-  if (plan->route_count > route_capacity)
-    plan->status |= kPublicationRouteOverflow;
-  if (plan->slice_count > slice_capacity)
-    plan->status |= kPublicationSliceOverflow;
-  if (plan->raw_reservation > plan->output_capacity)
-    plan->status |= kPublicationOutputOverflow;
-}
-
 __global__ void assign_resident_output_offsets_kernel(
     BalancedMergeJob *jobs, const std::uint64_t *job_output_offsets,
     const std::uint64_t *job_raw_reservations,
@@ -3559,63 +3233,6 @@ __global__ void finalize_resident_route_metadata_kernel(
   descriptors[descriptor_index(q, level)] =
       header.count == 1u ? route_slices[header.begin].rows
                          : Descriptor::make(0u, total);
-}
-
-__global__ void build_resident_query_metadata_kernel(
-    const ResidentPublicationPlan *plan, const Row *arena,
-    const Descriptor *descriptors, const RouteHeader *route_headers,
-    const RouteSlice *route_slices,
-    const std::uint32_t *route_logical_begins,
-    const std::uint32_t *level_q_logical_offsets,
-    const std::uint32_t *level_cell_rank_blocks,
-    std::uint16_t *level_cell_ranks, std::uint16_t *local_rank,
-    std::uint16_t *level_guides) {
-  const std::uint32_t q = blockIdx.x;
-  if (q >= kQuotients || plan->status) return;
-  const std::uint32_t level = plan->destination_level;
-  const RouteHeader header = route_headers[descriptor_index(q, level)];
-  const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-  if (plan->destination_is_foundation) {
-    for (std::uint32_t cell = threadIdx.x; cell < 128u;
-         cell += blockDim.x) {
-      const std::uint32_t target = cell << 9u;
-      const std::uint32_t position =
-          header.count && descriptor.count() <= (1u << 16u)
-              ? logical_section_bound(
-                    q, level, target, false, arena, route_headers,
-                    route_slices, route_logical_begins,
-                    level_q_logical_offsets)
-              : 0u;
-      local_rank[std::size_t{q} * 128u + cell] =
-          static_cast<std::uint16_t>(position);
-    }
-  } else {
-    const std::uint32_t rank_block =
-        level_cell_rank_blocks[descriptor_index(q, level)];
-    if (rank_block != kInvalid) {
-      for (std::uint32_t cell = threadIdx.x; cell < kFoundationCells;
-           cell += blockDim.x) {
-        const std::uint32_t position = logical_section_bound(
-            q, level, cell * kFoundationCellKeys, false, arena,
-            route_headers, route_slices, route_logical_begins,
-            level_q_logical_offsets);
-        level_cell_ranks[
-            std::size_t{rank_block} * kFoundationCells + cell] =
-            static_cast<std::uint16_t>(position);
-      }
-    }
-    if (header.count && descriptor.count() >= kGuideRegions) {
-    for (std::uint32_t sample = threadIdx.x; sample < kGuideSamples;
-         sample += blockDim.x) {
-      const std::uint32_t position =
-          (sample + 1u) * descriptor.count() / kGuideRegions;
-      level_guides[guide_index(q, level) + sample] =
-          logical_section_row(
-              q, level, position, arena, route_headers, route_slices,
-              route_logical_begins, level_q_logical_offsets).key;
-    }
-    }
-  }
 }
 
 __global__ void build_split_resident_query_metadata_kernel(
@@ -3679,8 +3296,7 @@ __global__ void build_split_resident_query_metadata_kernel(
 __global__ void publish_resident_manifest_kernel(
     ResidentPublicationPlan *plan, DeviceManifest *manifests,
     std::uint32_t *active_manifest,
-    std::uint64_t *query_occupied_level_mask,
-    std::uint32_t route_stride) {
+    std::uint64_t *query_occupied_level_mask) {
   if (blockIdx.x || plan->status) return;
   const DeviceManifest *current = manifests + plan->active_manifest;
   DeviceManifest *next = manifests + plan->inactive_manifest;
@@ -3697,20 +3313,8 @@ __global__ void publish_resident_manifest_kernel(
   __syncthreads();
   if (threadIdx.x == 0u) {
     next->occupied_level_mask = current->occupied_level_mask & ~consumed;
-    next->reserved = current->reserved;
     DeviceLevelState state{};
-    state.logical_rows = plan->survivor_count;
-    state.data_begin = plan->output_begin;
-    state.data_capacity = plan->output_capacity;
-    state.route_begin = destination * route_stride;
-    state.route_count = plan->route_count;
     state.storage_generation = plan->output_generation;
-    state.guide_generation = current->generation + 1u;
-    state.flags = plan->keep_tombstones ? kLevelKeepsTombstones : 0u;
-    state.flags |= plan->destination_is_foundation
-        ? (kLevelHasRank | kLevelIsFoundation) : kLevelHasGuide;
-    if (!plan->destination_is_foundation && plan->rank_block_count)
-      state.flags |= kLevelHasRank;
     next->levels[destination] = state;
     if (plan->survivor_count)
       next->occupied_level_mask |= std::uint64_t{1} << destination;
@@ -3751,8 +3355,7 @@ __global__ void initialize_device_manifest_kernel(
     DeviceManifest *manifests, std::uint32_t *active_manifest,
     std::uint64_t *query_occupied_level_mask,
     std::uint32_t level, std::uint32_t count,
-    std::uint64_t data_begin, std::uint64_t data_capacity,
-    std::uint32_t route_stride, std::uint32_t storage_generation) {
+    std::uint32_t storage_generation) {
   if (blockIdx.x || threadIdx.x) return;
   DeviceManifest manifest{};
   if (count) {
@@ -3761,14 +3364,7 @@ __global__ void initialize_device_manifest_kernel(
     manifest.foundation_level = level;
     manifest.generation = 1u;
     DeviceLevelState state{};
-    state.logical_rows = count;
-    state.data_begin = data_begin;
-    state.data_capacity = data_capacity;
-    state.route_begin = level * route_stride;
-    state.route_count = kQuotients;
     state.storage_generation = storage_generation;
-    state.guide_generation = 1u;
-    state.flags = kLevelHasRank | kLevelIsFoundation;
     manifest.levels[level] = state;
   }
   manifests[0] = manifest;
@@ -3796,425 +3392,6 @@ __global__ void initialize_single_route_auxiliary_kernel(
 
 
 
-__device__ __forceinline__ std::uint32_t pull_candidate_order_key(
-    const Row &row) {
-  const std::uint32_t local_q = row.flags >> kMergeSourceBits;
-  const std::uint32_t age =
-      row.flags & ((1u << kMergeSourceBits) - 1u);
-  return (local_q << (16u + kMergeSourceBits)) |
-      (std::uint32_t{row.key} << kMergeSourceBits) | age;
-}
-
-__device__ __forceinline__ bool pull_index_less(
-    std::uint16_t left, std::uint16_t right, const Row *candidates) {
-  return pull_candidate_order_key(candidates[left]) <
-      pull_candidate_order_key(candidates[right]);
-}
-
-__device__ __forceinline__ std::uint32_t pull_merge_partition(
-    const std::uint16_t *left, std::uint32_t left_count,
-    const std::uint16_t *right, std::uint32_t right_count,
-    std::uint32_t diagonal, const Row *candidates) {
-  std::uint32_t low = diagonal > right_count
-      ? diagonal - right_count : 0u;
-  std::uint32_t high = min(diagonal, left_count);
-  while (low <= high) {
-    const std::uint32_t left_index = (low + high) >> 1u;
-    const std::uint32_t right_index = diagonal - left_index;
-    if (left_index && right_index < right_count &&
-        pull_index_less(right[right_index], left[left_index - 1u],
-                        candidates)) {
-      high = left_index - 1u;
-    } else if (right_index && left_index < left_count &&
-               pull_index_less(left[left_index], right[right_index - 1u],
-                               candidates)) {
-      low = left_index + 1u;
-    } else {
-      return left_index;
-    }
-  }
-  return low;
-}
-
-
-__global__ void compact_balanced_merge_jobs_kernel(
-    BalancedMergeJob *jobs, const ResidentPublicationPlan *resident_plan,
-    const PullSlice *pull_slices,
-    const Row *current_rows, Row *arena,
-    const RouteHeader *next_route_headers, RouteSlice *route_slices,
-    std::uint32_t *section_output_counts, std::uint32_t *overflow_flag) {
-  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
-  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
-  __shared__ typename BlockScan::TempStorage block_scan_storage;
-  extern __shared__ __align__(16) unsigned char merge_workspace[];
-  const std::uint32_t merge_capacity = resident_plan->job_capacity;
-  Row *candidates = reinterpret_cast<Row *>(merge_workspace);
-  std::uint16_t *merge_indices_a = reinterpret_cast<std::uint16_t *>(
-      candidates + merge_capacity);
-  std::uint16_t *merge_indices_b =
-      merge_indices_a + merge_capacity + 1u;
-  std::uint32_t *tombstone_words = reinterpret_cast<std::uint32_t *>(
-      merge_indices_b + merge_capacity + 1u);
-  __shared__ std::uint32_t source_offsets[kMaximumLevels + 2u];
-  __shared__ std::uint16_t run_offsets[kMaximumLevels + 1u];
-  __shared__ std::uint16_t run_lengths[kMaximumLevels + 1u];
-  __shared__ std::uint16_t run_sources[kMaximumLevels + 1u];
-  __shared__ std::uint32_t slice_count_shared;
-  __shared__ std::uint32_t run_count_shared;
-  __shared__ std::uint32_t small_count_shared;
-  __shared__ std::uint32_t largest_source_shared;
-  __shared__ std::uint32_t largest_count_shared;
-  __shared__ std::uint32_t task_output_count_shared;
-  __shared__ std::uint32_t output_valid_shared;
-
-  if (resident_plan->status) return;
-  for (std::uint32_t job_index = blockIdx.x;
-       job_index < resident_plan->job_count; job_index += gridDim.x) {
-  const std::uint32_t source_level_limit =
-      resident_plan->source_level_limit;
-  const bool keep_tombstones = resident_plan->keep_tombstones != 0u;
-  const unsigned long long output_limit =
-      resident_plan->output_begin + resident_plan->output_capacity;
-  const BalancedMergeJob job = jobs[job_index];
-  const std::uint32_t quotient_count =
-      job.quotient_end - job.quotient_begin;
-  const std::uint32_t sources = source_level_limit + 2u;
-  if (threadIdx.x == 0u) {
-    slice_count_shared = job.slice_count;
-    std::uint32_t slice = 0u;
-    for (std::uint32_t source = 0u; source < sources; ++source) {
-      source_offsets[source] = pull_slices[
-          job.slice_begin + slice].candidate_begin;
-      while (slice < job.slice_count &&
-             (pull_slices[job.slice_begin + slice].tag >> 9u) == source)
-        ++slice;
-    }
-    source_offsets[sources] = pull_slices[
-        job.slice_begin + job.slice_count].candidate_begin;
-
-    std::uint32_t largest_source = 0u;
-    std::uint32_t largest_count = 0u;
-    for (std::uint32_t source = 0u; source < sources; ++source) {
-      const std::uint32_t count =
-          source_offsets[source + 1u] - source_offsets[source];
-      if (count > largest_count) {
-        largest_count = count;
-        largest_source = source;
-      }
-    }
-    largest_source_shared = largest_source;
-    largest_count_shared = largest_count;
-  }
-  __syncthreads();
-
-  const std::uint32_t task_rows = source_offsets[sources];
-  if (task_rows > merge_capacity) {
-    if (threadIdx.x == 0u) atomicExch(overflow_flag, 1u);
-    __syncthreads();
-    continue;
-  }
-
-  // Each warp loads consecutive groups of 32 records.  It writes one complete
-  // tombstone word instead of issuing one contended atomic update per row.
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t warp = threadIdx.x >> 5u;
-  const std::uint32_t words = (task_rows + 31u) / 32u;
-  for (std::uint32_t word = warp; word < words;
-       word += blockDim.x / 32u) {
-    const std::uint32_t index = word * 32u + lane;
-    bool tombstone = false;
-    if (index < task_rows) {
-    std::uint32_t low = 0u, high = slice_count_shared;
-    while (low + 1u < high) {
-      const std::uint32_t middle = (low + high) >> 1u;
-      if (pull_slices[job.slice_begin + middle].candidate_begin <= index)
-        low = middle;
-      else
-        high = middle;
-    }
-    const PullSlice slice = pull_slices[job.slice_begin + low];
-    const std::uint32_t local = slice.tag & 0x1ffu;
-    const std::uint32_t source = slice.tag >> 9u;
-    Row row = source == 0u
-        ? current_rows[slice.offset + index - slice.candidate_begin]
-        : arena[slice.offset + index - slice.candidate_begin];
-    tombstone = (row.flags & kTombstone) != 0u;
-    row.flags = static_cast<std::uint16_t>(
-        (local << kMergeSourceBits) | source);
-    candidates[index] = row;
-    }
-    const std::uint32_t mask = __ballot_sync(0xffffffffu, tombstone);
-    if (lane == 0u) tombstone_words[word] = mask;
-  }
-  __syncthreads();
-
-  // Pack all smaller source runs first and reserve the largest source at the
-  // end of both index planes.  The smaller runs merge into one aggregate;
-  // the largest source participates only in the final round.
-  if (threadIdx.x == 0u) {
-    std::uint32_t run_count = 0u;
-    std::uint32_t packed = 0u;
-    for (std::uint32_t source = 0u; source < sources; ++source) {
-      const std::uint32_t count =
-          source_offsets[source + 1u] - source_offsets[source];
-      if (!count || source == largest_source_shared) continue;
-      run_offsets[run_count] = static_cast<std::uint16_t>(packed);
-      run_lengths[run_count] = static_cast<std::uint16_t>(count);
-      run_sources[run_count] = static_cast<std::uint16_t>(source);
-      packed += count;
-      ++run_count;
-    }
-    run_count_shared = run_count;
-    small_count_shared = packed;
-  }
-  __syncthreads();
-
-  for (std::uint32_t run = 0u; run < run_count_shared; ++run) {
-    const std::uint32_t count = run_lengths[run];
-    const std::uint32_t destination = run_offsets[run];
-    const std::uint32_t source = run_sources[run];
-    const std::uint32_t candidate_begin = source_offsets[source];
-    for (std::uint32_t index = threadIdx.x; index < count;
-         index += blockDim.x)
-      merge_indices_a[destination + index] =
-          static_cast<std::uint16_t>(candidate_begin + index);
-  }
-  for (std::uint32_t index = threadIdx.x;
-       index < largest_count_shared; index += blockDim.x) {
-    const std::uint16_t candidate = static_cast<std::uint16_t>(
-        source_offsets[largest_source_shared] + index);
-    merge_indices_a[small_count_shared + index] = candidate;
-    merge_indices_b[small_count_shared + index] = candidate;
-  }
-  __syncthreads();
-
-  bool input_is_a = true;
-  while (run_count_shared > 1u) {
-    const std::uint16_t *input =
-        input_is_a ? merge_indices_a : merge_indices_b;
-    std::uint16_t *output =
-        input_is_a ? merge_indices_b : merge_indices_a;
-    const std::uint32_t items_per_thread =
-        (small_count_shared + kThreads - 1u) / kThreads;
-    std::uint32_t position = threadIdx.x * items_per_thread;
-    const std::uint32_t thread_end = min(
-        position + items_per_thread, small_count_shared);
-    while (position < thread_end) {
-      std::uint32_t pair = 0u;
-      while (pair * 2u < run_count_shared) {
-        const std::uint32_t first = pair * 2u;
-        const std::uint32_t pair_count = run_lengths[first] +
-            (first + 1u < run_count_shared
-                 ? run_lengths[first + 1u] : 0u);
-        if (position < run_offsets[first] + pair_count) break;
-        ++pair;
-      }
-      const std::uint32_t first = pair * 2u;
-      const std::uint32_t pair_begin = run_offsets[first];
-      const std::uint32_t left_count = run_lengths[first];
-      const std::uint32_t right_count = first + 1u < run_count_shared
-          ? run_lengths[first + 1u] : 0u;
-      const std::uint32_t pair_end =
-          pair_begin + left_count + right_count;
-      const std::uint32_t output_end = min(thread_end, pair_end);
-      if (!right_count) {
-        while (position < output_end) {
-          output[position] = input[position];
-          ++position;
-        }
-        continue;
-      }
-      const std::uint16_t *left = input + pair_begin;
-      const std::uint16_t *right = left + left_count;
-      const std::uint32_t diagonal = position - pair_begin;
-      std::uint32_t left_index = pull_merge_partition(
-          left, left_count, right, right_count, diagonal, candidates);
-      std::uint32_t right_index = diagonal - left_index;
-      while (position < output_end) {
-        const bool choose_left = right_index >= right_count ||
-            (left_index < left_count &&
-             pull_index_less(left[left_index], right[right_index],
-                             candidates));
-        output[position++] = choose_left
-            ? left[left_index++] : right[right_index++];
-      }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0u) {
-      const std::uint32_t old_run_count = run_count_shared;
-      const std::uint32_t next_run_count =
-          (old_run_count + 1u) >> 1u;
-      for (std::uint32_t next = 0u; next < next_run_count; ++next) {
-        const std::uint32_t first = next * 2u;
-        run_offsets[next] = run_offsets[first];
-        run_lengths[next] = static_cast<std::uint16_t>(
-            run_lengths[first] +
-            (first + 1u < old_run_count ? run_lengths[first + 1u] : 0u));
-      }
-      run_count_shared = next_run_count;
-    }
-    input_is_a = !input_is_a;
-    __syncthreads();
-  }
-
-  // Merge the aggregate of every smaller source with the largest source.
-  // This is also the only merge round in the common two-source carry.
-  if (small_count_shared && largest_count_shared) {
-    const std::uint16_t *input =
-        input_is_a ? merge_indices_a : merge_indices_b;
-    std::uint16_t *output =
-        input_is_a ? merge_indices_b : merge_indices_a;
-    const std::uint16_t *left = input;
-    const std::uint16_t *right = input + small_count_shared;
-    const std::uint32_t items_per_thread =
-        (task_rows + kThreads - 1u) / kThreads;
-    std::uint32_t position = threadIdx.x * items_per_thread;
-    const std::uint32_t output_end = min(
-        position + items_per_thread, task_rows);
-    if (position < output_end) {
-      std::uint32_t left_index = pull_merge_partition(
-          left, small_count_shared, right, largest_count_shared,
-          position, candidates);
-      std::uint32_t right_index = position - left_index;
-      while (position < output_end) {
-        const bool choose_left = right_index >= largest_count_shared ||
-            (left_index < small_count_shared &&
-             pull_index_less(left[left_index], right[right_index],
-                             candidates));
-        output[position++] = choose_left
-            ? left[left_index++] : right[right_index++];
-      }
-    }
-    input_is_a = !input_is_a;
-    __syncthreads();
-  }
-
-  const std::uint16_t *sorted_indices =
-      input_is_a ? merge_indices_a : merge_indices_b;
-  std::uint16_t *survivor_indices =
-      input_is_a ? merge_indices_b : merge_indices_a;
-  const std::uint32_t items_per_thread =
-      (task_rows + kThreads - 1u) / kThreads;
-  std::uint32_t live_mask = 0u;
-  std::uint32_t local_live = 0u;
-  for (std::uint32_t item = 0u; item < items_per_thread; ++item) {
-    const std::uint32_t index = threadIdx.x * items_per_thread + item;
-    if (index >= task_rows) continue;
-    const std::uint16_t candidate_index = sorted_indices[index];
-    const Row row = candidates[candidate_index];
-    const std::uint32_t full_local_key =
-        pull_candidate_order_key(row) >> kMergeSourceBits;
-    const bool first = index == 0u || full_local_key !=
-        (pull_candidate_order_key(candidates[sorted_indices[index - 1u]]) >>
-         kMergeSourceBits);
-    const bool tombstone =
-        (tombstone_words[candidate_index >> 5u] &
-         (1u << (candidate_index & 31u))) != 0u;
-    const bool live = first && (keep_tombstones || !tombstone);
-    if (live) {
-      live_mask |= 1u << item;
-      ++local_live;
-    }
-  }
-
-  std::uint32_t thread_output_base{}, task_output_count{};
-  BlockScan(block_scan_storage).ExclusiveSum(
-      local_live, thread_output_base, task_output_count);
-  std::uint32_t local_rank = 0u;
-  for (std::uint32_t item = 0u; item < items_per_thread; ++item) {
-    if (!(live_mask & (1u << item))) continue;
-    const std::uint32_t index = threadIdx.x * items_per_thread + item;
-    survivor_indices[thread_output_base + local_rank++] =
-        sorted_indices[index];
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0u) {
-    // The GPU scan assigned this key-ordered raw-input slab before the merge.
-    // Its unused tail is intentionally left invisible through route counts.
-    const std::uint32_t page_capacity = job.existing_capacity;
-    const unsigned long long page_offset = job.existing_offset;
-    const bool output_valid = task_output_count <= page_capacity &&
-        page_offset + page_capacity <= output_limit;
-    if (!output_valid) atomicExch(overflow_flag, 1u);
-    task_output_count_shared = task_output_count;
-    output_valid_shared = output_valid;
-
-    // Initialize every owned route, including sections whose complete input
-    // is deleted.  Nonempty routes are filled directly from survivor
-    // boundaries after this initialization.
-    for (std::uint32_t local = 0u; local < quotient_count; ++local) {
-      const std::uint32_t output_q = job.quotient_begin + local;
-      const RouteHeader route = next_route_headers[output_q];
-      if (job.route_ordinal < route.count) {
-        const std::uint32_t suffix_begin = output_q == job.quotient_begin
-            ? static_cast<std::uint32_t>(job.key_begin & 0xffffu) : 0u;
-        const std::uint32_t suffix_end =
-            output_q + 1u == job.quotient_end
-            ? static_cast<std::uint32_t>(
-                  job.key_end - (std::uint64_t{output_q} << 16u))
-            : 1u << 16u;
-        route_slices[route.begin + job.route_ordinal] = {
-            Descriptor{}, suffix_begin, suffix_end};
-      }
-    }
-    jobs[job_index].existing_offset = page_offset;
-    jobs[job_index].existing_capacity = output_valid ? page_capacity : 0u;
-    jobs[job_index].output_count = task_output_count;
-  }
-  __syncthreads();
-
-  // The survivor plane is compact and sorted.  A final survivor of each
-  // quotient finds the first survivor of that quotient and publishes the
-  // exact output interval.  No per-quotient shared arrays are required.
-  for (std::uint32_t rank = threadIdx.x;
-       rank < task_output_count_shared; rank += blockDim.x) {
-    const std::uint16_t candidate_index = survivor_indices[rank];
-    Row row = candidates[candidate_index];
-    const std::uint32_t local_q = row.flags >> kMergeSourceBits;
-    const bool tombstone =
-        (tombstone_words[candidate_index >> 5u] &
-         (1u << (candidate_index & 31u))) != 0u;
-    row.flags = tombstone ? kTombstone : 0u;
-    if (output_valid_shared)
-      arena[job.existing_offset + rank] = row;
-
-    const bool last = rank + 1u == task_output_count_shared ||
-        (candidates[survivor_indices[rank + 1u]].flags >>
-         kMergeSourceBits) != local_q;
-    if (last) {
-      std::uint32_t low = 0u, high = rank;
-      while (low < high) {
-        const std::uint32_t middle = (low + high) >> 1u;
-        const std::uint32_t middle_q =
-            candidates[survivor_indices[middle]].flags >> kMergeSourceBits;
-        if (middle_q < local_q) low = middle + 1u;
-        else high = middle;
-      }
-      const std::uint32_t output_count = rank - low + 1u;
-      const std::uint32_t output_q = job.quotient_begin + local_q;
-      const Descriptor output_descriptor = output_valid_shared
-          ? Descriptor::make(job.existing_offset + low, output_count)
-          : Descriptor{};
-      atomicAdd(section_output_counts + output_q, output_count);
-      const RouteHeader route = next_route_headers[output_q];
-      if (job.route_ordinal < route.count) {
-        const std::uint32_t suffix_begin =
-            output_q == job.quotient_begin
-                ? static_cast<std::uint32_t>(job.key_begin & 0xffffu) : 0u;
-        const std::uint32_t suffix_end =
-            output_q + 1u == job.quotient_end
-                ? static_cast<std::uint32_t>(
-                      job.key_end - (std::uint64_t{output_q} << 16u))
-                : 1u << 16u;
-        route_slices[route.begin + job.route_ordinal] = {
-            output_descriptor, suffix_begin, suffix_end};
-      }
-    }
-  }
-  __syncthreads();
-  }
-}
 
 __device__ __forceinline__ std::uint32_t direct_raw_batch_for_candidate(
     std::uint16_t candidate,
@@ -6390,9 +5567,6 @@ public:
         maximum_resident_jobs_(
             gpulsmopt2_detail::maximum_resident_merge_jobs(
                 publication_capacity_, resident_merge_capacity_)),
-        maximum_resident_boundaries_(
-            maximum_resident_jobs_ + gpulsmopt2_detail::kPlanningTiles),
-        maximum_pull_slices_(publication_capacity_ + maximum_resident_jobs_),
         route_stride_(gpulsmopt2_detail::adaptive_route_stride(
             publication_capacity_, resident_merge_capacity_)),
         local_rank_(gpulsmopt2_detail::kLocalRankEntries),
@@ -6460,23 +5634,10 @@ public:
         resident_tile_job_offsets_(gpulsmopt2_detail::kPlanningTiles + 1u),
         resident_job_raw_reservations_(maximum_resident_jobs_ + 1u),
         resident_job_output_offsets_(maximum_resident_jobs_ + 1u),
-        resident_boundary_keys_(maximum_resident_boundaries_),
-        resident_boundary_cursors_(
-            maximum_resident_boundaries_ *
-            gpulsmopt2_detail::kMaximumMergeSources),
         resident_route_counts_(gpulsmopt2_detail::kQuotients + 1u),
         resident_route_offsets_(gpulsmopt2_detail::kQuotients + 1u),
-        resident_source_slice_offsets_(
-            maximum_resident_jobs_ *
-            (gpulsmopt2_detail::kMaximumMergeSources + 1u)),
-        resident_source_candidate_offsets_(
-            maximum_resident_jobs_ *
-            (gpulsmopt2_detail::kMaximumMergeSources + 1u)),
-        resident_slice_reservations_(maximum_resident_jobs_ + 1u),
-        resident_slice_offsets_(maximum_resident_jobs_ + 1u),
         resident_section_logical_offsets_(gpulsmopt2_detail::kQuotients + 1u),
         balanced_merge_jobs_(maximum_resident_jobs_),
-        balanced_merge_pull_slices_(maximum_pull_slices_),
         foundation_overflow_flag_(1u),
         admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
         range_partials_(gpulsmopt2_detail::kRangeSchedulerBlocks),
@@ -6614,9 +5775,7 @@ public:
             level_q_logical_offsets_.data());
     gpulsmopt2_detail::initialize_device_manifest_kernel<<<1, 1, 0, stream>>>(
         device_manifests_.data(), active_device_manifest_.data(),
-        query_occupied_level_mask_.data(), level, base_count, 0u,
-        foundation_pool_capacity_ / 2u,
-        static_cast<std::uint32_t>(route_stride_), 0u);
+        query_occupied_level_mask_.data(), level, base_count, 0u);
     refresh_active_levels();
     rebuild_foundation_rank(stream);
     end_operation(stream);
@@ -6905,20 +6064,11 @@ public:
          resident_tile_job_offsets_.size() +
          resident_route_counts_.size() +
          resident_route_offsets_.size() +
-         resident_source_slice_offsets_.size() +
-         resident_slice_reservations_.size() +
-         resident_slice_offsets_.size() +
          resident_section_logical_offsets_.size()) * sizeof(std::uint32_t) +
-        resident_source_candidate_offsets_.size() * sizeof(std::uint16_t) +
         (resident_job_raw_reservations_.size() +
-         resident_job_output_offsets_.size() +
-         resident_boundary_keys_.size()) * sizeof(std::uint64_t) +
-        resident_boundary_cursors_.size() *
-            sizeof(gpulsmopt2_detail::BoundaryCursor) +
+         resident_job_output_offsets_.size()) * sizeof(std::uint64_t) +
         balanced_merge_jobs_.size() *
             sizeof(gpulsmopt2_detail::BalancedMergeJob) +
-        balanced_merge_pull_slices_.size() *
-            sizeof(gpulsmopt2_detail::PullSlice) +
         foundation_next_route_headers_.size() *
             sizeof(gpulsmopt2_detail::RouteHeader) +
         resident_scan_temp_.size() * sizeof(std::uint8_t) +
@@ -7070,11 +6220,6 @@ private:
     maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
     bytes = 0u;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, bytes, resident_slice_reservations_.data(),
-        resident_slice_offsets_.data(), maximum_resident_jobs_ + 1u, 0));
-    maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
-    bytes = 0u;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, bytes, foundation_section_output_counts_.data(),
         resident_section_logical_offsets_.data(),
         gpulsmopt2_detail::kQuotients + 1u, 0));
@@ -7198,10 +6343,6 @@ private:
         resident_job_raw_reservations_.size() * sizeof(std::uint64_t),
         capture_stream));
     CUDA_CHECK(cudaMemsetAsync(
-        resident_slice_reservations_.data(), 0,
-        resident_slice_reservations_.size() * sizeof(std::uint32_t),
-        capture_stream));
-    CUDA_CHECK(cudaMemsetAsync(
         foundation_section_output_counts_.data(), 0,
         foundation_section_output_counts_.size() * sizeof(std::uint32_t),
         capture_stream));
@@ -7225,13 +6366,12 @@ private:
             balanced_merge_raw_counts_.data(),
             resident_tile_job_offsets_.data(), resident_plan_.data(),
             static_cast<std::uint32_t>(maximum_resident_jobs_),
-            balanced_merge_jobs_.data(), resident_boundary_keys_.data(),
-            resident_job_raw_reservations_.data());
+            balanced_merge_jobs_.data(), resident_job_raw_reservations_.data());
     gpulsmopt2_detail::resolve_resident_job_boundaries_kernel<<<
         resident_planner_blocks_, 32u, 0,
         capture_stream>>>(
-            balanced_merge_jobs_.data(), resident_boundary_keys_.data(),
-            resident_job_raw_reservations_.data(), resident_plan_.data(),
+            balanced_merge_jobs_.data(), resident_job_raw_reservations_.data(),
+            resident_plan_.data(),
             publication_rows_a_.data(), foundation_source_offsets_.data(),
             arena_.data(), route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
@@ -7329,8 +6469,7 @@ private:
         1, gpulsmopt2_detail::kMaximumLevels, 0, capture_stream>>>(
             resident_plan_.data(), device_manifests_.data(),
             active_device_manifest_.data(),
-            query_occupied_level_mask_.data(),
-            static_cast<std::uint32_t>(route_stride_));
+            query_occupied_level_mask_.data());
     CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
     return graph;
   }
@@ -7498,8 +6637,7 @@ private:
     std::fill_n(level_counts_, gpulsmopt2_detail::kMaximumLevels, 0u);
     gpulsmopt2_detail::initialize_device_manifest_kernel<<<1, 1, 0, stream>>>(
         device_manifests_.data(), active_device_manifest_.data(),
-        query_occupied_level_mask_.data(), 0u, 0u, 0u, 0u,
-        static_cast<std::uint32_t>(route_stride_), 0u);
+        query_occupied_level_mask_.data(), 0u, 0u, 0u);
     std::fill_n(raw_batch_counts_, gpulsmopt2_detail::kBatchesPerEpoch, 0u);
     stats_ = {};
   }
@@ -7764,8 +6902,6 @@ private:
   std::uint32_t resident_merge_capacity_{};
   std::size_t resident_merge_workspace_bytes_{};
   std::size_t maximum_resident_jobs_{};
-  std::size_t maximum_resident_boundaries_{};
-  std::size_t maximum_pull_slices_{};
   std::size_t route_stride_{};
   std::uint64_t host_occupied_level_mask_{};
   std::uint32_t pending_batches_{};
@@ -7823,21 +6959,13 @@ private:
   gpulsmopt2_detail::Buffer<std::uint32_t> foundation_source_offsets_,
       foundation_section_output_counts_;
   gpulsmopt2_detail::Buffer<std::uint64_t> balanced_merge_raw_counts_,
-      resident_job_raw_reservations_, resident_job_output_offsets_,
-      resident_boundary_keys_;
+      resident_job_raw_reservations_, resident_job_output_offsets_;
   gpulsmopt2_detail::Buffer<std::uint32_t>
       resident_tile_job_counts_, resident_tile_job_offsets_,
       resident_route_counts_, resident_route_offsets_,
-      resident_source_slice_offsets_, resident_slice_reservations_,
-      resident_slice_offsets_, resident_section_logical_offsets_;
-  gpulsmopt2_detail::Buffer<std::uint16_t>
-      resident_source_candidate_offsets_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::BoundaryCursor>
-      resident_boundary_cursors_;
+      resident_section_logical_offsets_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::BalancedMergeJob>
       balanced_merge_jobs_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::PullSlice>
-      balanced_merge_pull_slices_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RouteHeader>
       foundation_next_route_headers_;
   gpulsmopt2_detail::Buffer<std::uint8_t> resident_scan_temp_;
