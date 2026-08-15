@@ -3928,86 +3928,16 @@ __global__ void compact_balanced_merge_jobs_kernel(
   }
 }
 
-__device__ __forceinline__ std::uint32_t direct_raw_batch_for_candidate(
-    std::uint16_t candidate,
-    const std::uint32_t *raw_candidate_offsets,
-    std::uint32_t pending_batches) {
-  std::uint32_t batch = 0u;
-#pragma unroll
-  for (std::uint32_t b = 1u; b < kBatchesPerEpoch; ++b)
-    if (b < pending_batches && candidate >= raw_candidate_offsets[b])
-      batch = b;
-  return batch;
-}
-
-__device__ __forceinline__ std::uint32_t direct_raw_metadata(
-    std::uint16_t candidate, std::uint32_t q,
-    const std::uint32_t *raw_candidate_offsets,
-    const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
-    std::uint32_t batch_stride, std::uint32_t pending_batches) {
-  const std::uint32_t batch = direct_raw_batch_for_candidate(
-      candidate, raw_candidate_offsets, pending_batches);
-  const std::uint32_t local =
-      candidate - raw_candidate_offsets[batch];
-  const std::size_t offset =
-      std::size_t{batch} * (kQuotients + 1u) + q;
-  return raw_payloads[std::size_t{batch} * batch_stride +
-                      raw_offsets[offset] + local].metadata;
-}
-
-__device__ __forceinline__ bool direct_epoch_candidate_less(
-    std::uint16_t left, std::uint16_t right, const Row *candidates,
-    std::uint32_t raw_count, std::uint32_t q,
-    const std::uint32_t *raw_candidate_offsets,
-    const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
-    std::uint32_t batch_stride, std::uint32_t pending_batches) {
-  const Row a = candidates[left];
-  const Row b = candidates[right];
-  const std::uint32_t a_key =
-      (static_cast<std::uint32_t>(a.flags >> kMergeSourceBits) << 16u) |
-      a.key;
-  const std::uint32_t b_key =
-      (static_cast<std::uint32_t>(b.flags >> kMergeSourceBits) << 16u) |
-      b.key;
-  (void)raw_count;
-  (void)q;
-  (void)raw_candidate_offsets;
-  (void)raw_payloads;
-  (void)raw_offsets;
-  (void)batch_stride;
-  (void)pending_batches;
-  // Candidate IDs make equal-key merge-path partitions unique.  Timestamp
-  // selection remains in the one-time duplicate-resolution pass below.
-  return a_key != b_key ? a_key < b_key : left < right;
-}
-
-__device__ __forceinline__ std::uint32_t direct_epoch_merge_partition(
-    const std::uint16_t *left, std::uint32_t left_count,
-    const std::uint16_t *right, std::uint32_t right_count,
-    std::uint32_t diagonal, const Row *candidates,
-    std::uint32_t raw_count, std::uint32_t q,
-    const std::uint32_t *raw_candidate_offsets,
-    const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
-    std::uint32_t batch_stride, std::uint32_t pending_batches) {
-  std::uint32_t low = diagonal > right_count
-      ? diagonal - right_count : 0u;
-  std::uint32_t high = min(diagonal, left_count);
-  while (low <= high) {
-    const std::uint32_t li = (low + high) >> 1u;
-    const std::uint32_t ri = diagonal - li;
-    if (li && ri < right_count && direct_epoch_candidate_less(
-            right[ri], left[li - 1u], candidates, raw_count, q,
-            raw_candidate_offsets, raw_payloads, raw_offsets,
-            batch_stride, pending_batches)) {
-      high = li - 1u;
-    } else if (ri && li < left_count && direct_epoch_candidate_less(
-                   left[li], right[ri - 1u], candidates, raw_count, q,
-                   raw_candidate_offsets, raw_payloads, raw_offsets,
-                   batch_stride, pending_batches)) {
-      low = li + 1u;
-    } else {
-      return li;
-    }
+__device__ __forceinline__ std::uint32_t direct_epoch_raw_segment_bound(
+    const Row *candidates, std::uint32_t raw_count,
+    std::uint32_t local_quotient) {
+  std::uint32_t low = 0u, high = raw_count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if ((candidates[middle].flags >> kMergeSourceBits) < local_quotient)
+      low = middle + 1u;
+    else
+      high = middle;
   }
   return low;
 }
@@ -4059,6 +3989,11 @@ __global__ void compact_direct_epoch_jobs_kernel(
   __shared__ std::uint32_t output_valid_shared;
   __shared__ std::uint32_t metadata_begin_shared;
   __shared__ std::uint32_t metadata_count_shared;
+  // One adaptive warp group owns a complete section during each radix pass.
+  // Counts and bases are private to each participating warp, so sections are
+  // sorted independently without storing the known upper key bits.
+  __shared__ std::uint32_t radix_counts[kThreads / 32u][16u];
+  __shared__ std::uint16_t radix_bases[kThreads / 32u][16u];
   if (plan->status) return;
   const DeviceManifestSnapshot manifest = load_active_manifest(
       manifests, active_manifest);
@@ -4153,6 +4088,54 @@ __global__ void compact_direct_epoch_jobs_kernel(
 
     const std::uint32_t lane = threadIdx.x & 31u;
     const std::uint32_t warp = threadIdx.x >> 5u;
+
+    // Raw admission storage is already grouped by upper-16-bit quotient.  Put
+    // each quotient's 16 batch intervals next to one another immediately, so
+    // the radix sorter below only has to order the remaining 16 key bits.
+    // indices_a is scratch for these prefixes until every candidate is loaded.
+    if (!updates_are_resolved) {
+      if (threadIdx.x == 0u) {
+        std::uint32_t prefix = 0u;
+        indices_a[0] = 0u;
+        for (std::uint32_t local_q = 0u; local_q < quotient_count;
+             ++local_q) {
+          const std::uint32_t q = q_begin + local_q;
+          for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+            const std::size_t base =
+                std::size_t{batch} * (kQuotients + 1u);
+            prefix += raw_offsets[base + q + 1u] - raw_offsets[base + q];
+          }
+          indices_a[local_q + 1u] = static_cast<std::uint16_t>(prefix);
+        }
+      }
+      __syncthreads();
+
+      for (std::uint32_t local_q = warp; local_q < quotient_count;
+           local_q += blockDim.x / 32u) {
+        const std::uint32_t q = q_begin + local_q;
+        std::uint32_t destination = indices_a[local_q];
+        for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+          const std::size_t base =
+              std::size_t{batch} * (kQuotients + 1u);
+          const std::uint32_t begin = raw_offsets[base + q];
+          const std::uint32_t count = raw_offsets[base + q + 1u] - begin;
+          for (std::uint32_t i = lane; i < count; i += 32u) {
+            const std::size_t source =
+                std::size_t{batch} * batch_stride + begin + i;
+            const RawPayload payload = raw_payloads[source];
+            candidates[destination + i] = {
+                static_cast<std::uint32_t>(source),
+                static_cast<std::uint16_t>(raw_keys[source]),
+                static_cast<std::uint16_t>(
+                    (local_q << kMergeSourceBits) |
+                    ((payload.metadata & kRawTombstone) ? kTombstone : 0u))};
+          }
+          destination += count;
+        }
+      }
+      __syncthreads();
+    }
+
     const std::uint32_t words = (task_rows + 31u) / 32u;
     for (std::uint32_t word = warp; word < words;
          word += blockDim.x / 32u) {
@@ -4181,20 +4164,10 @@ __global__ void compact_direct_epoch_jobs_kernel(
             row.flags = static_cast<std::uint16_t>(
                 ((key >> 16u) - q_begin) << kMergeSourceBits);
           } else {
-          const std::uint32_t batch = direct_raw_batch_for_candidate(
-              static_cast<std::uint16_t>(candidate),
-              source_offsets, pending_batches);
-          const std::uint32_t local =
-              candidate - source_offsets[batch];
-          const std::size_t base =
-              std::size_t{batch} * (kQuotients + 1u);
-          const std::size_t source = std::size_t{batch} * batch_stride +
-              raw_offsets[base + q_begin] + local;
-          const RawPayload payload = raw_payloads[source];
-          row = raw_row(raw_keys[source], payload);
-          tombstone = (payload.metadata & kRawTombstone) != 0u;
-          row.flags = static_cast<std::uint16_t>(
-              ((raw_keys[source] >> 16u) - q_begin) << kMergeSourceBits);
+            row = candidates[candidate];
+            tombstone = (row.flags & kTombstone) != 0u;
+            row.flags = static_cast<std::uint16_t>(
+                row.flags & ~((1u << kMergeSourceBits) - 1u));
           }
         } else {
           std::uint32_t level = 0u;
@@ -4230,55 +4203,103 @@ __global__ void compact_direct_epoch_jobs_kernel(
     __syncthreads();
 
     bool input_is_a = true;
-    for (std::uint32_t width = 1u;
-         !updates_are_resolved && width < raw_count; width <<= 1u) {
+    // The upper key half is fixed by the section segment.  Four stable 4-bit
+    // passes therefore completely order the lower 16 bits.  A warp owns one
+    // segment at a time; it advances digit cursors in input order, preserving
+    // stability without comparison sorting or full-key temporary storage.
+    for (std::uint32_t pass = 0u;
+         !updates_are_resolved && raw_count && pass < 4u; ++pass) {
       const std::uint16_t *input = input_is_a ? indices_a : indices_b;
       std::uint16_t *output = input_is_a ? indices_b : indices_a;
-      // Give every worker one short consecutive output interval.  It finds
-      // the interval's merge position once, then advances linearly.  The
-      // previous per-output partitioning repeated a binary search for nearly
-      // every row in the large rounds.
-      const std::uint32_t items_per_thread =
-          (raw_count + kThreads - 1u) / kThreads;
-      std::uint32_t position = threadIdx.x * items_per_thread;
-      const std::uint32_t thread_end = min(
-          position + items_per_thread, raw_count);
-      while (position < thread_end) {
-        const std::uint32_t pair_begin =
-            (position / (width * 2u)) * width * 2u;
-        const std::uint32_t left_count = min(
-            width, raw_count - pair_begin);
-        const std::uint32_t right_begin = pair_begin + left_count;
-        const std::uint32_t right_count = right_begin < raw_count
-            ? min(width, raw_count - right_begin) : 0u;
-        const std::uint32_t pair_end = right_begin + right_count;
-        const std::uint32_t output_end = min(thread_end, pair_end);
-        if (!right_count) {
-          while (position < output_end) {
-            output[position] = input[position];
-            ++position;
+      const std::uint32_t shift = pass * 4u;
+      constexpr std::uint32_t kWarps = kThreads / 32u;
+      const std::uint32_t warps_per_q = quotient_count <= 1u ? 8u :
+          quotient_count <= 2u ? 4u : quotient_count <= 4u ? 2u : 1u;
+      const std::uint32_t q_groups = kWarps / warps_per_q;
+      const std::uint32_t q_group = warp / warps_per_q;
+      const std::uint32_t warp_in_q = warp % warps_per_q;
+      const std::uint32_t q_rounds =
+          (quotient_count + q_groups - 1u) / q_groups;
+      for (std::uint32_t round = 0u; round < q_rounds; ++round) {
+        const std::uint32_t local_q = round * q_groups + q_group;
+        const bool valid_q = local_q < quotient_count;
+        std::uint32_t begin = 0u, end = 0u;
+        if (valid_q && lane == 0u) {
+          begin = direct_epoch_raw_segment_bound(
+              candidates, raw_count, local_q);
+          end = direct_epoch_raw_segment_bound(
+              candidates, raw_count, local_q + 1u);
+        }
+        begin = __shfl_sync(0xffffffffu, begin, 0);
+        end = __shfl_sync(0xffffffffu, end, 0);
+        const std::uint32_t q_count = end - begin;
+        const std::uint32_t warp_items =
+            (q_count + warps_per_q - 1u) / warps_per_q;
+        const std::uint32_t warp_begin =
+            begin + min(warp_in_q * warp_items, q_count);
+        const std::uint32_t warp_end =
+            begin + min((warp_in_q + 1u) * warp_items, q_count);
+
+        if (lane < 16u) radix_counts[warp][lane] = 0u;
+        __syncthreads();
+        for (std::uint32_t chunk = warp_begin;
+             chunk < warp_end; chunk += 32u) {
+          const std::uint32_t position = chunk + lane;
+          const bool valid = position < warp_end;
+          const std::uint32_t active =
+              __ballot_sync(0xffffffffu, valid);
+          if (valid) {
+            const std::uint32_t digit =
+                (candidates[input[position]].key >> shift) & 15u;
+            const std::uint32_t peers = __match_any_sync(active, digit);
+            const std::uint32_t leader = __ffs(peers) - 1u;
+            if (lane == leader)
+              radix_counts[warp][digit] += __popc(peers);
           }
-          continue;
         }
-        const std::uint16_t *left = input + pair_begin;
-        const std::uint16_t *right = input + right_begin;
-        const std::uint32_t diagonal = position - pair_begin;
-        std::uint32_t left_index = direct_epoch_merge_partition(
-            left, left_count, right, right_count, diagonal, candidates,
-            raw_count, q_begin, source_offsets, raw_payloads, raw_offsets,
-            batch_stride, pending_batches);
-        std::uint32_t right_index = diagonal - left_index;
-        while (position < output_end) {
-          const bool take_left = right_index >= right_count ||
-              (left_index < left_count && direct_epoch_candidate_less(
-                  left[left_index], right[right_index], candidates,
-                  raw_count, q_begin, source_offsets, raw_payloads,
-                  raw_offsets, batch_stride, pending_batches));
-          output[position++] = take_left
-              ? left[left_index++] : right[right_index++];
+        __syncthreads();
+        if (valid_q && warp_in_q == 0u && lane == 0u) {
+          std::uint32_t prefix = begin;
+#pragma unroll
+          for (std::uint32_t digit = 0u; digit < 16u; ++digit) {
+            for (std::uint32_t local_warp = 0u;
+                 local_warp < warps_per_q; ++local_warp) {
+              const std::uint32_t physical_warp =
+                  q_group * warps_per_q + local_warp;
+              radix_bases[physical_warp][digit] =
+                  static_cast<std::uint16_t>(prefix);
+              prefix += radix_counts[physical_warp][digit];
+              radix_counts[physical_warp][digit] = 0u;
+            }
+          }
         }
+        __syncthreads();
+
+        for (std::uint32_t chunk = warp_begin;
+             chunk < warp_end; chunk += 32u) {
+          const std::uint32_t position = chunk + lane;
+          const bool valid = position < warp_end;
+          const std::uint32_t active =
+              __ballot_sync(0xffffffffu, valid);
+          if (valid) {
+            const std::uint16_t candidate = input[position];
+            const std::uint32_t digit =
+                (candidates[candidate].key >> shift) & 15u;
+            const std::uint32_t peers = __match_any_sync(active, digit);
+            const std::uint32_t leader = __ffs(peers) - 1u;
+            std::uint32_t prior = 0u;
+            if (lane == leader) {
+              prior = radix_counts[warp][digit];
+              radix_counts[warp][digit] += __popc(peers);
+            }
+            prior = __shfl_sync(peers, prior, leader);
+            const std::uint32_t rank =
+                __popc(peers & ((1u << lane) - 1u));
+            output[radix_bases[warp][digit] + prior + rank] = candidate;
+          }
+        }
+        __syncthreads();
       }
-      __syncthreads();
       input_is_a = !input_is_a;
     }
 
@@ -4307,9 +4328,9 @@ __global__ void compact_direct_epoch_jobs_kernel(
                   kMergeSourceBits;
       if (!first) continue;
       std::uint16_t winner = candidate;
-      std::uint32_t newest = direct_raw_metadata(
-          candidate, q_begin, source_offsets, raw_payloads, raw_offsets,
-          batch_stride, pending_batches) & ~kRawTombstone;
+      std::uint32_t newest =
+          raw_payloads[candidates[candidate].value].metadata &
+          ~kRawTombstone;
       std::uint32_t next = index + 1u;
       while (next < raw_count &&
              (pull_candidate_order_key(candidates[raw_sorted[next]]) >>
@@ -4317,9 +4338,9 @@ __global__ void compact_direct_epoch_jobs_kernel(
                  (pull_candidate_order_key(candidates[candidate]) >>
                   kMergeSourceBits)) {
         const std::uint16_t other = raw_sorted[next++];
-        const std::uint32_t age = direct_raw_metadata(
-            other, q_begin, source_offsets, raw_payloads, raw_offsets,
-            batch_stride, pending_batches) & ~kRawTombstone;
+        const std::uint32_t age =
+            raw_payloads[candidates[other].value].metadata &
+            ~kRawTombstone;
         if (age > newest) {
           newest = age;
           winner = other;
@@ -4337,6 +4358,10 @@ __global__ void compact_direct_epoch_jobs_kernel(
       if (!(winner_mask & (1u << item))) continue;
       const std::uint32_t index = threadIdx.x * items_per_thread + item;
       const std::uint16_t winner = raw_resolved[index];
+      if (!updates_are_resolved) {
+        const RawPayload payload = raw_payloads[candidates[winner].value];
+        candidates[winner].value = payload.value;
+      }
       candidates[winner].flags = static_cast<std::uint16_t>(
           candidates[winner].flags & ~((1u << kMergeSourceBits) - 1u));
       const_cast<std::uint16_t *>(raw_sorted)[
@@ -4548,6 +4573,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
     const std::uint32_t merged_count =
         task_rows - raw_count + resolved_raw_count_shared;
     const std::uint16_t *sorted = input_is_a ? indices_a : indices_b;
+
     std::uint16_t *survivors = input_is_a ? indices_b : indices_a;
     const std::uint32_t merged_items_per_thread =
         (merged_count + kThreads - 1u) / kThreads;
