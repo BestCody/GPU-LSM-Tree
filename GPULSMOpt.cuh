@@ -69,9 +69,10 @@ constexpr std::uint32_t kRangeSubgroupWork = 512u;
 constexpr std::uint32_t kLookupWarpsPerBlock = 8u;
 constexpr std::uint32_t kLookupHashSlots = 64u;
 constexpr std::uint32_t kEmptyLookupKey = 1u << 16u;
-constexpr std::uint32_t kDirectAdmissionMinimum = kQuotients / 16u;
-constexpr std::uint32_t kDirectAdmissionMaximum =
-    kQuotients * 8u;
+constexpr std::uint32_t kAdmissionCtaGroupMaximum = 64u;
+constexpr std::uint32_t kAdmissionCtaHashSlots = 128u;
+static_assert((kAdmissionCtaHashSlots &
+               (kAdmissionCtaHashSlots - 1u)) == 0u);
 constexpr std::uint32_t kFoundationCompactionThreads = 256u;
 constexpr std::uint32_t kFoundationItemsPerThread = 9u;
 constexpr std::uint32_t kFoundationSectionCapacity =
@@ -2346,44 +2347,6 @@ __global__ void warp_range_fragment_kernel(
   }
 }
 
-__global__ void gather_raw_batch_kernel(
-    const std::uint32_t *sorted_keys, const std::uint32_t *sorted_ids,
-    const std::uint32_t *values, std::uint32_t count, std::uint32_t batch_slot,
-    bool tombstone, std::uint32_t *destination_keys,
-    RawPayload *destination_payloads,
-    std::uint64_t *batch_signatures,
-    std::uint64_t *epoch_signatures) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) return;
-  const std::uint32_t original = sorted_ids[i];
-  destination_keys[i] = sorted_keys[i];
-  destination_payloads[i] = make_raw_payload(
-      tombstone ? 0u : values[original],
-      (batch_slot << kBatchPositionBits) | original, tombstone);
-  const std::uint32_t key = sorted_keys[i];
-  const std::uint32_t first = key * 0x9e3779b1u;
-  const std::uint32_t second = (key ^ (key >> 16u)) * 0x85ebca6bu;
-  const std::uint64_t bits =
-      (1ull << (first >> 26u)) | (1ull << (second >> 26u));
-  const unsigned active = __activemask();
-  const std::uint32_t quotient = key >> 16u;
-  const unsigned peers = __match_any_sync(active, quotient);
-  const std::uint32_t low = __reduce_or_sync(
-      peers, static_cast<std::uint32_t>(bits));
-  const std::uint32_t high = __reduce_or_sync(
-      peers, static_cast<std::uint32_t>(bits >> 32u));
-  if ((threadIdx.x & 31u) == static_cast<std::uint32_t>(__ffs(peers) - 1)) {
-    const std::uint64_t aggregate =
-        std::uint64_t{low} | (std::uint64_t{high} << 32u);
-    atomicOr(reinterpret_cast<unsigned long long *>(
-                 batch_signatures + quotient),
-             static_cast<unsigned long long>(aggregate));
-    atomicOr(reinterpret_cast<unsigned long long *>(
-                 epoch_signatures + quotient),
-             static_cast<unsigned long long>(aggregate));
-  }
-}
-
 __device__ __forceinline__ std::uint64_t pending_signature_bits(
     std::uint32_t key) {
   const std::uint32_t first = key * 0x9e3779b1u;
@@ -2394,22 +2357,106 @@ __device__ __forceinline__ std::uint64_t pending_signature_bits(
 __global__ void count_admission_quotients_kernel(
     const std::uint32_t *keys, std::uint32_t count,
     std::uint32_t *quotient_counts,
-    std::uint32_t *reservation_ranks,
+    std::uint32_t *reservation_ranks) {
+  constexpr std::uint32_t kEmpty = 0xffffffffu;
+  __shared__ std::uint32_t local_keys[kAdmissionCtaHashSlots];
+  __shared__ std::uint32_t local_counts[kAdmissionCtaHashSlots];
+  __shared__ std::uint32_t global_bases[kAdmissionCtaHashSlots];
+  __shared__ std::uint32_t warp_group_counts[kThreads / 32u];
+
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool valid = i < count;
+  const std::uint32_t key = valid ? keys[i] : 0u;
+  const std::uint32_t quotient = key >> 16u;
+  const unsigned active = __ballot_sync(0xffffffffu, valid);
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  unsigned peers = 0u;
+  std::uint32_t leader = 0u;
+  bool group_leader = false;
+  if (valid) {
+    peers = __match_any_sync(active, quotient);
+    leader = __ffs(peers) - 1u;
+    group_leader = lane == leader;
+  }
+  const unsigned leaders = __ballot_sync(0xffffffffu, group_leader);
+  if (lane == 0u) warp_group_counts[warp] = __popc(leaders);
+  __syncthreads();
+  std::uint32_t cta_group_count = 0u;
+#pragma unroll
+  for (std::uint32_t w = 0u; w < kThreads / 32u; ++w)
+    cta_group_count += warp_group_counts[w];
+
+  // Random input usually has almost no repeated quotient inside a CTA.  In
+  // that case a CTA hash only adds synchronization and probing, so preserve
+  // the same histogram/scatter algorithm but stop aggregation at the warp.
+  // Grouped or skewed input uses the CTA hash and emits one global update per
+  // quotient for the whole CTA.
+  if (cta_group_count > kAdmissionCtaGroupMaximum) {
+    if (!valid) return;
+    std::uint32_t base = 0u;
+    if (group_leader)
+      base = atomicAdd(quotient_counts + quotient, __popc(peers));
+    base = __shfl_sync(peers, base, leader);
+    const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+    reservation_ranks[i] = base + __popc(peers & before);
+    return;
+  }
+
+  for (std::uint32_t slot = threadIdx.x;
+       slot < kAdmissionCtaHashSlots; slot += blockDim.x) {
+    local_keys[slot] = kEmpty;
+    local_counts[slot] = 0u;
+  }
+  __syncthreads();
+
+  std::uint32_t local_slot = 0u;
+  std::uint32_t local_rank = 0u;
+  if (valid) {
+    std::uint32_t group_base = 0u;
+    if (group_leader) {
+      local_slot = (quotient * 0x9e3779b1u) &
+          (kAdmissionCtaHashSlots - 1u);
+      while (true) {
+        const std::uint32_t found = atomicCAS(
+            local_keys + local_slot, kEmpty, quotient);
+        if (found == kEmpty || found == quotient) break;
+        local_slot = (local_slot + 1u) &
+            (kAdmissionCtaHashSlots - 1u);
+      }
+      group_base = atomicAdd(local_counts + local_slot, __popc(peers));
+    }
+    local_slot = __shfl_sync(peers, local_slot, leader);
+    group_base = __shfl_sync(peers, group_base, leader);
+    const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+    local_rank = group_base + __popc(peers & before);
+  }
+  __syncthreads();
+
+  for (std::uint32_t slot = threadIdx.x;
+       slot < kAdmissionCtaHashSlots; slot += blockDim.x) {
+    const std::uint32_t local_quotient = local_keys[slot];
+    if (local_quotient == kEmpty) continue;
+    global_bases[slot] = atomicAdd(
+        quotient_counts + local_quotient, local_counts[slot]);
+  }
+  __syncthreads();
+
+  if (valid)
+    reservation_ranks[i] = global_bases[local_slot] + local_rank;
+}
+
+__global__ void build_admission_signatures_kernel(
+    const std::uint32_t *section_grouped_keys, std::uint32_t count,
     std::uint64_t *batch_signatures) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  const std::uint32_t key = keys[i];
+  const std::uint32_t key = section_grouped_keys[i];
   const std::uint32_t quotient = key >> 16u;
   const unsigned active = __activemask();
   const unsigned peers = __match_any_sync(active, quotient);
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t leader = __ffs(peers) - 1u;
-  std::uint32_t base = 0u;
-  if (lane == leader)
-    base = atomicAdd(quotient_counts + quotient, __popc(peers));
-  base = __shfl_sync(peers, base, leader);
-  const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
-  reservation_ranks[i] = base + __popc(peers & before);
   const std::uint64_t bits = pending_signature_bits(key);
   const std::uint32_t low = __reduce_or_sync(
       peers, static_cast<std::uint32_t>(bits));
@@ -2451,22 +2498,6 @@ __global__ void scatter_admission_records_kernel(
   destination_payloads[output] = make_raw_payload(
       tombstone ? 0u : values[i],
       (batch_slot << kBatchPositionBits) | i, tombstone);
-}
-
-__global__ void finalize_quotient_metadata_kernel(
-    const std::uint32_t *sorted_keys, std::uint32_t count,
-    std::uint32_t *offsets) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kQuotients) return;
-  const std::uint32_t key = q << 16u;
-  std::uint32_t lo = 0u, hi = count;
-  while (lo < hi) {
-    const std::uint32_t mid = (lo + hi) >> 1u;
-    if (sorted_keys[mid] < key) lo = mid + 1u;
-    else hi = mid;
-  }
-  offsets[q] = lo;
-  if (q + 1u == kQuotients) offsets[kQuotients] = count;
 }
 
 __global__ void build_query_quotient_offsets_kernel(
@@ -5337,50 +5368,30 @@ private:
         gpulsmopt2_detail::kQuotients * sizeof(std::uint64_t), stream));
     std::uint32_t *batch_offsets = raw_offsets_.data() +
         std::size_t{slot} * (gpulsmopt2_detail::kQuotients + 1u);
-    const bool direct =
-        n >= gpulsmopt2_detail::kDirectAdmissionMinimum &&
-        n <= gpulsmopt2_detail::kDirectAdmissionMaximum;
-    if (direct) {
-      gpulsmopt2_detail::count_admission_quotients_kernel<<<
-          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
-              keys, n, admission_counts_.data(), radix_ids_out_.data(),
-              batch_signatures);
-      std::size_t scan_bytes = admission_temp_.size();
-      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-          admission_temp_.data(), scan_bytes, admission_counts_.data(),
-          batch_offsets, gpulsmopt2_detail::kQuotients + 1u, stream));
-      gpulsmopt2_detail::commit_admission_metadata_kernel<<<
-          gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
-          gpulsmopt2_detail::kThreads, 0, stream>>>(
-              admission_counts_.data(), batch_signatures,
-              raw_epoch_signatures_.data());
-      gpulsmopt2_detail::scatter_admission_records_kernel<<<
-          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
-              keys, values, n, slot, tombstone,
-              batch_offsets, radix_ids_out_.data(),
-              raw_keys_.data() + std::size_t{slot} * batch_capacity_,
-              raw_payloads_.data() + std::size_t{slot} * batch_capacity_);
-    } else {
-      std::size_t sort_bytes{};
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, sort_bytes, keys, radix_keys_.data(),
-          radix_ids_out_.data(), radix_ids_out_.data(), n, 16, 32, stream));
-      ensure_radix_workspace(sort_bytes, n, stream);
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          radix_workspace(), sort_bytes, keys, radix_keys_.data(),
-          radix_input_ids(), radix_ids_out_.data(), n, 16, 32, stream));
-      gpulsmopt2_detail::gather_raw_batch_kernel<<<
-          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
-              radix_keys_.data(), radix_ids_out_.data(), values, n, slot,
-              tombstone,
-              raw_keys_.data() + std::size_t{slot} * batch_capacity_,
-              raw_payloads_.data() + std::size_t{slot} * batch_capacity_,
-              batch_signatures, raw_epoch_signatures_.data());
-      gpulsmopt2_detail::finalize_quotient_metadata_kernel<<<
-          gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
-          gpulsmopt2_detail::kThreads, 0, stream>>>(
-              radix_keys_.data(), n, batch_offsets);
-    }
+    gpulsmopt2_detail::count_admission_quotients_kernel<<<
+        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            keys, n, admission_counts_.data(), radix_ids_out_.data());
+    std::size_t scan_bytes = admission_temp_.size();
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        admission_temp_.data(), scan_bytes, admission_counts_.data(),
+        batch_offsets, gpulsmopt2_detail::kQuotients + 1u, stream));
+    std::uint32_t *destination_keys = raw_keys_.data() +
+        std::size_t{slot} * batch_capacity_;
+    gpulsmopt2_detail::RawPayload *destination_payloads =
+        raw_payloads_.data() + std::size_t{slot} * batch_capacity_;
+    gpulsmopt2_detail::scatter_admission_records_kernel<<<
+        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            keys, values, n, slot, tombstone,
+            batch_offsets, radix_ids_out_.data(),
+            destination_keys, destination_payloads);
+    gpulsmopt2_detail::build_admission_signatures_kernel<<<
+        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            destination_keys, n, batch_signatures);
+    gpulsmopt2_detail::commit_admission_metadata_kernel<<<
+        gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            admission_counts_.data(), batch_signatures,
+            raw_epoch_signatures_.data());
     CUDA_CHECK(cudaGetLastError());
     raw_batch_counts_[slot] = n;
     ++pending_batches_;
