@@ -842,11 +842,6 @@ private:
   std::vector<Mapping> mappings_;
 };
 
-__global__ void iota_kernel(std::uint32_t *ids, std::uint32_t count) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < count) ids[i] = i;
-}
-
 __device__ __forceinline__ std::uint32_t size_class_for(
     std::uint32_t count) {
   if (count <= 1u) return 0u;
@@ -911,6 +906,45 @@ __device__ __forceinline__ void guide_search_bounds(
   }
   begin = lo * count / kGuideRegions;
   end = (lo + 1u) * count / kGuideRegions;
+}
+
+__device__ __forceinline__ void resident_point_search_bounds(
+    std::uint32_t q, std::uint32_t level, std::uint32_t suffix,
+    std::uint32_t foundation_level, const Descriptor &selected_rows,
+    std::uint32_t selected_route, std::uint32_t route_count,
+    const Descriptor *descriptors,
+    const std::uint32_t *route_logical_begins,
+    const std::uint32_t *level_q_logical_offsets,
+    const std::uint16_t *local_rank, const std::uint16_t *level_guides,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
+    std::uint32_t &begin, std::uint32_t &end) {
+  const std::uint32_t logical_count =
+      descriptors[descriptor_index(q, level)].count();
+  const std::uint32_t cell = suffix / kFoundationCellKeys;
+  CellInputSlice logical{};
+  const bool ranked = exact_cell_input_slice(
+      q, level, cell, foundation_level, logical_count, local_rank,
+      level_cell_rank_blocks, level_cell_ranks, logical);
+  if (!ranked) {
+    guide_search_bounds(level_guides, q, level, logical_count, suffix,
+                        logical.begin, logical.count);
+    logical.count -= logical.begin;
+  }
+  const std::uint32_t logical_begin = logical.begin;
+  const std::uint32_t logical_end = logical.begin + logical.count;
+  if (route_count == 1u) {
+    begin = logical_begin;
+    end = min(selected_rows.count(), logical_end);
+    return;
+  }
+  const std::uint32_t section_begin = level_q_logical_offsets[
+      std::size_t{level} * (kQuotients + 1u) + q];
+  const std::uint32_t route_begin =
+      route_logical_begins[selected_route] - section_begin;
+  begin = logical_begin > route_begin ? logical_begin - route_begin : 0u;
+  end = min(selected_rows.count(), logical_end > route_begin
+      ? logical_end - route_begin : 0u);
 }
 
 __device__ __forceinline__ std::uint32_t upper_bound_rows(
@@ -2543,6 +2577,20 @@ __global__ void scatter_admission_records_kernel(
   destination_payloads[output] = make_raw_payload(
       tombstone ? 0u : values[i],
       (batch_slot << kBatchPositionBits) | i, tombstone);
+}
+
+__global__ void scatter_query_records_kernel(
+    const std::uint32_t *queries, std::uint32_t count,
+    const std::uint32_t *offsets,
+    const std::uint32_t *reservation_ranks,
+    std::uint32_t *grouped_queries, std::uint32_t *original_ids) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t key = queries[i];
+  const std::uint32_t q = key >> 16u;
+  const std::uint32_t output = offsets[q] + reservation_ranks[i];
+  grouped_queries[output] = key;
+  original_ids[output] = i;
 }
 
 __global__ void build_query_quotient_offsets_kernel(
@@ -5187,6 +5235,8 @@ __global__ void lookup_with_pending_kernel(
     const std::uint32_t *level_q_logical_offsets,
     const std::uint16_t *local_rank,
     const std::uint16_t *level_guides,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
     std::uint32_t active_levels,
     std::uint32_t foundation_level,
     std::uint64_t occupied_levels,
@@ -5258,25 +5308,12 @@ __global__ void lookup_with_pending_kernel(
     const Descriptor descriptor = selected.rows;
     if (!descriptor.count()) continue;
     const Row *rows = arena + descriptor.offset();
-    std::uint32_t begin = 0u, end = descriptor.count();
-    if (route_header.count == 1u) {
-      guide_search_bounds(level_guides, q, level, descriptor.count(), suffix,
-                          begin, end);
-    } else {
-      const std::uint32_t logical_count =
-          descriptors[descriptor_index(q, level)].count();
-      std::uint32_t logical_begin = 0u, logical_end = logical_count;
-      guide_search_bounds(level_guides, q, level, logical_count, suffix,
-                          logical_begin, logical_end);
-      const std::uint32_t section_begin = level_q_logical_offsets[
-          std::size_t{level} * (kQuotients + 1u) + q];
-      const std::uint32_t route_begin =
-          route_logical_begins[selected.route] - section_begin;
-      begin = logical_begin > route_begin
-          ? logical_begin - route_begin : 0u;
-      end = min(descriptor.count(), logical_end > route_begin
-          ? logical_end - route_begin : 0u);
-    }
+    std::uint32_t begin{}, end{};
+    resident_point_search_bounds(
+        q, level, suffix, foundation_level, descriptor, selected.route,
+        route_header.count, descriptors, route_logical_begins,
+        level_q_logical_offsets, local_rank, level_guides,
+        level_cell_rank_blocks, level_cell_ranks, begin, end);
     if (begin >= end) continue;
     const std::uint32_t position =
         lower_bound_rows(rows + begin, end - begin, suffix);
@@ -5364,6 +5401,8 @@ __device__ __forceinline__ void lookup_resident_only(
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
     const std::uint16_t *local_rank, const std::uint16_t *level_guides,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
     std::uint32_t active_levels, std::uint32_t foundation_level,
     std::uint64_t occupied_levels, const std::uint32_t *query_ids,
     std::uint32_t *final_values, std::uint8_t *final_found) {
@@ -5385,25 +5424,12 @@ __device__ __forceinline__ void lookup_resident_only(
     const Descriptor descriptor = selected.rows;
     if (!descriptor.count()) continue;
     const Row *rows = arena + descriptor.offset();
-    std::uint32_t begin = 0u, end = descriptor.count();
-    if (route_header.count == 1u) {
-      guide_search_bounds(level_guides, q, level, descriptor.count(), suffix,
-                          begin, end);
-    } else {
-      const std::uint32_t logical_count =
-          descriptors[descriptor_index(q, level)].count();
-      std::uint32_t logical_begin = 0u, logical_end = logical_count;
-      guide_search_bounds(level_guides, q, level, logical_count, suffix,
-                          logical_begin, logical_end);
-      const std::uint32_t section_begin = level_q_logical_offsets[
-          std::size_t{level} * (kQuotients + 1u) + q];
-      const std::uint32_t route_begin =
-          route_logical_begins[selected.route] - section_begin;
-      begin = logical_begin > route_begin
-          ? logical_begin - route_begin : 0u;
-      end = min(descriptor.count(), logical_end > route_begin
-          ? logical_end - route_begin : 0u);
-    }
+    std::uint32_t begin{}, end{};
+    resident_point_search_bounds(
+        q, level, suffix, foundation_level, descriptor, selected.route,
+        route_header.count, descriptors, route_logical_begins,
+        level_q_logical_offsets, local_rank, level_guides,
+        level_cell_rank_blocks, level_cell_ranks, begin, end);
     if (begin >= end) continue;
     const std::uint32_t position =
         lower_bound_rows(rows + begin, end - begin, suffix);
@@ -5537,6 +5563,8 @@ __global__ void lookup_with_dense_router_kernel(
     const std::uint32_t *level_q_logical_offsets,
     const std::uint16_t *local_rank,
     const std::uint16_t *level_guides,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
     std::uint32_t active_levels,
     std::uint32_t foundation_level,
     std::uint64_t occupied_levels,
@@ -5575,6 +5603,7 @@ __global__ void lookup_with_dense_router_kernel(
           key, i, out_values, out_found, arena, descriptors,
           route_headers, route_slices, route_logical_begins,
           level_q_logical_offsets, local_rank, level_guides,
+          level_cell_rank_blocks, level_cell_ranks,
           active_levels, foundation_level, occupied_levels, query_ids,
           final_values, final_found);
     return;
@@ -5697,6 +5726,7 @@ __global__ void lookup_with_dense_router_kernel(
       key, i, out_values, out_found, arena, descriptors,
       route_headers, route_slices, route_logical_begins,
       level_q_logical_offsets, local_rank, level_guides,
+      level_cell_rank_blocks, level_cell_ranks,
       active_levels, foundation_level, occupied_levels, query_ids,
       final_values, final_found);
 }
@@ -6004,13 +6034,7 @@ public:
     CUDA_CHECK(cudaFuncGetAttributes(
         &dense_router_attributes,
         gpulsmopt2_detail::lookup_with_dense_router_kernel));
-    std::size_t initial_sort_bytes{};
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, initial_sort_bytes,
-        raw_keys_.data(),
-        radix_keys_.data(), radix_ids_out_.data(), radix_ids_out_.data(),
-        static_cast<std::uint32_t>(batch_capacity_), 16, 32, 0));
-    ensure_radix_workspace(initial_sort_bytes, batch_capacity_, 0);
+    ensure_radix_workspace(batch_capacity_);
     std::size_t admission_scan_bytes{};
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, admission_scan_bytes, admission_counts_.data(),
@@ -6174,15 +6198,23 @@ public:
     const std::uint32_t *queries = batch.queries;
     const std::uint32_t *query_ids = nullptr;
     if (grouped && !quotients_grouped) {
-      std::size_t bytes{};
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, bytes, batch.queries, radix_keys_.data(),
-          radix_ids_out_.data(), radix_ids_out_.data(), count, 16, 32,
-          stream));
-      ensure_radix_workspace(bytes, count, stream);
-      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          radix_workspace(), bytes, batch.queries, radix_keys_.data(),
-          radix_input_ids(), radix_ids_out_.data(), count, 16, 32, stream));
+      ensure_radix_workspace(count);
+      gpulsmopt2_detail::count_admission_quotients_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          batch.queries, count, admission_counts_.data(),
+          radix_input_ids());
+      std::size_t scan_bytes = admission_temp_.size();
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          admission_temp_.data(), scan_bytes, admission_counts_.data(),
+          query_quotient_offsets(),
+          gpulsmopt2_detail::kQuotients + 1u, stream));
+      gpulsmopt2_detail::scatter_query_records_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          batch.queries, count, query_quotient_offsets(),
+          radix_input_ids(), radix_keys_.data(), radix_ids_out_.data());
+      CUDA_CHECK(cudaMemsetAsync(
+          admission_counts_.data(), 0,
+          admission_counts_.size() * sizeof(std::uint32_t), stream));
       queries = radix_keys_.data();
       query_ids = radix_ids_out_.data();
     }
@@ -6202,7 +6234,9 @@ public:
             raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
             route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
-            local_rank_.data(), level_guides_.data(), active_levels_,
+            local_rank_.data(), level_guides_.data(),
+            level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
+            active_levels_,
             foundation_level(), occupied_level_mask(), query_ids,
             nullptr, nullptr, query_occupied_level_mask_.data());
       } else {
@@ -6215,7 +6249,8 @@ public:
             arena_.data(), descriptors_.data(), route_headers_.data(),
             route_slices_.data(), route_logical_begins_.data(),
             level_q_logical_offsets_.data(), local_rank_.data(),
-            level_guides_.data(), active_levels_, foundation_level(),
+            level_guides_.data(), level_cell_rank_blocks_.data(),
+            level_cell_ranks_.data(), active_levels_, foundation_level(),
             occupied_level_mask(), query_ids, nullptr, nullptr,
             query_occupied_level_mask_.data());
       }
@@ -6230,7 +6265,9 @@ public:
           raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
           route_headers_.data(), route_slices_.data(),
           route_logical_begins_.data(), level_q_logical_offsets_.data(),
-          local_rank_.data(), level_guides_.data(), active_levels_,
+          local_rank_.data(), level_guides_.data(),
+          level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
+          active_levels_,
           foundation_level(),
           occupied_level_mask(),
           nullptr, nullptr, nullptr, query_occupied_level_mask_.data());
@@ -7124,13 +7161,13 @@ private:
   static std::size_t aligned_id_bytes(std::size_t count) {
     return (count * sizeof(std::uint32_t) + 255u) & ~std::size_t{255u};
   }
-  void ensure_radix_workspace(std::size_t bytes, std::size_t count,
-                              cudaStream_t stream) {
+  void ensure_radix_workspace(std::size_t count) {
     const std::size_t capacity = std::max(radix_id_capacity_, count);
     const std::size_t ids_bytes = aligned_id_bytes(capacity);
-    const std::size_t required = ids_bytes * 3u + bytes;
-    const bool resized = radix_storage_.size() < required;
-    if (resized) radix_storage_.resize(required);
+    const std::size_t query_offset_bytes =
+        aligned_id_bytes(gpulsmopt2_detail::kQuotients + 1u);
+    const std::size_t required = ids_bytes * 3u + query_offset_bytes;
+    if (radix_storage_.size() < required) radix_storage_.resize(required);
     std::uint8_t *storage = radix_storage_.data();
     radix_keys_.attach(reinterpret_cast<std::uint32_t *>(storage), capacity);
     radix_ids_out_.attach(
@@ -7138,16 +7175,12 @@ private:
     radix_input_ids_ =
         reinterpret_cast<std::uint32_t *>(storage + ids_bytes * 2u);
     radix_workspace_ = storage + ids_bytes * 3u;
-    if (resized || count > radix_id_capacity_) {
-      gpulsmopt2_detail::iota_kernel<<<
-          blocks(capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
-              radix_input_ids_, static_cast<std::uint32_t>(capacity));
-      CUDA_CHECK(cudaGetLastError());
-    }
     radix_id_capacity_ = capacity;
   }
   std::uint32_t *radix_input_ids() { return radix_input_ids_; }
-  void *radix_workspace() { return radix_workspace_; }
+  std::uint32_t *query_quotient_offsets() {
+    return reinterpret_cast<std::uint32_t *>(radix_workspace_);
+  }
   void launch_section_ranges(cudaStream_t stream) {
     gpulsmopt2_detail::cooperative_section_owned_range_kernel<
         gpulsmopt2_detail::SumRowsAggregate>
