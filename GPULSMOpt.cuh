@@ -1448,7 +1448,8 @@ __global__ void cooperative_section_owned_range_kernel(
     const SectionRangeTask *tasks,
     const std::uint32_t *task_count, const Row *arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
-    const RouteSlice *route_slices, const std::uint32_t *raw_keys,
+    const RouteSlice *route_slices, const std::uint16_t *local_rank,
+    const std::uint32_t *raw_keys,
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, std::uint32_t active_levels,
@@ -1476,6 +1477,11 @@ __global__ void cooperative_section_owned_range_kernel(
   union BaseMaskWorkspace {
     std::uint32_t section[kSectionBaseMaskWords];
     std::uint32_t fragments[kSectionRangeWarps][kFragmentBaseMaskWords];
+    // The interval-union path consumes a stored-row tile once and exposes its
+    // inclusive value prefix to every interval endpoint in the union.  This
+    // aliases the old visibility masks: the two paths are mutually exclusive.
+    unsigned long long
+        warp_tile_prefix[kSectionRangeWarps][128u + 1u];
   };
   __shared__ BaseMaskWorkspace base_mask_workspace;
   __shared__ std::uint32_t current_count_shared;
@@ -1486,9 +1492,20 @@ __global__ void cooperative_section_owned_range_kernel(
   __shared__ std::uint32_t worker_width_shared;
   __shared__ std::uint32_t minimum_work_shared;
   __shared__ std::uint32_t maximum_work_shared;
+  __shared__ std::uint32_t use_union_sweep_shared;
+  __shared__ unsigned long long
+      union_direct_warp_shared[kSectionRangeWarps];
+  __shared__ unsigned long long
+      union_sweep_warp_shared[kSectionRangeWarps];
+  __shared__ std::uint32_t union_count_warp_shared[kSectionRangeWarps];
   __shared__ std::uint32_t fragment_work_shared[kSectionTaskFragments];
   __shared__ RangeFragmentBounds
       fragment_bounds_shared[kSectionTaskFragments];
+  // Exact foundation cell starts already exist for point lookup.  Extending
+  // them with the section count gives every endpoint a bounded [begin, end)
+  // search interval without adding persistent metadata.
+  __shared__ std::uint32_t foundation_cell_ranks[kFoundationCells + 1u];
+  __shared__ std::uint32_t foundation_ranks_valid_shared;
   __shared__ std::uint32_t section_base_mask_valid_shared;
   __shared__ std::uint32_t quotient_shared;
   __shared__ std::uint32_t fragment_begin_shared;
@@ -1529,6 +1546,32 @@ __global__ void cooperative_section_owned_range_kernel(
         descriptors[descriptor_index(q, threadIdx.x)];
   else if (threadIdx.x < active_levels)
     section_descriptors[threadIdx.x] = {};
+  // Warp zero loads the 256-byte rank block while the CTA is already doing
+  // task setup.  The existing synchronization below also publishes it, so
+  // rank narrowing adds no barrier.  A split or oversized section keeps the
+  // original full-route search.
+  if (threadIdx.x < 32u) {
+    bool ranked = false;
+    Descriptor rank_descriptor{};
+    if (local_rank && foundation_level < active_levels) {
+      rank_descriptor =
+          descriptors[descriptor_index(q, foundation_level)];
+      const RouteHeader rank_header =
+          route_headers[descriptor_index(q, foundation_level)];
+      ranked = rank_header.count == 1u &&
+          rank_descriptor.count() <= (1u << 16u);
+    }
+    if (threadIdx.x == 0u) {
+      foundation_ranks_valid_shared = ranked;
+      foundation_cell_ranks[kFoundationCells] = rank_descriptor.count();
+    }
+    if (ranked) {
+      for (std::uint32_t cell = threadIdx.x; cell < kFoundationCells;
+           cell += 32u)
+        foundation_cell_ranks[cell] =
+            local_rank[std::size_t{q} * kFoundationCells + cell];
+    }
+  }
   if (threadIdx.x == 0u) {
     foundation_descriptor_shared = foundation_level < active_levels
         ? section_descriptors[foundation_level] : Descriptor{};
@@ -1777,10 +1820,32 @@ __global__ void cooperative_section_owned_range_kernel(
       const Descriptor descriptor =
           route_slices[foundation_header.begin].rows;
       const Row *rows = arena + descriptor.offset();
-      bounds.base_begin = lower_bound_rows(
-          rows, descriptor.count(), fragment.low_suffix);
-      bounds.base_end = upper_bound_rows(
-          rows, descriptor.count(), fragment.high_suffix);
+      if (foundation_ranks_valid_shared) {
+        const std::uint32_t low_cell =
+            std::uint32_t{fragment.low_suffix} / kFoundationCellKeys;
+        const std::uint32_t low_begin =
+            foundation_cell_ranks[low_cell];
+        const std::uint32_t low_end =
+            foundation_cell_ranks[low_cell + 1u];
+        bounds.base_begin = low_begin + lower_bound_rows(
+            rows + low_begin, low_end - low_begin,
+            fragment.low_suffix);
+
+        const std::uint32_t high_cell =
+            std::uint32_t{fragment.high_suffix} / kFoundationCellKeys;
+        const std::uint32_t high_begin =
+            foundation_cell_ranks[high_cell];
+        const std::uint32_t high_end =
+            foundation_cell_ranks[high_cell + 1u];
+        bounds.base_end = high_begin + upper_bound_rows(
+            rows + high_begin, high_end - high_begin,
+            fragment.high_suffix);
+      } else {
+        bounds.base_begin = lower_bound_rows(
+            rows, descriptor.count(), fragment.low_suffix);
+        bounds.base_end = upper_bound_rows(
+            rows, descriptor.count(), fragment.high_suffix);
+      }
       base_work = bounds.base_end - bounds.base_begin;
     } else {
       base_work = route_range_row_count(
@@ -1807,6 +1872,312 @@ __global__ void cooperative_section_owned_range_kernel(
     next_fragment_shared = fragment_begin;
   }
   __syncthreads();
+
+  // The fragments are radix ordered by (quotient, low suffix).  Four warp
+  // scans identify disjoint unions and compute their exact row work in
+  // parallel.  No second endpoint sort or serial per-task planner is needed.
+  const std::uint32_t planning_warp = threadIdx.x >> 5u;
+  const std::uint32_t planning_lane = threadIdx.x & 31u;
+  constexpr unsigned planning_mask = 0xffffffffu;
+  const std::uint32_t planning_index = fragment_begin + threadIdx.x;
+  const bool planning_valid = planning_index < fragment_end;
+  SectionRangeFragment planning_fragment{};
+  RangeFragmentBounds planning_bounds{};
+  unsigned long long planning_direct = 0ull;
+  if (planning_valid) {
+    planning_fragment = fragments[planning_index];
+    planning_bounds =
+        fragment_bounds_shared[planning_index - fragment_begin];
+    planning_direct =
+        fragment_work_shared[planning_index - fragment_begin];
+  }
+
+  // A running maximum of high endpoints identifies a new union exactly when
+  // the next low endpoint exceeds every preceding high endpoint.
+  std::uint32_t prefix_high = planning_valid
+      ? planning_fragment.high_suffix : 0u;
+  for (std::uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
+    const std::uint32_t preceding =
+        __shfl_up_sync(planning_mask, prefix_high, offset);
+    if (planning_lane >= offset)
+      prefix_high = max(prefix_high, preceding);
+  }
+  const std::uint32_t preceding_high =
+      __shfl_up_sync(planning_mask, prefix_high, 1u);
+  const bool union_leader = planning_valid &&
+      (planning_lane == 0u ||
+       std::uint32_t{planning_fragment.low_suffix} > preceding_high);
+  const unsigned valid_lanes =
+      __ballot_sync(planning_mask, planning_valid);
+  const unsigned union_leaders =
+      __ballot_sync(planning_mask, union_leader);
+
+  std::uint32_t prefix_update_end = planning_bounds.update_end;
+  std::uint32_t prefix_base_end = planning_bounds.base_end;
+  for (std::uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
+    const std::uint32_t preceding_update =
+        __shfl_up_sync(planning_mask, prefix_update_end, offset);
+    const std::uint32_t preceding_base =
+        __shfl_up_sync(planning_mask, prefix_base_end, offset);
+    if (planning_lane >= offset) {
+      prefix_update_end = max(prefix_update_end, preceding_update);
+      prefix_base_end = max(prefix_base_end, preceding_base);
+    }
+  }
+  const unsigned through_lane = planning_lane == 31u
+      ? 0xffffffffu : ((1u << (planning_lane + 1u)) - 1u);
+  const unsigned preceding_leaders = union_leaders & through_lane;
+  const std::uint32_t leader_lane = preceding_leaders
+      ? 31u - static_cast<std::uint32_t>(__clz(preceding_leaders)) : 0u;
+  const std::uint32_t union_update_begin = __shfl_sync(
+      planning_mask, planning_bounds.update_begin, leader_lane);
+  const std::uint32_t union_base_begin = __shfl_sync(
+      planning_mask, planning_bounds.base_begin, leader_lane);
+  const bool union_last = planning_valid &&
+      (planning_lane == 31u ||
+       (valid_lanes & (1u << (planning_lane + 1u))) == 0u ||
+       (union_leaders & (1u << (planning_lane + 1u))) != 0u);
+  unsigned long long planning_union = union_last
+      ? std::uint64_t{prefix_update_end - union_update_begin} +
+          (foundation_header.count <= 1u
+              ? prefix_base_end - union_base_begin : 0u)
+      : 0ull;
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u) {
+    planning_direct += __shfl_down_sync(
+        planning_mask, planning_direct, offset);
+    planning_union += __shfl_down_sync(
+        planning_mask, planning_union, offset);
+  }
+  if (planning_lane == 0u) {
+    union_direct_warp_shared[planning_warp] = planning_direct;
+    union_sweep_warp_shared[planning_warp] = planning_union;
+    union_count_warp_shared[planning_warp] = __popc(union_leaders);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0u) {
+    unsigned long long direct_work = 0ull;
+    unsigned long long union_work = 0ull;
+    std::uint32_t union_count = 0u;
+    for (std::uint32_t warp = 0u; warp < kSectionRangeWarps; ++warp) {
+      direct_work += union_direct_warp_shared[warp];
+      union_work += union_sweep_warp_shared[warp];
+      union_count += union_count_warp_shared[warp];
+    }
+    const std::uint32_t fragment_count = fragment_end - fragment_begin;
+
+    // Split storage has no single physical row coordinate.  Only dense
+    // overlap pays to count its short route list exactly; sparse split tasks
+    // reject the sweep before doing any route searches.
+    if (foundation_header.count > 1u && fragment_count >= 8u &&
+        union_count * 4u <= fragment_count) {
+      for (std::uint32_t warp_begin = fragment_begin;
+           warp_begin < fragment_end; warp_begin += 32u) {
+        const std::uint32_t warp_end = min(warp_begin + 32u, fragment_end);
+        std::uint32_t cursor = warp_begin;
+        while (cursor < warp_end) {
+          const SectionRangeFragment first = fragments[cursor];
+          const std::uint32_t low = first.low_suffix;
+          std::uint32_t high = first.high_suffix;
+          ++cursor;
+          while (cursor < warp_end) {
+            const SectionRangeFragment next = fragments[cursor];
+            if (std::uint32_t{next.low_suffix} > high) break;
+            high = max(high, std::uint32_t{next.high_suffix});
+            ++cursor;
+          }
+          union_work += route_range_row_count(
+              low, high, arena, foundation_header, route_slices);
+        }
+      }
+    } else if (foundation_header.count > 1u) {
+      union_work = ~0ull;
+    }
+    use_union_sweep_shared = !overflow_shared && fragment_count >= 8u &&
+        union_work != 0ull && direct_work >= union_work * 2ull;
+  }
+  __syncthreads();
+
+  if (use_union_sweep_shared) {
+    // Four independent warp sweeps retain the row reuse without serializing
+    // the CTA at every tile.  Each warp owns 32 consecutive low-sorted
+    // intervals, discovers their disjoint unions, and processes a 128-row
+    // tile with only warp synchronization.  The four row tiles therefore run
+    // concurrently.
+    const std::uint32_t union_warp = threadIdx.x >> 5u;
+    const std::uint32_t union_lane = threadIdx.x & 31u;
+    constexpr unsigned union_mask = 0xffffffffu;
+    std::uint32_t cursor = min(
+        fragment_begin + union_warp * 32u, fragment_end);
+    const std::uint32_t warp_fragment_end = min(cursor + 32u, fragment_end);
+    while (cursor < warp_fragment_end) {
+      std::uint32_t union_end = cursor;
+      std::uint32_t union_low = 0u;
+      std::uint32_t union_high = 0u;
+      if (union_lane == 0u) {
+        const SectionRangeFragment first = fragments[cursor];
+        union_low = first.low_suffix;
+        union_high = first.high_suffix;
+        union_end = cursor + 1u;
+        while (union_end < warp_fragment_end) {
+          const SectionRangeFragment next = fragments[union_end];
+          if (std::uint32_t{next.low_suffix} > union_high) break;
+          union_high = max(union_high,
+                           std::uint32_t{next.high_suffix});
+          ++union_end;
+        }
+      }
+      union_end = __shfl_sync(union_mask, union_end, 0u);
+      union_low = __shfl_sync(union_mask, union_low, 0u);
+      union_high = __shfl_sync(union_mask, union_high, 0u);
+
+      const std::uint32_t fragment_index = cursor + union_lane;
+      const bool fragment_active = fragment_index < union_end;
+      SectionRangeFragment fragment{};
+      RangeFragmentBounds fragment_bounds{};
+      unsigned long long fragment_sum = 0ull;
+      if (fragment_active) {
+        fragment = fragments[fragment_index];
+        fragment_bounds =
+            fragment_bounds_shared[fragment_index - fragment_begin];
+        for (std::uint32_t index = fragment_bounds.update_begin;
+             index < fragment_bounds.update_end; ++index) {
+          const Row row = current[index];
+          if ((row.flags & kTombstone) == 0u)
+            fragment_sum = Aggregate::consume(fragment_sum, row);
+        }
+      }
+
+      // A single physical route uses the exact positions found during
+      // planning.  The first low endpoint is the union minimum, and the
+      // maximum saved end is the union maximum because upper_bound is
+      // monotone.  Split routes have independent coordinates and retain the
+      // route-local searches below.
+      std::uint32_t saved_union_begin = fragment_bounds.base_begin;
+      std::uint32_t saved_union_end = fragment_active
+          ? fragment_bounds.base_end : 0u;
+      if (foundation_header.count == 1u) {
+        saved_union_begin = __shfl_sync(
+            union_mask, saved_union_begin, 0u);
+        for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+          saved_union_end = max(saved_union_end, __shfl_down_sync(
+              union_mask, saved_union_end, offset));
+        saved_union_end = __shfl_sync(
+            union_mask, saved_union_end, 0u);
+      }
+
+      // A route of any physical size uses the same bounded row-tile loop.
+      // Split sections simply contribute more ordered routes.
+      for (std::uint32_t local_route = 0u;
+           local_route < foundation_header.count; ++local_route) {
+        const RouteSlice route =
+            route_slices[foundation_header.begin + local_route];
+        const Row *route_rows = arena + route.rows.offset();
+        std::uint32_t route_scan_begin = 0u;
+        std::uint32_t route_scan_end = 0u;
+        if (foundation_header.count == 1u) {
+          route_scan_begin = saved_union_begin;
+          route_scan_end = saved_union_end;
+        } else if (union_lane == 0u && route.suffix_end > union_low &&
+                   route.suffix_begin <= union_high) {
+          route_scan_begin = lower_bound_rows(
+              route_rows, route.rows.count(), union_low);
+          route_scan_end = upper_bound_rows(
+              route_rows, route.rows.count(), union_high);
+        }
+        route_scan_begin =
+            __shfl_sync(union_mask, route_scan_begin, 0u);
+        route_scan_end = __shfl_sync(union_mask, route_scan_end, 0u);
+
+        std::uint32_t fragment_route_begin = 0u;
+        std::uint32_t fragment_route_end = 0u;
+        if (fragment_active && route_scan_begin != route_scan_end) {
+          if (foundation_header.count == 1u) {
+            fragment_route_begin = fragment_bounds.base_begin;
+            fragment_route_end = fragment_bounds.base_end;
+          } else {
+            fragment_route_begin = lower_bound_rows(
+                route_rows, route.rows.count(), fragment.low_suffix);
+            fragment_route_end = upper_bound_rows(
+                route_rows, route.rows.count(), fragment.high_suffix);
+          }
+        }
+
+        constexpr std::uint32_t kUnionTileRows = 128u;
+        for (std::uint32_t tile_begin = route_scan_begin;
+             tile_begin < route_scan_end;
+             tile_begin += kUnionTileRows) {
+          const std::uint32_t tile_end =
+              min(tile_begin + kUnionTileRows, route_scan_end);
+          const std::uint32_t tile_count = tile_end - tile_begin;
+          for (std::uint32_t index = union_lane; index < tile_count;
+               index += 32u)
+            workspace.base_rows[union_warp][index] =
+                route_rows[tile_begin + index];
+          __syncwarp(union_mask);
+
+          const std::uint32_t chunk_begin = union_lane * 4u;
+          unsigned long long item_prefix[4]{};
+          unsigned long long chunk_sum = 0ull;
+#pragma unroll
+          for (std::uint32_t item = 0u; item < 4u; ++item) {
+            const std::uint32_t index = chunk_begin + item;
+            if (index < tile_count) {
+              const Row row = workspace.base_rows[union_warp][index];
+              bool covered = false;
+              if (current_count) {
+                const std::uint32_t update =
+                    lower_bound_rows(current, current_count, row.key);
+                covered = update < current_count &&
+                    current[update].key == row.key;
+              }
+              if (!covered && (row.flags & kTombstone) == 0u)
+                chunk_sum = Aggregate::consume(chunk_sum, row);
+            }
+            item_prefix[item] = chunk_sum;
+          }
+          unsigned long long chunk_prefix = chunk_sum;
+          for (std::uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
+            const unsigned long long preceding =
+                __shfl_up_sync(union_mask, chunk_prefix, offset);
+            if (union_lane >= offset) chunk_prefix += preceding;
+          }
+          const unsigned long long chunk_base = chunk_prefix - chunk_sum;
+          if (union_lane == 0u)
+            base_mask_workspace
+                .warp_tile_prefix[union_warp][0] = 0ull;
+#pragma unroll
+          for (std::uint32_t item = 0u; item < 4u; ++item) {
+            const std::uint32_t index = chunk_begin + item;
+            if (index < tile_count)
+              base_mask_workspace
+                  .warp_tile_prefix[union_warp][index + 1u] =
+                      chunk_base + item_prefix[item];
+          }
+          __syncwarp(union_mask);
+
+          if (fragment_active) {
+            const std::uint32_t consume_begin =
+                max(fragment_route_begin, tile_begin);
+            const std::uint32_t consume_end =
+                min(fragment_route_end, tile_end);
+            if (consume_begin < consume_end)
+              fragment_sum += base_mask_workspace
+                  .warp_tile_prefix[union_warp]
+                      [consume_end - tile_begin] -
+                  base_mask_workspace
+                      .warp_tile_prefix[union_warp]
+                          [consume_begin - tile_begin];
+          }
+          __syncwarp(union_mask);
+        }
+      }
+      if (fragment_active)
+        aggregate_partials[fragment.original_index] = fragment_sum;
+      cursor = union_end;
+    }
+    break;
+  }
 
   // Split storage is scanned as one logical run.  Each fragment chooses its
   // cooperation width from the number of rows it will actually examine.  The
@@ -7191,7 +7562,7 @@ private:
             range_section_task_offsets_.data() +
                 gpulsmopt2_detail::kQuotients,
             arena_.data(), descriptors_.data(), route_headers_.data(),
-            route_slices_.data(), raw_keys_.data(),
+            route_slices_.data(), local_rank_.data(), raw_keys_.data(),
             raw_payloads_.data(),
             raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
             pending_batches_,
@@ -7240,15 +7611,30 @@ private:
         entries * sizeof(std::uint32_t));
     const std::size_t bytes = view_bytes * 2u +
         aligned_range_bytes(temp_bytes);
-    if (range_query_storage_.size() < bytes)
-      range_query_storage_.resize(bytes);
+    std::uint8_t *storage = nullptr;
+    if (range_query_storage_.size() >= bytes) {
+      storage = range_query_storage_.data();
+    } else {
+      // Range queries and publication are serialized by operation_done_.  The
+      // first publication key plane is therefore idle for the entire range
+      // operation and can hold the query counts, offsets, and scan scratch.
+      // Keep the owning range allocation as a fallback for configurations
+      // whose publication plane is too small.
+      const std::size_t borrowed_bytes =
+          publication_epoch_keys_a_.size() * sizeof(std::uint32_t);
+      if (borrowed_bytes >= bytes) {
+        storage = reinterpret_cast<std::uint8_t *>(
+            publication_epoch_keys_a_.data());
+      } else {
+        range_query_storage_.resize(bytes);
+        storage = range_query_storage_.data();
+      }
+    }
     std::size_t offset = 0u;
-    attach_range_view(range_fragment_counts_, range_query_storage_.data(),
-                      offset, entries);
-    attach_range_view(range_fragment_offsets_, range_query_storage_.data(),
-                      offset, entries);
+    attach_range_view(range_fragment_counts_, storage, offset, entries);
+    attach_range_view(range_fragment_offsets_, storage, offset, entries);
     offset = aligned_range_bytes(offset);
-    range_query_temp_ = range_query_storage_.data() + offset;
+    range_query_temp_ = storage + offset;
   }
   void ensure_range_fragment_capacity(std::size_t count) {
     if (range_fragments_.size() >= count &&
@@ -7257,12 +7643,20 @@ private:
     bytes += aligned_range_bytes(
         count * sizeof(gpulsmopt2_detail::RangeFragment));
     bytes += aligned_range_bytes(count * sizeof(unsigned long long));
-    range_fragment_storage_.resize(bytes);
+    std::uint8_t *storage = nullptr;
+    const std::size_t borrowed_bytes =
+        publication_epoch_assignments_b_.size() *
+        sizeof(gpulsmopt2_detail::RawAssignment);
+    if (borrowed_bytes >= bytes) {
+      storage = reinterpret_cast<std::uint8_t *>(
+          publication_epoch_assignments_b_.data());
+    } else {
+      range_fragment_storage_.resize(bytes);
+      storage = range_fragment_storage_.data();
+    }
     std::size_t offset = 0u;
-    attach_range_view(range_fragments_, range_fragment_storage_.data(),
-                      offset, count);
-    attach_range_view(range_fragment_partials_,
-                      range_fragment_storage_.data(), offset, count);
+    attach_range_view(range_fragments_, storage, offset, count);
+    attach_range_view(range_fragment_partials_, storage, offset, count);
   }
   void ensure_range_section_capacity(std::size_t count,
                                      std::size_t temp_bytes) {
@@ -7283,28 +7677,29 @@ private:
     bytes += aligned_range_bytes(
         maximum_tasks * sizeof(gpulsmopt2_detail::SectionRangeTask));
     bytes += aligned_range_bytes(temp_bytes);
-    range_section_storage_.resize(bytes);
+    std::uint8_t *storage = nullptr;
+    const std::size_t borrowed_bytes =
+        publication_epoch_assignments_a_.size() *
+        sizeof(gpulsmopt2_detail::RawAssignment);
+    if (borrowed_bytes >= bytes) {
+      storage = reinterpret_cast<std::uint8_t *>(
+          publication_epoch_assignments_a_.data());
+    } else {
+      range_section_storage_.resize(bytes);
+      storage = range_section_storage_.data();
+    }
     std::size_t offset = 0u;
-    attach_range_view(range_section_keys_in_, range_section_storage_.data(),
-                      offset, count);
-    attach_range_view(range_section_keys_out_, range_section_storage_.data(),
-                      offset, count);
-    attach_range_view(range_section_fragments_in_,
-                      range_section_storage_.data(), offset, count);
-    attach_range_view(range_section_fragments_out_,
-                      range_section_storage_.data(), offset, count);
-    attach_range_view(range_fragment_partials_, range_section_storage_.data(),
-                      offset, count);
-    attach_range_view(range_section_offsets_, range_section_storage_.data(),
-                      offset, sections);
-    attach_range_view(range_section_task_offsets_,
-                      range_section_storage_.data(), offset, sections);
-    attach_range_view(range_section_task_counts_,
-                      range_section_storage_.data(), offset, sections);
-    attach_range_view(range_section_tasks_, range_section_storage_.data(),
-                      offset, maximum_tasks);
+    attach_range_view(range_section_keys_in_, storage, offset, count);
+    attach_range_view(range_section_keys_out_, storage, offset, count);
+    attach_range_view(range_section_fragments_in_, storage, offset, count);
+    attach_range_view(range_section_fragments_out_, storage, offset, count);
+    attach_range_view(range_fragment_partials_, storage, offset, count);
+    attach_range_view(range_section_offsets_, storage, offset, sections);
+    attach_range_view(range_section_task_offsets_, storage, offset, sections);
+    attach_range_view(range_section_task_counts_, storage, offset, sections);
+    attach_range_view(range_section_tasks_, storage, offset, maximum_tasks);
     offset = aligned_range_bytes(offset);
-    range_section_temp_ = range_section_storage_.data() + offset;
+    range_section_temp_ = storage + offset;
     range_section_temp_bytes_ = temp_bytes;
   }
   std::size_t batch_capacity_{};
