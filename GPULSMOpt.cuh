@@ -192,6 +192,40 @@ struct Row {
   std::uint16_t flags;
 };
 
+// Published rows use two equally indexed streams.  Searches touch only the
+// compact key/flag stream; values are fetched only for an exact match or when
+// an operation genuinely consumes the complete row.
+struct ResidentRows {
+  std::uint32_t *key_flags{};
+  std::uint32_t *values{};
+
+  __host__ __device__ __forceinline__ ResidentRows operator+(
+      std::uint64_t offset) const {
+    return {key_flags + offset, values + offset};
+  }
+
+  __host__ __device__ __forceinline__ std::uint16_t key_at(
+      std::uint64_t position) const {
+    return static_cast<std::uint16_t>(key_flags[position]);
+  }
+
+  __host__ __device__ __forceinline__ Row operator[](
+      std::uint64_t position) const {
+    const std::uint32_t packed = key_flags[position];
+    return {values[position], static_cast<std::uint16_t>(packed),
+            static_cast<std::uint16_t>(packed >> 16u)};
+  }
+
+  __host__ __device__ __forceinline__ void store(
+      std::uint64_t position, const Row &row) const {
+    values[position] = row.value;
+    key_flags[position] = std::uint32_t{row.key} |
+        (std::uint32_t{row.flags} << 16u);
+  }
+};
+
+static_assert(sizeof(ResidentRows) == 2u * sizeof(void *));
+
 // The publication merge never compares values.  Keep only the complete
 // comparison key in shared memory and recover the winning value from its
 // source after visibility has been resolved.  The layout exactly matches the
@@ -898,6 +932,17 @@ __device__ __forceinline__ std::uint32_t lower_bound_rows(
   return lo;
 }
 
+__device__ __forceinline__ std::uint32_t lower_bound_rows(
+    ResidentRows rows, std::uint32_t count, std::uint32_t key) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (rows.key_at(mid) < key) lo = mid + 1u;
+    else hi = mid;
+  }
+  return lo;
+}
+
 // Normal published sections are resolved runs, so equality is final.  Carry
 // the matching row out of the search instead of finding its position and
 // loading it again in the caller.
@@ -911,6 +956,22 @@ __device__ __forceinline__ bool find_unique_point_row(
     else if (candidate.key > key) hi = mid;
     else {
       result = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+__device__ __forceinline__ bool find_unique_point_row(
+    ResidentRows rows, std::uint32_t count, std::uint32_t key, Row &result) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    const std::uint16_t candidate = rows.key_at(mid);
+    if (candidate < key) lo = mid + 1u;
+    else if (candidate > key) hi = mid;
+    else {
+      result = rows[mid];
       return true;
     }
   }
@@ -936,6 +997,27 @@ __device__ __forceinline__ bool find_leftmost_point_row(
       }
     }
   }
+  return matched;
+}
+
+__device__ __forceinline__ bool find_leftmost_point_row(
+    ResidentRows rows, std::uint32_t count, std::uint32_t key, Row &result) {
+  std::uint32_t lo = 0u, hi = count;
+  bool matched = false;
+  std::uint32_t matched_position = 0u;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    const std::uint16_t candidate = rows.key_at(mid);
+    if (candidate < key) lo = mid + 1u;
+    else {
+      hi = mid;
+      if (candidate == key) {
+        matched_position = mid;
+        matched = true;
+      }
+    }
+  }
+  if (matched) result = rows[matched_position];
   return matched;
 }
 
@@ -1007,12 +1089,23 @@ __device__ __forceinline__ std::uint32_t upper_bound_rows(
   return lo;
 }
 
+__device__ __forceinline__ std::uint32_t upper_bound_rows(
+    ResidentRows rows, std::uint32_t count, std::uint32_t key) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    if (rows.key_at(mid) <= key) lo = mid + 1u;
+    else hi = mid;
+  }
+  return lo;
+}
+
 // Search a section as one logical sorted list even when its rows are stored in
 // several route extents.  The returned position is relative to the section,
 // not to any physical extent.
 __device__ __forceinline__ std::uint32_t logical_section_bound(
     std::uint32_t q, std::uint32_t level, std::uint32_t key, bool upper,
-    const Row *arena, const RouteHeader *route_headers,
+    ResidentRows arena, const RouteHeader *route_headers,
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets) {
@@ -1044,7 +1137,7 @@ __device__ __forceinline__ std::uint32_t logical_section_bound(
   const std::uint32_t preceding =
       route_logical_begins[route] - section_begin;
   if (key < slice.suffix_begin) return preceding;
-  const Row *rows = arena + slice.rows.offset();
+  const ResidentRows rows = arena + slice.rows.offset();
   return preceding + (upper
       ? upper_bound_rows(rows, slice.rows.count(), key)
       : lower_bound_rows(rows, slice.rows.count(), key));
@@ -1052,7 +1145,7 @@ __device__ __forceinline__ std::uint32_t logical_section_bound(
 
 __device__ __forceinline__ Row logical_section_row(
     std::uint32_t q, std::uint32_t level, std::uint32_t position,
-    const Row *arena, const RouteHeader *route_headers,
+    ResidentRows arena, const RouteHeader *route_headers,
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets) {
@@ -1082,13 +1175,13 @@ struct SumRowsAggregate {
 };
 
 __device__ __forceinline__ std::uint32_t route_range_row_count(
-    std::uint32_t low, std::uint32_t high, const Row *arena,
+    std::uint32_t low, std::uint32_t high, ResidentRows arena,
     RouteHeader header, const RouteSlice *route_slices) {
   std::uint32_t count = 0u;
   for (std::uint32_t local = 0u; local < header.count; ++local) {
     const RouteSlice route = route_slices[header.begin + local];
     if (route.suffix_end <= low || route.suffix_begin > high) continue;
-    const Row *rows = arena + route.rows.offset();
+    const ResidentRows rows = arena + route.rows.offset();
     const std::uint32_t begin = lower_bound_rows(rows, route.rows.count(), low);
     const std::uint32_t end =
         upper_bound_rows(rows, route.rows.count(), high);
@@ -1106,7 +1199,7 @@ __device__ __forceinline__ typename Aggregate::State
 cooperative_sum_visible_route_runs(
     std::uint32_t low, std::uint32_t high,
     const Row *current, std::uint32_t current_count,
-    const Row *arena, RouteHeader base_header,
+    ResidentRows arena, RouteHeader base_header,
     const RouteSlice *route_slices,
     std::uint32_t group_lane, std::uint32_t group_size) {
   typename Aggregate::State result = Aggregate::identity();
@@ -1124,7 +1217,7 @@ cooperative_sum_visible_route_runs(
   for (std::uint32_t local = 0u; local < base_header.count; ++local) {
     const RouteSlice route = route_slices[base_header.begin + local];
     if (route.suffix_end <= low || route.suffix_begin > high) continue;
-    const Row *rows = arena + route.rows.offset();
+    const ResidentRows rows = arena + route.rows.offset();
     const std::uint32_t begin = lower_bound_rows(rows, route.rows.count(), low);
     const std::uint32_t end =
         upper_bound_rows(rows, route.rows.count(), high);
@@ -1344,7 +1437,7 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches,
-    const Row *arena, const Descriptor *descriptors,
+    ResidentRows arena, const Descriptor *descriptors,
     const RouteHeader *route_headers, const RouteSlice *route_slices,
     std::uint32_t active_levels, std::uint64_t occupied_levels) {
   constexpr unsigned mask = 0xffffffffu;
@@ -1395,7 +1488,7 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
       const RouteSlice route = route_slices[header.begin + route_index];
       if (route.suffix_end <= low_suffix ||
           route.suffix_begin > high_suffix) continue;
-      const Row *rows = arena + route.rows.offset();
+      const ResidentRows rows = arena + route.rows.offset();
       const std::uint32_t begin = lower_bound_rows(
           rows, route.rows.count(), low_suffix);
       const std::uint32_t end = high == kInvalid
@@ -1424,7 +1517,7 @@ __device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
             ? descriptors[descriptor_index(q, newer)]
             : routed_descriptor_for_suffix(
                   q, newer, item.key, route_headers, route_slices);
-        const Row *newer_rows = arena + newer_descriptor.offset();
+        const ResidentRows newer_rows = arena + newer_descriptor.offset();
         const std::uint32_t position =
             lower_bound_rows(newer_rows, newer_descriptor.count(), item.key);
         covered = position < newer_descriptor.count() &&
@@ -1495,7 +1588,7 @@ template <class Aggregate>
 __global__ void cooperative_section_owned_range_kernel(
     const SectionRangeFragment *fragments,
     const SectionRangeTask *tasks,
-    const std::uint32_t *task_count, const Row *arena,
+    const std::uint32_t *task_count, ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
     const RouteSlice *route_slices, const std::uint16_t *local_rank,
     const std::uint32_t *raw_keys,
@@ -1766,7 +1859,7 @@ __global__ void cooperative_section_owned_range_kernel(
           route_slices[source_header.begin + source_route].rows;
       const std::uint32_t source_count = descriptor.count();
       if (!source_count) continue;
-      const Row *source = arena + descriptor.offset();
+      const ResidentRows source = arena + descriptor.offset();
       const std::uint32_t current_count = current_count_shared;
       if (!current_count) {
         for (std::uint32_t index = threadIdx.x; index < source_count;
@@ -1868,7 +1961,7 @@ __global__ void cooperative_section_owned_range_kernel(
     if (foundation_header.count == 1u) {
       const Descriptor descriptor =
           route_slices[foundation_header.begin].rows;
-      const Row *rows = arena + descriptor.offset();
+      const ResidentRows rows = arena + descriptor.offset();
       if (foundation_ranks_valid_shared) {
         const std::uint32_t low_cell =
             std::uint32_t{fragment.low_suffix} / kFoundationCellKeys;
@@ -2121,7 +2214,7 @@ __global__ void cooperative_section_owned_range_kernel(
            local_route < foundation_header.count; ++local_route) {
         const RouteSlice route =
             route_slices[foundation_header.begin + local_route];
-        const Row *route_rows = arena + route.rows.offset();
+        const ResidentRows route_rows = arena + route.rows.offset();
         std::uint32_t route_scan_begin = 0u;
         std::uint32_t route_scan_end = 0u;
         if (foundation_header.count == 1u) {
@@ -2315,7 +2408,7 @@ __global__ void cooperative_section_owned_range_kernel(
     }
     break;
   }
-  const Row *foundation_rows =
+  const ResidentRows foundation_rows =
       arena + foundation_descriptor_shared.offset();
 
   if (!overflow_shared && current_count &&
@@ -2611,7 +2704,7 @@ __global__ void warp_range_fragment_kernel(
     const RangeFragment *fragments, std::uint32_t fragment_count,
     const std::uint32_t *device_fragment_count,
     const std::uint32_t *query_low, const std::uint32_t *query_high,
-    const Row *arena,
+    ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
     const RouteSlice *route_slices, const std::uint32_t *raw_keys,
     const RawPayload *raw_payloads,
@@ -2748,7 +2841,7 @@ __global__ void warp_range_fragment_kernel(
           route_slices[source_header.begin + source_route].rows.bits;
     descriptor_bits = __shfl_sync(full_mask, descriptor_bits, 0u);
     const Descriptor descriptor{descriptor_bits};
-    const Row *rows = arena + descriptor.offset();
+    const ResidentRows rows = arena + descriptor.offset();
     std::uint32_t older_begin = 0u, older_end = 0u;
     if (lane == 0u && descriptor.count()) {
       older_begin = low == q_low
@@ -2766,7 +2859,7 @@ __global__ void warp_range_fragment_kernel(
       class_overflow = true;
       break;
     }
-    const Row *older = rows + older_begin;
+    const ResidentRows older = rows + older_begin;
     if (!current_count) {
       for (std::uint32_t index = lane; index < older_count; index += 32u)
         current[index] = older[index];
@@ -3097,6 +3190,13 @@ __global__ void gather_initial_level_kernel(
   const std::uint32_t key = sorted_keys[source];
   level_keys[i] = key;
   level_rows[i] = make_row(key, sorted_values[source], 0u);
+}
+
+__global__ void store_resident_rows_kernel(
+    const Row *source, std::uint32_t count, ResidentRows destination,
+    std::uint64_t destination_begin = 0u) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count) destination.store(destination_begin + i, source[i]);
 }
 
 __global__ void publish_foundation_build_kernel(
@@ -3475,7 +3575,7 @@ __device__ __forceinline__ std::uint32_t
 balanced_merge_prefix_count_warp(
     std::uint32_t q, std::uint32_t suffix,
     const Row *current_rows, const std::uint32_t *current_offsets,
-    const Row *arena, const RouteHeader *route_headers,
+    ResidentRows arena, const RouteHeader *route_headers,
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
@@ -3504,7 +3604,7 @@ balanced_merge_prefix_count_warp(
 __device__ __forceinline__ std::uint32_t resident_hot_boundary_warp(
     std::uint32_t q, std::uint32_t target,
     const Row *current_rows, const std::uint32_t *current_offsets,
-    const Row *arena, const RouteHeader *route_headers,
+    ResidentRows arena, const RouteHeader *route_headers,
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
@@ -3529,7 +3629,7 @@ __global__ void resolve_resident_job_boundaries_kernel(
     BalancedMergeJob *jobs, std::uint64_t *job_raw_reservations,
     const ResidentPublicationPlan *plan,
     const Row *current_rows, const std::uint32_t *current_offsets,
-    const Row *arena, const RouteHeader *route_headers,
+    ResidentRows arena, const RouteHeader *route_headers,
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
@@ -3712,7 +3812,7 @@ __global__ void finalize_resident_route_metadata_kernel(
 }
 
 __global__ void build_split_resident_query_metadata_kernel(
-    const ResidentPublicationPlan *plan, const Row *arena,
+    const ResidentPublicationPlan *plan, ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
     const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
@@ -4083,7 +4183,7 @@ __device__ __forceinline__ std::uint32_t load_candidate_value(
     const std::uint32_t *source_offsets,
     const RawPayload *raw_payloads, const std::uint32_t *raw_offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches,
-    const Row *staged_rows, const Row *arena,
+    const Row *staged_rows, ResidentRows arena,
     const RouteHeader *route_headers, const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
@@ -4131,7 +4231,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, const std::uint32_t *staged_keys,
     const Row *staged_rows, const std::uint32_t *staged_offsets,
-    const std::uint32_t *staged_epoch_mode, Row *arena,
+    const std::uint32_t *staged_epoch_mode, ResidentRows arena,
     const DeviceManifest *manifests, const std::uint32_t *active_manifest,
     const Descriptor *descriptors, const RouteHeader *route_headers,
     const RouteSlice *route_slices,
@@ -4923,7 +5023,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                           static_cast<std::uint16_t>(
                               tombstone ? kTombstone : 0u)};
             if (output_valid_shared)
-              arena[job.existing_offset + output_begin + i] = row;
+              arena.store(job.existing_offset + output_begin + i, row);
           }
         }
       }
@@ -4954,7 +5054,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                         static_cast<std::uint16_t>(
                             tombstone ? kTombstone : 0u)};
           if (output_valid_shared)
-            arena[job.existing_offset + output_begin + i] = row;
+            arena.store(job.existing_offset + output_begin + i, row);
         }
         __syncthreads();
       }
@@ -5441,7 +5541,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
       const Row row{value, candidate_token_key(token),
                     static_cast<std::uint16_t>(
                         tombstone ? kTombstone : 0u)};
-      if (output_valid_shared) arena[job.existing_offset + rank] = row;
+      if (output_valid_shared)
+        arena.store(job.existing_offset + rank, row);
     }
     __syncthreads();
 
@@ -5631,7 +5732,7 @@ __global__ void publish_single_route_directory_kernel(
 
 
 __global__ void build_foundation_rank_directory_kernel(
-    const Row *arena, const Descriptor *descriptors,
+    ResidentRows arena, const Descriptor *descriptors,
     std::uint32_t foundation_level, std::uint16_t *local_rank) {
   const std::uint32_t q = blockIdx.x;
   const std::uint32_t cell = threadIdx.x;
@@ -5655,7 +5756,7 @@ __global__ void lookup_with_pending_kernel(
     std::uint32_t batch_stride, std::uint32_t pending_batches,
     const std::uint64_t *batch_signatures,
     const std::uint64_t *epoch_signatures,
-    const Row *arena, const Descriptor *descriptors,
+    ResidentRows arena, const Descriptor *descriptors,
     const RouteHeader *route_headers, const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
@@ -5737,7 +5838,7 @@ __global__ void lookup_with_pending_kernel(
               q, level, suffix, route_headers, route_slices);
     const Descriptor descriptor = selected.rows;
     if (!descriptor.count()) continue;
-    const Row *rows = arena + descriptor.offset();
+    const ResidentRows rows = arena + descriptor.offset();
     std::uint32_t begin{}, end{};
     resident_point_search_bounds(
         q, level, suffix, foundation_level, descriptor, selected.route,
@@ -5780,7 +5881,7 @@ __global__ void lookup_with_pending_kernel(
                     route_headers, route_slices)
               : RoutedSliceSelection{};
   const Descriptor foundation = foundation_selection.rows;
-  const Row *foundation_rows = arena + foundation.offset();
+  const ResidentRows foundation_rows = arena + foundation.offset();
   const std::uint32_t cell = (key >> 9u) & 127u;
   const std::size_t local_index = std::size_t{q} * 128u + cell;
   const std::uint32_t foundation_logical_count = foundation_logical.count();
@@ -5831,7 +5932,7 @@ __global__ void lookup_with_pending_kernel(
 __device__ __forceinline__ void lookup_resident_only(
     std::uint32_t key, std::uint32_t query_index,
     std::uint32_t *out_values, std::uint8_t *out_found,
-    const Row *arena, const Descriptor *descriptors,
+    ResidentRows arena, const Descriptor *descriptors,
     const RouteHeader *route_headers, const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
@@ -5862,7 +5963,7 @@ __device__ __forceinline__ void lookup_resident_only(
               q, level, suffix, route_headers, route_slices);
     const Descriptor descriptor = selected.rows;
     if (!descriptor.count()) continue;
-    const Row *rows = arena + descriptor.offset();
+    const ResidentRows rows = arena + descriptor.offset();
     std::uint32_t begin{}, end{};
     resident_point_search_bounds(
         q, level, suffix, foundation_level, descriptor, selected.route,
@@ -5906,7 +6007,7 @@ __device__ __forceinline__ void lookup_resident_only(
                     route_headers, route_slices)
               : RoutedSliceSelection{};
   const Descriptor foundation = foundation_selection.rows;
-  const Row *foundation_rows = arena + foundation.offset();
+  const ResidentRows foundation_rows = arena + foundation.offset();
   const std::uint32_t cell = (key >> 9u) & 127u;
   const std::size_t local_index = std::size_t{q} * 128u + cell;
   const std::uint32_t foundation_logical_count = foundation_logical.count();
@@ -6001,7 +6102,7 @@ __global__ void lookup_with_dense_router_kernel(
     const std::uint32_t *raw_offsets,
     std::uint32_t batch_stride, std::uint32_t pending_batches,
     const std::uint64_t *epoch_signatures,
-    const Row *arena, const Descriptor *descriptors,
+    ResidentRows arena, const Descriptor *descriptors,
     const RouteHeader *route_headers, const RouteSlice *route_slices,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
@@ -6181,7 +6282,7 @@ __device__ bool first_visible_in_quotient(
     std::uint32_t q, std::uint32_t lower,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, const Row *arena,
+    std::uint32_t pending_batches, ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
     const RouteSlice *route_slices, std::uint32_t active_levels,
     std::uint64_t occupied_levels,
@@ -6319,7 +6420,7 @@ __global__ void successor_with_pending_kernel(
     std::uint32_t *out_keys, const std::uint32_t *raw_keys,
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, const Row *arena,
+    std::uint32_t pending_batches, ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
     const RouteSlice *route_slices, std::uint32_t active_levels,
     const std::uint64_t *query_occupied_level_mask = nullptr) {
@@ -6402,9 +6503,12 @@ public:
                 gpulsmopt2_detail::kGuideEntriesPerLevel,
             gpulsmopt2_detail::kMaximumLevels *
                 gpulsmopt2_detail::kGuideEntriesPerLevel),
-        arena_(gpulsmopt2_detail::maximum_resident_elements<
-                   gpulsmopt2_detail::Row>(),
-               foundation_pool_capacity_ + level_pool_capacity_),
+        arena_key_flags_(gpulsmopt2_detail::maximum_resident_elements<
+                             gpulsmopt2_detail::Row>(),
+                         foundation_pool_capacity_ + level_pool_capacity_),
+        arena_values_(gpulsmopt2_detail::maximum_resident_elements<
+                          gpulsmopt2_detail::Row>(),
+                      foundation_pool_capacity_ + level_pool_capacity_),
         descriptors_(std::size_t{gpulsmopt2_detail::kQuotients} *
                      gpulsmopt2_detail::kMaximumLevels),
         route_headers_(std::size_t{gpulsmopt2_detail::kQuotients} *
@@ -6577,10 +6681,10 @@ public:
             foundation_source_offsets_.data());
     if (base_count > foundation_pool_capacity_ / 2u)
       throw std::bad_alloc();
-    CUDA_CHECK(cudaMemcpyAsync(
-        arena_.data(), publication_rows_a_.data(),
-        std::size_t{base_count} * sizeof(gpulsmopt2_detail::Row),
-        cudaMemcpyDeviceToDevice, stream));
+    gpulsmopt2_detail::store_resident_rows_kernel<<<
+        blocks(base_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            publication_rows_a_.data(), base_count, resident_rows());
+    CUDA_CHECK(cudaGetLastError());
     gpulsmopt2_detail::publish_foundation_build_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -6675,7 +6779,7 @@ public:
             queries, batch.out_values, batch.out_found, count,
             raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
-            raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
+            raw_epoch_signatures_.data(), resident_rows(), descriptors_.data(),
             route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
             local_rank_.data(), level_guides_.data(),
@@ -6690,7 +6794,7 @@ public:
             raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
             raw_signatures_.data(), raw_epoch_signatures_.data(),
-            arena_.data(), descriptors_.data(), route_headers_.data(),
+            resident_rows(), descriptors_.data(), route_headers_.data(),
             route_slices_.data(), route_logical_begins_.data(),
             level_q_logical_offsets_.data(), local_rank_.data(),
             level_guides_.data(), level_cell_rank_blocks_.data(),
@@ -6706,7 +6810,7 @@ public:
           raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
           static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
           raw_signatures_.data(),
-          raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
+          raw_epoch_signatures_.data(), resident_rows(), descriptors_.data(),
           route_headers_.data(), route_slices_.data(),
           route_logical_begins_.data(), level_q_logical_offsets_.data(),
           local_rank_.data(), level_guides_.data(),
@@ -6865,7 +6969,7 @@ public:
         batch.queries, static_cast<std::uint32_t>(batch.count), batch.out_keys,
         raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
         static_cast<std::uint32_t>(batch_capacity_),
-        pending_batches_, arena_.data(), descriptors_.data(),
+        pending_batches_, resident_rows(), descriptors_.data(),
         route_headers_.data(), route_slices_.data(), active_levels_,
         query_occupied_level_mask_.data());
     CUDA_CHECK(cudaGetLastError());
@@ -6883,7 +6987,8 @@ public:
   std::size_t gpu_resident_bytes() const {
     return local_rank_.size() * sizeof(std::uint16_t) +
         level_guides_.size() * sizeof(std::uint16_t) +
-        arena_.size() * sizeof(gpulsmopt2_detail::Row) +
+        arena_key_flags_.size() * sizeof(std::uint32_t) +
+        arena_values_.size() * sizeof(std::uint32_t) +
         descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
         route_headers_.size() * sizeof(gpulsmopt2_detail::RouteHeader) +
         route_slices_.size() * sizeof(gpulsmopt2_detail::RouteSlice) +
@@ -6944,6 +7049,10 @@ public:
   }
 
 private:
+  gpulsmopt2_detail::ResidentRows resident_rows() {
+    return {arena_key_flags_.data(), arena_values_.data()};
+  }
+
   static int blocks(std::size_t count) {
     return static_cast<int>((count + gpulsmopt2_detail::kThreads - 1u) /
                             gpulsmopt2_detail::kThreads);
@@ -6987,7 +7096,7 @@ private:
     }
     gpulsmopt2_detail::build_foundation_rank_directory_kernel<<<
         gpulsmopt2_detail::kQuotients, 128u, 0, stream>>>(
-            arena_.data(), descriptors_.data(), foundation_level(),
+            resident_rows(), descriptors_.data(), foundation_level(),
             local_rank_.data());
     CUDA_CHECK(cudaGetLastError());
   }
@@ -7234,7 +7343,7 @@ private:
             balanced_merge_jobs_.data(), resident_job_raw_reservations_.data(),
             resident_plan_.data(),
             publication_rows_a_.data(), foundation_source_offsets_.data(),
-            arena_.data(), route_headers_.data(), route_slices_.data(),
+            resident_rows(), route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
             device_manifests_.data(), active_device_manifest_.data());
     scan_bytes = resident_scan_temp_.size();
@@ -7287,7 +7396,7 @@ private:
             publication_keys_a_.data(), publication_rows_a_.data(),
             foundation_source_offsets_.data(),
             staged_epoch_mode_.data(),
-            arena_.data(),
+            resident_rows(),
             device_manifests_.data(), active_device_manifest_.data(),
             descriptors_.data(), route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
@@ -7321,7 +7430,7 @@ private:
             level_q_logical_offsets_.data());
     gpulsmopt2_detail::build_split_resident_query_metadata_kernel<<<
         resident_planner_blocks_, 128u, 0, capture_stream>>>(
-            resident_plan_.data(), arena_.data(), descriptors_.data(),
+            resident_plan_.data(), resident_rows(), descriptors_.data(),
             route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
             level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
@@ -7634,7 +7743,7 @@ private:
             range_section_tasks_.data(),
             range_section_task_offsets_.data() +
                 gpulsmopt2_detail::kQuotients,
-            arena_.data(), descriptors_.data(), route_headers_.data(),
+            resident_rows(), descriptors_.data(), route_headers_.data(),
             route_slices_.data(), local_rank_.data(), raw_keys_.data(),
             raw_payloads_.data(),
             raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
@@ -7654,7 +7763,7 @@ private:
         <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
             range_fragments_.data(), fragment_count,
             range_fragment_offsets_.data() + query_count,
-            batch.lo, batch.hi, arena_.data(), descriptors_.data(),
+            batch.lo, batch.hi, resident_rows(), descriptors_.data(),
             route_headers_.data(), route_slices_.data(),
             raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
@@ -7804,7 +7913,8 @@ private:
 
   gpulsmopt2_detail::Buffer<std::uint16_t> local_rank_;
   gpulsmopt2_detail::VirtualBuffer<std::uint16_t> level_guides_;
-  gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row> arena_;
+  gpulsmopt2_detail::VirtualBuffer<std::uint32_t> arena_key_flags_;
+  gpulsmopt2_detail::VirtualBuffer<std::uint32_t> arena_values_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RouteHeader> route_headers_;
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::RouteSlice>
