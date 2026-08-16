@@ -58,8 +58,11 @@ static_assert(kMaximumOperationTile <=
 constexpr std::size_t kMaximumPublicationRows =
     std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t kDescriptorOffsetBits = 47u;
+constexpr std::uint64_t kDescriptorSplitFlag =
+    std::uint64_t{1} << (kDescriptorOffsetBits - 1u);
 constexpr std::uint64_t kDescriptorOffsetMask =
-    (std::uint64_t{1} << kDescriptorOffsetBits) - 1u;
+    kDescriptorSplitFlag - 1u;
+static_assert(kMaximumPublicationRows < kDescriptorSplitFlag);
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
 constexpr std::uint32_t kRangeThreadWork = 8u;
 constexpr std::uint32_t kRangeSubgroupWork = 512u;
@@ -336,11 +339,18 @@ struct Descriptor {
     return {std::uint64_t{offset} |
             (std::uint64_t{count} << kDescriptorOffsetBits)};
   }
+  __host__ __device__ static Descriptor make_split(std::uint32_t count) {
+    return {kDescriptorSplitFlag |
+            (std::uint64_t{count} << kDescriptorOffsetBits)};
+  }
   __host__ __device__ std::uint64_t offset() const {
     return bits & kDescriptorOffsetMask;
   }
   __host__ __device__ std::uint32_t count() const {
     return static_cast<std::uint32_t>(bits >> kDescriptorOffsetBits);
+  }
+  __host__ __device__ bool split() const {
+    return (bits & kDescriptorSplitFlag) != 0u;
   }
 };
 
@@ -888,6 +898,47 @@ __device__ __forceinline__ std::uint32_t lower_bound_rows(
   return lo;
 }
 
+// Normal published sections are resolved runs, so equality is final.  Carry
+// the matching row out of the search instead of finding its position and
+// loading it again in the caller.
+__device__ __forceinline__ bool find_unique_point_row(
+    const Row *rows, std::uint32_t count, std::uint32_t key, Row &result) {
+  std::uint32_t lo = 0u, hi = count;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    const Row candidate = rows[mid];
+    if (candidate.key < key) lo = mid + 1u;
+    else if (candidate.key > key) hi = mid;
+    else {
+      result = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Keep lower_bound semantics on the adaptive split path.  This is defensive
+// against adjacent versions while still carrying the leftmost matching row
+// out of the search.
+__device__ __forceinline__ bool find_leftmost_point_row(
+    const Row *rows, std::uint32_t count, std::uint32_t key, Row &result) {
+  std::uint32_t lo = 0u, hi = count;
+  bool matched = false;
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) >> 1u;
+    const Row candidate = rows[mid];
+    if (candidate.key < key) lo = mid + 1u;
+    else {
+      hi = mid;
+      if (candidate.key == key) {
+        result = candidate;
+        matched = true;
+      }
+    }
+  }
+  return matched;
+}
+
 __device__ __forceinline__ void guide_search_bounds(
     const std::uint16_t *guides, std::uint32_t q,
     std::uint32_t level, std::uint32_t count, std::uint32_t key,
@@ -912,15 +963,13 @@ __device__ __forceinline__ void resident_point_search_bounds(
     std::uint32_t q, std::uint32_t level, std::uint32_t suffix,
     std::uint32_t foundation_level, const Descriptor &selected_rows,
     std::uint32_t selected_route, std::uint32_t route_count,
-    const Descriptor *descriptors,
+    std::uint32_t logical_count,
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
     const std::uint16_t *local_rank, const std::uint16_t *level_guides,
     const std::uint32_t *level_cell_rank_blocks,
     const std::uint16_t *level_cell_ranks,
     std::uint32_t &begin, std::uint32_t &end) {
-  const std::uint32_t logical_count =
-      descriptors[descriptor_index(q, level)].count();
   const std::uint32_t cell = suffix / kFoundationCellKeys;
   CellInputSlice logical{};
   const bool ranked = exact_cell_input_slice(
@@ -3658,7 +3707,8 @@ __global__ void finalize_resident_route_metadata_kernel(
   route_headers[descriptor_index(q, level)] = header;
   descriptors[descriptor_index(q, level)] =
       header.count == 1u ? route_slices[header.begin].rows
-                         : Descriptor::make(0u, total);
+      : header.count > 1u ? Descriptor::make_split(total)
+                          : Descriptor{};
 }
 
 __global__ void build_split_resident_query_metadata_kernel(
@@ -4116,6 +4166,10 @@ __global__ void compact_direct_epoch_jobs_kernel(
   std::uint16_t *cell_output_offsets = cell_queue + kCellOwnedCells;
   __shared__ std::uint32_t source_offsets[kBatchesPerEpoch +
                                            kMaximumLevels + 2u];
+  // Crowded jobs need their logical per-level starting positions again when
+  // materializing values.  Keep them separate from run_offsets, which is
+  // repurposed by the merge scheduler before output is written.
+  __shared__ std::uint16_t crowded_level_begins[kMaximumLevels + 2u];
   __shared__ std::uint16_t run_offsets[kMaximumLevels + 2u];
   __shared__ std::uint16_t run_lengths[kMaximumLevels + 2u];
   __shared__ std::uint16_t run_sources[kMaximumLevels + 2u];
@@ -4188,6 +4242,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       raw_count_shared = total;
       for (std::uint32_t level = 0u;
            level <= plan->source_level_limit; ++level) {
+        crowded_level_begins[level] = 0u;
         source_offsets[kBatchesPerEpoch + level] = total;
         if (level_is_occupied(manifest.occupied_level_mask, level)) {
           if (crowded_piece) {
@@ -4203,12 +4258,11 @@ __global__ void compact_direct_epoch_jobs_kernel(
                 q_begin, level, high, false, arena, route_headers,
                 route_slices, route_logical_begins,
                 level_q_logical_offsets);
-            // Reuse the future run-offset plane while loading a split input.
             // A nonempty 16-bit suffix interval begins below 65,536.
-            run_offsets[level] = static_cast<std::uint16_t>(begin);
+            crowded_level_begins[level] =
+                static_cast<std::uint16_t>(begin);
             total += end - begin;
           } else {
-            run_offsets[level] = 0u;
             for (std::uint32_t q = q_begin; q < q_end; ++q)
               total += descriptors[descriptor_index(q, level)].count();
           }
@@ -4353,7 +4407,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                 source_offsets[kBatchesPerEpoch + level];
             std::uint32_t q = q_begin;
             if (crowded_piece) {
-              position += run_offsets[level];
+              position += crowded_level_begins[level];
             } else while (q < q_end) {
               const std::uint32_t count =
                   descriptors[descriptor_index(q, level)].count();
@@ -4864,7 +4918,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                     source_offsets, raw_payloads, raw_offsets, batch_stride,
                     pending_batches, staged_rows, arena, route_headers,
                     route_slices, route_logical_begins,
-                    level_q_logical_offsets, run_offsets);
+                    level_q_logical_offsets, crowded_level_begins);
             const Row row{value, candidate_token_key(token),
                           static_cast<std::uint16_t>(
                               tombstone ? kTombstone : 0u)};
@@ -4895,7 +4949,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                   source_offsets, raw_payloads, raw_offsets, batch_stride,
                   pending_batches, staged_rows, arena, route_headers,
                   route_slices, route_logical_begins,
-                  level_q_logical_offsets, run_offsets);
+                  level_q_logical_offsets, crowded_level_begins);
           const Row row{value, candidate_token_key(token),
                         static_cast<std::uint16_t>(
                             tombstone ? kTombstone : 0u)};
@@ -5382,7 +5436,8 @@ __global__ void compact_direct_epoch_jobs_kernel(
           staged_epoch, crowded_piece, raw_storage_begin_shared, q_begin,
           source_offsets, raw_payloads, raw_offsets, batch_stride,
           pending_batches, staged_rows, arena, route_headers, route_slices,
-          route_logical_begins, level_q_logical_offsets, run_offsets);
+          route_logical_begins, level_q_logical_offsets,
+          crowded_level_begins);
       const Row row{value, candidate_token_key(token),
                     static_cast<std::uint16_t>(
                         tombstone ? kTombstone : 0u)};
@@ -5669,11 +5724,15 @@ __global__ void lookup_with_pending_kernel(
     const std::uint32_t level =
         static_cast<std::uint32_t>(__ffsll(occupied_levels) - 1);
     occupied_levels &= occupied_levels - 1u;
-    const RouteHeader route_header =
-        route_headers[descriptor_index(q, level)];
-    const RoutedSliceSelection selected = route_header.count == 1u
-        ? RoutedSliceSelection{
-              route_slices[route_header.begin].rows, route_header.begin, true}
+    const std::size_t mapping = descriptor_index(q, level);
+    const Descriptor logical_descriptor = descriptors[mapping];
+    const RouteHeader route_header = logical_descriptor.split()
+        ? route_headers[mapping] : RouteHeader{};
+    const std::uint32_t route_count = logical_descriptor.split()
+        ? route_header.count : logical_descriptor.count() ? 1u : 0u;
+    const RoutedSliceSelection selected = !logical_descriptor.split()
+        ? RoutedSliceSelection{logical_descriptor, 0u,
+                               logical_descriptor.count() != 0u}
         : routed_slice_for_suffix(
               q, level, suffix, route_headers, route_slices);
     const Descriptor descriptor = selected.rows;
@@ -5682,32 +5741,39 @@ __global__ void lookup_with_pending_kernel(
     std::uint32_t begin{}, end{};
     resident_point_search_bounds(
         q, level, suffix, foundation_level, descriptor, selected.route,
-        route_header.count, descriptors, route_logical_begins,
+        route_count, logical_descriptor.count(), route_logical_begins,
         level_q_logical_offsets, local_rank, level_guides,
         level_cell_rank_blocks, level_cell_ranks, begin, end);
     if (begin >= end) continue;
-    const std::uint32_t position =
-        lower_bound_rows(rows + begin, end - begin, suffix);
-    if (position < end - begin && rows[begin + position].key == suffix) {
-      const bool live =
-          (rows[begin + position].flags & kTombstone) == 0u;
+    Row matched_row{};
+    const bool matched = logical_descriptor.split()
+        ? find_leftmost_point_row(
+              rows + begin, end - begin, suffix, matched_row)
+        : find_unique_point_row(
+              rows + begin, end - begin, suffix, matched_row);
+    if (matched) {
+      const bool live = (matched_row.flags & kTombstone) == 0u;
       const std::uint32_t destination = query_ids ? query_ids[i] : i;
       std::uint32_t *values = final_values ? final_values : out_values;
       std::uint8_t *found = final_found ? final_found : out_found;
       values[destination] =
-          live ? rows[begin + position].value : found ? 0u : kInvalid;
+          live ? matched_row.value : found ? 0u : kInvalid;
       if (found) found[destination] = live;
       return;
     }
   }
-  const RouteHeader foundation_header = foundation_level < active_levels
-      ? route_headers[descriptor_index(q, foundation_level)]
-      : RouteHeader{};
+  const std::size_t foundation_mapping =
+      descriptor_index(q, foundation_level);
+  const Descriptor foundation_logical = foundation_level < active_levels
+      ? descriptors[foundation_mapping] : Descriptor{};
+  const RouteHeader foundation_header = foundation_logical.split()
+      ? route_headers[foundation_mapping] : RouteHeader{};
+  const std::uint32_t foundation_route_count = foundation_logical.split()
+      ? foundation_header.count : foundation_logical.count() ? 1u : 0u;
   const RoutedSliceSelection foundation_selection =
-      foundation_header.count == 1u
-          ? RoutedSliceSelection{
-                route_slices[foundation_header.begin].rows,
-                foundation_header.begin, true}
+      !foundation_logical.split()
+          ? RoutedSliceSelection{foundation_logical, 0u,
+                                 foundation_logical.count() != 0u}
           : foundation_level < active_levels
               ? routed_slice_for_suffix(
                     q, foundation_level, suffix,
@@ -5717,10 +5783,8 @@ __global__ void lookup_with_pending_kernel(
   const Row *foundation_rows = arena + foundation.offset();
   const std::uint32_t cell = (key >> 9u) & 127u;
   const std::size_t local_index = std::size_t{q} * 128u + cell;
-  const std::uint32_t foundation_logical_count =
-      foundation_level < active_levels
-          ? descriptors[descriptor_index(q, foundation_level)].count() : 0u;
-  const bool ranked = foundation_header.count &&
+  const std::uint32_t foundation_logical_count = foundation_logical.count();
+  const bool ranked = foundation_route_count &&
       foundation_logical_count <= (1u << 16u);
   const std::uint32_t logical_begin =
       ranked ? local_rank[local_index] : 0u;
@@ -5730,7 +5794,7 @@ __global__ void lookup_with_pending_kernel(
       : foundation_logical_count;
   std::uint32_t begin = logical_begin;
   std::uint32_t end = logical_end;
-  if (foundation_header.count != 1u) {
+  if (foundation_route_count != 1u) {
     const std::uint32_t foundation_section_begin =
         foundation_level < active_levels
             ? level_q_logical_offsets[
@@ -5748,18 +5812,18 @@ __global__ void lookup_with_pending_kernel(
               ? logical_end - foundation_route_begin : 0u)
         : 0u;
   }
-  const std::uint32_t position =
-      lower_bound_rows(foundation_rows + begin, end - begin, suffix);
-  const bool matched = position < end - begin &&
-      foundation_rows[begin + position].key == suffix;
-  const bool live = matched &&
-      (foundation_rows[begin + position].flags & kTombstone) == 0u;
+  Row matched_row{};
+  const bool matched = foundation_logical.split()
+      ? find_leftmost_point_row(
+            foundation_rows + begin, end - begin, suffix, matched_row)
+      : find_unique_point_row(
+            foundation_rows + begin, end - begin, suffix, matched_row);
+  const bool live = matched && (matched_row.flags & kTombstone) == 0u;
   const std::uint32_t destination = query_ids ? query_ids[i] : i;
   std::uint32_t *values = final_values ? final_values : out_values;
   std::uint8_t *found = final_found ? final_found : out_found;
   values[destination] =
-      live ? foundation_rows[begin + position].value
-           : found ? 0u : kInvalid;
+      live ? matched_row.value : found ? 0u : kInvalid;
   if (found) found[destination] = live;
 }
 
@@ -5785,11 +5849,15 @@ __device__ __forceinline__ void lookup_resident_only(
     const std::uint32_t level =
         static_cast<std::uint32_t>(__ffsll(occupied_levels) - 1);
     occupied_levels &= occupied_levels - 1u;
-    const RouteHeader route_header =
-        route_headers[descriptor_index(q, level)];
-    const RoutedSliceSelection selected = route_header.count == 1u
-        ? RoutedSliceSelection{
-              route_slices[route_header.begin].rows, route_header.begin, true}
+    const std::size_t mapping = descriptor_index(q, level);
+    const Descriptor logical_descriptor = descriptors[mapping];
+    const RouteHeader route_header = logical_descriptor.split()
+        ? route_headers[mapping] : RouteHeader{};
+    const std::uint32_t route_count = logical_descriptor.split()
+        ? route_header.count : logical_descriptor.count() ? 1u : 0u;
+    const RoutedSliceSelection selected = !logical_descriptor.split()
+        ? RoutedSliceSelection{logical_descriptor, 0u,
+                               logical_descriptor.count() != 0u}
         : routed_slice_for_suffix(
               q, level, suffix, route_headers, route_slices);
     const Descriptor descriptor = selected.rows;
@@ -5798,33 +5866,40 @@ __device__ __forceinline__ void lookup_resident_only(
     std::uint32_t begin{}, end{};
     resident_point_search_bounds(
         q, level, suffix, foundation_level, descriptor, selected.route,
-        route_header.count, descriptors, route_logical_begins,
+        route_count, logical_descriptor.count(), route_logical_begins,
         level_q_logical_offsets, local_rank, level_guides,
         level_cell_rank_blocks, level_cell_ranks, begin, end);
     if (begin >= end) continue;
-    const std::uint32_t position =
-        lower_bound_rows(rows + begin, end - begin, suffix);
-    if (position < end - begin && rows[begin + position].key == suffix) {
-      const bool live =
-          (rows[begin + position].flags & kTombstone) == 0u;
+    Row matched_row{};
+    const bool matched = logical_descriptor.split()
+        ? find_leftmost_point_row(
+              rows + begin, end - begin, suffix, matched_row)
+        : find_unique_point_row(
+              rows + begin, end - begin, suffix, matched_row);
+    if (matched) {
+      const bool live = (matched_row.flags & kTombstone) == 0u;
       const std::uint32_t destination =
           query_ids ? query_ids[query_index] : query_index;
       std::uint32_t *values = final_values ? final_values : out_values;
       std::uint8_t *found = final_found ? final_found : out_found;
       values[destination] =
-          live ? rows[begin + position].value : found ? 0u : kInvalid;
+          live ? matched_row.value : found ? 0u : kInvalid;
       if (found) found[destination] = live;
       return;
     }
   }
-  const RouteHeader foundation_header = foundation_level < active_levels
-      ? route_headers[descriptor_index(q, foundation_level)]
-      : RouteHeader{};
+  const std::size_t foundation_mapping =
+      descriptor_index(q, foundation_level);
+  const Descriptor foundation_logical = foundation_level < active_levels
+      ? descriptors[foundation_mapping] : Descriptor{};
+  const RouteHeader foundation_header = foundation_logical.split()
+      ? route_headers[foundation_mapping] : RouteHeader{};
+  const std::uint32_t foundation_route_count = foundation_logical.split()
+      ? foundation_header.count : foundation_logical.count() ? 1u : 0u;
   const RoutedSliceSelection foundation_selection =
-      foundation_header.count == 1u
-          ? RoutedSliceSelection{
-                route_slices[foundation_header.begin].rows,
-                foundation_header.begin, true}
+      !foundation_logical.split()
+          ? RoutedSliceSelection{foundation_logical, 0u,
+                                 foundation_logical.count() != 0u}
           : foundation_level < active_levels
               ? routed_slice_for_suffix(
                     q, foundation_level, suffix,
@@ -5834,10 +5909,8 @@ __device__ __forceinline__ void lookup_resident_only(
   const Row *foundation_rows = arena + foundation.offset();
   const std::uint32_t cell = (key >> 9u) & 127u;
   const std::size_t local_index = std::size_t{q} * 128u + cell;
-  const std::uint32_t foundation_logical_count =
-      foundation_level < active_levels
-          ? descriptors[descriptor_index(q, foundation_level)].count() : 0u;
-  const bool ranked = foundation_header.count &&
+  const std::uint32_t foundation_logical_count = foundation_logical.count();
+  const bool ranked = foundation_route_count &&
       foundation_logical_count <= (1u << 16u);
   const std::uint32_t logical_begin =
       ranked ? local_rank[local_index] : 0u;
@@ -5847,7 +5920,7 @@ __device__ __forceinline__ void lookup_resident_only(
       : foundation_logical_count;
   std::uint32_t begin = logical_begin;
   std::uint32_t end = logical_end;
-  if (foundation_header.count != 1u) {
+  if (foundation_route_count != 1u) {
     const std::uint32_t foundation_section_begin =
         foundation_level < active_levels
             ? level_q_logical_offsets[
@@ -5865,19 +5938,19 @@ __device__ __forceinline__ void lookup_resident_only(
               ? logical_end - foundation_route_begin : 0u)
         : 0u;
   }
-  const std::uint32_t position =
-      lower_bound_rows(foundation_rows + begin, end - begin, suffix);
-  const bool matched = position < end - begin &&
-      foundation_rows[begin + position].key == suffix;
-  const bool live = matched &&
-      (foundation_rows[begin + position].flags & kTombstone) == 0u;
+  Row matched_row{};
+  const bool matched = foundation_logical.split()
+      ? find_leftmost_point_row(
+            foundation_rows + begin, end - begin, suffix, matched_row)
+      : find_unique_point_row(
+            foundation_rows + begin, end - begin, suffix, matched_row);
+  const bool live = matched && (matched_row.flags & kTombstone) == 0u;
   const std::uint32_t destination =
       query_ids ? query_ids[query_index] : query_index;
   std::uint32_t *values = final_values ? final_values : out_values;
   std::uint8_t *found = final_found ? final_found : out_found;
   values[destination] =
-      live ? foundation_rows[begin + position].value
-           : found ? 0u : kInvalid;
+      live ? matched_row.value : found ? 0u : kInvalid;
   if (found) found[destination] = live;
 }
 
