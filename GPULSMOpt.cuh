@@ -67,6 +67,13 @@ constexpr std::uint32_t kAdmissionCtaGroupMaximum = 64u;
 constexpr std::uint32_t kAdmissionCtaHashSlots = 128u;
 static_assert((kAdmissionCtaHashSlots &
                (kAdmissionCtaHashSlots - 1u)) == 0u);
+constexpr std::uint32_t kLookupRouterSlots = 2048u;
+constexpr std::uint32_t kLookupRouterMask = kLookupRouterSlots - 1u;
+constexpr std::uint32_t kLookupRouterAttempts = 4u;
+constexpr std::uint32_t kLookupRouterProbeTarget = 8u;
+constexpr std::uint32_t kLookupRouterDenseRowsPerSection = 8u;
+constexpr std::uint32_t kLookupRouterMinimumBatches = 5u;
+static_assert((kLookupRouterSlots & (kLookupRouterSlots - 1u)) == 0u);
 constexpr std::uint32_t kFoundationCompactionThreads = 256u;
 constexpr std::uint32_t kFoundationCells = 128u;
 constexpr std::uint32_t kFoundationCellKeys = 512u;
@@ -5349,6 +5356,352 @@ __global__ void lookup_with_pending_kernel(
 }
 
 
+__device__ __forceinline__ void lookup_resident_only(
+    std::uint32_t key, std::uint32_t query_index,
+    std::uint32_t *out_values, std::uint8_t *out_found,
+    const Row *arena, const Descriptor *descriptors,
+    const RouteHeader *route_headers, const RouteSlice *route_slices,
+    const std::uint32_t *route_logical_begins,
+    const std::uint32_t *level_q_logical_offsets,
+    const std::uint16_t *local_rank, const std::uint16_t *level_guides,
+    std::uint32_t active_levels, std::uint32_t foundation_level,
+    std::uint64_t occupied_levels, const std::uint32_t *query_ids,
+    std::uint32_t *final_values, std::uint8_t *final_found) {
+  const std::uint32_t q = key >> 16u;
+  const std::uint32_t suffix = key_suffix(key);
+  if (foundation_level < kMaximumLevels)
+    occupied_levels &= ~(std::uint64_t{1} << foundation_level);
+  while (occupied_levels) {
+    const std::uint32_t level =
+        static_cast<std::uint32_t>(__ffsll(occupied_levels) - 1);
+    occupied_levels &= occupied_levels - 1u;
+    const RouteHeader route_header =
+        route_headers[descriptor_index(q, level)];
+    const RoutedSliceSelection selected = route_header.count == 1u
+        ? RoutedSliceSelection{
+              route_slices[route_header.begin].rows, route_header.begin, true}
+        : routed_slice_for_suffix(
+              q, level, suffix, route_headers, route_slices);
+    const Descriptor descriptor = selected.rows;
+    if (!descriptor.count()) continue;
+    const Row *rows = arena + descriptor.offset();
+    std::uint32_t begin = 0u, end = descriptor.count();
+    if (route_header.count == 1u) {
+      guide_search_bounds(level_guides, q, level, descriptor.count(), suffix,
+                          begin, end);
+    } else {
+      const std::uint32_t logical_count =
+          descriptors[descriptor_index(q, level)].count();
+      std::uint32_t logical_begin = 0u, logical_end = logical_count;
+      guide_search_bounds(level_guides, q, level, logical_count, suffix,
+                          logical_begin, logical_end);
+      const std::uint32_t section_begin = level_q_logical_offsets[
+          std::size_t{level} * (kQuotients + 1u) + q];
+      const std::uint32_t route_begin =
+          route_logical_begins[selected.route] - section_begin;
+      begin = logical_begin > route_begin
+          ? logical_begin - route_begin : 0u;
+      end = min(descriptor.count(), logical_end > route_begin
+          ? logical_end - route_begin : 0u);
+    }
+    if (begin >= end) continue;
+    const std::uint32_t position =
+        lower_bound_rows(rows + begin, end - begin, suffix);
+    if (position < end - begin && rows[begin + position].key == suffix) {
+      const bool live =
+          (rows[begin + position].flags & kTombstone) == 0u;
+      const std::uint32_t destination =
+          query_ids ? query_ids[query_index] : query_index;
+      std::uint32_t *values = final_values ? final_values : out_values;
+      std::uint8_t *found = final_found ? final_found : out_found;
+      values[destination] =
+          live ? rows[begin + position].value : found ? 0u : kInvalid;
+      if (found) found[destination] = live;
+      return;
+    }
+  }
+  const RouteHeader foundation_header = foundation_level < active_levels
+      ? route_headers[descriptor_index(q, foundation_level)]
+      : RouteHeader{};
+  const RoutedSliceSelection foundation_selection =
+      foundation_header.count == 1u
+          ? RoutedSliceSelection{
+                route_slices[foundation_header.begin].rows,
+                foundation_header.begin, true}
+          : foundation_level < active_levels
+              ? routed_slice_for_suffix(
+                    q, foundation_level, suffix,
+                    route_headers, route_slices)
+              : RoutedSliceSelection{};
+  const Descriptor foundation = foundation_selection.rows;
+  const Row *foundation_rows = arena + foundation.offset();
+  const std::uint32_t cell = (key >> 9u) & 127u;
+  const std::size_t local_index = std::size_t{q} * 128u + cell;
+  const std::uint32_t foundation_logical_count =
+      foundation_level < active_levels
+          ? descriptors[descriptor_index(q, foundation_level)].count() : 0u;
+  const bool ranked = foundation_header.count &&
+      foundation_logical_count <= (1u << 16u);
+  const std::uint32_t logical_begin =
+      ranked ? local_rank[local_index] : 0u;
+  const std::uint32_t logical_end = ranked
+      ? (cell == 127u ? foundation_logical_count
+                      : local_rank[local_index + 1u])
+      : foundation_logical_count;
+  std::uint32_t begin = logical_begin;
+  std::uint32_t end = logical_end;
+  if (foundation_header.count != 1u) {
+    const std::uint32_t foundation_section_begin =
+        foundation_level < active_levels
+            ? level_q_logical_offsets[
+                  std::size_t{foundation_level} * (kQuotients + 1u) + q]
+            : 0u;
+    const std::uint32_t foundation_route_begin = foundation_selection.valid
+        ? route_logical_begins[foundation_selection.route] -
+              foundation_section_begin
+        : 0u;
+    begin = foundation_selection.valid &&
+            logical_begin > foundation_route_begin
+        ? logical_begin - foundation_route_begin : 0u;
+    end = foundation_selection.valid
+        ? min(foundation.count(), logical_end > foundation_route_begin
+              ? logical_end - foundation_route_begin : 0u)
+        : 0u;
+  }
+  const std::uint32_t position =
+      lower_bound_rows(foundation_rows + begin, end - begin, suffix);
+  const bool matched = position < end - begin &&
+      foundation_rows[begin + position].key == suffix;
+  const bool live = matched &&
+      (foundation_rows[begin + position].flags & kTombstone) == 0u;
+  const std::uint32_t destination =
+      query_ids ? query_ids[query_index] : query_index;
+  std::uint32_t *values = final_values ? final_values : out_values;
+  std::uint8_t *found = final_found ? final_found : out_found;
+  values[destination] =
+      live ? foundation_rows[begin + position].value
+           : found ? 0u : kInvalid;
+  if (found) found[destination] = live;
+}
+
+
+__device__ __forceinline__ std::uint32_t lookup_router_mix(
+    std::uint32_t key, std::uint32_t seed) {
+  std::uint32_t value = key ^ (0x9e3779b9u * (seed + 1u));
+  value ^= value >> 16u;
+  value *= 0x7feb352du;
+  value ^= value >> 15u;
+  value *= 0x846ca68bu;
+  value ^= value >> 16u;
+  return value;
+}
+
+
+__device__ __forceinline__ void lookup_router_location(
+    std::uint32_t key, std::uint32_t seed,
+    std::uint32_t &slot, std::uint32_t &step) {
+  const std::uint32_t first = lookup_router_mix(key, seed);
+  const std::uint32_t second = lookup_router_mix(
+      key ^ 0xa511e9b3u, seed + 0x632be59bu);
+  slot = first & kLookupRouterMask;
+  step = (second | 1u) & kLookupRouterMask;
+}
+
+
+__device__ __forceinline__ std::uint32_t lookup_router_find(
+    std::uint32_t key, std::uint32_t seed,
+    const std::uint32_t *owners, const std::uint32_t *query_keys) {
+  std::uint32_t slot{}, step{};
+  lookup_router_location(key, seed, slot, step);
+#pragma unroll 1
+  for (std::uint32_t probe = 0u; probe < kLookupRouterSlots; ++probe) {
+    const std::uint32_t owner = owners[slot];
+    if (owner == kInvalid) return kInvalid;
+    if (query_keys[owner] == key) return owner;
+    slot = (slot + step) & kLookupRouterMask;
+  }
+  return kInvalid;
+}
+
+
+__global__ void lookup_with_dense_router_kernel(
+    const std::uint32_t *queries, std::uint32_t *out_values,
+    std::uint8_t *out_found, std::uint32_t count,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets,
+    std::uint32_t batch_stride, std::uint32_t pending_batches,
+    const std::uint64_t *epoch_signatures,
+    const Row *arena, const Descriptor *descriptors,
+    const RouteHeader *route_headers, const RouteSlice *route_slices,
+    const std::uint32_t *route_logical_begins,
+    const std::uint32_t *level_q_logical_offsets,
+    const std::uint16_t *local_rank,
+    const std::uint16_t *level_guides,
+    std::uint32_t active_levels,
+    std::uint32_t foundation_level,
+    std::uint64_t occupied_levels,
+    const std::uint32_t *query_ids,
+    std::uint32_t *final_values, std::uint8_t *final_found,
+    const std::uint64_t *query_occupied_level_mask = nullptr) {
+  __shared__ std::uint32_t router_owners[kLookupRouterSlots];
+  __shared__ std::uint32_t router_query_keys[kThreads];
+  __shared__ unsigned long long router_winners[kThreads];
+  __shared__ std::uint16_t router_sections[kThreads];
+  __shared__ std::uint32_t router_section_count;
+  __shared__ std::uint32_t router_max_probe;
+  __shared__ std::uint32_t router_seed;
+
+  const std::uint32_t local = threadIdx.x;
+  const std::uint32_t i = blockIdx.x * blockDim.x + local;
+  const bool valid = i < count;
+  const std::uint32_t key = valid ? queries[i] : 0u;
+  const std::uint32_t q = key >> 16u;
+  if (query_occupied_level_mask) {
+    const DeviceManifestSnapshot manifest =
+        load_query_manifest(query_occupied_level_mask);
+    active_levels = manifest.active_levels;
+    foundation_level = manifest.foundation_level;
+    occupied_levels = manifest.occupied_level_mask;
+  }
+
+  bool possible = false;
+  if (valid) {
+    const std::uint64_t bits = pending_signature_bits(key);
+    possible = (epoch_signatures[q] & bits) == bits;
+  }
+  if (!__syncthreads_or(possible)) {
+    if (valid)
+      lookup_resident_only(
+          key, i, out_values, out_found, arena, descriptors,
+          route_headers, route_slices, route_logical_begins,
+          level_q_logical_offsets, local_rank, level_guides,
+          active_levels, foundation_level, occupied_levels, query_ids,
+          final_values, final_found);
+    return;
+  }
+
+  router_query_keys[local] = key;
+  router_winners[local] = 0ull;
+  if (local == 0u) router_section_count = 0u;
+  __syncthreads();
+
+  if (valid && (local == 0u ||
+                (router_query_keys[local - 1u] >> 16u) != q)) {
+    const std::uint32_t section = atomicAdd(&router_section_count, 1u);
+    router_sections[section] = static_cast<std::uint16_t>(q);
+  }
+  __syncthreads();
+
+  for (std::uint32_t attempt = 0u;
+       attempt < kLookupRouterAttempts; ++attempt) {
+    for (std::uint32_t slot = local; slot < kLookupRouterSlots;
+         slot += kThreads)
+      router_owners[slot] = kInvalid;
+    if (local == 0u) router_max_probe = 0u;
+    __syncthreads();
+
+    std::uint32_t probes = 0u;
+    if (valid) {
+      std::uint32_t slot{}, step{};
+      lookup_router_location(key, attempt, slot, step);
+#pragma unroll 1
+      for (; probes < kLookupRouterSlots; ++probes) {
+        const std::uint32_t owner = atomicCAS(
+            router_owners + slot, kInvalid, local);
+        if (owner == kInvalid || router_query_keys[owner] == key) {
+          ++probes;
+          break;
+        }
+        slot = (slot + step) & kLookupRouterMask;
+      }
+      atomicMax(&router_max_probe, probes);
+    }
+    __syncthreads();
+    if (router_max_probe <= kLookupRouterProbeTarget ||
+        attempt + 1u == kLookupRouterAttempts) {
+      if (local == 0u) router_seed = attempt;
+      break;
+    }
+  }
+  __syncthreads();
+
+  const std::uint32_t section_count = router_section_count;
+  const std::uint32_t task_count = section_count * pending_batches;
+  std::uint32_t worker_width = 16u;
+  if (task_count < 16u) {
+    worker_width = task_count >= 8u ? 32u
+        : task_count >= 4u ? 64u
+        : task_count >= 2u ? 128u : 256u;
+  }
+  const std::uint32_t worker_groups = kThreads / worker_width;
+  const std::uint32_t worker_group = local / worker_width;
+  const std::uint32_t worker_local = local & (worker_width - 1u);
+
+  for (std::uint32_t task = worker_group;
+       task < task_count; task += worker_groups) {
+    const std::uint32_t batch = task / section_count;
+    const std::uint32_t section =
+        router_sections[task - batch * section_count];
+    const std::size_t oi =
+        std::size_t{batch} * (kQuotients + 1u) + section;
+    const std::uint32_t begin = raw_offsets[oi];
+    const std::uint32_t end = raw_offsets[oi + 1u];
+    for (std::uint32_t position = begin + worker_local;
+         position < end; position += worker_width) {
+      const std::uint32_t record = batch * batch_stride + position;
+      const std::uint32_t pending_key = raw_keys[record];
+      const std::uint32_t owner = lookup_router_find(
+          pending_key, router_seed, router_owners, router_query_keys);
+      const bool matched = owner != kInvalid;
+      unsigned matched_mask = __ballot_sync(__activemask(), matched);
+      if (!matched) continue;
+      const RawPayload payload = raw_payloads[record];
+      const std::uint64_t order =
+          static_cast<std::uint64_t>(raw_position(payload)) + 1u;
+      const unsigned long long token =
+          static_cast<unsigned long long>((order << 24u) | record);
+      const unsigned peers = __match_any_sync(matched_mask, owner);
+      unsigned long long newest = token;
+      unsigned remaining = peers;
+      while (remaining) {
+        const std::uint32_t source =
+            static_cast<std::uint32_t>(__ffs(remaining) - 1);
+        newest = max(newest, __shfl_sync(peers, token, source));
+        remaining &= remaining - 1u;
+      }
+      const std::uint32_t lane = threadIdx.x & 31u;
+      if (lane == static_cast<std::uint32_t>(__ffs(peers) - 1))
+        atomicMax(router_winners + owner, newest);
+    }
+  }
+  __syncthreads();
+
+  if (!valid) return;
+  const std::uint32_t owner = lookup_router_find(
+      key, router_seed, router_owners, router_query_keys);
+  const unsigned long long winner = owner == kInvalid
+      ? 0ull : router_winners[owner];
+  if (winner) {
+    const std::uint32_t record =
+        static_cast<std::uint32_t>(winner & ((1ull << 24u) - 1u));
+    const RawPayload payload = raw_payloads[record];
+    const bool live = (payload.metadata & kRawTombstone) == 0u;
+    const std::uint32_t destination = query_ids ? query_ids[i] : i;
+    std::uint32_t *values = final_values ? final_values : out_values;
+    std::uint8_t *found = final_found ? final_found : out_found;
+    values[destination] = live ? payload.value : found ? 0u : kInvalid;
+    if (found) found[destination] = live;
+    return;
+  }
+  lookup_resident_only(
+      key, i, out_values, out_found, arena, descriptors,
+      route_headers, route_slices, route_logical_begins,
+      level_q_logical_offsets, local_rank, level_guides,
+      active_levels, foundation_level, occupied_levels, query_ids,
+      final_values, final_found);
+}
+
+
 
 __device__ bool first_visible_in_quotient(
     std::uint32_t q, std::uint32_t lower,
@@ -5644,6 +5997,13 @@ public:
         range_reduction_completion_(1u) {
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
+    // Force the optional dense lookup kernel's code to load during structure
+    // initialization.  Otherwise CUDA's lazy module loading is charged to the
+    // first dense lookup, even though it is not algorithmic lookup work.
+    cudaFuncAttributes dense_router_attributes{};
+    CUDA_CHECK(cudaFuncGetAttributes(
+        &dense_router_attributes,
+        gpulsmopt2_detail::lookup_with_dense_router_kernel));
     std::size_t initial_sort_bytes{};
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, initial_sort_bytes,
@@ -5826,19 +6186,39 @@ public:
       queries = radix_keys_.data();
       query_ids = radix_ids_out_.data();
     }
+    const std::uint64_t dense_router_threshold =
+        std::uint64_t{pending_batches_} * gpulsmopt2_detail::kQuotients *
+        gpulsmopt2_detail::kLookupRouterDenseRowsPerSection;
+    const bool use_dense_router = grouped &&
+        pending_batches_ >= gpulsmopt2_detail::kLookupRouterMinimumBatches &&
+        std::uint64_t{pending_records_} >= dense_router_threshold;
     if (grouped) {
-      gpulsmopt2_detail::lookup_with_pending_kernel<<<
-          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
-          queries, batch.out_values, batch.out_found, count,
-          raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
-          static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
-          raw_signatures_.data(), raw_epoch_signatures_.data(),
-          arena_.data(), descriptors_.data(), route_headers_.data(),
-          route_slices_.data(), route_logical_begins_.data(),
-          level_q_logical_offsets_.data(), local_rank_.data(),
-          level_guides_.data(),
-          active_levels_, foundation_level(), occupied_level_mask(),
-          query_ids, nullptr, nullptr, query_occupied_level_mask_.data());
+      if (use_dense_router) {
+        gpulsmopt2_detail::lookup_with_dense_router_kernel<<<
+            blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            queries, batch.out_values, batch.out_found, count,
+            raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+            static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+            raw_epoch_signatures_.data(), arena_.data(), descriptors_.data(),
+            route_headers_.data(), route_slices_.data(),
+            route_logical_begins_.data(), level_q_logical_offsets_.data(),
+            local_rank_.data(), level_guides_.data(), active_levels_,
+            foundation_level(), occupied_level_mask(), query_ids,
+            nullptr, nullptr, query_occupied_level_mask_.data());
+      } else {
+        gpulsmopt2_detail::lookup_with_pending_kernel<<<
+            blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            queries, batch.out_values, batch.out_found, count,
+            raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+            static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+            raw_signatures_.data(), raw_epoch_signatures_.data(),
+            arena_.data(), descriptors_.data(), route_headers_.data(),
+            route_slices_.data(), route_logical_begins_.data(),
+            level_q_logical_offsets_.data(), local_rank_.data(),
+            level_guides_.data(), active_levels_, foundation_level(),
+            occupied_level_mask(), query_ids, nullptr, nullptr,
+            query_occupied_level_mask_.data());
+      }
       CUDA_CHECK(cudaGetLastError());
     } else {
       gpulsmopt2_detail::lookup_with_pending_kernel<<<
