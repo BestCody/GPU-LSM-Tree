@@ -444,9 +444,10 @@ def main():
             path = os.path.join(graph_dir, name)
             if not os.path.exists(path):
                 continue
+            image_path = os.path.abspath(path)
             report.write(
                 f"### {heading}\n\n"
-                f"![{description}](graphs/{name})\n\n"
+                f"![{description}]({image_path})\n\n"
                 f"{description}.\n\n")
     print("Wrote", report_path)
 
