@@ -8,12 +8,14 @@
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/iterator/counting_input_iterator.cuh>
+#include <cub/iterator/transform_input_iterator.cuh>
 #include <thrust/iterator/transform_output_iterator.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,8 +40,7 @@ constexpr std::uint32_t kBatchPositionBits = 20u;
 constexpr std::uint32_t kLocalRankBits = 7u;
 constexpr std::uint32_t kLocalRankEntries =
     kQuotients * (1u << kLocalRankBits);
-// Eight pivots divide a logical section into nine search regions.  Keeping the
-// guide small matters because one guide is reserved for every section/level.
+// Eight pivots form nine search regions.
 constexpr std::uint32_t kGuideRegions = 9u;
 constexpr std::uint32_t kGuideSamples = kGuideRegions - 1u;
 constexpr std::size_t kGuideEntriesPerLevel =
@@ -81,6 +82,13 @@ constexpr std::uint32_t kFoundationCompactionThreads = 256u;
 constexpr std::uint32_t kFoundationCells = 128u;
 constexpr std::uint32_t kFoundationCellKeys = 512u;
 constexpr std::uint32_t kDenseCellRankMinimumRows = kFoundationCells;
+// A full section ends at the descriptor count.
+__host__ __device__ constexpr bool cell_rank_supported(
+    std::uint64_t count) {
+  return count <= kQuotients;
+}
+static_assert((kFoundationCells - 1u) * kFoundationCellKeys <=
+              std::numeric_limits<std::uint16_t>::max());
 constexpr std::uint32_t kCellOwnedQuotients = 2u;
 constexpr std::uint32_t kCellOwnedCells =
     kCellOwnedQuotients * kFoundationCells;
@@ -92,9 +100,7 @@ constexpr std::uint32_t kPlanningTileQuotients =
 constexpr std::uint32_t kMaximumMergeSources = kMaximumLevels + 1u;
 constexpr std::uint32_t kBalancedMergeCapacityCeiling =
     kFoundationCompactionThreads * 32u;
-// A quotient has at most 65 sorted sources and 65,536 distinct suffixes.
-// This upper bound is sufficient to split even that theoretical maximum into
-// on-chip jobs without imposing a fixed number of pieces on ordinary data.
+// Bound for splitting a maximally dense quotient.
 constexpr std::uint32_t kMergeSourceBits = 7u;
 constexpr std::uint64_t kResidentWorkFlag = std::uint64_t{1} << 63u;
 
@@ -120,8 +126,7 @@ inline std::size_t initial_storage_capacity(
 
 inline std::size_t foundation_pool_capacity(std::size_t requested) {
   constexpr std::size_t even_maximum = kMaximumPublicationRows - 1u;
-  // Two alternating banks.  A merge reserves one output slot per raw input
-  // before duplicate removal, so each bank keeps a 2x raw-row bound.
+  // Two banks reserve worst-case raw rows.
   const std::size_t requested_banks = requested > even_maximum / 4u
       ? even_maximum : requested * 4u;
   const std::size_t capacity = std::max<std::size_t>(
@@ -131,12 +136,7 @@ inline std::size_t foundation_pool_capacity(std::size_t requested) {
 
 inline std::size_t maximum_resident_merge_jobs(
     std::size_t maximum_raw_rows, std::uint32_t merge_capacity) {
-  // The smallest possible safe target occurs when all 64 levels and the new
-  // epoch participate.  Every whole section can require its own job even when
-  // the total raw-row count divided by the target is smaller (for example,
-  // 65,536 sections with 1,153 rows each cannot be paired).  One slot per
-  // section plus the hot-section pieces is therefore the distribution-
-  // independent section-preserving bound.
+  // Reserve one job per section plus hot pieces.
   const std::size_t safe =
       merge_capacity - (kMaximumMergeSources - 1u);
   return std::size_t{kQuotients} +
@@ -145,8 +145,7 @@ inline std::size_t maximum_resident_merge_jobs(
 
 inline std::size_t adaptive_route_stride(
     std::size_t maximum_raw_rows, std::uint32_t merge_capacity) {
-  // A normal section needs one route and only oversized sections add routes.
-  // Size this from the maximum raw carry, rather than expected live rows.
+  // Routes cover normal and oversized sections.
   return std::size_t{kQuotients} +
       maximum_resident_merge_jobs(maximum_raw_rows, merge_capacity);
 }
@@ -192,9 +191,7 @@ struct Row {
   std::uint16_t flags;
 };
 
-// Published rows use two equally indexed streams.  Searches touch only the
-// compact key/flag stream; values are fetched only for an exact match or when
-// an operation genuinely consumes the complete row.
+// Keys and values use parallel storage streams.
 struct ResidentRows {
   std::uint32_t *key_flags{};
   std::uint32_t *values{};
@@ -226,14 +223,7 @@ struct ResidentRows {
 
 static_assert(sizeof(ResidentRows) == 2u * sizeof(void *));
 
-// The publication merge never compares values.  Keep only the complete
-// comparison key in shared memory and recover the winning value from its
-// source after visibility has been resolved.  The layout exactly matches the
-// former (local quotient, suffix, source age) ordering:
-//
-//   [ local quotient : 9 ][ suffix : 16 ][ source age : 7 ]
-//
-// Tombstones remain orthogonal and are held in a compact bitmap.
+// Candidate tokens exclude values and tombstones.
 using CandidateToken = std::uint32_t;
 
 __host__ __device__ __forceinline__ CandidateToken make_candidate_token(
@@ -306,9 +296,7 @@ static_assert(sizeof(RawPayload) == 8u);
 
 inline std::size_t balanced_merge_dynamic_shared_bytes(
     std::uint32_t capacity) {
-  // Normal jobs use four 16-bit cell planes: input offsets, survivor counts,
-  // a medium/large-cell queue, and output offsets.  Crowded jobs reuse the
-  // same tail as their tombstone bitmap.
+  // Cell planes share the merge workspace.
   constexpr std::size_t cell_words =
       (kCellOwnedCells + 2u) + kCellOwnedCells +
       kCellOwnedCells + kCellOwnedCells + (kCellOwnedCells + 1u);
@@ -390,10 +378,7 @@ struct Descriptor {
 
 static_assert(sizeof(Descriptor) == 8u);
 
-// A quotient can intersect more than one adaptive location.  The first-level
-// directory is indexed exactly like the old descriptor table; it names a
-// short, key-ordered run of route slices.  Each slice is a packed, contiguous
-// part of one adaptive location.
+// Route slices form one logical sorted section.
 struct RouteHeader {
   std::uint32_t begin{};
   std::uint32_t count{};
@@ -425,13 +410,10 @@ struct LevelStorageSpan {
   std::uint64_t capacity{};
 };
 
-// Dense non-foundation sections receive one exact 128-cell boundary block.
-// Blocks are compacted inside each preassigned level span so sparse levels do
-// not pay for a full 65,536-section directory.
+// Dense sections store exact cell boundaries.
 struct LevelRankSpan {
   std::uint64_t begin_block{};
   std::uint32_t capacity_blocks{};
-  std::uint32_t reserved{};
 };
 
 enum ResidentPublicationStatus : std::uint32_t {
@@ -463,22 +445,22 @@ struct ResidentPublicationPlan {
   std::uint64_t survivor_count{};
 };
 
+static_assert(sizeof(ResidentPublicationPlan) == 88u);
+
 struct DeviceManifestSnapshot {
   std::uint64_t occupied_level_mask{};
   std::uint32_t active_levels{};
   std::uint32_t foundation_level{kMaximumLevels};
-  std::uint32_t generation{};
 };
 
 __device__ __forceinline__ DeviceManifestSnapshot load_active_manifest(
     const DeviceManifest *manifests,
     const std::uint32_t *active_manifest) {
-  // Publication is an atomic release.  Readers only need one cached load;
-  // contending on an atomic read per query would destroy the fast path.
+  // Read the published manifest once.
   const std::uint32_t index = __ldg(active_manifest) & 1u;
   const DeviceManifest *manifest = manifests + index;
   return {manifest->occupied_level_mask, manifest->active_levels,
-          manifest->foundation_level, manifest->generation};
+          manifest->foundation_level};
 }
 
 __device__ __forceinline__ DeviceManifestSnapshot load_query_manifest(
@@ -487,7 +469,7 @@ __device__ __forceinline__ DeviceManifestSnapshot load_query_manifest(
   const std::uint32_t active_levels = occupied
       ? 64u - static_cast<std::uint32_t>(__clzll(occupied)) : 0u;
   return {occupied, active_levels,
-          active_levels ? active_levels - 1u : kMaximumLevels, 0u};
+          active_levels ? active_levels - 1u : kMaximumLevels};
 }
 
 __device__ __forceinline__ bool level_is_occupied(
@@ -561,7 +543,7 @@ __device__ __forceinline__ bool exact_cell_input_slice(
     const std::uint16_t *local_rank,
     const std::uint32_t *level_cell_rank_blocks,
     const std::uint16_t *level_cell_ranks, CellInputSlice &slice) {
-  if (section_count > (1u << 16u)) return false;
+  if (!cell_rank_supported(section_count)) return false;
   const std::uint16_t *ranks = nullptr;
   if (level == foundation_level) {
     ranks = local_rank + std::size_t{q} * kFoundationCells;
@@ -692,18 +674,6 @@ public:
   explicit Buffer(std::size_t count) { resize(count); }
   Buffer(const Buffer &) = delete;
   Buffer &operator=(const Buffer &) = delete;
-  Buffer &operator=(Buffer &&other) noexcept {
-    if (this != &other) {
-      if (pointer_ && owns_) cudaFree(pointer_);
-      pointer_ = other.pointer_;
-      count_ = other.count_;
-      owns_ = other.owns_;
-      other.pointer_ = nullptr;
-      other.count_ = 0u;
-      other.owns_ = true;
-    }
-    return *this;
-  }
   ~Buffer() { if (pointer_ && owns_) cudaFree(pointer_); }
   void resize(std::size_t count) {
     if (pointer_ && owns_) CUDA_CHECK(cudaFree(pointer_));
@@ -726,6 +696,25 @@ private:
   T *pointer_{};
   std::size_t count_{};
   bool owns_{true};
+};
+
+// Pinned receipts support asynchronous publication.
+template <class T> class PinnedBuffer {
+public:
+  explicit PinnedBuffer(std::size_t count) {
+    if (count)
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void **>(&pointer_),
+                                count * sizeof(T)));
+  }
+  PinnedBuffer(const PinnedBuffer &) = delete;
+  PinnedBuffer &operator=(const PinnedBuffer &) = delete;
+  ~PinnedBuffer() {
+    if (pointer_) cudaFreeHost(pointer_);
+  }
+  T *data() { return pointer_; }
+
+private:
+  T *pointer_{};
 };
 
 inline void check_driver(CUresult result, const char *file, int line) {
@@ -778,7 +767,6 @@ inline VmmFunctions &vmm_functions() {
 
 template <class T> class VirtualBuffer {
 public:
-  VirtualBuffer() = default;
   VirtualBuffer(std::size_t maximum_count, std::size_t initial_count) {
     reserve(maximum_count);
     grow(initial_count);
@@ -829,10 +817,6 @@ public:
 
   T *data() {
     return reinterpret_cast<T *>(static_cast<std::uintptr_t>(address_));
-  }
-  const T *data() const {
-    return reinterpret_cast<const T *>(
-        static_cast<std::uintptr_t>(address_));
   }
   std::size_t size() const { return mapped_bytes_ / sizeof(T); }
 private:
@@ -943,9 +927,7 @@ __device__ __forceinline__ std::uint32_t lower_bound_rows(
   return lo;
 }
 
-// Normal published sections are resolved runs, so equality is final.  Carry
-// the matching row out of the search instead of finding its position and
-// loading it again in the caller.
+// Return the matching row with its position.
 __device__ __forceinline__ bool find_unique_point_row(
     const Row *rows, std::uint32_t count, std::uint32_t key, Row &result) {
   std::uint32_t lo = 0u, hi = count;
@@ -978,9 +960,7 @@ __device__ __forceinline__ bool find_unique_point_row(
   return false;
 }
 
-// Keep lower_bound semantics on the adaptive split path.  This is defensive
-// against adjacent versions while still carrying the leftmost matching row
-// out of the search.
+// Split routes use leftmost-match semantics.
 __device__ __forceinline__ bool find_leftmost_point_row(
     const Row *rows, std::uint32_t count, std::uint32_t key, Row &result) {
   std::uint32_t lo = 0u, hi = count;
@@ -1100,9 +1080,7 @@ __device__ __forceinline__ std::uint32_t upper_bound_rows(
   return lo;
 }
 
-// Search a section as one logical sorted list even when its rows are stored in
-// several route extents.  The returned position is relative to the section,
-// not to any physical extent.
+// Search split routes as one logical section.
 __device__ __forceinline__ std::uint32_t logical_section_bound(
     std::uint32_t q, std::uint32_t level, std::uint32_t key, bool upper,
     ResidentRows arena, const RouteHeader *route_headers,
@@ -1190,10 +1168,7 @@ __device__ __forceinline__ std::uint32_t route_range_row_count(
   return count;
 }
 
-// The newer rows have already been resolved into one sorted list.  A worker
-// group can therefore scan every physical base extent once and only test that
-// compact newest-visible list, instead of re-searching every newer level for
-// every candidate row.
+// Scan base rows against the resolved newer run.
 template <class Aggregate>
 __device__ __forceinline__ typename Aggregate::State
 cooperative_sum_visible_route_runs(
@@ -1228,10 +1203,7 @@ cooperative_sum_visible_route_runs(
         begin + (std::uint64_t{count} * (group_lane + 1u)) / group_size;
     if (lane_begin == lane_end) continue;
 
-    // Give every worker one consecutive part of the stored run.  It locates
-    // its first newer row once, then advances through both sorted sequences.
-    // Thus a stored row is never followed by another search through levels or
-    // through the already-resolved newest-visible view.
+    // Merge one base interval per worker.
     std::uint32_t update = update_begin + lower_bound_rows(
         current + update_begin, update_end - update_begin,
         rows[lane_begin].key);
@@ -1261,6 +1233,13 @@ __global__ void count_range_fragments_kernel(
       lo <= hi ? (hi >> 16u) - (lo >> 16u) + 1u : 0u;
   counts[query] = count;
 }
+
+struct WidenFragmentCount {
+  __host__ __device__ std::uint64_t operator()(
+      std::uint32_t count) const {
+    return count;
+  }
+};
 
 __device__ __forceinline__ void emit_range_fragment(
     std::uint32_t index, std::uint32_t query, std::uint32_t quotient,
@@ -1594,11 +1573,9 @@ __global__ void cooperative_section_owned_range_kernel(
     const std::uint32_t *raw_keys,
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, std::uint32_t active_levels,
-    std::uint32_t foundation_level,
+    std::uint32_t pending_batches,
     typename Aggregate::State *aggregate_partials,
-    std::uint64_t occupied_levels = ~std::uint64_t{0},
-    const std::uint64_t *query_occupied_level_mask = nullptr) {
+    const std::uint64_t *query_occupied_level_mask) {
   constexpr std::uint32_t kCapacity = 512u;
   using BlockScan =
       cub::BlockScan<std::uint32_t, kSectionRangeThreads>;
@@ -1619,9 +1596,7 @@ __global__ void cooperative_section_owned_range_kernel(
   union BaseMaskWorkspace {
     std::uint32_t section[kSectionBaseMaskWords];
     std::uint32_t fragments[kSectionRangeWarps][kFragmentBaseMaskWords];
-    // The interval-union path consumes a stored-row tile once and exposes its
-    // inclusive value prefix to every interval endpoint in the union.  This
-    // aliases the old visibility masks: the two paths are mutually exclusive.
+    // Reuse row tiles across overlapping ranges.
     unsigned long long
         warp_tile_prefix[kSectionRangeWarps][128u + 1u];
   };
@@ -1643,9 +1618,7 @@ __global__ void cooperative_section_owned_range_kernel(
   __shared__ std::uint32_t fragment_work_shared[kSectionTaskFragments];
   __shared__ RangeFragmentBounds
       fragment_bounds_shared[kSectionTaskFragments];
-  // Exact foundation cell starts already exist for point lookup.  Extending
-  // them with the section count gives every endpoint a bounded [begin, end)
-  // search interval without adding persistent metadata.
+  // Extend cell starts with the section endpoint.
   __shared__ std::uint32_t foundation_cell_ranks[kFoundationCells + 1u];
   __shared__ std::uint32_t foundation_ranks_valid_shared;
   __shared__ std::uint32_t section_base_mask_valid_shared;
@@ -1657,13 +1630,11 @@ __global__ void cooperative_section_owned_range_kernel(
   __shared__ Descriptor foundation_descriptor_shared;
   __shared__ Descriptor section_descriptors[kMaximumLevels];
 
-  if (query_occupied_level_mask) {
-    const DeviceManifestSnapshot manifest =
-        load_query_manifest(query_occupied_level_mask);
-    active_levels = manifest.active_levels;
-    foundation_level = manifest.foundation_level;
-    occupied_levels = manifest.occupied_level_mask;
-  }
+  const DeviceManifestSnapshot manifest =
+      load_query_manifest(query_occupied_level_mask);
+  const std::uint32_t active_levels = manifest.active_levels;
+  const std::uint32_t foundation_level = manifest.foundation_level;
+  const std::uint64_t occupied_levels = manifest.occupied_level_mask;
 
   for (std::uint32_t task_index = blockIdx.x;;
        task_index += gridDim.x) {
@@ -1688,10 +1659,7 @@ __global__ void cooperative_section_owned_range_kernel(
         descriptors[descriptor_index(q, threadIdx.x)];
   else if (threadIdx.x < active_levels)
     section_descriptors[threadIdx.x] = {};
-  // Warp zero loads the 256-byte rank block while the CTA is already doing
-  // task setup.  The existing synchronization below also publishes it, so
-  // rank narrowing adds no barrier.  A split or oversized section keeps the
-  // original full-route search.
+  // Warp zero loads the rank block during setup.
   if (threadIdx.x < 32u) {
     bool ranked = false;
     Descriptor rank_descriptor{};
@@ -1701,7 +1669,7 @@ __global__ void cooperative_section_owned_range_kernel(
       const RouteHeader rank_header =
           route_headers[descriptor_index(q, foundation_level)];
       ranked = rank_header.count == 1u &&
-          rank_descriptor.count() <= (1u << 16u);
+          cell_rank_supported(rank_descriptor.count());
     }
     if (threadIdx.x == 0u) {
       foundation_ranks_valid_shared = ranked;
@@ -1940,10 +1908,7 @@ __global__ void cooperative_section_owned_range_kernel(
       ? route_headers[descriptor_index(q, foundation_level)]
       : RouteHeader{};
 
-  // Count the rows of every fragment in parallel.  Scheduling is based on
-  // actual input rows, never on key-space width.  A task can use one fast
-  // uniform schedule when all fragments fall in the same worker class; mixed
-  // tasks use the per-fragment adaptive schedule below.
+  // Schedule fragments by input-row count.
   if (threadIdx.x == 0u) {
     minimum_work_shared = 0xffffffffu;
     maximum_work_shared = 0u;
@@ -2015,9 +1980,7 @@ __global__ void cooperative_section_owned_range_kernel(
   }
   __syncthreads();
 
-  // The fragments are radix ordered by (quotient, low suffix).  Four warp
-  // scans identify disjoint unions and compute their exact row work in
-  // parallel.  No second endpoint sort or serial per-task planner is needed.
+  // Warp scans form disjoint interval unions.
   const std::uint32_t planning_warp = threadIdx.x >> 5u;
   const std::uint32_t planning_lane = threadIdx.x & 31u;
   constexpr unsigned planning_mask = 0xffffffffu;
@@ -2034,8 +1997,7 @@ __global__ void cooperative_section_owned_range_kernel(
         fragment_work_shared[planning_index - fragment_begin];
   }
 
-  // A running maximum of high endpoints identifies a new union exactly when
-  // the next low endpoint exceeds every preceding high endpoint.
+  // Split after the prior maximum endpoint.
   std::uint32_t prefix_high = planning_valid
       ? planning_fragment.high_suffix : 0u;
   for (std::uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
@@ -2108,9 +2070,7 @@ __global__ void cooperative_section_owned_range_kernel(
     }
     const std::uint32_t fragment_count = fragment_end - fragment_begin;
 
-    // Split storage has no single physical row coordinate.  Only dense
-    // overlap pays to count its short route list exactly; sparse split tasks
-    // reject the sweep before doing any route searches.
+    // Count split routes only for dense overlap.
     if (foundation_header.count > 1u && fragment_count >= 8u &&
         union_count * 4u <= fragment_count) {
       for (std::uint32_t warp_begin = fragment_begin;
@@ -2141,11 +2101,7 @@ __global__ void cooperative_section_owned_range_kernel(
   __syncthreads();
 
   if (use_union_sweep_shared) {
-    // Four independent warp sweeps retain the row reuse without serializing
-    // the CTA at every tile.  Each warp owns 32 consecutive low-sorted
-    // intervals, discovers their disjoint unions, and processes a 128-row
-    // tile with only warp synchronization.  The four row tiles therefore run
-    // concurrently.
+    // Four warps sweep independent interval groups.
     const std::uint32_t union_warp = threadIdx.x >> 5u;
     const std::uint32_t union_lane = threadIdx.x & 31u;
     constexpr unsigned union_mask = 0xffffffffu;
@@ -2190,11 +2146,7 @@ __global__ void cooperative_section_owned_range_kernel(
         }
       }
 
-      // A single physical route uses the exact positions found during
-      // planning.  The first low endpoint is the union minimum, and the
-      // maximum saved end is the union maximum because upper_bound is
-      // monotone.  Split routes have independent coordinates and retain the
-      // route-local searches below.
+      // Reuse saved bounds for single-route sections.
       std::uint32_t saved_union_begin = fragment_bounds.base_begin;
       std::uint32_t saved_union_end = fragment_active
           ? fragment_bounds.base_end : 0u;
@@ -2208,8 +2160,7 @@ __global__ void cooperative_section_owned_range_kernel(
             union_mask, saved_union_end, 0u);
       }
 
-      // A route of any physical size uses the same bounded row-tile loop.
-      // Split sections simply contribute more ordered routes.
+      // Scan every route in bounded row tiles.
       for (std::uint32_t local_route = 0u;
            local_route < foundation_header.count; ++local_route) {
         const RouteSlice route =
@@ -2321,9 +2272,7 @@ __global__ void cooperative_section_owned_range_kernel(
     break;
   }
 
-  // Split storage is scanned as one logical run.  Each fragment chooses its
-  // cooperation width from the number of rows it will actually examine.  The
-  // same adaptive schedule handles an uneven task in an unsplit section.
+  // Choose worker width from actual rows.
   if (!overflow_shared &&
       (foundation_header.count > 1u || dynamic_queue_shared)) {
     for (std::uint32_t fragment_index = fragment_begin + threadIdx.x;
@@ -2709,11 +2658,9 @@ __global__ void warp_range_fragment_kernel(
     const RouteSlice *route_slices, const std::uint32_t *raw_keys,
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, std::uint32_t active_levels,
-    std::uint32_t foundation_level,
+    std::uint32_t pending_batches,
     typename Aggregate::State *aggregate_partials,
-    std::uint64_t occupied_levels = ~std::uint64_t{0},
-    const std::uint64_t *query_occupied_level_mask = nullptr) {
+    const std::uint64_t *query_occupied_level_mask) {
   constexpr std::uint32_t kWarps = 4u;
   constexpr std::uint32_t kUpdateCapacity = 128u;
   union WarpScratch {
@@ -2722,13 +2669,11 @@ __global__ void warp_range_fragment_kernel(
   };
   __shared__ Row current_shared[kWarps][kUpdateCapacity];
   __shared__ WarpScratch scratch[kWarps];
-  if (query_occupied_level_mask) {
-    const DeviceManifestSnapshot manifest =
-        load_query_manifest(query_occupied_level_mask);
-    active_levels = manifest.active_levels;
-    foundation_level = manifest.foundation_level;
-    occupied_levels = manifest.occupied_level_mask;
-  }
+  const DeviceManifestSnapshot manifest =
+      load_query_manifest(query_occupied_level_mask);
+  const std::uint32_t active_levels = manifest.active_levels;
+  const std::uint32_t foundation_level = manifest.foundation_level;
+  const std::uint64_t occupied_levels = manifest.occupied_level_mask;
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t warp = threadIdx.x >> 5u;
   const std::uint32_t fragment_index = blockIdx.x * kWarps + warp;
@@ -2979,11 +2924,7 @@ __global__ void count_admission_quotients_kernel(
   for (std::uint32_t w = 0u; w < kThreads / 32u; ++w)
     cta_group_count += warp_group_counts[w];
 
-  // Random input usually has almost no repeated quotient inside a CTA.  In
-  // that case a CTA hash only adds synchronization and probing, so preserve
-  // the same histogram/scatter algorithm but stop aggregation at the warp.
-  // Grouped or skewed input uses the CTA hash and emits one global update per
-  // quotient for the whole CTA.
+  // Use CTA aggregation only for skewed input.
   if (cta_group_count > kAdmissionCtaGroupMaximum) {
     if (!valid) return;
     std::uint32_t base = 0u;
@@ -3075,6 +3016,19 @@ __global__ void commit_admission_metadata_kernel(
   counts[q] = 0u;
 }
 
+// Rebuild signatures after failed publication.
+__global__ void rebuild_epoch_signatures_kernel(
+    const std::uint64_t *batch_signatures,
+    std::uint64_t *epoch_signatures) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kQuotients) return;
+  std::uint64_t aggregate = 0u;
+  for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch)
+    aggregate |= batch_signatures[
+        std::size_t{batch} * kQuotients + q];
+  epoch_signatures[q] = aggregate;
+}
+
 __global__ void scatter_admission_records_kernel(
     const std::uint32_t *keys, const std::uint32_t *values,
     std::uint32_t count, std::uint32_t batch_slot, bool tombstone,
@@ -3144,10 +3098,7 @@ __global__ void pack_publication_epoch_kernel(
       {key, payload.value, payload.metadata};
 }
 
-// A captured radix sort has a fixed maximum item count.  Duplicate the first
-// real assignment into the unused tail: ReduceByKey absorbs those copies into
-// an already-existing key, so variable-size epochs retain their exact logical
-// result without a host graph update or a sentinel key.
+// Pad captured sorts with the first assignment.
 __global__ void pad_publication_epoch_kernel(
     std::uint32_t epoch_capacity, const std::uint32_t *batch_offsets,
     std::uint32_t *keys, RawAssignment *assignments) {
@@ -3230,9 +3181,7 @@ __global__ void count_resident_merge_work_kernel(
   raw_counts[q] = count | (has_resident ? kResidentWorkFlag : 0u);
 }
 
-// Count the quotient-grouped epoch in place.  The admitted records are not
-// suffix sorted: the merge CTA deliberately receives the raw intervals and
-// orders their lightweight candidate indices in shared memory.
+// Count grouped raw intervals without suffix sorting.
 __global__ void count_direct_epoch_merge_work_kernel(
     const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
     const Descriptor *descriptors, const DeviceManifest *manifests,
@@ -3314,9 +3263,7 @@ __global__ void validate_direct_epoch_plan_kernel(
     plan->status |= kPublicationOutputOverflow;
 }
 
-// --------------------------------------------------------------------------
-// GPU-resident plan-and-publish pipeline.
-// --------------------------------------------------------------------------
+// GPU-resident publication.
 
 __global__ void choose_resident_publication_path_kernel(
     const std::uint32_t *selected_count,
@@ -3339,7 +3286,7 @@ __global__ void choose_resident_publication_path_kernel(
   next.active_manifest = active;
   next.inactive_manifest = active ^ 1u;
   next.destination_level = destination;
-  // Every publication uses the same quotient-owned planner and merger.
+  // Use one quotient-owned planner and merger.
   next.source_level_limit = destination ? destination - 1u : 0u;
   next.source_count = destination ? destination + 1u : 1u;
   next.destination_is_foundation =
@@ -3562,7 +3509,7 @@ __global__ void emit_resident_planning_jobs_kernel(
     while (raw_end > raw_begin &&
            !resident_work_count(counts[raw_end - first - 1u]))
       --raw_end;
-    // The loop above stops one past the final nonempty raw quotient.
+    // Stop after the last nonempty quotient.
     if (raw_end == raw_begin) raw_end = first + kPlanningTileQuotients;
     emit_resident_job(
         jobs, job_raw_reservations, global,
@@ -3713,7 +3660,8 @@ __global__ void count_resident_route_slots_kernel(
   const std::uint32_t requested =
       !plan->status && destination < kMaximumLevels &&
       !plan->destination_is_foundation && q < kQuotients &&
-      raw >= kDenseCellRankMinimumRows && raw <= (1u << 16u);
+      raw >= kDenseCellRankMinimumRows &&
+      cell_rank_supported(raw);
   std::uint32_t local{}, block_count{};
   BlockScan(scan_storage).ExclusiveSum(requested, local, block_count);
   if (threadIdx.x == 0u)
@@ -3830,7 +3778,7 @@ __global__ void build_split_resident_query_metadata_kernel(
     for (std::uint32_t cell = threadIdx.x; cell < 128u;
          cell += blockDim.x) {
       const std::uint32_t target = cell << 9u;
-      const std::uint32_t position = descriptor.count() <= (1u << 16u)
+      const std::uint32_t position = cell_rank_supported(descriptor.count())
           ? logical_section_bound(
                 q, level, target, false, arena, route_headers,
                 route_slices, route_logical_begins,
@@ -4015,8 +3963,7 @@ __device__ __forceinline__ bool direct_epoch_candidate_less(
       candidate_token_logical_key(candidate_tokens[left]);
   const std::uint32_t b_key =
       candidate_token_logical_key(candidate_tokens[right]);
-  // Candidate IDs make equal-key merge-path partitions unique.  Timestamp
-  // selection remains in the one-time duplicate-resolution pass below.
+  // Candidate IDs break equal-key partition ties.
   return a_key != b_key ? a_key < b_key : left < right;
 }
 
@@ -4114,12 +4061,7 @@ __device__ __forceinline__ bool cell_owned_candidate_is_tombstone(
           (1u << (candidate & 31u))) != 0u;
 }
 
-// A normal cell remains single-thread owned.  Grouping cells with similar
-// amounts of serial work into the same warp avoids making short cells execute
-// under the mask of an unrelated long cell.  The raw term accounts for the
-// insertion sort; the total term approximates the subsequent sorted merges.
-// Eight coarse buckets are deliberate: their queue can be built inside the
-// two cell scans the kernel already performs, without a sorting pass.
+// Bucket cells by estimated serial work.
 __device__ __forceinline__ std::uint32_t cell_owned_cost_bucket(
     std::uint32_t total_count, std::uint32_t raw_count) {
   const std::uint32_t raw_sort_work =
@@ -4221,10 +4163,7 @@ __device__ __forceinline__ std::uint32_t load_candidate_value(
       route_logical_begins, level_q_logical_offsets).value;
 }
 
-// Common publication path.  A CTA owns an adaptive consecutive range of
-// complete quotients, derives every input interval itself, sorts only the raw
-// update indices, resolves their equal-key groups, and merges that one update
-// run with the already sorted resident runs.
+// Merge one adaptive quotient range per CTA.
 __global__ void compact_direct_epoch_jobs_kernel(
     BalancedMergeJob *jobs, const ResidentPublicationPlan *plan,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
@@ -4266,9 +4205,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
   std::uint16_t *cell_output_offsets = cell_queue + kCellOwnedCells;
   __shared__ std::uint32_t source_offsets[kBatchesPerEpoch +
                                            kMaximumLevels + 2u];
-  // Crowded jobs need their logical per-level starting positions again when
-  // materializing values.  Keep them separate from run_offsets, which is
-  // repurposed by the merge scheduler before output is written.
+  // Preserve crowded per-level start positions.
   __shared__ std::uint16_t crowded_level_begins[kMaximumLevels + 2u];
   __shared__ std::uint16_t run_offsets[kMaximumLevels + 2u];
   __shared__ std::uint16_t run_lengths[kMaximumLevels + 2u];
@@ -4358,7 +4295,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                 q_begin, level, high, false, arena, route_headers,
                 route_slices, route_logical_begins,
                 level_q_logical_offsets);
-            // A nonempty 16-bit suffix interval begins below 65,536.
+            // Suffix range starts fit in 16 bits.
             crowded_level_begins[level] =
                 static_cast<std::uint16_t>(begin);
             total += end - begin;
@@ -4395,10 +4332,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
         tombstone_words[word] = 0u;
       __syncthreads();
 
-      // The raw intervals are already concatenated batch-by-batch.  Give
-      // each warp complete batch intervals so the batch number is known
-      // without a 15-way search for every record.  Eight warps naturally
-      // cover the sixteen batches in two balanced rounds.
+      // Assign complete raw batches to warps.
       for (std::uint32_t batch = warp; batch < pending_batches;
            batch += blockDim.x / 32u) {
         const std::uint32_t batch_begin = source_offsets[batch];
@@ -4423,8 +4357,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
         }
       }
 
-      // Resident rows remain source-major and are therefore loaded in one
-      // consecutive CTA-wide pass.  Their source age is encoded directly.
+      // Load resident rows in one CTA-wide pass.
       for (std::uint32_t candidate = raw_count + threadIdx.x;
            candidate < task_rows; candidate += blockDim.x) {
         std::uint32_t level = 0u;
@@ -4537,10 +4470,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       std::uint32_t *cell_cursors =
           reinterpret_cast<std::uint32_t *>(indices_b);
 
-      // Stored inputs are already sorted.  Let each destination cell pull
-      // its own interval from every source: dense sections use their exact
-      // persisted boundaries, while sparse sections pay two short searches.
-      // This replaces the old per-resident-row histogram entirely.
+      // Let each cell pull sorted resident slices.
       for (std::uint32_t cell = threadIdx.x; cell < total_cells;
            cell += blockDim.x) {
         const std::uint32_t local_q = cell / kFoundationCells;
@@ -4570,8 +4500,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       }
       __syncthreads();
 
-      // Only unsorted raw updates need histogramming and scattering.  The
-      // upper half of the packed counter records that raw prefix length.
+      // Histogram only unsorted raw updates.
       for (std::uint32_t candidate = threadIdx.x; candidate < raw_count;
            candidate += blockDim.x) {
         const CandidateToken token = candidate_tokens[candidate];
@@ -4626,8 +4555,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       }
       __syncthreads();
 
-      // Each cell owns consecutive slices of every resident level.  Pulling
-      // those sorted slices directly avoids a second all-candidate scatter.
+      // Pull each cell's resident slices directly.
       if (threadIdx.x < total_cells) {
         const std::uint32_t cell = threadIdx.x;
         const std::uint32_t total_cell_count =
@@ -4667,9 +4595,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
 
       const std::uint32_t bucket_slots =
           quotient_count * kCellOwnedCostBuckets;
-      // The secondary index plane is scratch until cell resolution begins.
-      // Reuse its first few words for a parallel bucket histogram and queue
-      // cursors, avoiding the serial 256-cell queue construction.
+      // Reuse the second index plane for queue scratch.
       for (std::uint32_t slot = threadIdx.x; slot <= bucket_slots;
            slot += blockDim.x)
         cell_cursors[slot] = 0u;
@@ -4724,9 +4650,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       }
       __syncthreads();
 
-      // A rare large cell receives the complete CTA.  It is still processed
-      // inside the same kernel and shared workspace, so there is no global
-      // continuation, task queue, or extra data movement.
+      // Give rare oversized cells the full CTA.
       for (std::uint32_t large_index = 0u;
            large_index < large_cell_count_shared; ++large_index) {
         const std::uint32_t cell = cell_queue[
@@ -4842,11 +4766,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
         __syncthreads();
       }
 
-      // Ordinary cells sort only their unsorted raw updates.  Resident slices
-      // are already ordered, so the cell pulls and merges them directly from
-      // newest level to oldest instead of scattering and sorting them again.
-      // The queue changes only execution ownership; every result remains in
-      // its original cell slice.
+      // Sort raw updates, then merge resident slices.
       const std::uint32_t processing_cell = threadIdx.x < total_cells
           ? cell_queue[threadIdx.x] : total_cells;
       if (processing_cell < total_cells) {
@@ -4885,8 +4805,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
                 winner = other;
               }
             }
-            // Keep tombstones until all older resident levels have been
-            // consumed; otherwise an older insertion could reappear.
+            // Keep tombstones until older levels merge.
             indices_a[cell_begin + current_count++] = winner;
             i = next;
           }
@@ -4992,9 +4911,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       }
       __syncthreads();
 
-      // Restore key-order ownership for output.  The second index plane
-      // becomes one compact logical survivor list for guide creation, while
-      // adjacent workers write adjacent cell ranges.
+      // Restore key order before output.
       const std::uint32_t output_cell = threadIdx.x;
       if (output_cell < total_cells) {
         const std::uint32_t input_begin = cell_input_offsets[output_cell];
@@ -5137,10 +5054,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
          !updates_are_resolved && width < raw_count; width <<= 1u) {
       const std::uint16_t *input = input_is_a ? indices_a : indices_b;
       std::uint16_t *output = input_is_a ? indices_b : indices_a;
-      // Give every worker one short consecutive output interval.  It finds
-      // the interval's merge position once, then advances linearly.  The
-      // previous per-output partitioning repeated a binary search for nearly
-      // every row in the large rounds.
+      // Merge one consecutive interval per worker.
       const std::uint32_t items_per_thread =
           (raw_count + kThreads - 1u) / kThreads;
       std::uint32_t position = threadIdx.x * items_per_thread;
@@ -5182,9 +5096,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       input_is_a = !input_is_a;
     }
 
-    // Resolve the sorted update run.  Only group leaders inspect metadata;
-    // consequently each raw record's payload is loaded once here rather than
-    // during every sorting comparison.
+    // Resolve duplicate updates after sorting.
     const std::uint16_t *raw_sorted = input_is_a ? indices_a : indices_b;
     std::uint16_t *raw_resolved = input_is_a ? indices_b : indices_a;
     const std::uint32_t items_per_thread =
@@ -5254,7 +5166,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       resolved_raw_count_shared = resolved_raw_count;
     __syncthreads();
 
-    // Append the resident run IDs after the compact resolved-update run.
+    // Append resident IDs after resolved updates.
     std::uint32_t packed_begin = resolved_raw_count_shared;
     for (std::uint32_t level = 0u;
          level <= plan->source_level_limit; ++level) {
@@ -5268,11 +5180,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
     }
     __syncthreads();
 
-    // Merge every smaller run first and expose the largest run only to the
-    // final round.  This keeps a large stored level from being read and
-    // rewritten once per merge-tree depth.  run_sources records the original
-    // packed positions so a non-final largest run can be reordered safely
-    // through the other index plane.
+    // Merge smaller runs before the largest run.
     if (threadIdx.x == 0u) {
       resolved_raw_count_shared = resolved_raw_count;
       std::uint32_t input_run_count = 0u;
@@ -5417,14 +5325,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
 
     const std::uint32_t merged_count =
         task_rows - raw_count + resolved_raw_count_shared;
-    // The aggregate of the smaller runs and the largest run remain in the
-    // input plane.  Each worker merges one consecutive interval and resolves
-    // visibility immediately.  Live IDs are first written sparsely at their
-    // merged positions in the other plane; after the block scan they are
-    // compacted back into the now-dead input plane while their rows are
-    // written to the final arena.  This preserves the sorted survivor plane
-    // required by metadata without materializing and rereading the complete
-    // merged-ID array.
+    // Merge and compact survivors directly to output.
     std::uint16_t *merge_input = input_is_a ? indices_a : indices_b;
     std::uint16_t *live_scratch = input_is_a ? indices_b : indices_a;
     std::uint16_t *survivors = merge_input;
@@ -5562,7 +5463,7 @@ __global__ void compact_direct_epoch_jobs_kernel(
       }
     }
 
-    // Metadata is emitted while the complete quotient is still resident.
+    // Emit metadata while the quotient is resident.
     for (std::uint32_t local_q = 0u;
          !crowded_piece && local_q < quotient_count; ++local_q) {
       if (threadIdx.x == 0u) {
@@ -5674,13 +5575,9 @@ inline std::uint32_t select_balanced_merge_capacity() {
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &maximum_blocks, compact_direct_epoch_jobs_kernel,
       kFoundationCompactionThreads, 0u));
-  // Compact candidate tokens make four resident merge CTAs possible on
-  // devices with sufficient registers and shared memory.  Preserve that
-  // latency-hiding gain instead of spending the reclaimed memory on larger
-  // jobs.  Less capable devices retain their highest supported occupancy.
+  // Preserve merge occupancy over larger jobs.
   const int desired_blocks = std::max(1, std::min(4, maximum_blocks));
-  // The cell histogram temporarily overlays one 32-bit cursor per possible
-  // cell on the 16-bit secondary index plane.
+  // Overlay cell cursors on the second index plane.
   const std::uint32_t minimum_capacity = std::max(
       kMaximumMergeSources, kCellOwnedCells * 2u + 1u);
   std::uint32_t block_low = minimum_capacity;
@@ -5709,8 +5606,7 @@ inline std::uint32_t select_balanced_merge_capacity() {
     if (blocks >= desired_blocks) low = middle;
     else high = middle - 1u;
   }
-  // An odd capacity keeps both 16-bit index planes four-byte aligned, which
-  // lets the cell histogram safely reuse the second plane as uint32 cursors.
+  // Keep both index planes four-byte aligned.
   return (low & 1u) ? low : low - 1u;
 }
 
@@ -5739,7 +5635,7 @@ __global__ void build_foundation_rank_directory_kernel(
   const Descriptor descriptor =
       descriptors[descriptor_index(q, foundation_level)];
   const std::uint32_t target = cell << 9u;
-  const std::uint32_t position = descriptor.count() <= 0xffffu
+  const std::uint32_t position = cell_rank_supported(descriptor.count())
       ? lower_bound_rows(arena + descriptor.offset(), descriptor.count(),
                          target)
       : 0u;
@@ -5764,21 +5660,15 @@ __global__ void lookup_with_pending_kernel(
     const std::uint16_t *level_guides,
     const std::uint32_t *level_cell_rank_blocks,
     const std::uint16_t *level_cell_ranks,
-    std::uint32_t active_levels,
-    std::uint32_t foundation_level,
-    std::uint64_t occupied_levels,
     const std::uint32_t *query_ids,
-    std::uint32_t *final_values, std::uint8_t *final_found,
-    const std::uint64_t *query_occupied_level_mask = nullptr) {
+    const std::uint64_t *query_occupied_level_mask) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  if (query_occupied_level_mask) {
-    const DeviceManifestSnapshot manifest =
-        load_query_manifest(query_occupied_level_mask);
-    active_levels = manifest.active_levels;
-    foundation_level = manifest.foundation_level;
-    occupied_levels = manifest.occupied_level_mask;
-  }
+  const DeviceManifestSnapshot manifest =
+      load_query_manifest(query_occupied_level_mask);
+  const std::uint32_t active_levels = manifest.active_levels;
+  const std::uint32_t foundation_level = manifest.foundation_level;
+  std::uint64_t occupied_levels = manifest.occupied_level_mask;
   const std::uint32_t key = queries[i], q = key >> 16u;
   const std::uint32_t suffix = key_suffix(key);
   const std::uint64_t signature_bits = pending_signature_bits(key);
@@ -5811,10 +5701,8 @@ __global__ void lookup_with_pending_kernel(
       if (matched) {
         const bool live = (row.flags & kTombstone) == 0u;
         const std::uint32_t destination = query_ids ? query_ids[i] : i;
-        std::uint32_t *values = final_values ? final_values : out_values;
-        std::uint8_t *found = final_found ? final_found : out_found;
-        values[destination] = live ? row.value : found ? 0u : kInvalid;
-        if (found) found[destination] = live;
+        out_values[destination] = live ? row.value : out_found ? 0u : kInvalid;
+        if (out_found) out_found[destination] = live;
         return;
       }
     }
@@ -5855,11 +5743,9 @@ __global__ void lookup_with_pending_kernel(
     if (matched) {
       const bool live = (matched_row.flags & kTombstone) == 0u;
       const std::uint32_t destination = query_ids ? query_ids[i] : i;
-      std::uint32_t *values = final_values ? final_values : out_values;
-      std::uint8_t *found = final_found ? final_found : out_found;
-      values[destination] =
-          live ? matched_row.value : found ? 0u : kInvalid;
-      if (found) found[destination] = live;
+      out_values[destination] =
+          live ? matched_row.value : out_found ? 0u : kInvalid;
+      if (out_found) out_found[destination] = live;
       return;
     }
   }
@@ -5886,7 +5772,7 @@ __global__ void lookup_with_pending_kernel(
   const std::size_t local_index = std::size_t{q} * 128u + cell;
   const std::uint32_t foundation_logical_count = foundation_logical.count();
   const bool ranked = foundation_route_count &&
-      foundation_logical_count <= (1u << 16u);
+      cell_rank_supported(foundation_logical_count);
   const std::uint32_t logical_begin =
       ranked ? local_rank[local_index] : 0u;
   const std::uint32_t logical_end = ranked
@@ -5921,11 +5807,9 @@ __global__ void lookup_with_pending_kernel(
             foundation_rows + begin, end - begin, suffix, matched_row);
   const bool live = matched && (matched_row.flags & kTombstone) == 0u;
   const std::uint32_t destination = query_ids ? query_ids[i] : i;
-  std::uint32_t *values = final_values ? final_values : out_values;
-  std::uint8_t *found = final_found ? final_found : out_found;
-  values[destination] =
-      live ? matched_row.value : found ? 0u : kInvalid;
-  if (found) found[destination] = live;
+  out_values[destination] =
+      live ? matched_row.value : out_found ? 0u : kInvalid;
+  if (out_found) out_found[destination] = live;
 }
 
 
@@ -5940,8 +5824,7 @@ __device__ __forceinline__ void lookup_resident_only(
     const std::uint32_t *level_cell_rank_blocks,
     const std::uint16_t *level_cell_ranks,
     std::uint32_t active_levels, std::uint32_t foundation_level,
-    std::uint64_t occupied_levels, const std::uint32_t *query_ids,
-    std::uint32_t *final_values, std::uint8_t *final_found) {
+    std::uint64_t occupied_levels, const std::uint32_t *query_ids) {
   const std::uint32_t q = key >> 16u;
   const std::uint32_t suffix = key_suffix(key);
   if (foundation_level < kMaximumLevels)
@@ -5981,11 +5864,9 @@ __device__ __forceinline__ void lookup_resident_only(
       const bool live = (matched_row.flags & kTombstone) == 0u;
       const std::uint32_t destination =
           query_ids ? query_ids[query_index] : query_index;
-      std::uint32_t *values = final_values ? final_values : out_values;
-      std::uint8_t *found = final_found ? final_found : out_found;
-      values[destination] =
-          live ? matched_row.value : found ? 0u : kInvalid;
-      if (found) found[destination] = live;
+      out_values[destination] =
+          live ? matched_row.value : out_found ? 0u : kInvalid;
+      if (out_found) out_found[destination] = live;
       return;
     }
   }
@@ -6012,7 +5893,7 @@ __device__ __forceinline__ void lookup_resident_only(
   const std::size_t local_index = std::size_t{q} * 128u + cell;
   const std::uint32_t foundation_logical_count = foundation_logical.count();
   const bool ranked = foundation_route_count &&
-      foundation_logical_count <= (1u << 16u);
+      cell_rank_supported(foundation_logical_count);
   const std::uint32_t logical_begin =
       ranked ? local_rank[local_index] : 0u;
   const std::uint32_t logical_end = ranked
@@ -6048,11 +5929,9 @@ __device__ __forceinline__ void lookup_resident_only(
   const bool live = matched && (matched_row.flags & kTombstone) == 0u;
   const std::uint32_t destination =
       query_ids ? query_ids[query_index] : query_index;
-  std::uint32_t *values = final_values ? final_values : out_values;
-  std::uint8_t *found = final_found ? final_found : out_found;
-  values[destination] =
-      live ? matched_row.value : found ? 0u : kInvalid;
-  if (found) found[destination] = live;
+  out_values[destination] =
+      live ? matched_row.value : out_found ? 0u : kInvalid;
+  if (out_found) out_found[destination] = live;
 }
 
 
@@ -6110,12 +5989,8 @@ __global__ void lookup_with_dense_router_kernel(
     const std::uint16_t *level_guides,
     const std::uint32_t *level_cell_rank_blocks,
     const std::uint16_t *level_cell_ranks,
-    std::uint32_t active_levels,
-    std::uint32_t foundation_level,
-    std::uint64_t occupied_levels,
     const std::uint32_t *query_ids,
-    std::uint32_t *final_values, std::uint8_t *final_found,
-    const std::uint64_t *query_occupied_level_mask = nullptr) {
+    const std::uint64_t *query_occupied_level_mask) {
   __shared__ std::uint32_t router_owners[kLookupRouterSlots];
   __shared__ std::uint32_t router_query_keys[kThreads];
   __shared__ unsigned long long router_winners[kThreads];
@@ -6129,13 +6004,11 @@ __global__ void lookup_with_dense_router_kernel(
   const bool valid = i < count;
   const std::uint32_t key = valid ? queries[i] : 0u;
   const std::uint32_t q = key >> 16u;
-  if (query_occupied_level_mask) {
-    const DeviceManifestSnapshot manifest =
-        load_query_manifest(query_occupied_level_mask);
-    active_levels = manifest.active_levels;
-    foundation_level = manifest.foundation_level;
-    occupied_levels = manifest.occupied_level_mask;
-  }
+  const DeviceManifestSnapshot manifest =
+      load_query_manifest(query_occupied_level_mask);
+  const std::uint32_t active_levels = manifest.active_levels;
+  const std::uint32_t foundation_level = manifest.foundation_level;
+  const std::uint64_t occupied_levels = manifest.occupied_level_mask;
 
   bool possible = false;
   if (valid) {
@@ -6149,8 +6022,7 @@ __global__ void lookup_with_dense_router_kernel(
           route_headers, route_slices, route_logical_begins,
           level_q_logical_offsets, local_rank, level_guides,
           level_cell_rank_blocks, level_cell_ranks,
-          active_levels, foundation_level, occupied_levels, query_ids,
-          final_values, final_found);
+          active_levels, foundation_level, occupied_levels, query_ids);
     return;
   }
 
@@ -6261,10 +6133,8 @@ __global__ void lookup_with_dense_router_kernel(
     const RawPayload payload = raw_payloads[record];
     const bool live = (payload.metadata & kRawTombstone) == 0u;
     const std::uint32_t destination = query_ids ? query_ids[i] : i;
-    std::uint32_t *values = final_values ? final_values : out_values;
-    std::uint8_t *found = final_found ? final_found : out_found;
-    values[destination] = live ? payload.value : found ? 0u : kInvalid;
-    if (found) found[destination] = live;
+    out_values[destination] = live ? payload.value : out_found ? 0u : kInvalid;
+    if (out_found) out_found[destination] = live;
     return;
   }
   lookup_resident_only(
@@ -6272,8 +6142,7 @@ __global__ void lookup_with_dense_router_kernel(
       route_headers, route_slices, route_logical_begins,
       level_q_logical_offsets, local_rank, level_guides,
       level_cell_rank_blocks, level_cell_ranks,
-      active_levels, foundation_level, occupied_levels, query_ids,
-      final_values, final_found);
+      active_levels, foundation_level, occupied_levels, query_ids);
 }
 
 
@@ -6422,19 +6291,14 @@ __global__ void successor_with_pending_kernel(
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
-    const RouteSlice *route_slices, std::uint32_t active_levels,
-    const std::uint64_t *query_occupied_level_mask = nullptr) {
+    const RouteSlice *route_slices,
+    const std::uint64_t *query_occupied_level_mask) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  std::uint64_t occupied_levels = active_levels == 64u
-      ? ~std::uint64_t{0}
-      : ((std::uint64_t{1} << active_levels) - 1u);
-  if (query_occupied_level_mask) {
-    const DeviceManifestSnapshot manifest =
-        load_query_manifest(query_occupied_level_mask);
-    active_levels = manifest.active_levels;
-    occupied_levels = manifest.occupied_level_mask;
-  }
+  const DeviceManifestSnapshot manifest =
+      load_query_manifest(query_occupied_level_mask);
+  const std::uint32_t active_levels = manifest.active_levels;
+  const std::uint64_t occupied_levels = manifest.occupied_level_mask;
   const std::uint32_t query = queries[i];
   for (std::uint32_t q = query >> 16u; q < kQuotients; ++q) {
     const std::uint32_t lower = q == (query >> 16u) ? query : q << 16u;
@@ -6458,7 +6322,6 @@ public:
   struct DeviceKeyBatch {
     const std::uint32_t *keys = nullptr;
     std::size_t count = 0u;
-    bool sorted = false;
   };
 
   struct MaintenanceStats {
@@ -6528,6 +6391,7 @@ public:
         query_occupied_level_mask_(1u),
         staged_epoch_mode_(1u),
         resident_plan_(1u),
+        publication_receipt_(1u),
         level_storage_spans_(gpulsmopt2_detail::kMaximumLevels),
         level_rank_spans_(gpulsmopt2_detail::kMaximumLevels),
         level_cell_rank_blocks_(
@@ -6572,12 +6436,12 @@ public:
         foundation_overflow_flag_(1u),
         admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
         range_partials_(gpulsmopt2_detail::kRangeSchedulerBlocks),
-        range_reduction_completion_(1u) {
+        range_reduction_completion_(1u),
+        range_fragment_total_(1u),
+        range_total_receipt_(1u) {
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
-    // Force the optional dense lookup kernel's code to load during structure
-    // initialization.  Otherwise CUDA's lazy module loading is charged to the
-    // first dense lookup, even though it is not algorithmic lookup work.
+    // Preload the optional dense lookup kernel.
     cudaFuncAttributes dense_router_attributes{};
     CUDA_CHECK(cudaFuncGetAttributes(
         &dense_router_attributes,
@@ -6613,6 +6477,7 @@ public:
   }
 
   void clear(cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
     begin_operation(stream);
     CUDA_CHECK(cudaMemsetAsync(local_rank_.data(), 0,
                                local_rank_.size() * sizeof(std::uint16_t),
@@ -6623,6 +6488,7 @@ public:
 
   void bulk_build(const std::uint32_t *keys, const std::uint32_t *values,
                   std::size_t count, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
     if ((count && (!keys || !values)) || count > std::numeric_limits<std::uint32_t>::max())
       throw std::invalid_argument("invalid GPULSMOpt initial input");
     begin_operation(stream);
@@ -6714,15 +6580,45 @@ public:
   }
 
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    reject_updates_after_publication_failure();
     admit(batch.keys, batch.values, batch.count, false, stream);
   }
 
   void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    reject_updates_after_publication_failure();
     admit(batch.keys, nullptr, batch.count, true, stream);
   }
 
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream,
               bool quotients_grouped = false) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    prepare_failed_epoch_for_reads(stream);
+    lookup_locked(batch, stream, quotients_grouped);
+  }
+
+  void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    prepare_failed_epoch_for_reads(stream);
+    range_locked(batch, stream);
+  }
+
+  void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    prepare_failed_epoch_for_reads(stream);
+    successor_locked(batch, stream);
+  }
+
+private:
+
+  void lookup_locked(const DeviceLookupBatch &batch, cudaStream_t stream,
+                     bool quotients_grouped) {
     if (!batch.count) return;
     if (!batch.queries || !batch.out_values)
       throw std::invalid_argument("invalid GPULSMOpt lookup");
@@ -6732,7 +6628,7 @@ public:
         const std::size_t count = std::min(
             batch.count - begin,
             gpulsmopt2_detail::kMaximumOperationTile);
-        lookup(DeviceLookupBatch{
+        lookup_locked(DeviceLookupBatch{
             batch.queries + begin, count, batch.out_values + begin,
             batch.out_found ? batch.out_found + begin : nullptr}, stream,
             quotients_grouped);
@@ -6784,9 +6680,7 @@ public:
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
             local_rank_.data(), level_guides_.data(),
             level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
-            active_levels_,
-            foundation_level(), occupied_level_mask(), query_ids,
-            nullptr, nullptr, query_occupied_level_mask_.data());
+            query_ids, query_occupied_level_mask_.data());
       } else {
         gpulsmopt2_detail::lookup_with_pending_kernel<<<
             blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -6798,8 +6692,7 @@ public:
             route_slices_.data(), route_logical_begins_.data(),
             level_q_logical_offsets_.data(), local_rank_.data(),
             level_guides_.data(), level_cell_rank_blocks_.data(),
-            level_cell_ranks_.data(), active_levels_, foundation_level(),
-            occupied_level_mask(), query_ids, nullptr, nullptr,
+            level_cell_ranks_.data(), query_ids,
             query_occupied_level_mask_.data());
       }
       CUDA_CHECK(cudaGetLastError());
@@ -6815,16 +6708,14 @@ public:
           route_logical_begins_.data(), level_q_logical_offsets_.data(),
           local_rank_.data(), level_guides_.data(),
           level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
-          active_levels_,
-          foundation_level(),
-          occupied_level_mask(),
-          nullptr, nullptr, nullptr, query_occupied_level_mask_.data());
+          nullptr, query_occupied_level_mask_.data());
     }
     CUDA_CHECK(cudaGetLastError());
     end_operation(stream);
   }
 
-  void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
+  void range_locked(const DeviceRangeOutputBatch &batch,
+                    cudaStream_t stream) {
     if (!batch.query_count) return;
     if (!batch.lo || !batch.hi || !batch.out_sums)
       throw std::invalid_argument("invalid GPULSMOpt range input");
@@ -6834,7 +6725,7 @@ public:
         const std::size_t count = std::min(
             batch.query_count - begin,
             gpulsmopt2_detail::kMaximumOperationTile);
-        range(DeviceRangeOutputBatch{
+        range_locked(DeviceRangeOutputBatch{
             batch.lo + begin, batch.hi + begin, count,
             batch.out_sums + begin}, stream);
       }
@@ -6843,11 +6734,27 @@ public:
     begin_operation(stream);
     const std::uint32_t query_count =
         static_cast<std::uint32_t>(batch.query_count);
+    const bool needs_wide_total = query_count >
+        std::numeric_limits<std::uint32_t>::max() /
+            gpulsmopt2_detail::kQuotients;
     std::size_t scan_bytes{};
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, scan_bytes, range_fragment_counts_.data(),
         range_fragment_offsets_.data(), query_count + 1u, stream));
-    ensure_range_fragment_query_capacity(query_count, scan_bytes);
+    std::size_t reduce_bytes{};
+    if (needs_wide_total) {
+      using WideCountIterator = cub::TransformInputIterator<
+          std::uint64_t, gpulsmopt2_detail::WidenFragmentCount,
+          const std::uint32_t *>;
+      const WideCountIterator counts(
+          range_fragment_counts_.data(),
+          gpulsmopt2_detail::WidenFragmentCount{});
+      CUDA_CHECK(cub::DeviceReduce::Sum(
+          nullptr, reduce_bytes, counts, range_fragment_total_.data(),
+          query_count, stream));
+    }
+    ensure_range_fragment_query_capacity(
+        query_count, std::max(scan_bytes, reduce_bytes));
     gpulsmopt2_detail::count_range_fragments_kernel<<<
         blocks(std::size_t{query_count} + 1u),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -6859,19 +6766,41 @@ public:
     std::uint32_t fragment_count{};
     if (query_count == 1u) {
       fragment_count = gpulsmopt2_detail::kQuotients;
+    } else if (needs_wide_total) {
+      using WideCountIterator = cub::TransformInputIterator<
+          std::uint64_t, gpulsmopt2_detail::WidenFragmentCount,
+          const std::uint32_t *>;
+      const WideCountIterator counts(
+          range_fragment_counts_.data(),
+          gpulsmopt2_detail::WidenFragmentCount{});
+      CUDA_CHECK(cub::DeviceReduce::Sum(
+          range_query_temp_, reduce_bytes, counts,
+          range_fragment_total_.data(), query_count, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          range_total_receipt_.data(), range_fragment_total_.data(),
+          sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      const std::uint64_t total = range_total_receipt_.data()[0];
+      if (total > std::numeric_limits<std::uint32_t>::max()) {
+        // Reject fragment totals above 32 bits.
+        end_operation(stream);
+        throw std::length_error(
+            "GPULSMOpt range produces more than 2^32-1 fragments");
+      }
+      fragment_count = static_cast<std::uint32_t>(total);
     } else {
       CUDA_CHECK(cudaMemcpyAsync(
           &fragment_count, range_fragment_offsets_.data() + query_count,
           sizeof(fragment_count), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      if (!fragment_count) {
-        CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
-                                   std::size_t{query_count} *
-                                       sizeof(std::uint32_t),
-                                   stream));
-        end_operation(stream);
-        return;
-      }
+    }
+    if (!fragment_count) {
+      CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
+                                 std::size_t{query_count} *
+                                     sizeof(std::uint32_t),
+                                 stream));
+      end_operation(stream);
+      return;
     }
     const bool use_section_owners = query_count > 1u &&
         std::uint64_t{fragment_count} >=
@@ -6948,7 +6877,8 @@ public:
     end_operation(stream);
   }
 
-  void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
+  void successor_locked(const DeviceSuccessorBatch &batch,
+                        cudaStream_t stream) {
     if (!batch.count) return;
     if (!batch.queries || !batch.out_keys)
       throw std::invalid_argument("invalid GPULSMOpt successor input");
@@ -6958,7 +6888,7 @@ public:
         const std::size_t count = std::min(
             batch.count - begin,
             gpulsmopt2_detail::kMaximumOperationTile);
-        successor(DeviceSuccessorBatch{
+        successor_locked(DeviceSuccessorBatch{
             batch.queries + begin, count, batch.out_keys + begin}, stream);
       }
       return;
@@ -6970,13 +6900,16 @@ public:
         raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
         static_cast<std::uint32_t>(batch_capacity_),
         pending_batches_, resident_rows(), descriptors_.data(),
-        route_headers_.data(), route_slices_.data(), active_levels_,
+        route_headers_.data(), route_slices_.data(),
         query_occupied_level_mask_.data());
     CUDA_CHECK(cudaGetLastError());
     end_operation(stream);
   }
 
+public:
   MaintenanceStats maintenance_stats() const {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    const_cast<GPULSMOpt *>(this)->resolve_publication_receipt();
     MaintenanceStats result = stats_;
     result.pending_batches = pending_batches_;
     result.pending_records = pending_records_;
@@ -6985,6 +6918,8 @@ public:
   }
 
   std::size_t gpu_resident_bytes() const {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    const_cast<GPULSMOpt *>(this)->resolve_publication_receipt();
     return local_rank_.size() * sizeof(std::uint16_t) +
         level_guides_.size() * sizeof(std::uint16_t) +
         arena_key_flags_.size() * sizeof(std::uint32_t) +
@@ -7044,6 +6979,7 @@ public:
         radix_storage_.size() * sizeof(std::uint8_t) +
         range_partials_.size() * sizeof(unsigned long long) +
         range_reduction_completion_.size() * sizeof(std::uint32_t) +
+        range_fragment_total_.size() * sizeof(std::uint64_t) +
         range_query_storage_.size() + range_fragment_storage_.size() +
         range_section_storage_.size();
   }
@@ -7081,10 +7017,6 @@ private:
   std::uint32_t foundation_level() const {
     return active_levels_ ? active_levels_ - 1u
                           : gpulsmopt2_detail::kMaximumLevels;
-  }
-
-  std::uint64_t occupied_level_mask() const {
-    return host_occupied_level_mask_;
   }
 
   void rebuild_foundation_rank(cudaStream_t stream) {
@@ -7140,7 +7072,7 @@ private:
               (capacity +
                gpulsmopt2_detail::kDenseCellRankMinimumRows - 1u) /
                   gpulsmopt2_detail::kDenseCellRankMinimumRows));
-      rank_spans[level] = {rank_cursor, rank_blocks, 0u};
+      rank_spans[level] = {rank_cursor, rank_blocks};
       rank_cursor += rank_blocks;
       cursor += capacity;
       if (capacity == publication_capacity_) break;
@@ -7573,6 +7505,90 @@ private:
     initialize_publication_workspace();
   }
 
+  void apply_publication_receipt() {
+    if (!publication_receipt_pending_) return;
+    const gpulsmopt2_detail::ResidentPublicationPlan &receipt =
+        publication_receipt_.data()[0];
+    publication_receipt_pending_ = false;
+    publication_failure_status_ = receipt.status;
+    if (receipt.status != gpulsmopt2_detail::kPublicationSuccess) {
+      // Keep raw batches when publication fails.
+      publication_failed_ = true;
+      failed_epoch_signatures_ready_ = false;
+      return;
+    }
+
+    const std::uint32_t destination = receipt.destination_level;
+    if (destination >= gpulsmopt2_detail::kMaximumLevels) {
+      publication_failed_ = true;
+      publication_failure_status_ =
+          gpulsmopt2_detail::kPublicationJobOverflow;
+      failed_epoch_signatures_ready_ = false;
+      return;
+    }
+    const std::uint64_t consumed = destination
+        ? ((std::uint64_t{1} << destination) - 1u) : 0u;
+    host_occupied_level_mask_ &= ~consumed;
+    for (std::uint32_t level = 0u; level < destination; ++level)
+      level_counts_[level] = 0u;
+    level_counts_[destination] =
+        static_cast<std::uint32_t>(receipt.survivor_count);
+    if (receipt.survivor_count)
+      host_occupied_level_mask_ |= std::uint64_t{1} << destination;
+    else
+      host_occupied_level_mask_ &= ~(std::uint64_t{1} << destination);
+    active_levels_ = host_occupied_level_mask_
+        ? 64u - static_cast<std::uint32_t>(
+                      __builtin_clzll(host_occupied_level_mask_))
+        : 0u;
+
+    pending_batches_ = 0u;
+    pending_records_ = 0u;
+    std::fill_n(raw_batch_counts_, gpulsmopt2_detail::kBatchesPerEpoch, 0u);
+    publication_failed_ = false;
+    publication_failure_status_ = gpulsmopt2_detail::kPublicationSuccess;
+    failed_epoch_signatures_ready_ = false;
+    ++stats_.epochs_published;
+  }
+
+  void resolve_publication_receipt() {
+    if (!publication_receipt_pending_) return;
+    // Resolve the asynchronous publication receipt.
+    const cudaError_t ready = cudaEventQuery(operation_done_);
+    if (ready == cudaErrorNotReady)
+      CUDA_CHECK(cudaEventSynchronize(operation_done_));
+    else
+      CUDA_CHECK(ready);
+    apply_publication_receipt();
+  }
+
+  void resolve_publication_receipt_on_stream(cudaStream_t stream) {
+    if (!publication_receipt_pending_) return;
+    // Synchronize between tiles of one large update.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    apply_publication_receipt();
+  }
+
+  void reject_updates_after_publication_failure() const {
+    if (!publication_failed_) return;
+    throw std::runtime_error(
+        "GPULSMOpt publication failed with status " +
+        std::to_string(publication_failure_status_) +
+        "; pending updates were preserved");
+  }
+
+  void prepare_failed_epoch_for_reads(cudaStream_t stream) {
+    if (!publication_failed_ || failed_epoch_signatures_ready_) return;
+    begin_operation(stream);
+    gpulsmopt2_detail::rebuild_epoch_signatures_kernel<<<
+        gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            raw_signatures_.data(), raw_epoch_signatures_.data());
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+    failed_epoch_signatures_ready_ = true;
+  }
+
 
   void begin_operation(cudaStream_t stream) {
     CUDA_CHECK(cudaStreamWaitEvent(stream, operation_done_, 0));
@@ -7602,6 +7618,10 @@ private:
         admission_counts_.size() * sizeof(std::uint32_t), stream));
     pending_batches_ = 0u;
     pending_records_ = 0u;
+    publication_receipt_pending_ = false;
+    publication_failed_ = false;
+    publication_failure_status_ = gpulsmopt2_detail::kPublicationSuccess;
+    failed_epoch_signatures_ready_ = false;
     active_levels_ = 0u;
     host_occupied_level_mask_ = 0u;
     std::fill_n(level_counts_, gpulsmopt2_detail::kMaximumLevels, 0u);
@@ -7619,6 +7639,7 @@ private:
       throw std::invalid_argument("invalid GPULSMOpt update batch");
     begin_operation(stream);
     std::size_t consumed = 0u;
+    bool incomplete = false;
     while (consumed < count) {
       const std::size_t remaining = count - consumed;
       const std::uint32_t tile_count = static_cast<std::uint32_t>(
@@ -7627,10 +7648,20 @@ private:
                  tombstone ? nullptr : values + consumed,
                  tile_count, tombstone, stream);
       consumed += tile_count;
+      if (consumed < count && publication_receipt_pending_)
+        resolve_publication_receipt_on_stream(stream);
+      if (consumed < count && publication_failed_) {
+        incomplete = true;
+        break;
+      }
     }
     ++stats_.admitted_batches;
-    stats_.admitted_records += count;
+    stats_.admitted_records += consumed;
     end_operation(stream);
+    if (incomplete)
+      throw std::runtime_error(
+          "GPULSMOpt publication failed while tiling an update; "
+          "accepted pending records were preserved");
   }
 
   void admit_tile(const std::uint32_t *keys, const std::uint32_t *values,
@@ -7677,37 +7708,30 @@ private:
   }
 
   void publish_epoch(cudaStream_t stream) {
-    if (pending_records_ > publication_capacity_)
-      throw std::bad_alloc();
+    if (pending_records_ > publication_capacity_) {
+      // Preserve an epoch that cannot reserve output.
+      publication_failed_ = true;
+      publication_failure_status_ =
+          gpulsmopt2_detail::kPublicationOutputOverflow;
+      failed_epoch_signatures_ready_ = true;
+      return;
+    }
     gpulsmopt2_detail::count_direct_epoch_records_kernel<<<1, 1, 0, stream>>>(
         raw_offsets_.data(), gpulsmopt2_detail::kBatchesPerEpoch,
         publication_selected_count_.data());
     CUDA_CHECK(cudaGraphLaunch(resident_publication_graph_exec_, stream));
     CUDA_CHECK(cudaGetLastError());
 
-    // This mirror is only for human-facing statistics.  Planning, allocation,
-    // query visibility, and the next carry all use the device manifest.
-    std::uint32_t destination = 0u;
-    while (destination < gpulsmopt2_detail::kMaximumLevels &&
-           (host_occupied_level_mask_ &
-            (std::uint64_t{1} << destination)))
-      ++destination;
-    if (destination < gpulsmopt2_detail::kMaximumLevels) {
-      const std::uint64_t consumed = destination
-          ? ((std::uint64_t{1} << destination) - 1u) : 0u;
-      host_occupied_level_mask_ &= ~consumed;
-      host_occupied_level_mask_ |= std::uint64_t{1} << destination;
-      active_levels_ = host_occupied_level_mask_
-          ? 64u - static_cast<std::uint32_t>(
-                        __builtin_clzll(host_occupied_level_mask_))
-          : 0u;
-    }
+    // Copy the receipt to pinned host memory.
+    CUDA_CHECK(cudaMemcpyAsync(
+        publication_receipt_.data(), resident_plan_.data(),
+        sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
+        cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemsetAsync(
         raw_epoch_signatures_.data(), 0,
         raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
-    pending_batches_ = 0u;
-    pending_records_ = 0u;
-    ++stats_.epochs_published;
+    publication_receipt_pending_ = true;
+    failed_epoch_signatures_ready_ = false;
     return;
   }
 
@@ -7747,11 +7771,7 @@ private:
             route_slices_.data(), local_rank_.data(), raw_keys_.data(),
             raw_payloads_.data(),
             raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
-            pending_batches_,
-            active_levels_,
-            active_levels_ ? active_levels_ - 1u
-                           : gpulsmopt2_detail::kInvalid,
-            range_fragment_partials_.data(), occupied_level_mask(),
+            pending_batches_, range_fragment_partials_.data(),
             query_occupied_level_mask_.data());
   }
   void launch_fragment_ranges(std::uint32_t fragment_count,
@@ -7767,12 +7787,8 @@ private:
             route_headers_.data(), route_slices_.data(),
             raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
-            pending_batches_,
-            active_levels_,
-            active_levels_ ? active_levels_ - 1u
-                           : gpulsmopt2_detail::kInvalid,
-            range_fragment_partials_.data(),
-            occupied_level_mask(), query_occupied_level_mask_.data());
+            pending_batches_, range_fragment_partials_.data(),
+            query_occupied_level_mask_.data());
   }
   static std::size_t aligned_range_bytes(std::size_t bytes) {
     return (bytes + 255u) & ~std::size_t{255u};
@@ -7797,11 +7813,7 @@ private:
     if (range_query_storage_.size() >= bytes) {
       storage = range_query_storage_.data();
     } else {
-      // Range queries and publication are serialized by operation_done_.  The
-      // first publication key plane is therefore idle for the entire range
-      // operation and can hold the query counts, offsets, and scan scratch.
-      // Keep the owning range allocation as a fallback for configurations
-      // whose publication plane is too small.
+      // Borrow idle publication scratch for ranges.
       const std::size_t borrowed_bytes =
           publication_epoch_keys_a_.size() * sizeof(std::uint32_t);
       if (borrowed_bytes >= bytes) {
@@ -7893,10 +7905,15 @@ private:
   std::size_t resident_merge_workspace_bytes_{};
   std::size_t maximum_resident_jobs_{};
   std::size_t route_stride_{};
+  mutable std::mutex operation_mutex_;
   std::uint64_t host_occupied_level_mask_{};
   std::uint32_t pending_batches_{};
   std::uint32_t pending_records_{};
   std::uint32_t active_levels_{};
+  bool publication_receipt_pending_{};
+  bool publication_failed_{};
+  bool failed_epoch_signatures_ready_{};
+  std::uint32_t publication_failure_status_{};
   std::size_t radix_id_capacity_{};
   std::uint32_t *radix_input_ids_{};
   void *radix_workspace_{};
@@ -7929,6 +7946,8 @@ private:
   gpulsmopt2_detail::Buffer<std::uint32_t> staged_epoch_mode_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::ResidentPublicationPlan>
       resident_plan_;
+  gpulsmopt2_detail::PinnedBuffer<
+      gpulsmopt2_detail::ResidentPublicationPlan> publication_receipt_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::LevelStorageSpan>
       level_storage_spans_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::LevelRankSpan>
@@ -7973,6 +7992,8 @@ private:
 
   gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_reduction_completion_;
+  gpulsmopt2_detail::Buffer<std::uint64_t> range_fragment_total_;
+  gpulsmopt2_detail::PinnedBuffer<std::uint64_t> range_total_receipt_;
   gpulsmopt2_detail::Buffer<std::uint8_t> range_query_storage_,
       range_fragment_storage_, range_section_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_fragment_counts_,
