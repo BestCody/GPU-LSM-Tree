@@ -295,7 +295,13 @@ def main():
     if validate_only:
         print(f"Validated {validated_ranges} paired range states")
         return
-    bulk = load_csvs(os.path.join(result_dir, "*", "bulk_build.csv"))
+    bulk_frames = [
+        load_csvs(os.path.join(result_dir, directory, "bulk_build.csv"))
+        for directory in ("gpulsmopt", "lsmu")
+    ]
+    bulk_frames = [frame for frame in bulk_frames if not frame.empty]
+    bulk = (pd.concat(bulk_frames, ignore_index=True)
+            if bulk_frames else pd.DataFrame())
     cleanup = load_csvs(os.path.join(
         result_dir, "lsmu", "cleanup_b*", "cleanup.csv"))
 
