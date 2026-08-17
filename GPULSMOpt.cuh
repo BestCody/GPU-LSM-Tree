@@ -2,6 +2,7 @@
 #include "gpu_dictionary_adapter.cuh"
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_reduce.cuh>
@@ -82,6 +83,9 @@ constexpr std::uint32_t kLookupRouterDenseRowsPerSection = 8u;
 constexpr std::uint32_t kLookupRouterMinimumBatches = 5u;
 static_assert((kLookupRouterSlots & (kLookupRouterSlots - 1u)) == 0u);
 constexpr std::uint32_t kFoundationCompactionThreads = 256u;
+constexpr std::uint32_t kLocalEpochItemsPerThread = 5u;
+constexpr std::uint32_t kLocalEpochCapacity =
+    kFoundationCompactionThreads * kLocalEpochItemsPerThread;
 constexpr std::uint32_t kFoundationCells = 128u;
 constexpr std::uint32_t kFoundationCellKeys = 512u;
 constexpr std::uint32_t kDenseCellRankMinimumRows = kFoundationCells;
@@ -2724,12 +2728,182 @@ __global__ void count_resident_merge_work_kernel(
   raw_counts[q] = count | (has_resident ? kResidentWorkFlag : 0u);
 }
 
+__global__ void build_staged_rank_directory_kernel(
+    const Row *rows, const std::uint32_t *offsets,
+    std::uint16_t *ranks) {
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t cell = threadIdx.x;
+  if (q >= kQuotients || cell >= kFoundationCells) return;
+  const std::uint32_t begin = offsets[q];
+  const std::uint32_t count = offsets[q + 1u] - begin;
+  const std::uint32_t position = cell_rank_supported(count)
+      ? lower_bound_rows(rows + begin, count, cell * kFoundationCellKeys)
+      : 0u;
+  ranks[std::size_t{q} * kFoundationCells + cell] =
+      static_cast<std::uint16_t>(position);
+}
+
+__global__ void resolve_epoch_sections_kernel(
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches,
+    const std::uint32_t *raw_section_offsets,
+    std::uint32_t *scratch_keys, Row *scratch_rows,
+    std::uint32_t *resolved_counts, std::uint16_t *resolved_ranks) {
+  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
+  constexpr std::uint32_t kItems = kLocalEpochItemsPerThread;
+  using BlockSort = cub::BlockRadixSort<
+      std::uint32_t, kThreads, kItems, std::uint32_t>;
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  union ResolutionStorage {
+    typename BlockSort::TempStorage sort;
+    unsigned long long winners[kLocalEpochCapacity];
+  };
+  __shared__ ResolutionStorage resolution_storage;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ std::uint32_t batch_prefix[kBatchesPerEpoch + 1u];
+  __shared__ std::uint16_t sorted_suffixes[kLocalEpochCapacity];
+  __shared__ std::uint32_t cell_counts[kFoundationCells];
+  const std::uint32_t q = blockIdx.x;
+  if (threadIdx.x == 0u) {
+    std::uint32_t total = 0u;
+    batch_prefix[0] = 0u;
+    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+      const std::size_t base =
+          std::size_t{batch} * (kQuotients + 1u) + q;
+      total += raw_offsets[base + 1u] - raw_offsets[base];
+      batch_prefix[batch + 1u] = total;
+    }
+    for (std::uint32_t batch = pending_batches;
+         batch < kBatchesPerEpoch; ++batch)
+      batch_prefix[batch + 1u] = total;
+  }
+  __syncthreads();
+  const std::uint32_t raw_count = batch_prefix[pending_batches];
+  if (!raw_count) {
+    if (threadIdx.x == 0u) resolved_counts[q] = 0u;
+    if (threadIdx.x < kFoundationCells)
+      resolved_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] = 0u;
+    return;
+  }
+
+  std::uint32_t sort_keys[kItems];
+  std::uint32_t sort_sources[kItems];
+  constexpr std::uint32_t kInvalidSortKey = 1u << 16u;
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    const std::uint32_t local = threadIdx.x * kItems + item;
+    sort_keys[item] = kInvalidSortKey;
+    sort_sources[item] = 0u;
+    if (local >= raw_count) continue;
+    std::uint32_t batch = 0u;
+    while (batch + 1u < pending_batches &&
+           local >= batch_prefix[batch + 1u])
+      ++batch;
+    const std::size_t base =
+        std::size_t{batch} * (kQuotients + 1u) + q;
+    const std::uint32_t source = static_cast<std::uint32_t>(
+        std::size_t{batch} * batch_stride + raw_offsets[base] +
+        local - batch_prefix[batch]);
+    sort_keys[item] = key_suffix(raw_keys[source]);
+    sort_sources[item] = source;
+  }
+  BlockSort(resolution_storage.sort).Sort(
+      sort_keys, sort_sources, 0, 17);
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    const std::uint32_t local = threadIdx.x * kItems + item;
+    sorted_suffixes[local] = static_cast<std::uint16_t>(sort_keys[item]);
+  }
+  if (threadIdx.x < kFoundationCells)
+    cell_counts[threadIdx.x] = 0u;
+  __syncthreads();
+
+  bool leader[kItems];
+  std::uint32_t leader_count = 0u;
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    const std::uint32_t local = threadIdx.x * kItems + item;
+    const bool valid = sort_keys[item] != kInvalidSortKey;
+    leader[item] = valid &&
+        (!local || sorted_suffixes[local - 1u] != sorted_suffixes[local]);
+    leader_count += leader[item];
+  }
+  std::uint32_t output_prefix = 0u, output_count = 0u;
+  BlockScan(scan_storage).ExclusiveSum(
+      leader_count, output_prefix, output_count);
+  for (std::uint32_t group = threadIdx.x; group < output_count;
+       group += blockDim.x)
+    resolution_storage.winners[group] = 0u;
+  __syncthreads();
+
+  std::uint32_t leaders_seen = 0u;
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    if (sort_keys[item] == kInvalidSortKey) continue;
+    const std::uint32_t group = leader[item]
+        ? output_prefix + leaders_seen
+        : output_prefix + leaders_seen - 1u;
+    if (leader[item]) {
+      sorted_suffixes[group] = static_cast<std::uint16_t>(sort_keys[item]);
+      ++leaders_seen;
+    }
+    const std::uint32_t source = sort_sources[item];
+    const std::uint32_t age = raw_position(raw_payloads[source]);
+    const unsigned long long token =
+        (static_cast<unsigned long long>(age + 1u) << 32u) | source;
+    atomicMax(resolution_storage.winners + group, token);
+  }
+  if (threadIdx.x == 0u) resolved_counts[q] = output_count;
+  __syncthreads();
+
+  const std::uint32_t scratch_begin = raw_section_offsets[q];
+  for (std::uint32_t group = threadIdx.x; group < output_count;
+       group += blockDim.x) {
+    const std::uint32_t source = static_cast<std::uint32_t>(
+        resolution_storage.winners[group]);
+    const std::uint32_t suffix = sorted_suffixes[group];
+    scratch_keys[scratch_begin + group] = full_key(q, suffix);
+    scratch_rows[scratch_begin + group] =
+        raw_row(full_key(q, suffix), raw_payloads[source]);
+    atomicAdd(cell_counts + suffix / kFoundationCellKeys, 1u);
+  }
+  __syncthreads();
+
+  const std::uint32_t cell_count = threadIdx.x < kFoundationCells
+      ? cell_counts[threadIdx.x] : 0u;
+  std::uint32_t cell_prefix = 0u, ignored = 0u;
+  BlockScan(scan_storage).ExclusiveSum(
+      cell_count, cell_prefix, ignored);
+  if (threadIdx.x < kFoundationCells)
+    resolved_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
+        static_cast<std::uint16_t>(cell_prefix);
+}
+
+__global__ void compact_resolved_epoch_sections_kernel(
+    const std::uint32_t *scratch_keys, const Row *scratch_rows,
+    const std::uint32_t *raw_section_offsets,
+    const std::uint32_t *resolved_offsets,
+    std::uint32_t *keys, Row *rows) {
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t count =
+      resolved_offsets[q + 1u] - resolved_offsets[q];
+  for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+    keys[resolved_offsets[q] + i] = scratch_keys[raw_section_offsets[q] + i];
+    rows[resolved_offsets[q] + i] = scratch_rows[raw_section_offsets[q] + i];
+  }
+}
+
+__global__ void set_resolved_epoch_count_kernel(
+    const std::uint32_t *resolved_offsets, std::uint32_t *selected_count) {
+  if (!blockIdx.x && !threadIdx.x)
+    *selected_count = resolved_offsets[kQuotients];
+}
+
 // Count grouped raw intervals without suffix sorting.
 __global__ void count_direct_epoch_merge_work_kernel(
     const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
     const Descriptor *descriptors, const DeviceManifest *manifests,
     const std::uint32_t *active_manifest, ResidentPublicationPlan *plan,
-    std::uint64_t *raw_counts, std::uint32_t *crowded_flag) {
+    std::uint64_t *raw_counts, std::uint32_t *raw_section_counts,
+    std::uint32_t *crowded_flag,
+    std::uint32_t *local_epoch_overflow_flag) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= kQuotients || plan->status) return;
   const DeviceManifestSnapshot manifest = load_active_manifest(
@@ -2740,6 +2914,10 @@ __global__ void count_direct_epoch_merge_work_kernel(
         std::size_t{batch} * (kQuotients + 1u) + q;
     count += raw_offsets[offset + 1u] - raw_offsets[offset];
   }
+  const std::uint32_t raw_count = static_cast<std::uint32_t>(count);
+  raw_section_counts[q] = raw_count;
+  if (raw_count > kLocalEpochCapacity)
+    atomicExch(local_epoch_overflow_flag, 1u);
   bool has_resident = false;
   for (std::uint32_t level = 0u;
        level <= plan->source_level_limit; ++level)
@@ -2779,9 +2957,19 @@ __global__ void choose_crowded_epoch_path_kernel(
     cudaGraphConditionalHandle conditional,
     const std::uint32_t *crowded_flag) {
   if (blockIdx.x || threadIdx.x) return;
+  const std::uint32_t crowded =
+      atomicAdd(const_cast<std::uint32_t *>(crowded_flag), 0u);
+  cudaGraphSetConditional(conditional, crowded ? 1u : 0u);
+}
+
+__global__ void choose_local_epoch_path_kernel(
+    cudaGraphConditionalHandle conditional,
+    const std::uint32_t *local_epoch_overflow_flag) {
+  if (blockIdx.x || threadIdx.x) return;
+  const std::uint32_t local_overflow = atomicAdd(
+      const_cast<std::uint32_t *>(local_epoch_overflow_flag), 0u);
   cudaGraphSetConditional(
-      conditional, atomicAdd(const_cast<std::uint32_t *>(crowded_flag), 0u)
-                           ? 1u : 0u);
+      conditional, local_overflow ? 1u : 0u);
 }
 
 __global__ void set_staged_epoch_mode_kernel(std::uint32_t *mode) {
@@ -3115,6 +3303,94 @@ __device__ __forceinline__ std::uint32_t resident_hot_boundary_warp(
   return low;
 }
 
+__device__ __forceinline__ std::uint32_t ranked_merge_prefix_warp(
+    std::uint32_t q, std::uint32_t cell,
+    const Row *current_rows, const std::uint32_t *current_offsets,
+    const std::uint16_t *current_ranks,
+    const Descriptor *descriptors,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
+    const std::uint16_t *local_rank,
+    std::uint32_t source_level_limit, std::uint32_t foundation_level,
+    std::uint64_t occupied_levels, bool &supported) {
+  constexpr unsigned mask = 0xffffffffu;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  std::uint32_t result = 0u;
+  bool valid = true;
+  if (lane == 0u) {
+    const std::uint32_t raw_count =
+        current_offsets[q + 1u] - current_offsets[q];
+    valid = cell_rank_supported(raw_count);
+    if (valid)
+      result = cell == kFoundationCells ? raw_count
+          : current_ranks[std::size_t{q} * kFoundationCells + cell];
+  }
+  for (std::uint32_t level = lane; level <= source_level_limit;
+       level += 32u) {
+    if (!level_is_occupied(occupied_levels, level)) continue;
+    const std::uint32_t count =
+        descriptors[descriptor_index(q, level)].count();
+    if (!cell_rank_supported(count)) {
+      valid = false;
+      continue;
+    }
+    if (cell == kFoundationCells) {
+      result += count;
+      continue;
+    }
+    const std::uint16_t *ranks = nullptr;
+    if (level == foundation_level) {
+      ranks = local_rank + std::size_t{q} * kFoundationCells;
+    } else {
+      const std::uint32_t block =
+          level_cell_rank_blocks[descriptor_index(q, level)];
+      if (block == kInvalid) {
+        valid = false;
+        continue;
+      }
+      ranks = level_cell_ranks +
+          std::size_t{block} * kFoundationCells;
+    }
+    result += ranks[cell];
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u) {
+    result += __shfl_down_sync(mask, result, offset);
+    valid &= __shfl_down_sync(mask, valid, offset);
+  }
+  supported = __shfl_sync(mask, valid, 0u);
+  return __shfl_sync(mask, result, 0u);
+}
+
+__device__ __forceinline__ std::uint32_t ranked_merge_boundary_warp(
+    std::uint32_t q, std::uint32_t target,
+    const Row *current_rows, const std::uint32_t *current_offsets,
+    const std::uint16_t *current_ranks,
+    const Descriptor *descriptors,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
+    const std::uint16_t *local_rank,
+    std::uint32_t source_level_limit, std::uint32_t foundation_level,
+    std::uint64_t occupied_levels, bool &supported) {
+  if (!target) {
+    supported = true;
+    return 0u;
+  }
+  std::uint32_t low = 1u, high = kFoundationCells;
+  supported = true;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    bool valid = true;
+    const std::uint32_t count = ranked_merge_prefix_warp(
+        q, middle, current_rows, current_offsets, current_ranks,
+        descriptors, level_cell_rank_blocks, level_cell_ranks, local_rank,
+        source_level_limit, foundation_level, occupied_levels, valid);
+    supported &= valid;
+    if (count < target) low = middle + 1u;
+    else high = middle;
+  }
+  return low;
+}
+
 __global__ void resolve_resident_job_boundaries_kernel(
     BalancedMergeJob *jobs, std::uint64_t *job_raw_reservations,
     const ResidentPublicationPlan *plan,
@@ -3124,7 +3400,12 @@ __global__ void resolve_resident_job_boundaries_kernel(
     const std::uint32_t *route_logical_begins,
     const std::uint32_t *level_q_logical_offsets,
     const DeviceManifest *manifests,
-    const std::uint32_t *active_manifest) {
+    const std::uint32_t *active_manifest,
+    const Descriptor *descriptors,
+    const std::uint16_t *current_ranks,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
+    const std::uint16_t *local_rank) {
   const std::uint32_t lane = threadIdx.x & 31u;
   constexpr unsigned mask = 0xffffffffu;
   const DeviceManifestSnapshot manifest = load_active_manifest(
@@ -3144,38 +3425,86 @@ __global__ void resolve_resident_job_boundaries_kernel(
   }
   BalancedMergeJob job = jobs[job_index];
   const std::uint32_t q = job.quotient_begin;
-  const std::uint32_t raw = static_cast<std::uint32_t>(
-      balanced_merge_prefix_count_warp(
-          q, 1u << 16u, current_rows, current_offsets, arena,
-          route_headers, route_slices, route_logical_begins,
-          level_q_logical_offsets, plan->source_level_limit,
-          manifest.occupied_level_mask));
+  bool ranked_total = true;
+  std::uint32_t raw = ranked_merge_prefix_warp(
+      q, kFoundationCells, current_rows, current_offsets, current_ranks,
+      descriptors, level_cell_rank_blocks, level_cell_ranks, local_rank,
+      plan->source_level_limit, manifest.foundation_level,
+      manifest.occupied_level_mask, ranked_total);
+  if (!ranked_total)
+    raw = balanced_merge_prefix_count_warp(
+        q, 1u << 16u, current_rows, current_offsets, arena,
+        route_headers, route_slices, route_logical_begins,
+        level_q_logical_offsets, plan->source_level_limit,
+        manifest.occupied_level_mask);
+  std::uint32_t low_cell = 0u, high_cell = kFoundationCells;
+  std::uint32_t ranked_begin = 0u, ranked_end = raw;
+  bool use_ranked = ranked_total;
+  std::uint32_t previous_cell = 0u;
+  std::uint32_t previous_count = 0u;
+  for (std::uint32_t piece = 0u;
+       piece < job.hot_pieces && use_ranked; ++piece) {
+    const std::uint32_t target = static_cast<std::uint32_t>(
+        (std::uint64_t{raw} * (piece + 1u) + job.hot_pieces - 1u) /
+        job.hot_pieces);
+    bool boundary_valid = true;
+    const std::uint32_t next_cell = piece + 1u == job.hot_pieces
+        ? kFoundationCells
+        : ranked_merge_boundary_warp(
+              q, target, current_rows, current_offsets, current_ranks,
+              descriptors, level_cell_rank_blocks, level_cell_ranks,
+              local_rank, plan->source_level_limit,
+              manifest.foundation_level, manifest.occupied_level_mask,
+              boundary_valid);
+    bool prefix_valid = true;
+    const std::uint32_t next_count = ranked_merge_prefix_warp(
+        q, next_cell, current_rows, current_offsets, current_ranks,
+        descriptors, level_cell_rank_blocks, level_cell_ranks, local_rank,
+        plan->source_level_limit, manifest.foundation_level,
+        manifest.occupied_level_mask, prefix_valid);
+    const std::uint32_t piece_count = next_count - previous_count;
+    use_ranked = boundary_valid && prefix_valid &&
+        next_cell > previous_cell && piece_count <= plan->job_capacity;
+    if (piece == job.hot_piece) {
+      low_cell = previous_cell;
+      high_cell = next_cell;
+      ranked_begin = previous_count;
+      ranked_end = next_count;
+    }
+    previous_cell = next_cell;
+    previous_count = next_count;
+  }
   const std::uint32_t low_target = static_cast<std::uint32_t>(
       (std::uint64_t{raw} * job.hot_piece + job.hot_pieces - 1u) /
       job.hot_pieces);
   const std::uint32_t high_target = static_cast<std::uint32_t>(
       (std::uint64_t{raw} * (job.hot_piece + 1u) +
        job.hot_pieces - 1u) / job.hot_pieces);
-  const std::uint32_t low = resident_hot_boundary_warp(
-      q, low_target, current_rows, current_offsets, arena,
-      route_headers, route_slices, route_logical_begins,
-      level_q_logical_offsets, plan->source_level_limit,
-      manifest.occupied_level_mask);
-  const std::uint32_t high = job.hot_piece + 1u == job.hot_pieces
-      ? (1u << 16u)
-      : resident_hot_boundary_warp(
-            q, high_target, current_rows, current_offsets, arena,
-            route_headers, route_slices, route_logical_begins,
-            level_q_logical_offsets, plan->source_level_limit,
-            manifest.occupied_level_mask);
-  const std::uint32_t exact = balanced_merge_prefix_count_warp(
-      q, high, current_rows, current_offsets, arena, route_headers,
-      route_slices, route_logical_begins, level_q_logical_offsets,
-      plan->source_level_limit, manifest.occupied_level_mask) -
-      balanced_merge_prefix_count_warp(
-          q, low, current_rows, current_offsets, arena, route_headers,
-          route_slices, route_logical_begins, level_q_logical_offsets,
-          plan->source_level_limit, manifest.occupied_level_mask);
+  std::uint32_t low = low_cell * kFoundationCellKeys;
+  std::uint32_t high = high_cell * kFoundationCellKeys;
+  std::uint32_t exact = ranked_end - ranked_begin;
+  if (!use_ranked) {
+    low = resident_hot_boundary_warp(
+        q, low_target, current_rows, current_offsets, arena,
+        route_headers, route_slices, route_logical_begins,
+        level_q_logical_offsets, plan->source_level_limit,
+        manifest.occupied_level_mask);
+    high = job.hot_piece + 1u == job.hot_pieces
+        ? (1u << 16u)
+        : resident_hot_boundary_warp(
+              q, high_target, current_rows, current_offsets, arena,
+              route_headers, route_slices, route_logical_begins,
+              level_q_logical_offsets, plan->source_level_limit,
+              manifest.occupied_level_mask);
+    exact = balanced_merge_prefix_count_warp(
+        q, high, current_rows, current_offsets, arena, route_headers,
+        route_slices, route_logical_begins, level_q_logical_offsets,
+        plan->source_level_limit, manifest.occupied_level_mask) -
+        balanced_merge_prefix_count_warp(
+            q, low, current_rows, current_offsets, arena, route_headers,
+            route_slices, route_logical_begins, level_q_logical_offsets,
+            plan->source_level_limit, manifest.occupied_level_mask);
+  }
   if (lane == 0u) {
     job.key_begin = (std::uint64_t{q} << 16u) + low;
     job.key_end = (std::uint64_t{q} << 16u) + high;
@@ -5945,6 +6274,9 @@ public:
         level_cell_ranks_(
             level_rank_block_capacity_ *
             gpulsmopt2_detail::kFoundationCells),
+        publication_cell_ranks_(
+            std::size_t{gpulsmopt2_detail::kQuotients} *
+            gpulsmopt2_detail::kFoundationCells),
         raw_keys_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_payloads_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
@@ -5979,6 +6311,7 @@ public:
         resident_section_logical_offsets_(gpulsmopt2_detail::kQuotients + 1u),
         balanced_merge_jobs_(maximum_resident_jobs_),
         foundation_overflow_flag_(1u),
+        local_epoch_overflow_flag_(1u),
         admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
         range_partials_(gpulsmopt2_detail::kRangeSchedulerBlocks),
         range_reduction_completion_(1u),
@@ -6529,6 +6862,7 @@ public:
             sizeof(gpulsmopt2_detail::LevelRankSpan) +
         level_cell_rank_blocks_.size() * sizeof(std::uint32_t) +
         level_cell_ranks_.size() * sizeof(std::uint16_t) +
+        publication_cell_ranks_.size() * sizeof(std::uint16_t) +
         raw_keys_.size() * sizeof(std::uint32_t) +
         raw_payloads_.size() * sizeof(gpulsmopt2_detail::RawPayload) +
         raw_offsets_.size() * sizeof(std::uint32_t) +
@@ -6545,7 +6879,8 @@ public:
          publication_batch_offsets_.size()) * sizeof(std::uint32_t) +
         (foundation_source_offsets_.size() +
          foundation_section_output_counts_.size() +
-         foundation_overflow_flag_.size()) * sizeof(std::uint32_t) +
+         foundation_overflow_flag_.size() +
+         local_epoch_overflow_flag_.size()) * sizeof(std::uint32_t) +
         balanced_merge_raw_counts_.size() * sizeof(std::uint64_t) +
         (resident_tile_job_counts_.size() +
          resident_tile_job_offsets_.size() +
@@ -6753,6 +7088,13 @@ private:
         foundation_overflow_flag_.data(), 0, sizeof(std::uint32_t),
         capture_stream));
     CUDA_CHECK(cudaMemsetAsync(
+        local_epoch_overflow_flag_.data(), 0, sizeof(std::uint32_t),
+        capture_stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        foundation_section_output_counts_.data(), 0,
+        foundation_section_output_counts_.size() * sizeof(std::uint32_t),
+        capture_stream));
+    CUDA_CHECK(cudaMemsetAsync(
         staged_epoch_mode_.data(), 0, sizeof(std::uint32_t),
         capture_stream));
     gpulsmopt2_detail::count_direct_epoch_merge_work_kernel<<<
@@ -6762,7 +7104,9 @@ private:
             descriptors_.data(), device_manifests_.data(),
             active_device_manifest_.data(), resident_plan_.data(),
             balanced_merge_raw_counts_.data(),
-            foundation_overflow_flag_.data());
+            foundation_section_output_counts_.data(),
+            foundation_overflow_flag_.data(),
+            local_epoch_overflow_flag_.data());
     CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
     return graph;
   }
@@ -6816,6 +7160,64 @@ private:
         gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
             publication_keys_a_.data(), publication_selected_count_.data(),
             foundation_source_offsets_.data());
+    gpulsmopt2_detail::build_staged_rank_directory_kernel<<<
+        gpulsmopt2_detail::kQuotients,
+        gpulsmopt2_detail::kFoundationCells, 0, capture_stream>>>(
+            publication_rows_a_.data(), foundation_source_offsets_.data(),
+            publication_cell_ranks_.data());
+    gpulsmopt2_detail::count_resident_merge_work_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients),
+        gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+            foundation_source_offsets_.data(), descriptors_.data(),
+            device_manifests_.data(), active_device_manifest_.data(),
+            resident_plan_.data(), balanced_merge_raw_counts_.data());
+    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
+    return graph;
+  }
+
+  cudaGraph_t capture_local_epoch_stage_graph(
+      cudaStream_t capture_stream) {
+    cudaGraph_t graph{};
+    CUDA_CHECK(cudaStreamBeginCapture(
+        capture_stream, cudaStreamCaptureModeThreadLocal));
+    std::size_t scan_bytes = resident_scan_temp_.size();
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        resident_scan_temp_.data(), scan_bytes,
+        foundation_section_output_counts_.data(),
+        resident_section_logical_offsets_.data(),
+        gpulsmopt2_detail::kQuotients + 1u, capture_stream));
+    auto *scratch_rows = reinterpret_cast<gpulsmopt2_detail::Row *>(
+        publication_epoch_assignments_a_.data());
+    gpulsmopt2_detail::resolve_epoch_sections_kernel<<<
+        gpulsmopt2_detail::kQuotients,
+        gpulsmopt2_detail::kFoundationCompactionThreads,
+        0, capture_stream>>>(
+            raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+            static_cast<std::uint32_t>(batch_capacity_),
+            gpulsmopt2_detail::kBatchesPerEpoch,
+            resident_section_logical_offsets_.data(),
+            publication_epoch_keys_a_.data(), scratch_rows,
+            foundation_section_output_counts_.data(),
+            publication_cell_ranks_.data());
+    scan_bytes = resident_scan_temp_.size();
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        resident_scan_temp_.data(), scan_bytes,
+        foundation_section_output_counts_.data(),
+        foundation_source_offsets_.data(),
+        gpulsmopt2_detail::kQuotients + 1u, capture_stream));
+    gpulsmopt2_detail::set_resolved_epoch_count_kernel<<<
+        1, 1, 0, capture_stream>>>(
+            foundation_source_offsets_.data(),
+            publication_selected_count_.data());
+    gpulsmopt2_detail::compact_resolved_epoch_sections_kernel<<<
+        gpulsmopt2_detail::kQuotients,
+        gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+            publication_epoch_keys_a_.data(), scratch_rows,
+            resident_section_logical_offsets_.data(),
+            foundation_source_offsets_.data(), publication_keys_a_.data(),
+            publication_rows_a_.data());
+    gpulsmopt2_detail::set_staged_epoch_mode_kernel<<<
+        1, 1, 0, capture_stream>>>(staged_epoch_mode_.data());
     gpulsmopt2_detail::count_resident_merge_work_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
         gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
@@ -6868,7 +7270,10 @@ private:
             publication_rows_a_.data(), foundation_source_offsets_.data(),
             resident_rows(), route_headers_.data(), route_slices_.data(),
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
-            device_manifests_.data(), active_device_manifest_.data());
+            device_manifests_.data(), active_device_manifest_.data(),
+            descriptors_.data(), publication_cell_ranks_.data(),
+            level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
+            local_rank_.data());
     scan_bytes = resident_scan_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         resident_scan_temp_.data(), scan_bytes,
@@ -6974,9 +7379,11 @@ private:
     CUDA_CHECK(cudaGraphConditionalHandleCreate(
         &crowded_conditional, graph, 0u, cudaGraphCondAssignDefault));
 
-    cudaGraph_t pre_graph{}, crowded_graph{}, normal_graph{}, finish_graph{};
+    cudaGraph_t pre_graph{}, local_graph{}, crowded_graph{}, normal_graph{},
+        finish_graph{};
     try {
       pre_graph = capture_resident_merge_pre_graph(capture_stream);
+      local_graph = capture_local_epoch_stage_graph(capture_stream);
       crowded_graph = capture_crowded_epoch_stage_graph(capture_stream);
       CUDA_CHECK(cudaStreamBeginCapture(
           capture_stream, cudaStreamCaptureModeThreadLocal));
@@ -7036,9 +7443,44 @@ private:
       if (!bodies)
         throw std::runtime_error(
             "CUDA did not create crowded publication bodies");
+
+      cudaGraphConditionalHandle local_overflow_conditional{};
+      CUDA_CHECK(cudaGraphConditionalHandleCreate(
+          &local_overflow_conditional, bodies[0], 0u,
+          cudaGraphCondAssignDefault));
+      auto *local_overflow_flag = local_epoch_overflow_flag_.data();
+      void *local_controller_arguments[] = {
+          &local_overflow_conditional, &local_overflow_flag};
+      cudaKernelNodeParams local_controller_params{};
+      local_controller_params.func = reinterpret_cast<void *>(
+          gpulsmopt2_detail::choose_local_epoch_path_kernel);
+      local_controller_params.gridDim = dim3(1u);
+      local_controller_params.blockDim = dim3(1u);
+      local_controller_params.kernelParams = local_controller_arguments;
+      cudaGraphNode_t local_controller{};
+      CUDA_CHECK(cudaGraphAddKernelNode(
+          &local_controller, bodies[0], nullptr, 0u,
+          &local_controller_params));
+      cudaGraphNodeParams local_conditional_params{};
+      local_conditional_params.type = cudaGraphNodeTypeConditional;
+      local_conditional_params.conditional.handle =
+          local_overflow_conditional;
+      local_conditional_params.conditional.type = cudaGraphCondTypeIf;
+      local_conditional_params.conditional.size = 2u;
+      cudaGraphNode_t local_conditional{};
+      CUDA_CHECK(cudaGraphAddNode(
+          &local_conditional, bodies[0], &local_controller, 1u,
+          &local_conditional_params));
+      cudaGraph_t *local_bodies =
+          local_conditional_params.conditional.phGraph_out;
+      if (!local_bodies)
+        throw std::runtime_error(
+            "CUDA did not create local publication bodies");
       cudaGraphNode_t child{};
       CUDA_CHECK(cudaGraphAddChildGraphNode(
-          &child, bodies[0], nullptr, 0u, crowded_graph));
+          &child, local_bodies[0], nullptr, 0u, crowded_graph));
+      CUDA_CHECK(cudaGraphAddChildGraphNode(
+          &child, local_bodies[1], nullptr, 0u, local_graph));
       CUDA_CHECK(cudaGraphAddChildGraphNode(
           &child, bodies[1], nullptr, 0u, normal_graph));
 
@@ -7047,6 +7489,7 @@ private:
           &finish_node, graph, &conditional, 1u, finish_graph));
     } catch (...) {
       if (pre_graph) cudaGraphDestroy(pre_graph);
+      if (local_graph) cudaGraphDestroy(local_graph);
       if (crowded_graph) cudaGraphDestroy(crowded_graph);
       if (normal_graph) cudaGraphDestroy(normal_graph);
       if (finish_graph) cudaGraphDestroy(finish_graph);
@@ -7054,6 +7497,7 @@ private:
       throw;
     }
     CUDA_CHECK(cudaGraphDestroy(pre_graph));
+    CUDA_CHECK(cudaGraphDestroy(local_graph));
     CUDA_CHECK(cudaGraphDestroy(crowded_graph));
     CUDA_CHECK(cudaGraphDestroy(normal_graph));
     CUDA_CHECK(cudaGraphDestroy(finish_graph));
@@ -7719,6 +8163,7 @@ private:
       level_rank_spans_;
   gpulsmopt2_detail::Buffer<std::uint32_t> level_cell_rank_blocks_;
   gpulsmopt2_detail::Buffer<std::uint16_t> level_cell_ranks_;
+  gpulsmopt2_detail::Buffer<std::uint16_t> publication_cell_ranks_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_keys_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawPayload> raw_payloads_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
@@ -7744,7 +8189,8 @@ private:
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RouteHeader>
       foundation_next_route_headers_;
   gpulsmopt2_detail::Buffer<std::uint8_t> resident_scan_temp_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> foundation_overflow_flag_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> foundation_overflow_flag_,
+      local_epoch_overflow_flag_;
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row>
       publication_rows_a_;
   gpulsmopt2_detail::Buffer<std::uint8_t> publication_temp_;
