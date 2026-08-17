@@ -5,6 +5,7 @@
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_reduce.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cub/iterator/counting_input_iterator.cuh>
@@ -67,6 +68,8 @@ static_assert(kMaximumPublicationRows < kDescriptorSplitFlag);
 constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
 constexpr std::uint32_t kRangeThreadWork = 8u;
 constexpr std::uint32_t kRangeSubgroupWork = 512u;
+constexpr std::uint32_t kRangeOnChipNewerRows = 128u;
+constexpr std::uint32_t kRangeHotWindowRows = 1u << 26u;
 constexpr std::uint32_t kAdmissionCtaGroupMaximum = 64u;
 constexpr std::uint32_t kAdmissionCtaHashSlots = 128u;
 static_assert((kAdmissionCtaHashSlots &
@@ -1133,14 +1136,226 @@ __device__ __forceinline__ Row logical_section_row(
   const std::uint32_t section_begin = level_q_logical_offsets[
       std::size_t{level} * (kQuotients + 1u) + q];
   const std::uint32_t logical = section_begin + position;
-  for (std::uint32_t local = 0u; local < header.count; ++local) {
-    const std::uint32_t route = header.begin + local;
+  std::uint32_t low = 0u, high = header.count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (route_logical_begins[header.begin + middle] <= logical)
+      low = middle + 1u;
+    else
+      high = middle;
+  }
+  if (low) {
+    const std::uint32_t route = header.begin + low - 1u;
     const RouteSlice slice = route_slices[route];
     const std::uint32_t begin = route_logical_begins[route];
-    if (logical >= begin && logical < begin + slice.rows.count())
+    if (logical < begin + slice.rows.count())
       return arena[slice.rows.offset() + logical - begin];
   }
   return {};
+}
+
+constexpr std::uint32_t kRangeHotRawLocator = 1u << 31u;
+
+__host__ __device__ __forceinline__ std::uint64_t range_hot_token(
+    std::uint32_t key, std::uint32_t locator) {
+  return (std::uint64_t{key} << 32u) | locator;
+}
+
+__host__ __device__ __forceinline__ std::uint32_t range_hot_key(
+    std::uint64_t token) {
+  return static_cast<std::uint32_t>(token >> 32u);
+}
+
+__host__ __device__ __forceinline__ std::uint32_t range_hot_locator(
+    std::uint64_t token) {
+  return static_cast<std::uint32_t>(token);
+}
+
+struct RangeHotTokenKey {
+  __host__ __device__ std::uint32_t operator()(std::uint64_t token) const {
+    return range_hot_key(token);
+  }
+};
+
+struct RangeHotNewestToken {
+  const RawPayload *raw_payloads{};
+  std::uint32_t raw_record_capacity{};
+
+  __device__ bool valid(std::uint64_t token) const {
+    const std::uint32_t locator = range_hot_locator(token);
+    return locator & kRangeHotRawLocator
+        ? (locator & ~kRangeHotRawLocator) < raw_record_capacity
+        : (locator >> 16u) < kMaximumLevels;
+  }
+
+  __device__ std::uint32_t age(std::uint64_t token) const {
+    const std::uint32_t locator = range_hot_locator(token);
+    if (locator & kRangeHotRawLocator)
+      return kMaximumLevels +
+          raw_position(raw_payloads[locator & ~kRangeHotRawLocator]);
+    return kMaximumLevels - 1u - (locator >> 16u);
+  }
+
+  __device__ std::uint64_t operator()(std::uint64_t first,
+                                      std::uint64_t second) const {
+    const bool first_valid = valid(first), second_valid = valid(second);
+    if (first_valid != second_valid) return second_valid ? second : first;
+    if (!first_valid) return 0u;
+    return age(second) > age(first) ? second : first;
+  }
+};
+
+struct RangeHotTokenRow {
+  const RawPayload *raw_payloads{};
+  ResidentRows arena{};
+  const RouteHeader *route_headers{};
+  const RouteSlice *route_slices{};
+  const std::uint32_t *route_logical_begins{};
+  const std::uint32_t *level_q_logical_offsets{};
+
+  __device__ Row operator()(std::uint64_t token) const {
+    const std::uint32_t key = range_hot_key(token);
+    const std::uint32_t locator = range_hot_locator(token);
+    if (locator & kRangeHotRawLocator) {
+      const std::uint32_t record = locator & ~kRangeHotRawLocator;
+      return raw_row(key, raw_payloads[record]);
+    }
+    const std::uint32_t level = locator >> 16u;
+    const std::uint32_t position = locator & 0xffffu;
+    return logical_section_row(
+        key >> 16u, level, position, arena, route_headers, route_slices,
+        route_logical_begins, level_q_logical_offsets);
+  }
+};
+
+__global__ void count_range_hot_newer_rows_kernel(
+    const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
+    const Descriptor *descriptors, const std::uint64_t *occupied_mask,
+    std::uint64_t *counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients) return;
+  if (q == kQuotients) {
+    counts[q] = 0u;
+    return;
+  }
+  const DeviceManifestSnapshot manifest = load_query_manifest(occupied_mask);
+  std::uint64_t physical = 0u;
+  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+    const std::size_t index =
+        std::size_t{batch} * (kQuotients + 1u) + q;
+    physical += raw_offsets[index + 1u] - raw_offsets[index];
+  }
+  for (std::uint32_t level = 0u; level < manifest.active_levels; ++level)
+    if (level != manifest.foundation_level &&
+        level_is_occupied(manifest.occupied_level_mask, level))
+      physical += descriptors[descriptor_index(q, level)].count();
+  counts[q] = physical > kRangeOnChipNewerRows ? physical : 0u;
+}
+
+__global__ void make_range_hot_window_offsets_kernel(
+    const std::uint64_t *global_offsets, std::uint32_t quotient_begin,
+    std::uint32_t quotient_count, std::uint64_t window_base,
+    std::uint32_t *window_offsets) {
+  const std::uint32_t local = blockIdx.x * blockDim.x + threadIdx.x;
+  if (local > quotient_count) return;
+  window_offsets[local] = static_cast<std::uint32_t>(
+      global_offsets[quotient_begin + local] - window_base);
+}
+
+__global__ void emit_range_hot_tokens_kernel(
+    const std::uint32_t *raw_keys, const std::uint32_t *raw_offsets,
+    std::uint32_t batch_stride, std::uint32_t pending_batches,
+    ResidentRows arena, const Descriptor *descriptors,
+    const RouteHeader *route_headers, const RouteSlice *route_slices,
+    const std::uint32_t *route_logical_begins,
+    const std::uint32_t *level_q_logical_offsets,
+    const std::uint64_t *occupied_mask, const std::uint64_t *hot_counts,
+    const std::uint64_t *hot_offsets, std::uint32_t quotient_begin,
+    std::uint32_t quotient_end, std::uint64_t window_base,
+    std::uint64_t *tokens) {
+  const std::uint32_t q = quotient_begin + blockIdx.x;
+  if (q >= quotient_end || !hot_counts[q]) return;
+  const DeviceManifestSnapshot manifest = load_query_manifest(occupied_mask);
+  std::uint64_t cursor = hot_offsets[q] - window_base;
+  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+    const std::size_t offset_index =
+        std::size_t{batch} * (kQuotients + 1u) + q;
+    const std::uint32_t begin = raw_offsets[offset_index];
+    const std::uint32_t end = raw_offsets[offset_index + 1u];
+    for (std::uint32_t position = begin + threadIdx.x;
+         position < end; position += blockDim.x) {
+      const std::uint32_t record = batch * batch_stride + position;
+      tokens[cursor + position - begin] = range_hot_token(
+          raw_keys[record], kRangeHotRawLocator | record);
+    }
+    cursor += end - begin;
+  }
+  for (std::uint32_t level = 0u; level < manifest.active_levels; ++level) {
+    if (level == manifest.foundation_level ||
+        !level_is_occupied(manifest.occupied_level_mask, level))
+      continue;
+    const RouteHeader header = route_headers[descriptor_index(q, level)];
+    const std::uint32_t section_begin = level_q_logical_offsets[
+        std::size_t{level} * (kQuotients + 1u) + q];
+    for (std::uint32_t local = 0u; local < header.count; ++local) {
+      const std::uint32_t route_index = header.begin + local;
+      const RouteSlice route = route_slices[route_index];
+      const std::uint32_t logical_begin =
+          route_logical_begins[route_index] - section_begin;
+      const ResidentRows rows = arena + route.rows.offset();
+      for (std::uint32_t position = threadIdx.x;
+           position < route.rows.count(); position += blockDim.x) {
+        const Row row = rows[position];
+        const std::uint32_t locator =
+            (level << 16u) | (logical_begin + position);
+        tokens[cursor + logical_begin + position] = range_hot_token(
+            full_key(q, row.key), locator);
+      }
+    }
+    cursor += descriptors[descriptor_index(q, level)].count();
+  }
+}
+
+__global__ void build_range_hot_descriptors_kernel(
+    const std::uint32_t *keys, const std::uint32_t *selected_count,
+    std::uint32_t quotient_begin, std::uint32_t quotient_end,
+    std::uint64_t output_base, Descriptor *descriptors) {
+  const std::uint32_t q = quotient_begin +
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= quotient_end) return;
+  const std::uint32_t count = *selected_count;
+  const std::uint64_t low_key = std::uint64_t{q} << 16u;
+  const std::uint64_t high_key = std::uint64_t{q + 1u} << 16u;
+  std::uint32_t low = 0u, high = count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (std::uint64_t{keys[middle]} < low_key) low = middle + 1u;
+    else high = middle;
+  }
+  const std::uint32_t begin = low;
+  high = count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (std::uint64_t{keys[middle]} < high_key) low = middle + 1u;
+    else high = middle;
+  }
+  descriptors[q] = Descriptor::make(output_base + begin, low - begin);
+}
+
+__global__ void materialize_range_hot_winners_kernel(
+    Row *rows, const std::uint32_t *selected_count,
+    const RawPayload *raw_payloads, ResidentRows arena,
+    const RouteHeader *route_headers, const RouteSlice *route_slices,
+    const std::uint32_t *route_logical_begins,
+    const std::uint32_t *level_q_logical_offsets) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= *selected_count) return;
+  std::uint64_t token{};
+  memcpy(&token, rows + index, sizeof(token));
+  const RangeHotTokenRow transform{
+      raw_payloads, arena, route_headers, route_slices,
+      route_logical_begins, level_q_logical_offsets};
+  rows[index] = transform(token);
 }
 
 struct SumRowsAggregate {
@@ -1217,6 +1432,114 @@ cooperative_sum_visible_route_runs(
     }
   }
   return result;
+}
+
+struct RangeTileSource {
+  const Row *plain{};
+  ResidentRows resident{};
+  bool plain_storage{};
+
+  __device__ Row load(std::uint32_t position) const {
+    return plain_storage ? plain[position] : resident[position];
+  }
+};
+
+template <class Aggregate>
+__device__ __forceinline__ void enumerate_range_source_tiles(
+    const SectionRangeFragment *fragments, std::uint32_t fragment_begin,
+    std::uint32_t fragment_count, RangeTileSource source,
+    const Row *newer, std::uint32_t newer_count, bool hide_with_newer,
+    const std::uint32_t *source_begins,
+    const std::uint32_t *source_ends,
+    const std::uint8_t *fragment_slots,
+    const std::uint8_t *fragment_widths,
+    const std::uint16_t *wave_fragment_begins,
+    std::uint32_t wave_count,
+    std::uint32_t *union_begins, std::uint32_t *union_ends,
+    std::uint32_t *union_count, Row *row_tile,
+    typename Aggregate::State *fragment_sums) {
+  if (threadIdx.x == 0u) {
+    std::uint32_t count = 0u;
+    for (std::uint32_t fragment = 0u; fragment < fragment_count;
+         ++fragment) {
+      const std::uint32_t begin = source_begins[fragment];
+      const std::uint32_t end = source_ends[fragment];
+      if (begin == end) continue;
+      if (!count || begin > union_ends[count - 1u]) {
+        union_begins[count] = begin;
+        union_ends[count] = end;
+        ++count;
+      } else {
+        union_ends[count - 1u] = max(union_ends[count - 1u], end);
+      }
+    }
+    *union_count = count;
+  }
+  __syncthreads();
+
+  for (std::uint32_t interval = 0u; interval < *union_count; ++interval) {
+    const std::uint32_t interval_begin = union_begins[interval];
+    const std::uint32_t interval_end = union_ends[interval];
+    for (std::uint32_t tile_begin = interval_begin;
+         tile_begin < interval_end; tile_begin += kSectionRangeThreads) {
+      const std::uint32_t tile_end =
+          min(tile_begin + kSectionRangeThreads, interval_end);
+      if (tile_begin + threadIdx.x < tile_end) {
+        Row row = source.load(tile_begin + threadIdx.x);
+        if (hide_with_newer && newer_count) {
+          const std::uint32_t position =
+              lower_bound_rows(newer, newer_count, row.key);
+          if (position < newer_count && newer[position].key == row.key)
+            row.flags |= kTombstone;
+        }
+        row_tile[threadIdx.x] = row;
+      }
+      __syncthreads();
+
+      for (std::uint32_t wave = 0u; wave < wave_count; ++wave) {
+        const std::uint32_t first = wave_fragment_begins[wave];
+        const std::uint32_t last = wave_fragment_begins[wave + 1u];
+        std::uint32_t low = first, high = last;
+        while (low < high) {
+          const std::uint32_t middle = (low + high) >> 1u;
+          if (fragment_slots[middle] <= threadIdx.x) low = middle + 1u;
+          else high = middle;
+        }
+        const std::uint32_t fragment = low ? low - 1u : last;
+        const bool active = fragment >= first && fragment < last &&
+            threadIdx.x >= fragment_slots[fragment] &&
+            threadIdx.x < std::uint32_t{fragment_slots[fragment]} +
+                fragment_widths[fragment];
+        if (active) {
+          const std::uint32_t width = fragment_widths[fragment];
+          const std::uint32_t slot = fragment_slots[fragment];
+          const std::uint32_t group_lane = threadIdx.x - slot;
+          const std::uint32_t consume_begin =
+              max(source_begins[fragment], tile_begin);
+          const std::uint32_t consume_end =
+              min(source_ends[fragment], tile_end);
+          typename Aggregate::State local = Aggregate::identity();
+          for (std::uint32_t position = consume_begin + group_lane;
+               position < consume_end; position += width) {
+            const Row row = row_tile[position - tile_begin];
+            if ((row.flags & kTombstone) == 0u)
+              local = Aggregate::consume(local, row);
+          }
+          const std::uint32_t warp_slot = slot & 31u;
+          const unsigned mask = width == 32u ? 0xffffffffu
+              : ((1u << width) - 1u) << warp_slot;
+          for (std::uint32_t offset = width >> 1u; offset;
+               offset >>= 1u)
+            local = Aggregate{}(local, __shfl_down_sync(
+                mask, local, offset, width));
+          if (!group_lane)
+            fragment_sums[fragment] = Aggregate{}(
+                fragment_sums[fragment], local);
+        }
+      }
+      __syncthreads();
+    }
+  }
 }
 
 __global__ void count_range_fragments_kernel(
@@ -1411,107 +1734,6 @@ __global__ void adaptive_reduce_range_partials_kernel(
   }
 }
 
-__device__ __noinline__ unsigned long long warp_sum_visible_by_verification(
-    std::uint32_t q, std::uint32_t low, std::uint32_t high,
-    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
-    const std::uint32_t *raw_offsets,
-    std::uint32_t batch_stride, std::uint32_t pending_batches,
-    ResidentRows arena, const Descriptor *descriptors,
-    const RouteHeader *route_headers, const RouteSlice *route_slices,
-    std::uint32_t active_levels, std::uint64_t occupied_levels) {
-  constexpr unsigned mask = 0xffffffffu;
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t low_suffix = key_suffix(low);
-  const std::uint32_t high_suffix = key_suffix(high);
-  unsigned long long local = 0ull;
-
-  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
-    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
-    const std::uint32_t section_begin = raw_offsets[oi];
-    const std::uint32_t section_end = raw_offsets[oi + 1u];
-    for (std::uint32_t index = section_begin + lane; index < section_end;
-         index += 32u) {
-      const std::uint32_t record = batch * batch_stride + index;
-      const RawAssignment item =
-          load_raw_assignment(raw_keys, raw_payloads, record);
-      const Row item_row = raw_row(item);
-      if (item_row.key < low_suffix || item_row.key > high_suffix) continue;
-      bool covered = false;
-      for (std::uint32_t other_batch = 0u;
-           other_batch < pending_batches && !covered; ++other_batch) {
-        const std::size_t noi =
-            std::size_t{other_batch} * (kQuotients + 1u) + q;
-        const std::uint32_t nb = raw_offsets[noi], ne = raw_offsets[noi + 1u];
-        for (std::uint32_t other = nb; other < ne; ++other) {
-          const std::uint32_t other_record =
-              other_batch * batch_stride + other;
-          const RawAssignment candidate =
-              load_raw_assignment(raw_keys, raw_payloads, other_record);
-          if (key_suffix(candidate.key) == item_row.key &&
-              raw_position(candidate) > raw_position(item)) {
-            covered = true;
-            break;
-          }
-        }
-      }
-      if (!covered && (item_row.flags & kTombstone) == 0u)
-        local += item_row.value;
-    }
-  }
-
-  for (std::uint32_t level = 0u; level < active_levels; ++level) {
-    if (!level_is_occupied(occupied_levels, level)) continue;
-    const RouteHeader header = route_headers[descriptor_index(q, level)];
-    for (std::uint32_t route_index = 0u;
-         route_index < header.count; ++route_index) {
-      const RouteSlice route = route_slices[header.begin + route_index];
-      if (route.suffix_end <= low_suffix ||
-          route.suffix_begin > high_suffix) continue;
-      const ResidentRows rows = arena + route.rows.offset();
-      const std::uint32_t begin = lower_bound_rows(
-          rows, route.rows.count(), low_suffix);
-      const std::uint32_t end = high == kInvalid
-          ? route.rows.count()
-          : upper_bound_rows(rows, route.rows.count(), high_suffix);
-      for (std::uint32_t index = begin + lane; index < end; index += 32u) {
-        const Row item = rows[index];
-      bool covered = false;
-      for (std::uint32_t batch = 0u;
-           batch < pending_batches && !covered; ++batch) {
-        const std::size_t oi =
-            std::size_t{batch} * (kQuotients + 1u) + q;
-        const std::uint32_t rb = raw_offsets[oi], re = raw_offsets[oi + 1u];
-        for (std::uint32_t position = rb; position < re; ++position)
-          if (key_suffix(raw_keys[batch * batch_stride + position]) ==
-              item.key) {
-            covered = true;
-            break;
-          }
-      }
-      for (std::uint32_t newer = 0u; newer < level && !covered; ++newer) {
-        if (!level_is_occupied(occupied_levels, newer)) continue;
-        const RouteHeader newer_header =
-            route_headers[descriptor_index(q, newer)];
-        const Descriptor newer_descriptor = newer_header.count == 1u
-            ? descriptors[descriptor_index(q, newer)]
-            : routed_descriptor_for_suffix(
-                  q, newer, item.key, route_headers, route_slices);
-        const ResidentRows newer_rows = arena + newer_descriptor.offset();
-        const std::uint32_t position =
-            lower_bound_rows(newer_rows, newer_descriptor.count(), item.key);
-        covered = position < newer_descriptor.count() &&
-            newer_rows[position].key == item.key;
-      }
-      if (!covered && (item.flags & kTombstone) == 0u) local += item.value;
-      }
-    }
-  }
-
-  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
-    local += __shfl_down_sync(mask, local, offset);
-  return __shfl_sync(mask, local, 0u);
-}
-
 __global__ void find_section_fragment_offsets_kernel(
     const std::uint32_t *sorted_sections, std::uint32_t count,
     std::uint32_t *offsets) {
@@ -1570,65 +1792,44 @@ __global__ void cooperative_section_owned_range_kernel(
     const std::uint32_t *task_count, ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
     const RouteSlice *route_slices, const std::uint16_t *local_rank,
-    const std::uint32_t *raw_keys,
-    const RawPayload *raw_payloads,
+    const Row *hot_rows, const Descriptor *hot_descriptors, bool hot_ready,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches,
     typename Aggregate::State *aggregate_partials,
     const std::uint64_t *query_occupied_level_mask) {
-  constexpr std::uint32_t kCapacity = 512u;
-  using BlockScan =
-      cub::BlockScan<std::uint32_t, kSectionRangeThreads>;
+  constexpr std::uint32_t kCapacity = kRangeOnChipNewerRows;
+  using BlockScan = cub::BlockScan<std::uint32_t, kSectionRangeThreads>;
   union Workspace {
     Row merged[kCapacity];
     TaggedRow tagged[kCapacity];
-    Row base_rows[kSectionRangeWarps][128u];
+    Row tile[kSectionRangeThreads];
   };
   __shared__ Row current[kCapacity];
   __shared__ Workspace workspace;
   __shared__ typename BlockScan::TempStorage scan_storage;
-  constexpr std::uint32_t kFragmentBaseMaskRows = 2048u;
-  constexpr std::uint32_t kFragmentBaseMaskWords =
-      kFragmentBaseMaskRows / 32u;
-  constexpr std::uint32_t kSectionBaseMaskRows = 16384u;
-  constexpr std::uint32_t kSectionBaseMaskWords =
-      kSectionBaseMaskRows / 32u;
-  union BaseMaskWorkspace {
-    std::uint32_t section[kSectionBaseMaskWords];
-    std::uint32_t fragments[kSectionRangeWarps][kFragmentBaseMaskWords];
-    // Reuse row tiles across overlapping ranges.
-    unsigned long long
-        warp_tile_prefix[kSectionRangeWarps][128u + 1u];
-  };
-  __shared__ BaseMaskWorkspace base_mask_workspace;
-  __shared__ std::uint32_t current_count_shared;
-  __shared__ std::uint32_t pending_count_shared;
-  __shared__ std::uint32_t overflow_shared;
-  __shared__ std::uint32_t next_fragment_shared;
-  __shared__ std::uint32_t dynamic_queue_shared;
-  __shared__ std::uint32_t worker_width_shared;
-  __shared__ std::uint32_t minimum_work_shared;
-  __shared__ std::uint32_t maximum_work_shared;
-  __shared__ std::uint32_t use_union_sweep_shared;
-  __shared__ unsigned long long
-      union_direct_warp_shared[kSectionRangeWarps];
-  __shared__ unsigned long long
-      union_sweep_warp_shared[kSectionRangeWarps];
-  __shared__ std::uint32_t union_count_warp_shared[kSectionRangeWarps];
-  __shared__ std::uint32_t fragment_work_shared[kSectionTaskFragments];
-  __shared__ RangeFragmentBounds
-      fragment_bounds_shared[kSectionTaskFragments];
-  // Extend cell starts with the section endpoint.
+  __shared__ Descriptor section_descriptors[kMaximumLevels];
   __shared__ std::uint32_t foundation_cell_ranks[kFoundationCells + 1u];
-  __shared__ std::uint32_t foundation_ranks_valid_shared;
-  __shared__ std::uint32_t section_base_mask_valid_shared;
+  __shared__ RangeFragmentBounds fragment_bounds[kSectionTaskFragments];
+  __shared__ std::uint32_t fragment_work[kSectionTaskFragments];
+  __shared__ typename Aggregate::State fragment_sums[kSectionTaskFragments];
+  __shared__ std::uint32_t source_begins[kSectionTaskFragments];
+  __shared__ std::uint32_t source_ends[kSectionTaskFragments];
+  __shared__ std::uint32_t union_begins[kSectionTaskFragments];
+  __shared__ std::uint32_t union_ends[kSectionTaskFragments];
+  __shared__ std::uint8_t fragment_slots[kSectionTaskFragments];
+  __shared__ std::uint8_t fragment_widths[kSectionTaskFragments];
+  __shared__ std::uint16_t wave_fragment_begins[33u];
   __shared__ std::uint32_t quotient_shared;
   __shared__ std::uint32_t fragment_begin_shared;
   __shared__ std::uint32_t fragment_end_shared;
+  __shared__ std::uint32_t current_count_shared;
+  __shared__ std::uint32_t pending_count_shared;
+  __shared__ std::uint32_t wave_count_shared;
+  __shared__ std::uint32_t union_count_shared;
+  __shared__ std::uint32_t ranks_valid_shared;
   __shared__ std::uint32_t task_valid_shared;
-  __shared__ std::uint32_t base_section_count_shared;
-  __shared__ Descriptor foundation_descriptor_shared;
-  __shared__ Descriptor section_descriptors[kMaximumLevels];
+  __shared__ Descriptor hot_descriptor_shared;
 
   const DeviceManifestSnapshot manifest =
       load_query_manifest(query_occupied_level_mask);
@@ -1649,1001 +1850,323 @@ __global__ void cooperative_section_owned_range_kernel(
     }
     __syncthreads();
     if (!task_valid_shared) return;
-    do {
-  const std::uint32_t q = quotient_shared;
-  const std::uint32_t fragment_begin = fragment_begin_shared;
-  const std::uint32_t fragment_end = fragment_end_shared;
-  if (threadIdx.x < active_levels &&
-      level_is_occupied(occupied_levels, threadIdx.x))
-    section_descriptors[threadIdx.x] =
-        descriptors[descriptor_index(q, threadIdx.x)];
-  else if (threadIdx.x < active_levels)
-    section_descriptors[threadIdx.x] = {};
-  // Warp zero loads the rank block during setup.
-  if (threadIdx.x < 32u) {
-    bool ranked = false;
-    Descriptor rank_descriptor{};
-    if (local_rank && foundation_level < active_levels) {
-      rank_descriptor =
-          descriptors[descriptor_index(q, foundation_level)];
-      const RouteHeader rank_header =
-          route_headers[descriptor_index(q, foundation_level)];
-      ranked = rank_header.count == 1u &&
-          cell_rank_supported(rank_descriptor.count());
+
+    const std::uint32_t q = quotient_shared;
+    const std::uint32_t fragment_begin = fragment_begin_shared;
+    const std::uint32_t fragment_end = fragment_end_shared;
+    const std::uint32_t fragment_count = fragment_end - fragment_begin;
+    if (threadIdx.x < active_levels) {
+      section_descriptors[threadIdx.x] =
+          level_is_occupied(occupied_levels, threadIdx.x)
+          ? descriptors[descriptor_index(q, threadIdx.x)] : Descriptor{};
     }
     if (threadIdx.x == 0u) {
-      foundation_ranks_valid_shared = ranked;
-      foundation_cell_ranks[kFoundationCells] = rank_descriptor.count();
-    }
-    if (ranked) {
-      for (std::uint32_t cell = threadIdx.x; cell < kFoundationCells;
-           cell += 32u)
-        foundation_cell_ranks[cell] =
-            local_rank[std::size_t{q} * kFoundationCells + cell];
-    }
-  }
-  if (threadIdx.x == 0u) {
-    foundation_descriptor_shared = foundation_level < active_levels
-        ? section_descriptors[foundation_level] : Descriptor{};
-    base_section_count_shared = foundation_descriptor_shared.count();
-    std::uint32_t physical = 0u;
-    pending_count_shared = 0u;
-    if (pending_batches) {
+      hot_descriptor_shared = hot_ready ? hot_descriptors[q] : Descriptor{};
+      pending_count_shared = 0u;
+      current_count_shared = 0u;
       for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
-        const std::size_t oi =
+        const std::size_t offset =
             std::size_t{batch} * (kQuotients + 1u) + q;
-        pending_count_shared += raw_offsets[oi + 1u] - raw_offsets[oi];
+        pending_count_shared += raw_offsets[offset + 1u] - raw_offsets[offset];
       }
-      physical += pending_count_shared;
     }
-    for (std::uint32_t level = 0u; level < active_levels; ++level)
-      if (level != foundation_level &&
-          level_is_occupied(occupied_levels, level))
-        physical += section_descriptors[level].count();
-    overflow_shared = physical > kCapacity;
-    current_count_shared = 0u;
-  }
-  __syncthreads();
+    if (threadIdx.x < 32u) {
+      bool ranked = false;
+      Descriptor descriptor{};
+      if (local_rank && foundation_level < active_levels) {
+        const RouteHeader header =
+            route_headers[descriptor_index(q, foundation_level)];
+        descriptor = descriptors[descriptor_index(q, foundation_level)];
+        ranked = header.count == 1u && cell_rank_supported(descriptor.count());
+      }
+      if (threadIdx.x == 0u) {
+        ranks_valid_shared = ranked;
+        foundation_cell_ranks[kFoundationCells] = descriptor.count();
+      }
+      if (ranked)
+        for (std::uint32_t cell = threadIdx.x; cell < kFoundationCells;
+             cell += 32u)
+          foundation_cell_ranks[cell] =
+              local_rank[std::size_t{q} * kFoundationCells + cell];
+    }
+    __syncthreads();
 
-  if (!overflow_shared && pending_count_shared) {
-    const std::uint32_t pending_count = pending_count_shared;
-    if (pending_count <= 32u) {
-      if (threadIdx.x < 32u) {
-        const std::uint32_t lane = threadIdx.x;
-        TaggedRow item{{0u, 0u, 0u}, kInvalidAge};
-        if (lane < pending_count) {
-          const RawAssignment loaded = load_pending_raw_ordinal(
-              raw_keys, raw_payloads, raw_offsets, batch_stride,
-              pending_batches, q, lane);
-          item = {raw_row(loaded),
-                  raw_age(raw_position(loaded), batch_stride)};
+    const bool use_hot = hot_descriptor_shared.count() != 0u;
+    if (!use_hot && pending_count_shared) {
+      const std::uint32_t pending_count = pending_count_shared;
+      if (pending_count <= 32u) {
+        if (threadIdx.x < 32u) {
+          const std::uint32_t lane = threadIdx.x;
+          TaggedRow item{{0u, 0u, 0u}, kInvalidAge};
+          if (lane < pending_count) {
+            const RawAssignment loaded = load_pending_raw_ordinal(
+                raw_keys, raw_payloads, raw_offsets, batch_stride,
+                pending_batches, q, lane);
+            item = {raw_row(loaded),
+                    raw_age(raw_position(loaded), batch_stride)};
+          }
+          constexpr unsigned mask = 0xffffffffu;
+          for (std::uint32_t width = 2u; width <= 32u; width <<= 1u)
+            for (std::uint32_t stride = width >> 1u; stride;
+                 stride >>= 1u) {
+              TaggedRow other{};
+              other.row.key = __shfl_xor_sync(mask, item.row.key, stride);
+              other.row.value = __shfl_xor_sync(mask, item.row.value, stride);
+              other.row.flags = __shfl_xor_sync(mask, item.row.flags, stride);
+              other.age = __shfl_xor_sync(mask, item.age, stride);
+              const bool ascending = (lane & width) == 0u;
+              const bool take_min = ((lane & stride) == 0u) == ascending;
+              if ((take_min && tagged_less(other, item)) ||
+                  (!take_min && tagged_less(item, other)))
+                item = other;
+            }
+          const std::uint32_t next_key =
+              __shfl_down_sync(mask, item.row.key, 1u);
+          const std::uint32_t next_age =
+              __shfl_down_sync(mask, item.age, 1u);
+          const bool winner = item.age != kInvalidAge &&
+              (lane == 31u || next_age == kInvalidAge ||
+               item.row.key != next_key);
+          const unsigned winners = __ballot_sync(mask, winner);
+          if (winner) {
+            const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
+            current[__popc(winners & before)] = item.row;
+          }
+          if (lane == 0u) current_count_shared = __popc(winners);
         }
-        constexpr unsigned full_mask = 0xffffffffu;
-        for (std::uint32_t width = 2u; width <= 32u; width <<= 1u) {
-          for (std::uint32_t stride = width >> 1u; stride; stride >>= 1u) {
-            TaggedRow other{};
-            other.row.key = __shfl_xor_sync(full_mask, item.row.key, stride);
-            other.row.value =
-                __shfl_xor_sync(full_mask, item.row.value, stride);
-            other.row.flags =
-                __shfl_xor_sync(full_mask, item.row.flags, stride);
-            other.age = __shfl_xor_sync(full_mask, item.age, stride);
-            const bool ascending = (lane & width) == 0u;
-            const bool take_min = ((lane & stride) == 0u) == ascending;
-            if ((take_min && tagged_less(other, item)) ||
-                (!take_min && tagged_less(item, other)))
-              item = other;
+        __syncthreads();
+      } else {
+        const std::uint32_t sort_size = 1u << size_class_for(pending_count);
+        for (std::uint32_t ordinal = threadIdx.x; ordinal < sort_size;
+             ordinal += blockDim.x) {
+          if (ordinal < pending_count) {
+            const RawAssignment loaded = load_pending_raw_ordinal(
+                raw_keys, raw_payloads, raw_offsets, batch_stride,
+                pending_batches, q, ordinal);
+            workspace.tagged[ordinal] =
+                {raw_row(loaded), raw_age(raw_position(loaded), batch_stride)};
+          } else {
+            workspace.tagged[ordinal] = {{0u, 0u, 0u}, kInvalidAge};
           }
         }
-        const std::uint32_t next_key =
-            __shfl_down_sync(full_mask, item.row.key, 1u);
-        const std::uint32_t next_age =
-            __shfl_down_sync(full_mask, item.age, 1u);
-        const bool winner = item.age != kInvalidAge &&
-            (lane == 31u || next_age == kInvalid ||
-             item.row.key != next_key);
-        const unsigned winners = __ballot_sync(full_mask, winner);
-        if (winner) {
-          const unsigned before = lane ? ((1u << lane) - 1u) : 0u;
-          current[__popc(winners & before)] = item.row;
-        }
-        if (lane == 0u) current_count_shared = __popc(winners);
-      }
-      __syncthreads();
-    } else {
-      const std::uint32_t sort_size = 1u << size_class_for(pending_count);
-      for (std::uint32_t ordinal = threadIdx.x; ordinal < sort_size;
-           ordinal += blockDim.x) {
-        if (ordinal < pending_count) {
-          const RawAssignment loaded = load_pending_raw_ordinal(
-              raw_keys, raw_payloads, raw_offsets, batch_stride,
-              pending_batches, q, ordinal);
-          workspace.tagged[ordinal] =
-              {raw_row(loaded),
-               raw_age(raw_position(loaded), batch_stride)};
-        } else {
-          workspace.tagged[ordinal] = {{0u, 0u, 0u}, kInvalidAge};
-        }
-      }
-      __syncthreads();
-      for (std::uint32_t width = 2u; width <= sort_size; width <<= 1u) {
-        for (std::uint32_t stride = width >> 1u; stride; stride >>= 1u) {
-          for (std::uint32_t index = threadIdx.x; index < sort_size;
-               index += blockDim.x) {
-            const std::uint32_t other_index = index ^ stride;
-            if (other_index > index) {
-              const TaggedRow x = workspace.tagged[index];
-              const TaggedRow y = workspace.tagged[other_index];
-              const bool ascending = (index & width) == 0u;
-              const bool swap = ascending ? tagged_less(y, x)
-                                          : tagged_less(x, y);
-              if (swap) {
-                workspace.tagged[index] = y;
-                workspace.tagged[other_index] = x;
+        __syncthreads();
+        for (std::uint32_t width = 2u; width <= sort_size; width <<= 1u)
+          for (std::uint32_t stride = width >> 1u; stride;
+               stride >>= 1u) {
+            for (std::uint32_t index = threadIdx.x; index < sort_size;
+                 index += blockDim.x) {
+              const std::uint32_t other_index = index ^ stride;
+              if (other_index > index) {
+                const TaggedRow first = workspace.tagged[index];
+                const TaggedRow second = workspace.tagged[other_index];
+                const bool ascending = (index & width) == 0u;
+                const bool swap = ascending ? tagged_less(second, first)
+                                            : tagged_less(first, second);
+                if (swap) {
+                  workspace.tagged[index] = second;
+                  workspace.tagged[other_index] = first;
+                }
               }
             }
+            __syncthreads();
           }
-          __syncthreads();
-        }
-      }
-      const std::uint32_t chunk_begin = threadIdx.x * 2u;
-      std::uint32_t local_winners = 0u;
-      bool winner[2]{};
-#pragma unroll
-      for (std::uint32_t item = 0u; item < 2u; ++item) {
-        const std::uint32_t index = chunk_begin + item;
-        winner[item] = index < sort_size &&
+        const std::uint32_t index = threadIdx.x;
+        const bool winner = index < sort_size &&
             workspace.tagged[index].age != kInvalidAge &&
             (index + 1u == sort_size ||
              workspace.tagged[index + 1u].age == kInvalidAge ||
              workspace.tagged[index].row.key !=
                  workspace.tagged[index + 1u].row.key);
-        local_winners += winner[item];
-      }
-      std::uint32_t thread_base{}, winner_count{};
-      BlockScan(scan_storage).ExclusiveSum(local_winners, thread_base,
-                                            winner_count);
-      std::uint32_t local_rank = 0u;
-#pragma unroll
-      for (std::uint32_t item = 0u; item < 2u; ++item)
-        if (winner[item])
-          current[thread_base + local_rank++] =
-              workspace.tagged[chunk_begin + item].row;
-      __syncthreads();
-      if (threadIdx.x == 0u) current_count_shared = winner_count;
-      __syncthreads();
-    }
-  }
-
-  if (!overflow_shared) {
-    for (std::uint32_t level = 0u; level < active_levels; ++level) {
-      if (level == foundation_level ||
-          !level_is_occupied(occupied_levels, level)) continue;
-      const RouteHeader source_header =
-          route_headers[descriptor_index(q, level)];
-      for (std::uint32_t source_route = 0u;
-           source_route < source_header.count; ++source_route) {
-      const Descriptor descriptor =
-          route_slices[source_header.begin + source_route].rows;
-      const std::uint32_t source_count = descriptor.count();
-      if (!source_count) continue;
-      const ResidentRows source = arena + descriptor.offset();
-      const std::uint32_t current_count = current_count_shared;
-      if (!current_count) {
-        for (std::uint32_t index = threadIdx.x; index < source_count;
-             index += blockDim.x)
-          current[index] = source[index];
+        std::uint32_t destination{}, winner_count{};
+        BlockScan(scan_storage).ExclusiveSum(
+            std::uint32_t{winner}, destination, winner_count);
+        if (winner) current[destination] = workspace.tagged[index].row;
         __syncthreads();
-        if (threadIdx.x == 0u) current_count_shared = source_count;
+        if (threadIdx.x == 0u) current_count_shared = winner_count;
         __syncthreads();
-        continue;
-      }
-
-      const std::uint32_t merged_count = current_count + source_count;
-      const std::uint32_t tile =
-          (merged_count + blockDim.x - 1u) / blockDim.x;
-      const std::uint32_t diagonal =
-          min(threadIdx.x * tile, merged_count);
-      std::uint32_t partition_low =
-          diagonal > current_count ? diagonal - current_count : 0u;
-      std::uint32_t partition_high = min(diagonal, source_count);
-      while (partition_low < partition_high) {
-        const std::uint32_t source_index =
-            (partition_low + partition_high) >> 1u;
-        const std::uint32_t current_index = diagonal - source_index;
-        if (source_index < source_count && current_index > 0u &&
-            current[current_index - 1u].key >= source[source_index].key)
-          partition_low = source_index + 1u;
-        else
-          partition_high = source_index;
-      }
-      std::uint32_t source_index = partition_low;
-      std::uint32_t current_index = diagonal - source_index;
-#pragma unroll
-      for (std::uint32_t item = 0u; item < 2u; ++item) {
-        const std::uint32_t output_index = diagonal + item;
-        if (item >= tile || output_index >= merged_count) break;
-        const bool choose_source = source_index < source_count &&
-            (current_index >= current_count ||
-             source[source_index].key <= current[current_index].key);
-        workspace.merged[output_index] = choose_source
-            ? source[source_index++] : current[current_index++];
-      }
-      __syncthreads();
-
-      const std::uint32_t chunk_begin = threadIdx.x * 2u;
-      std::uint32_t local_winners = 0u;
-      bool winner[2]{};
-#pragma unroll
-      for (std::uint32_t item = 0u; item < 2u; ++item) {
-        const std::uint32_t index = chunk_begin + item;
-        winner[item] = index < merged_count &&
-            (index + 1u == merged_count ||
-             workspace.merged[index].key !=
-                 workspace.merged[index + 1u].key);
-        local_winners += winner[item];
-      }
-      std::uint32_t thread_base{}, winner_count{};
-      BlockScan(scan_storage).ExclusiveSum(local_winners, thread_base,
-                                            winner_count);
-      std::uint32_t local_rank = 0u;
-#pragma unroll
-      for (std::uint32_t item = 0u; item < 2u; ++item)
-        if (winner[item])
-          current[thread_base + local_rank++] =
-              workspace.merged[chunk_begin + item];
-      __syncthreads();
-      if (threadIdx.x == 0u) current_count_shared = winner_count;
-      __syncthreads();
       }
     }
-  }
 
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t warp = threadIdx.x >> 5u;
-  constexpr unsigned full_mask = 0xffffffffu;
-  const std::uint32_t current_count = current_count_shared;
-  const std::uint32_t base_section_count = base_section_count_shared;
-  const RouteHeader foundation_header = foundation_level < active_levels
-      ? route_headers[descriptor_index(q, foundation_level)]
-      : RouteHeader{};
-
-  // Schedule fragments by input-row count.
-  if (threadIdx.x == 0u) {
-    minimum_work_shared = 0xffffffffu;
-    maximum_work_shared = 0u;
-  }
-  __syncthreads();
-  for (std::uint32_t fragment_index = fragment_begin + threadIdx.x;
-       fragment_index < fragment_end; fragment_index += blockDim.x) {
-    const SectionRangeFragment fragment = fragments[fragment_index];
-    const std::uint32_t update_begin = lower_bound_rows(
-        current, current_count, fragment.low_suffix);
-    const std::uint32_t update_end = upper_bound_rows(
-        current, current_count, fragment.high_suffix);
-    RangeFragmentBounds bounds{update_begin, update_end, 0u, 0u};
-    std::uint32_t base_work = 0u;
-    if (foundation_header.count == 1u) {
-      const Descriptor descriptor =
-          route_slices[foundation_header.begin].rows;
-      const ResidentRows rows = arena + descriptor.offset();
-      if (foundation_ranks_valid_shared) {
-        const std::uint32_t low_cell =
-            std::uint32_t{fragment.low_suffix} / kFoundationCellKeys;
-        const std::uint32_t low_begin =
-            foundation_cell_ranks[low_cell];
-        const std::uint32_t low_end =
-            foundation_cell_ranks[low_cell + 1u];
-        bounds.base_begin = low_begin + lower_bound_rows(
-            rows + low_begin, low_end - low_begin,
-            fragment.low_suffix);
-
-        const std::uint32_t high_cell =
-            std::uint32_t{fragment.high_suffix} / kFoundationCellKeys;
-        const std::uint32_t high_begin =
-            foundation_cell_ranks[high_cell];
-        const std::uint32_t high_end =
-            foundation_cell_ranks[high_cell + 1u];
-        bounds.base_end = high_begin + upper_bound_rows(
-            rows + high_begin, high_end - high_begin,
-            fragment.high_suffix);
-      } else {
-        bounds.base_begin = lower_bound_rows(
-            rows, descriptor.count(), fragment.low_suffix);
-        bounds.base_end = upper_bound_rows(
-            rows, descriptor.count(), fragment.high_suffix);
-      }
-      base_work = bounds.base_end - bounds.base_begin;
-    } else {
-      base_work = route_range_row_count(
-          fragment.low_suffix, fragment.high_suffix, arena,
-          foundation_header, route_slices);
-    }
-    const std::uint32_t work =
-        update_end - update_begin + base_work;
-    fragment_bounds_shared[fragment_index - fragment_begin] = bounds;
-    fragment_work_shared[fragment_index - fragment_begin] = work;
-    atomicMin(&minimum_work_shared, work);
-    atomicMax(&maximum_work_shared, work);
-  }
-  __syncthreads();
-  if (threadIdx.x == 0u) {
-    const std::uint32_t minimum_width =
-        minimum_work_shared <= kRangeThreadWork ? 1u
-        : minimum_work_shared <= kRangeSubgroupWork ? 8u : 32u;
-    const std::uint32_t maximum_width =
-        maximum_work_shared <= kRangeThreadWork ? 1u
-        : maximum_work_shared <= kRangeSubgroupWork ? 8u : 32u;
-    worker_width_shared = maximum_width;
-    dynamic_queue_shared = minimum_width != maximum_width;
-    next_fragment_shared = fragment_begin;
-  }
-  __syncthreads();
-
-  // Warp scans form disjoint interval unions.
-  const std::uint32_t planning_warp = threadIdx.x >> 5u;
-  const std::uint32_t planning_lane = threadIdx.x & 31u;
-  constexpr unsigned planning_mask = 0xffffffffu;
-  const std::uint32_t planning_index = fragment_begin + threadIdx.x;
-  const bool planning_valid = planning_index < fragment_end;
-  SectionRangeFragment planning_fragment{};
-  RangeFragmentBounds planning_bounds{};
-  unsigned long long planning_direct = 0ull;
-  if (planning_valid) {
-    planning_fragment = fragments[planning_index];
-    planning_bounds =
-        fragment_bounds_shared[planning_index - fragment_begin];
-    planning_direct =
-        fragment_work_shared[planning_index - fragment_begin];
-  }
-
-  // Split after the prior maximum endpoint.
-  std::uint32_t prefix_high = planning_valid
-      ? planning_fragment.high_suffix : 0u;
-  for (std::uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
-    const std::uint32_t preceding =
-        __shfl_up_sync(planning_mask, prefix_high, offset);
-    if (planning_lane >= offset)
-      prefix_high = max(prefix_high, preceding);
-  }
-  const std::uint32_t preceding_high =
-      __shfl_up_sync(planning_mask, prefix_high, 1u);
-  const bool union_leader = planning_valid &&
-      (planning_lane == 0u ||
-       std::uint32_t{planning_fragment.low_suffix} > preceding_high);
-  const unsigned valid_lanes =
-      __ballot_sync(planning_mask, planning_valid);
-  const unsigned union_leaders =
-      __ballot_sync(planning_mask, union_leader);
-
-  std::uint32_t prefix_update_end = planning_bounds.update_end;
-  std::uint32_t prefix_base_end = planning_bounds.base_end;
-  for (std::uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
-    const std::uint32_t preceding_update =
-        __shfl_up_sync(planning_mask, prefix_update_end, offset);
-    const std::uint32_t preceding_base =
-        __shfl_up_sync(planning_mask, prefix_base_end, offset);
-    if (planning_lane >= offset) {
-      prefix_update_end = max(prefix_update_end, preceding_update);
-      prefix_base_end = max(prefix_base_end, preceding_base);
-    }
-  }
-  const unsigned through_lane = planning_lane == 31u
-      ? 0xffffffffu : ((1u << (planning_lane + 1u)) - 1u);
-  const unsigned preceding_leaders = union_leaders & through_lane;
-  const std::uint32_t leader_lane = preceding_leaders
-      ? 31u - static_cast<std::uint32_t>(__clz(preceding_leaders)) : 0u;
-  const std::uint32_t union_update_begin = __shfl_sync(
-      planning_mask, planning_bounds.update_begin, leader_lane);
-  const std::uint32_t union_base_begin = __shfl_sync(
-      planning_mask, planning_bounds.base_begin, leader_lane);
-  const bool union_last = planning_valid &&
-      (planning_lane == 31u ||
-       (valid_lanes & (1u << (planning_lane + 1u))) == 0u ||
-       (union_leaders & (1u << (planning_lane + 1u))) != 0u);
-  unsigned long long planning_union = union_last
-      ? std::uint64_t{prefix_update_end - union_update_begin} +
-          (foundation_header.count <= 1u
-              ? prefix_base_end - union_base_begin : 0u)
-      : 0ull;
-  for (std::uint32_t offset = 16u; offset; offset >>= 1u) {
-    planning_direct += __shfl_down_sync(
-        planning_mask, planning_direct, offset);
-    planning_union += __shfl_down_sync(
-        planning_mask, planning_union, offset);
-  }
-  if (planning_lane == 0u) {
-    union_direct_warp_shared[planning_warp] = planning_direct;
-    union_sweep_warp_shared[planning_warp] = planning_union;
-    union_count_warp_shared[planning_warp] = __popc(union_leaders);
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0u) {
-    unsigned long long direct_work = 0ull;
-    unsigned long long union_work = 0ull;
-    std::uint32_t union_count = 0u;
-    for (std::uint32_t warp = 0u; warp < kSectionRangeWarps; ++warp) {
-      direct_work += union_direct_warp_shared[warp];
-      union_work += union_sweep_warp_shared[warp];
-      union_count += union_count_warp_shared[warp];
-    }
-    const std::uint32_t fragment_count = fragment_end - fragment_begin;
-
-    // Count split routes only for dense overlap.
-    if (foundation_header.count > 1u && fragment_count >= 8u &&
-        union_count * 4u <= fragment_count) {
-      for (std::uint32_t warp_begin = fragment_begin;
-           warp_begin < fragment_end; warp_begin += 32u) {
-        const std::uint32_t warp_end = min(warp_begin + 32u, fragment_end);
-        std::uint32_t cursor = warp_begin;
-        while (cursor < warp_end) {
-          const SectionRangeFragment first = fragments[cursor];
-          const std::uint32_t low = first.low_suffix;
-          std::uint32_t high = first.high_suffix;
-          ++cursor;
-          while (cursor < warp_end) {
-            const SectionRangeFragment next = fragments[cursor];
-            if (std::uint32_t{next.low_suffix} > high) break;
-            high = max(high, std::uint32_t{next.high_suffix});
-            ++cursor;
+    if (!use_hot) {
+      for (std::uint32_t level = 0u; level < active_levels; ++level) {
+        if (level == foundation_level ||
+            !level_is_occupied(occupied_levels, level)) continue;
+        const RouteHeader header = route_headers[descriptor_index(q, level)];
+        for (std::uint32_t local = 0u; local < header.count; ++local) {
+          const Descriptor descriptor = route_slices[header.begin + local].rows;
+          const std::uint32_t source_count = descriptor.count();
+          if (!source_count) continue;
+          const ResidentRows source = arena + descriptor.offset();
+          const std::uint32_t old_count = current_count_shared;
+          if (!old_count) {
+            for (std::uint32_t index = threadIdx.x; index < source_count;
+                 index += blockDim.x)
+              current[index] = source[index];
+            __syncthreads();
+            if (threadIdx.x == 0u) current_count_shared = source_count;
+            __syncthreads();
+            continue;
           }
-          union_work += route_range_row_count(
-              low, high, arena, foundation_header, route_slices);
+          const std::uint32_t merged_count = old_count + source_count;
+          const std::uint32_t diagonal = min(threadIdx.x, merged_count);
+          std::uint32_t low = diagonal > old_count ? diagonal - old_count : 0u;
+          std::uint32_t high = min(diagonal, source_count);
+          while (low < high) {
+            const std::uint32_t source_index = (low + high) >> 1u;
+            const std::uint32_t current_index = diagonal - source_index;
+            if (source_index < source_count && current_index > 0u &&
+                current[current_index - 1u].key >= source[source_index].key)
+              low = source_index + 1u;
+            else
+              high = source_index;
+          }
+          if (threadIdx.x < merged_count) {
+            const std::uint32_t source_index = low;
+            const std::uint32_t current_index = diagonal - source_index;
+            const bool choose_source = source_index < source_count &&
+                (current_index >= old_count ||
+                 source[source_index].key <= current[current_index].key);
+            workspace.merged[threadIdx.x] = choose_source
+                ? source[source_index] : current[current_index];
+          }
+          __syncthreads();
+          const std::uint32_t index = threadIdx.x;
+          const bool winner = index < merged_count &&
+              (index + 1u == merged_count ||
+               workspace.merged[index].key != workspace.merged[index + 1u].key);
+          std::uint32_t destination{}, winner_count{};
+          BlockScan(scan_storage).ExclusiveSum(
+              std::uint32_t{winner}, destination, winner_count);
+          if (winner) current[destination] = workspace.merged[index];
+          __syncthreads();
+          if (threadIdx.x == 0u) current_count_shared = winner_count;
+          __syncthreads();
         }
       }
-    } else if (foundation_header.count > 1u) {
-      union_work = ~0ull;
     }
-    use_union_sweep_shared = !overflow_shared && fragment_count >= 8u &&
-        union_work != 0ull && direct_work >= union_work * 2ull;
-  }
-  __syncthreads();
 
-  if (use_union_sweep_shared) {
-    // Four warps sweep independent interval groups.
-    const std::uint32_t union_warp = threadIdx.x >> 5u;
-    const std::uint32_t union_lane = threadIdx.x & 31u;
-    constexpr unsigned union_mask = 0xffffffffu;
-    std::uint32_t cursor = min(
-        fragment_begin + union_warp * 32u, fragment_end);
-    const std::uint32_t warp_fragment_end = min(cursor + 32u, fragment_end);
-    while (cursor < warp_fragment_end) {
-      std::uint32_t union_end = cursor;
-      std::uint32_t union_low = 0u;
-      std::uint32_t union_high = 0u;
-      if (union_lane == 0u) {
-        const SectionRangeFragment first = fragments[cursor];
-        union_low = first.low_suffix;
-        union_high = first.high_suffix;
-        union_end = cursor + 1u;
-        while (union_end < warp_fragment_end) {
-          const SectionRangeFragment next = fragments[union_end];
-          if (std::uint32_t{next.low_suffix} > union_high) break;
-          union_high = max(union_high,
-                           std::uint32_t{next.high_suffix});
-          ++union_end;
-        }
-      }
-      union_end = __shfl_sync(union_mask, union_end, 0u);
-      union_low = __shfl_sync(union_mask, union_low, 0u);
-      union_high = __shfl_sync(union_mask, union_high, 0u);
+    const Row *newer = use_hot
+        ? hot_rows + hot_descriptor_shared.offset() : current;
+    const std::uint32_t newer_count = use_hot
+        ? hot_descriptor_shared.count() : current_count_shared;
+    const RouteHeader foundation_header = foundation_level < active_levels
+        ? route_headers[descriptor_index(q, foundation_level)] : RouteHeader{};
 
-      const std::uint32_t fragment_index = cursor + union_lane;
-      const bool fragment_active = fragment_index < union_end;
-      SectionRangeFragment fragment{};
-      RangeFragmentBounds fragment_bounds{};
-      unsigned long long fragment_sum = 0ull;
-      if (fragment_active) {
-        fragment = fragments[fragment_index];
-        fragment_bounds =
-            fragment_bounds_shared[fragment_index - fragment_begin];
-        for (std::uint32_t index = fragment_bounds.update_begin;
-             index < fragment_bounds.update_end; ++index) {
-          const Row row = current[index];
-          if ((row.flags & kTombstone) == 0u)
-            fragment_sum = Aggregate::consume(fragment_sum, row);
-        }
-      }
-
-      // Reuse saved bounds for single-route sections.
-      std::uint32_t saved_union_begin = fragment_bounds.base_begin;
-      std::uint32_t saved_union_end = fragment_active
-          ? fragment_bounds.base_end : 0u;
+    for (std::uint32_t local = threadIdx.x; local < fragment_count;
+         local += blockDim.x) {
+      const SectionRangeFragment fragment = fragments[fragment_begin + local];
+      RangeFragmentBounds bounds{};
+      bounds.update_begin = lower_bound_rows(
+          newer, newer_count, fragment.low_suffix);
+      bounds.update_end = upper_bound_rows(
+          newer, newer_count, fragment.high_suffix);
+      std::uint32_t base_work = 0u;
       if (foundation_header.count == 1u) {
-        saved_union_begin = __shfl_sync(
-            union_mask, saved_union_begin, 0u);
-        for (std::uint32_t offset = 16u; offset; offset >>= 1u)
-          saved_union_end = max(saved_union_end, __shfl_down_sync(
-              union_mask, saved_union_end, offset));
-        saved_union_end = __shfl_sync(
-            union_mask, saved_union_end, 0u);
-      }
-
-      // Scan every route in bounded row tiles.
-      for (std::uint32_t local_route = 0u;
-           local_route < foundation_header.count; ++local_route) {
-        const RouteSlice route =
-            route_slices[foundation_header.begin + local_route];
-        const ResidentRows route_rows = arena + route.rows.offset();
-        std::uint32_t route_scan_begin = 0u;
-        std::uint32_t route_scan_end = 0u;
-        if (foundation_header.count == 1u) {
-          route_scan_begin = saved_union_begin;
-          route_scan_end = saved_union_end;
-        } else if (union_lane == 0u && route.suffix_end > union_low &&
-                   route.suffix_begin <= union_high) {
-          route_scan_begin = lower_bound_rows(
-              route_rows, route.rows.count(), union_low);
-          route_scan_end = upper_bound_rows(
-              route_rows, route.rows.count(), union_high);
-        }
-        route_scan_begin =
-            __shfl_sync(union_mask, route_scan_begin, 0u);
-        route_scan_end = __shfl_sync(union_mask, route_scan_end, 0u);
-
-        std::uint32_t fragment_route_begin = 0u;
-        std::uint32_t fragment_route_end = 0u;
-        if (fragment_active && route_scan_begin != route_scan_end) {
-          if (foundation_header.count == 1u) {
-            fragment_route_begin = fragment_bounds.base_begin;
-            fragment_route_end = fragment_bounds.base_end;
-          } else {
-            fragment_route_begin = lower_bound_rows(
-                route_rows, route.rows.count(), fragment.low_suffix);
-            fragment_route_end = upper_bound_rows(
-                route_rows, route.rows.count(), fragment.high_suffix);
-          }
-        }
-
-        constexpr std::uint32_t kUnionTileRows = 128u;
-        for (std::uint32_t tile_begin = route_scan_begin;
-             tile_begin < route_scan_end;
-             tile_begin += kUnionTileRows) {
-          const std::uint32_t tile_end =
-              min(tile_begin + kUnionTileRows, route_scan_end);
-          const std::uint32_t tile_count = tile_end - tile_begin;
-          for (std::uint32_t index = union_lane; index < tile_count;
-               index += 32u)
-            workspace.base_rows[union_warp][index] =
-                route_rows[tile_begin + index];
-          __syncwarp(union_mask);
-
-          const std::uint32_t chunk_begin = union_lane * 4u;
-          unsigned long long item_prefix[4]{};
-          unsigned long long chunk_sum = 0ull;
-#pragma unroll
-          for (std::uint32_t item = 0u; item < 4u; ++item) {
-            const std::uint32_t index = chunk_begin + item;
-            if (index < tile_count) {
-              const Row row = workspace.base_rows[union_warp][index];
-              bool covered = false;
-              if (current_count) {
-                const std::uint32_t update =
-                    lower_bound_rows(current, current_count, row.key);
-                covered = update < current_count &&
-                    current[update].key == row.key;
-              }
-              if (!covered && (row.flags & kTombstone) == 0u)
-                chunk_sum = Aggregate::consume(chunk_sum, row);
-            }
-            item_prefix[item] = chunk_sum;
-          }
-          unsigned long long chunk_prefix = chunk_sum;
-          for (std::uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
-            const unsigned long long preceding =
-                __shfl_up_sync(union_mask, chunk_prefix, offset);
-            if (union_lane >= offset) chunk_prefix += preceding;
-          }
-          const unsigned long long chunk_base = chunk_prefix - chunk_sum;
-          if (union_lane == 0u)
-            base_mask_workspace
-                .warp_tile_prefix[union_warp][0] = 0ull;
-#pragma unroll
-          for (std::uint32_t item = 0u; item < 4u; ++item) {
-            const std::uint32_t index = chunk_begin + item;
-            if (index < tile_count)
-              base_mask_workspace
-                  .warp_tile_prefix[union_warp][index + 1u] =
-                      chunk_base + item_prefix[item];
-          }
-          __syncwarp(union_mask);
-
-          if (fragment_active) {
-            const std::uint32_t consume_begin =
-                max(fragment_route_begin, tile_begin);
-            const std::uint32_t consume_end =
-                min(fragment_route_end, tile_end);
-            if (consume_begin < consume_end)
-              fragment_sum += base_mask_workspace
-                  .warp_tile_prefix[union_warp]
-                      [consume_end - tile_begin] -
-                  base_mask_workspace
-                      .warp_tile_prefix[union_warp]
-                          [consume_begin - tile_begin];
-          }
-          __syncwarp(union_mask);
-        }
-      }
-      if (fragment_active)
-        aggregate_partials[fragment.original_index] = fragment_sum;
-      cursor = union_end;
-    }
-    break;
-  }
-
-  // Choose worker width from actual rows.
-  if (!overflow_shared &&
-      (foundation_header.count > 1u || dynamic_queue_shared)) {
-    for (std::uint32_t fragment_index = fragment_begin + threadIdx.x;
-         fragment_index < fragment_end; fragment_index += blockDim.x) {
-      const SectionRangeFragment fragment = fragments[fragment_index];
-      const std::uint32_t work =
-          fragment_work_shared[fragment_index - fragment_begin];
-      if (work <= kRangeThreadWork) {
-        aggregate_partials[fragment.original_index] =
-            cooperative_sum_visible_route_runs<Aggregate>(
-                fragment.low_suffix, fragment.high_suffix,
-                current, current_count, arena, foundation_header,
-                route_slices, 0u, 1u);
-      }
-    }
-    __syncthreads();
-
-    constexpr std::uint32_t kSubgroup = 8u;
-    const std::uint32_t subgroup = threadIdx.x / kSubgroup;
-    const std::uint32_t subgroup_lane = threadIdx.x & (kSubgroup - 1u);
-    const std::uint32_t subgroup_leader = subgroup * kSubgroup;
-    const unsigned subgroup_mask =
-        ((1u << kSubgroup) - 1u) << subgroup_leader;
-    for (std::uint32_t fragment_index = fragment_begin + subgroup;
-         fragment_index < fragment_end;
-         fragment_index += blockDim.x / kSubgroup) {
-      SectionRangeFragment fragment{};
-      std::uint32_t work = 0u;
-      if (subgroup_lane == 0u) {
-        fragment = fragments[fragment_index];
-        work = fragment_work_shared[fragment_index - fragment_begin];
-      }
-      fragment.original_index = __shfl_sync(
-          subgroup_mask, fragment.original_index, subgroup_leader);
-      fragment.low_suffix = static_cast<std::uint16_t>(__shfl_sync(
-          subgroup_mask, std::uint32_t{fragment.low_suffix}, subgroup_leader));
-      fragment.high_suffix = static_cast<std::uint16_t>(__shfl_sync(
-          subgroup_mask, std::uint32_t{fragment.high_suffix}, subgroup_leader));
-      work = __shfl_sync(subgroup_mask, work, subgroup_leader);
-      if (work > kRangeThreadWork && work <= kRangeSubgroupWork) {
-        unsigned long long value =
-            cooperative_sum_visible_route_runs<Aggregate>(
-                fragment.low_suffix, fragment.high_suffix,
-                current, current_count, arena, foundation_header,
-                route_slices, subgroup_lane, kSubgroup);
-        for (std::uint32_t offset = kSubgroup / 2u; offset; offset >>= 1u)
-          value += __shfl_down_sync(
-              subgroup_mask, value, offset, kSubgroup);
-        if (subgroup_lane == 0u)
-          aggregate_partials[fragment.original_index] = value;
-      }
-    }
-    __syncthreads();
-
-    for (std::uint32_t fragment_index = fragment_begin + warp;
-         fragment_index < fragment_end;
-         fragment_index += kSectionRangeWarps) {
-      SectionRangeFragment fragment{};
-      std::uint32_t work = 0u;
-      if (lane == 0u) {
-        fragment = fragments[fragment_index];
-        work = fragment_work_shared[fragment_index - fragment_begin];
-      }
-      fragment.original_index =
-          __shfl_sync(full_mask, fragment.original_index, 0u);
-      fragment.low_suffix = static_cast<std::uint16_t>(__shfl_sync(
-          full_mask, std::uint32_t{fragment.low_suffix}, 0u));
-      fragment.high_suffix = static_cast<std::uint16_t>(__shfl_sync(
-          full_mask, std::uint32_t{fragment.high_suffix}, 0u));
-      work = __shfl_sync(full_mask, work, 0u);
-      if (work > kRangeSubgroupWork) {
-        unsigned long long value =
-            cooperative_sum_visible_route_runs<Aggregate>(
-                fragment.low_suffix, fragment.high_suffix,
-                current, current_count, arena, foundation_header,
-                route_slices, lane, 32u);
-        for (std::uint32_t offset = 16u; offset; offset >>= 1u)
-          value += __shfl_down_sync(full_mask, value, offset);
-        if (lane == 0u)
-          aggregate_partials[fragment.original_index] = value;
-      }
-    }
-    break;
-  }
-  const ResidentRows foundation_rows =
-      arena + foundation_descriptor_shared.offset();
-
-  if (!overflow_shared && current_count &&
-      base_section_count <= kSectionBaseMaskRows) {
-    const std::uint32_t words = (base_section_count + 31u) >> 5u;
-    for (std::uint32_t word = threadIdx.x; word < words;
-         word += blockDim.x)
-      base_mask_workspace.section[word] = 0u;
-    __syncthreads();
-    for (std::uint32_t update = threadIdx.x; update < current_count;
-         update += blockDim.x) {
-      const std::uint32_t key = current[update].key;
-      const std::uint32_t position = lower_bound_rows(
-          foundation_rows, base_section_count, key);
-      if (position < base_section_count &&
-          foundation_rows[position].key == key)
-        atomicOr(base_mask_workspace.section + (position >> 5u),
-                 1u << (position & 31u));
-    }
-    __syncthreads();
-    if (threadIdx.x == 0u) section_base_mask_valid_shared = 1u;
-  } else {
-    if (threadIdx.x == 0u) section_base_mask_valid_shared = 0u;
-  }
-  __syncthreads();
-  if (!overflow_shared && worker_width_shared == 1u) {
-      for (std::uint32_t fragment_index = fragment_begin + threadIdx.x;
-           fragment_index < fragment_end; fragment_index += blockDim.x) {
-        const SectionRangeFragment fragment = fragments[fragment_index];
-        aggregate_partials[fragment.original_index] =
-            cooperative_sum_visible_route_runs<Aggregate>(
-                fragment.low_suffix, fragment.high_suffix,
-                current, current_count, arena, foundation_header,
-                route_slices, 0u, 1u);
-      }
-      break;
-  }
-  if (!overflow_shared && !dynamic_queue_shared &&
-      worker_width_shared == 8u &&
-      (section_base_mask_valid_shared || current_count == 0u)) {
-      constexpr std::uint32_t kGroup = 4u;
-      constexpr std::uint32_t kSubgroup = 32u / kGroup;
-      constexpr std::uint32_t kTileRows = 128u;
-      const std::uint32_t subgroup = lane / kSubgroup;
-      const std::uint32_t subgroup_lane = lane & (kSubgroup - 1u);
-      const unsigned subgroup_mask =
-          ((1u << kSubgroup) - 1u) << (subgroup * kSubgroup);
-      std::uint32_t group_begin =
-          fragment_begin + warp * kGroup;
-      while (true) {
-        if (dynamic_queue_shared) {
-          if (lane == 0u)
-            group_begin = atomicAdd(&next_fragment_shared, kGroup);
-          group_begin = __shfl_sync(full_mask, group_begin, 0u);
-        }
-        if (group_begin >= fragment_end) break;
-        const std::uint32_t fragment_index = group_begin + subgroup;
-        const bool active = fragment_index < fragment_end;
-        SectionRangeFragment fragment{};
-        if (active && subgroup_lane == 0u)
-          fragment = fragments[fragment_index];
-        std::uint32_t update_begin = 0u, update_end = 0u;
-        std::uint32_t base_begin = 0u, base_end = 0u;
-        if (active && subgroup_lane == 0u) {
-          const RangeFragmentBounds bounds =
-              fragment_bounds_shared[fragment_index - fragment_begin];
-          update_begin = bounds.update_begin;
-          update_end = bounds.update_end;
-          base_begin = bounds.base_begin;
-          base_end = bounds.base_end;
-        }
-        const std::uint32_t leader = subgroup * kSubgroup;
-        update_begin = __shfl_sync(full_mask, update_begin, leader);
-        update_end = __shfl_sync(full_mask, update_end, leader);
-        base_begin = __shfl_sync(full_mask, base_begin, leader);
-        base_end = __shfl_sync(full_mask, base_end, leader);
-
-        unsigned long long local = 0ull;
-        if (active) {
-          for (std::uint32_t index = update_begin + subgroup_lane;
-               index < update_end; index += kSubgroup) {
-            const Row row = current[index];
-            if ((row.flags & kTombstone) == 0u)
-              local = Aggregate::consume(local, row);
-          }
-        }
-
-        std::uint32_t union_begin = base_section_count;
-        std::uint32_t union_end = 0u;
-        std::uint32_t direct_rows = 0u;
-#pragma unroll
-        for (std::uint32_t member = 0u; member < kGroup; ++member) {
-          const std::uint32_t member_lane = member * kSubgroup;
-          const bool member_active =
-              __shfl_sync(full_mask, active, member_lane);
-          const std::uint32_t member_begin =
-              __shfl_sync(full_mask, base_begin, member_lane);
-          const std::uint32_t member_end =
-              __shfl_sync(full_mask, base_end, member_lane);
-          if (member_active) {
-            union_begin = min(union_begin, member_begin);
-            union_end = max(union_end, member_end);
-            direct_rows += member_end - member_begin;
-          }
-        }
-        const std::uint32_t union_rows = union_end - union_begin;
-        const bool share_rows = union_rows != 0u &&
-            direct_rows >= union_rows + (union_rows >> 1u);
-
-        if (share_rows) {
-          for (std::uint32_t tile_begin = union_begin;
-               tile_begin < union_end; tile_begin += kTileRows) {
-            const std::uint32_t tile_end =
-                min(tile_begin + kTileRows, union_end);
-            for (std::uint32_t index = lane;
-                 index < tile_end - tile_begin; index += 32u) {
-              const std::uint32_t position =
-                  tile_begin + index;
-              workspace.base_rows[warp][index] =
-                  foundation_rows[position];
-            }
-            __syncwarp();
-            if (active) {
-              const std::uint32_t consume_begin =
-                  max(base_begin, tile_begin);
-              const std::uint32_t consume_end =
-                  min(base_end, tile_end);
-              for (std::uint32_t index =
-                       consume_begin + subgroup_lane;
-                   index < consume_end; index += kSubgroup) {
-                const Row row =
-                    workspace.base_rows[warp][index - tile_begin];
-                bool covered = false;
-                if (section_base_mask_valid_shared) {
-                  covered =
-                      (base_mask_workspace.section[index >> 5u] &
-                       (1u << (index & 31u))) != 0u;
-                } else if (current_count) {
-                  const std::uint32_t update_position =
-                      lower_bound_rows(current, current_count,
-                                       row.key);
-                  covered = update_position < current_count &&
-                      current[update_position].key == row.key;
-                }
-                if (!covered && (row.flags & kTombstone) == 0u)
-                  local = Aggregate::consume(local, row);
-              }
-            }
-            __syncwarp();
-          }
-        } else if (active) {
-          for (std::uint32_t index = base_begin + subgroup_lane;
-               index < base_end; index += kSubgroup) {
-            const std::uint32_t position =
-                index;
-            const Row row = foundation_rows[position];
-            bool covered = false;
-            if (section_base_mask_valid_shared) {
-              covered =
-                  (base_mask_workspace.section[index >> 5u] &
-                   (1u << (index & 31u))) != 0u;
-            } else if (current_count) {
-              const std::uint32_t update_position =
-                  lower_bound_rows(current, current_count, row.key);
-              covered = update_position < current_count &&
-                  current[update_position].key == row.key;
-            }
-            if (!covered && (row.flags & kTombstone) == 0u)
-              local = Aggregate::consume(local, row);
-          }
-        }
-
-        for (std::uint32_t offset = kSubgroup / 2u; offset;
-             offset >>= 1u) {
-          const unsigned long long other = __shfl_down_sync(
-              subgroup_mask, local, offset, kSubgroup);
-          local = Aggregate{}(local, other);
-        }
-        if (active && subgroup_lane == 0u)
-          aggregate_partials[fragment.original_index] = local;
-        if (!dynamic_queue_shared)
-          group_begin += kSectionRangeWarps * kGroup;
-      }
-      break;
-  }
-  std::uint32_t fragment_index = fragment_begin + warp;
-  while (true) {
-    if (dynamic_queue_shared) {
-      if (lane == 0u)
-        fragment_index = atomicAdd(&next_fragment_shared, 1u);
-      fragment_index = __shfl_sync(full_mask, fragment_index, 0u);
-    }
-    if (fragment_index >= fragment_end) break;
-    const SectionRangeFragment fragment = fragments[fragment_index];
-    const std::uint32_t q_low = q << 16u;
-    const std::uint32_t low = q_low | fragment.low_suffix;
-    const std::uint32_t high = q_low | fragment.high_suffix;
-    unsigned long long local = 0ull;
-    if (overflow_shared) {
-      local = warp_sum_visible_by_verification(
-          q, low, high, raw_keys, raw_payloads, raw_offsets, batch_stride,
-          pending_batches, arena, descriptors,
-          route_headers, route_slices, active_levels, occupied_levels);
-    } else {
-      std::uint32_t update_begin = 0u, update_end = 0u;
-      std::uint32_t begin = 0u, end = 0u;
-      if (lane == 0u) {
-        const RangeFragmentBounds bounds =
-            fragment_bounds_shared[fragment_index - fragment_begin];
-        update_begin = bounds.update_begin;
-        update_end = bounds.update_end;
-        begin = bounds.base_begin;
-        end = bounds.base_end;
-      }
-      update_begin = __shfl_sync(full_mask, update_begin, 0u);
-      update_end = __shfl_sync(full_mask, update_end, 0u);
-      begin = __shfl_sync(full_mask, begin, 0u);
-      end = __shfl_sync(full_mask, end, 0u);
-      const std::uint32_t update_count = update_end - update_begin;
-      for (std::uint32_t index = update_begin + lane; index < update_end;
-           index += 32u) {
-        const Row row = current[index];
-        if ((row.flags & kTombstone) == 0u)
-          local = Aggregate::consume(local, row);
-      }
-
-      if (!update_count) {
-        for (std::uint32_t index = begin + lane; index < end; index += 32u)
-          if ((foundation_rows[index].flags & kTombstone) == 0u)
-            local = Aggregate::consume(local, foundation_rows[index]);
-      } else {
-        const Row *updates = current + update_begin;
-        const std::uint32_t base_count = end - begin;
-        if (section_base_mask_valid_shared) {
-          for (std::uint32_t index = begin + lane; index < end;
-               index += 32u)
-            if ((base_mask_workspace.section[index >> 5u] &
-                 (1u << (index & 31u))) == 0u)
-              if ((foundation_rows[index].flags & kTombstone) == 0u)
-                local = Aggregate::consume(local, foundation_rows[index]);
-        } else if (base_count <= kFragmentBaseMaskRows) {
-          const std::uint32_t mask_words = (base_count + 31u) >> 5u;
-          for (std::uint32_t word = lane; word < mask_words; word += 32u)
-            base_mask_workspace.fragments[warp][word] = 0u;
-          __syncwarp();
-
-          for (std::uint32_t update = lane; update < update_count;
-               update += 32u) {
-            const std::uint32_t key = updates[update].key;
-            const std::uint32_t position =
-                lower_bound_rows(foundation_rows + begin, base_count, key);
-            if (position < base_count &&
-                foundation_rows[begin + position].key == key)
-              atomicOr(base_mask_workspace.fragments[warp] +
-                           (position >> 5u),
-                       1u << (position & 31u));
-          }
-          __syncwarp();
-          for (std::uint32_t index = lane; index < base_count; index += 32u)
-            if ((base_mask_workspace.fragments[warp][index >> 5u] &
-                 (1u << (index & 31u))) == 0u)
-              if ((foundation_rows[begin + index].flags & kTombstone) == 0u)
-                local = Aggregate::consume(
-                    local, foundation_rows[begin + index]);
+        const Descriptor descriptor = route_slices[foundation_header.begin].rows;
+        const ResidentRows rows = arena + descriptor.offset();
+        if (ranks_valid_shared) {
+          const std::uint32_t low_cell =
+              std::uint32_t{fragment.low_suffix} / kFoundationCellKeys;
+          const std::uint32_t low_begin = foundation_cell_ranks[low_cell];
+          const std::uint32_t low_end = foundation_cell_ranks[low_cell + 1u];
+          bounds.base_begin = low_begin + lower_bound_rows(
+              rows + low_begin, low_end - low_begin, fragment.low_suffix);
+          const std::uint32_t high_cell =
+              std::uint32_t{fragment.high_suffix} / kFoundationCellKeys;
+          const std::uint32_t high_begin = foundation_cell_ranks[high_cell];
+          const std::uint32_t high_end = foundation_cell_ranks[high_cell + 1u];
+          bounds.base_end = high_begin + upper_bound_rows(
+              rows + high_begin, high_end - high_begin, fragment.high_suffix);
         } else {
-          for (std::uint32_t index = begin + lane; index < end;
-               index += 32u) {
-            const Row row = foundation_rows[index];
-            const std::uint32_t update_position =
-                lower_bound_rows(updates, update_count, row.key);
-            if (update_position == update_count ||
-                updates[update_position].key != row.key)
-              if ((row.flags & kTombstone) == 0u)
-                local = Aggregate::consume(local, row);
-          }
+          bounds.base_begin = lower_bound_rows(
+              rows, descriptor.count(), fragment.low_suffix);
+          bounds.base_end = upper_bound_rows(
+              rows, descriptor.count(), fragment.high_suffix);
+        }
+        base_work = bounds.base_end - bounds.base_begin;
+      } else {
+        base_work = route_range_row_count(
+            fragment.low_suffix, fragment.high_suffix, arena,
+            foundation_header, route_slices);
+      }
+      fragment_bounds[local] = bounds;
+      fragment_work[local] = bounds.update_end - bounds.update_begin + base_work;
+      fragment_sums[local] = Aggregate::identity();
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0u) {
+      std::uint32_t wave = 0u, cursor = 0u;
+      wave_fragment_begins[0u] = 0u;
+      for (std::uint32_t fragment = 0u; fragment < fragment_count;
+           ++fragment) {
+        const std::uint32_t work = fragment_work[fragment];
+        const std::uint32_t width = work <= kRangeThreadWork ? 1u
+            : work <= kRangeSubgroupWork ? 8u : 32u;
+        std::uint32_t slot = (cursor + width - 1u) & ~(width - 1u);
+        if ((slot >> 5u) != ((slot + width - 1u) >> 5u))
+          slot = (slot + 31u) & ~31u;
+        if (slot + width > kSectionRangeThreads) {
+          ++wave;
+          wave_fragment_begins[wave] = fragment;
+          slot = 0u;
+        }
+        fragment_slots[fragment] = static_cast<std::uint8_t>(slot);
+        fragment_widths[fragment] = static_cast<std::uint8_t>(width);
+        cursor = slot + width;
+      }
+      wave_count_shared = wave + 1u;
+      wave_fragment_begins[wave_count_shared] = fragment_count;
+    }
+    __syncthreads();
+
+    for (std::uint32_t local = threadIdx.x; local < fragment_count;
+         local += blockDim.x) {
+      source_begins[local] = fragment_bounds[local].update_begin;
+      source_ends[local] = fragment_bounds[local].update_end;
+    }
+    __syncthreads();
+    enumerate_range_source_tiles<Aggregate>(
+        fragments, fragment_begin, fragment_count,
+        RangeTileSource{newer, {}, true}, newer, newer_count, false,
+        source_begins, source_ends, fragment_slots, fragment_widths,
+        wave_fragment_begins, wave_count_shared, union_begins, union_ends,
+        &union_count_shared, workspace.tile, fragment_sums);
+
+    for (std::uint32_t route_index = 0u;
+         route_index < foundation_header.count; ++route_index) {
+      const RouteSlice route = route_slices[foundation_header.begin + route_index];
+      const ResidentRows rows = arena + route.rows.offset();
+      for (std::uint32_t local = threadIdx.x; local < fragment_count;
+           local += blockDim.x) {
+        const SectionRangeFragment fragment = fragments[fragment_begin + local];
+        if (foundation_header.count == 1u) {
+          source_begins[local] = fragment_bounds[local].base_begin;
+          source_ends[local] = fragment_bounds[local].base_end;
+        } else if (route.suffix_end > fragment.low_suffix &&
+                   route.suffix_begin <= fragment.high_suffix) {
+          source_begins[local] = lower_bound_rows(
+              rows, route.rows.count(), fragment.low_suffix);
+          source_ends[local] = upper_bound_rows(
+              rows, route.rows.count(), fragment.high_suffix);
+        } else {
+          source_begins[local] = source_ends[local] = 0u;
         }
       }
-      for (std::uint32_t offset = 16u; offset; offset >>= 1u)
-        local += __shfl_down_sync(full_mask, local, offset);
+      __syncthreads();
+      enumerate_range_source_tiles<Aggregate>(
+          fragments, fragment_begin, fragment_count,
+          RangeTileSource{nullptr, rows, false}, newer, newer_count, true,
+          source_begins, source_ends, fragment_slots, fragment_widths,
+          wave_fragment_begins, wave_count_shared, union_begins, union_ends,
+          &union_count_shared, workspace.tile, fragment_sums);
     }
-    if (lane == 0u)
-      aggregate_partials[fragment.original_index] = local;
-    if (!dynamic_queue_shared)
-      fragment_index += kSectionRangeWarps;
-  }
-    } while (false);
+
+    for (std::uint32_t local = threadIdx.x; local < fragment_count;
+         local += blockDim.x) {
+      const SectionRangeFragment fragment = fragments[fragment_begin + local];
+      aggregate_partials[fragment.original_index] = fragment_sums[local];
+    }
     __syncthreads();
   }
 }
@@ -2655,7 +2178,9 @@ __global__ void warp_range_fragment_kernel(
     const std::uint32_t *query_low, const std::uint32_t *query_high,
     ResidentRows arena,
     const Descriptor *descriptors, const RouteHeader *route_headers,
-    const RouteSlice *route_slices, const std::uint32_t *raw_keys,
+    const RouteSlice *route_slices, const Row *hot_rows,
+    const Descriptor *hot_descriptors, bool hot_ready,
+    const std::uint32_t *raw_keys,
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches,
@@ -2705,6 +2230,25 @@ __global__ void warp_range_fragment_kernel(
   Row *current = current_shared[warp];
   Row *merged = scratch[warp].merged;
 
+  unsigned long long hot_bits = 0u;
+  if (lane == 0u && hot_ready) hot_bits = hot_descriptors[q].bits;
+  hot_bits = __shfl_sync(full_mask, hot_bits, 0u);
+  const Descriptor hot_descriptor{hot_bits};
+  if (hot_descriptor.count()) {
+    const RouteHeader foundation_header = foundation_level < active_levels
+        ? route_headers[descriptor_index(q, foundation_level)]
+        : RouteHeader{};
+    unsigned long long value = cooperative_sum_visible_route_runs<Aggregate>(
+        low_suffix, high_suffix, hot_rows + hot_descriptor.offset(),
+        hot_descriptor.count(), arena, foundation_header, route_slices,
+        lane, 32u);
+    for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+      value = Aggregate{}(value,
+          __shfl_down_sync(full_mask, value, offset));
+    if (lane == 0u) aggregate_partials[fragment_index] = value;
+    return;
+  }
+
   std::uint32_t current_count = 0u;
   if (pending_batches) {
     std::uint32_t pending_count = 0u;
@@ -2734,11 +2278,7 @@ __global__ void warp_range_fragment_kernel(
     }
     const bool pending_overflow = pending_count > kUpdateCapacity;
     if (__shfl_sync(full_mask, pending_overflow, 0u)) {
-      const unsigned long long value = warp_sum_visible_by_verification(
-          q, low, high, raw_keys, raw_payloads, raw_offsets, batch_stride,
-          pending_batches, arena, descriptors, route_headers, route_slices,
-          active_levels, occupied_levels);
-      if (lane == 0u) aggregate_partials[fragment_index] = value;
+      asm volatile("trap;");
       return;
     }
 
@@ -2852,11 +2392,7 @@ __global__ void warp_range_fragment_kernel(
   }
   class_overflow = __shfl_sync(full_mask, class_overflow, 0u);
   if (class_overflow) {
-    const unsigned long long value = warp_sum_visible_by_verification(
-        q, low, high, raw_keys, raw_payloads, raw_offsets, batch_stride,
-        pending_batches, arena, descriptors, route_headers, route_slices,
-        active_levels, occupied_levels);
-    if (lane == 0u) aggregate_partials[fragment_index] = value;
+    asm volatile("trap;");
     return;
   }
 
@@ -6438,7 +5974,14 @@ public:
         range_partials_(gpulsmopt2_detail::kRangeSchedulerBlocks),
         range_reduction_completion_(1u),
         range_fragment_total_(1u),
-        range_total_receipt_(1u) {
+        range_total_receipt_(1u),
+        range_hot_counts_(gpulsmopt2_detail::kQuotients + 1u),
+        range_hot_offsets_(gpulsmopt2_detail::kQuotients + 1u),
+        range_hot_window_offsets_(gpulsmopt2_detail::kQuotients + 1u),
+        range_hot_descriptors_(gpulsmopt2_detail::kQuotients),
+        range_hot_selected_count_(1u),
+        range_hot_total_receipt_(1u),
+        range_hot_offsets_receipt_(gpulsmopt2_detail::kQuotients + 1u) {
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
     // Preload the optional dense lookup kernel.
@@ -6734,6 +6277,34 @@ private:
     begin_operation(stream);
     const std::uint32_t query_count =
         static_cast<std::uint32_t>(batch.query_count);
+    const bool may_have_crowded_newer = pending_batches_ != 0u ||
+        (host_occupied_level_mask_ & (host_occupied_level_mask_ - 1u)) != 0u;
+    if (may_have_crowded_newer) {
+      std::size_t hot_scan_bytes{};
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          nullptr, hot_scan_bytes, range_hot_counts_.data(),
+          range_hot_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, stream));
+      if (range_hot_temp_.size() < hot_scan_bytes)
+        range_hot_temp_.resize(hot_scan_bytes);
+      CUDA_CHECK(cudaMemsetAsync(
+          range_hot_descriptors_.data(), 0,
+          range_hot_descriptors_.size() *
+              sizeof(gpulsmopt2_detail::Descriptor), stream));
+      gpulsmopt2_detail::count_range_hot_newer_rows_kernel<<<
+          blocks(gpulsmopt2_detail::kQuotients + 1u),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              raw_offsets_.data(), pending_batches_, descriptors_.data(),
+              query_occupied_level_mask_.data(), range_hot_counts_.data());
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          range_hot_temp_.data(), hot_scan_bytes, range_hot_counts_.data(),
+          range_hot_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, stream));
+      CUDA_CHECK(cudaMemcpyAsync(
+          range_hot_total_receipt_.data(),
+          range_hot_offsets_.data() + gpulsmopt2_detail::kQuotients,
+          sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
+    }
     const bool needs_wide_total = query_count >
         std::numeric_limits<std::uint32_t>::max() /
             gpulsmopt2_detail::kQuotients;
@@ -6766,6 +6337,7 @@ private:
     std::uint32_t fragment_count{};
     if (query_count == 1u) {
       fragment_count = gpulsmopt2_detail::kQuotients;
+      if (may_have_crowded_newer) CUDA_CHECK(cudaStreamSynchronize(stream));
     } else if (needs_wide_total) {
       using WideCountIterator = cub::TransformInputIterator<
           std::uint64_t, gpulsmopt2_detail::WidenFragmentCount,
@@ -6794,6 +6366,10 @@ private:
           sizeof(fragment_count), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+    const std::uint64_t hot_total = may_have_crowded_newer
+        ? range_hot_total_receipt_.data()[0] : 0u;
+    if (hot_total) materialize_range_hot_sections(hot_total, stream);
+    const bool hot_ready = hot_total != 0u;
     if (!fragment_count) {
       CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
                                  std::size_t{query_count} *
@@ -6860,9 +6436,10 @@ private:
               range_section_offsets_.data(),
               range_section_task_offsets_.data(),
               range_section_tasks_.data());
-      launch_section_ranges(stream);
+      launch_section_ranges(stream, hot_ready);
     } else {
-      launch_fragment_ranges(fragment_count, query_count, batch, stream);
+      launch_fragment_ranges(
+          fragment_count, query_count, batch, stream, hot_ready);
     }
     CUDA_CHECK(cudaMemsetAsync(range_reduction_completion_.data(), 0,
                                sizeof(std::uint32_t), stream));
@@ -6980,6 +6557,14 @@ public:
         range_partials_.size() * sizeof(unsigned long long) +
         range_reduction_completion_.size() * sizeof(std::uint32_t) +
         range_fragment_total_.size() * sizeof(std::uint64_t) +
+        (range_hot_counts_.size() + range_hot_offsets_.size() +
+         range_hot_tokens_a_.size() + range_hot_tokens_b_.size()) *
+            sizeof(std::uint64_t) +
+        (range_hot_window_offsets_.size() +
+         range_hot_selected_count_.size()) * sizeof(std::uint32_t) +
+        range_hot_descriptors_.size() *
+            sizeof(gpulsmopt2_detail::Descriptor) +
+        range_hot_temp_.size() * sizeof(std::uint8_t) +
         range_query_storage_.size() + range_fragment_storage_.size() +
         range_section_storage_.size();
   }
@@ -7758,7 +7343,156 @@ private:
   std::uint32_t *query_quotient_offsets() {
     return reinterpret_cast<std::uint32_t *>(radix_workspace_);
   }
-  void launch_section_ranges(cudaStream_t stream) {
+  void materialize_range_hot_sections(std::uint64_t total,
+                                      cudaStream_t stream) {
+    if (!total) return;
+    if (total > gpulsmopt2_detail::kMaximumPublicationRows)
+      throw std::length_error("GPULSMOpt crowded range input is too large");
+
+    struct Window {
+      std::uint32_t quotient_begin;
+      std::uint32_t quotient_end;
+      std::uint64_t input_begin;
+      std::uint32_t input_count;
+    };
+    std::vector<Window> windows;
+    if (total <= gpulsmopt2_detail::kRangeHotWindowRows) {
+      windows.push_back({0u, gpulsmopt2_detail::kQuotients, 0u,
+                         static_cast<std::uint32_t>(total)});
+    } else {
+      CUDA_CHECK(cudaMemcpyAsync(
+          range_hot_offsets_receipt_.data(), range_hot_offsets_.data(),
+          (gpulsmopt2_detail::kQuotients + 1u) * sizeof(std::uint64_t),
+          cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      const std::uint64_t *offsets = range_hot_offsets_receipt_.data();
+      std::uint32_t begin = 0u;
+      while (begin < gpulsmopt2_detail::kQuotients &&
+             offsets[begin] < total) {
+        const std::uint64_t base = offsets[begin];
+        std::uint32_t end = begin;
+        while (end < gpulsmopt2_detail::kQuotients &&
+               offsets[end + 1u] - base <=
+                   gpulsmopt2_detail::kRangeHotWindowRows)
+          ++end;
+        if (end == begin) ++end;
+        const std::uint64_t count = offsets[end] - base;
+        if (count > std::numeric_limits<int>::max())
+          throw std::length_error(
+              "one GPULSMOpt crowded section exceeds the GPU sort limit");
+        windows.push_back({begin, end, base,
+                           static_cast<std::uint32_t>(count)});
+        begin = end;
+      }
+    }
+
+    std::size_t maximum_window = 0u;
+    for (const Window &window : windows)
+      maximum_window = std::max<std::size_t>(
+          maximum_window, window.input_count);
+    if (range_hot_token_capacity_ < maximum_window) {
+      range_hot_tokens_a_.resize(maximum_window);
+      range_hot_tokens_b_.resize(maximum_window);
+      range_hot_token_capacity_ = maximum_window;
+    }
+    ensure_publication_capacity(static_cast<std::size_t>(total), stream);
+
+    std::size_t required_temp = 0u;
+    for (const Window &window : windows) {
+      std::size_t sort_bytes{};
+      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortKeys(
+          nullptr, sort_bytes, range_hot_tokens_a_.data(),
+          range_hot_tokens_b_.data(),
+          static_cast<int>(window.input_count),
+          static_cast<int>(window.quotient_end - window.quotient_begin),
+          range_hot_window_offsets_.data(),
+          range_hot_window_offsets_.data() + 1u, 32, 48, stream));
+      using KeyIterator = cub::TransformInputIterator<
+          std::uint32_t, gpulsmopt2_detail::RangeHotTokenKey,
+          const std::uint64_t *>;
+      const KeyIterator keys(range_hot_tokens_b_.data(),
+                             gpulsmopt2_detail::RangeHotTokenKey{});
+      auto *winner_tokens = reinterpret_cast<std::uint64_t *>(
+          publication_rows_a_.data() + window.input_begin);
+      std::size_t reduce_bytes{};
+      CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+          nullptr, reduce_bytes, keys,
+          publication_keys_a_.data() + window.input_begin,
+          range_hot_tokens_b_.data(), winner_tokens,
+          range_hot_selected_count_.data(),
+          gpulsmopt2_detail::RangeHotNewestToken{
+              raw_payloads_.data(), static_cast<std::uint32_t>(
+                  batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)},
+          window.input_count, stream));
+      required_temp = std::max(required_temp,
+                               std::max(sort_bytes, reduce_bytes));
+    }
+    if (range_hot_temp_.size() < required_temp)
+      range_hot_temp_.resize(required_temp);
+
+    for (const Window &window : windows) {
+      const std::uint32_t quotient_count =
+          window.quotient_end - window.quotient_begin;
+      gpulsmopt2_detail::make_range_hot_window_offsets_kernel<<<
+          blocks(std::size_t{quotient_count} + 1u),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              range_hot_offsets_.data(), window.quotient_begin,
+              quotient_count, window.input_begin,
+              range_hot_window_offsets_.data());
+      gpulsmopt2_detail::emit_range_hot_tokens_kernel<<<
+          quotient_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              raw_keys_.data(), raw_offsets_.data(),
+              static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+              resident_rows(), descriptors_.data(), route_headers_.data(),
+              route_slices_.data(), route_logical_begins_.data(),
+              level_q_logical_offsets_.data(),
+              query_occupied_level_mask_.data(), range_hot_counts_.data(),
+              range_hot_offsets_.data(), window.quotient_begin,
+              window.quotient_end, window.input_begin,
+              range_hot_tokens_a_.data());
+      std::size_t workspace_bytes = range_hot_temp_.size();
+      CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortKeys(
+          range_hot_temp_.data(), workspace_bytes,
+          range_hot_tokens_a_.data(), range_hot_tokens_b_.data(),
+          static_cast<int>(window.input_count),
+          static_cast<int>(quotient_count),
+          range_hot_window_offsets_.data(),
+          range_hot_window_offsets_.data() + 1u, 32, 48, stream));
+      using KeyIterator = cub::TransformInputIterator<
+          std::uint32_t, gpulsmopt2_detail::RangeHotTokenKey,
+          const std::uint64_t *>;
+      const KeyIterator keys(range_hot_tokens_b_.data(),
+                             gpulsmopt2_detail::RangeHotTokenKey{});
+      auto *winner_tokens = reinterpret_cast<std::uint64_t *>(
+          publication_rows_a_.data() + window.input_begin);
+      workspace_bytes = range_hot_temp_.size();
+      CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+          range_hot_temp_.data(), workspace_bytes, keys,
+          publication_keys_a_.data() + window.input_begin,
+          range_hot_tokens_b_.data(), winner_tokens,
+          range_hot_selected_count_.data(),
+          gpulsmopt2_detail::RangeHotNewestToken{
+              raw_payloads_.data(), static_cast<std::uint32_t>(
+                  batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)},
+          window.input_count, stream));
+      gpulsmopt2_detail::materialize_range_hot_winners_kernel<<<
+          blocks(window.input_count), gpulsmopt2_detail::kThreads, 0,
+          stream>>>(
+              publication_rows_a_.data() + window.input_begin,
+              range_hot_selected_count_.data(), raw_payloads_.data(),
+              resident_rows(), route_headers_.data(), route_slices_.data(),
+              route_logical_begins_.data(),
+              level_q_logical_offsets_.data());
+      gpulsmopt2_detail::build_range_hot_descriptors_kernel<<<
+          blocks(quotient_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              publication_keys_a_.data() + window.input_begin,
+              range_hot_selected_count_.data(), window.quotient_begin,
+              window.quotient_end, window.input_begin,
+              range_hot_descriptors_.data());
+    }
+    CUDA_CHECK(cudaGetLastError());
+  }
+  void launch_section_ranges(cudaStream_t stream, bool hot_ready) {
     gpulsmopt2_detail::cooperative_section_owned_range_kernel<
         gpulsmopt2_detail::SumRowsAggregate>
         <<<range_section_blocks_, gpulsmopt2_detail::kSectionRangeThreads,
@@ -7768,7 +7502,10 @@ private:
             range_section_task_offsets_.data() +
                 gpulsmopt2_detail::kQuotients,
             resident_rows(), descriptors_.data(), route_headers_.data(),
-            route_slices_.data(), local_rank_.data(), raw_keys_.data(),
+            route_slices_.data(), local_rank_.data(),
+            publication_rows_a_.data(),
+            range_hot_descriptors_.data(), hot_ready,
+            raw_keys_.data(),
             raw_payloads_.data(),
             raw_offsets_.data(), static_cast<std::uint32_t>(batch_capacity_),
             pending_batches_, range_fragment_partials_.data(),
@@ -7777,7 +7514,7 @@ private:
   void launch_fragment_ranges(std::uint32_t fragment_count,
                               std::uint32_t query_count,
                               const DeviceRangeOutputBatch &batch,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, bool hot_ready) {
     gpulsmopt2_detail::warp_range_fragment_kernel<
         gpulsmopt2_detail::SumRowsAggregate>
         <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
@@ -7785,6 +7522,8 @@ private:
             range_fragment_offsets_.data() + query_count,
             batch.lo, batch.hi, resident_rows(), descriptors_.data(),
             route_headers_.data(), route_slices_.data(),
+            publication_rows_a_.data(),
+            range_hot_descriptors_.data(), hot_ready,
             raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             pending_batches_, range_fragment_partials_.data(),
@@ -7994,6 +7733,16 @@ private:
   gpulsmopt2_detail::Buffer<std::uint32_t> range_reduction_completion_;
   gpulsmopt2_detail::Buffer<std::uint64_t> range_fragment_total_;
   gpulsmopt2_detail::PinnedBuffer<std::uint64_t> range_total_receipt_;
+  gpulsmopt2_detail::Buffer<std::uint64_t> range_hot_counts_,
+      range_hot_offsets_, range_hot_tokens_a_, range_hot_tokens_b_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> range_hot_window_offsets_,
+      range_hot_selected_count_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor>
+      range_hot_descriptors_;
+  gpulsmopt2_detail::Buffer<std::uint8_t> range_hot_temp_;
+  gpulsmopt2_detail::PinnedBuffer<std::uint64_t> range_hot_total_receipt_,
+      range_hot_offsets_receipt_;
+  std::size_t range_hot_token_capacity_{};
   gpulsmopt2_detail::Buffer<std::uint8_t> range_query_storage_,
       range_fragment_storage_, range_section_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_fragment_counts_,
