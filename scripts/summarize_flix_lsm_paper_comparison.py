@@ -316,15 +316,29 @@ def main():
     if not cleanup.empty:
         cleanup.to_csv(os.path.join(summary_dir, "cleanup_lsmu.csv"), index=False)
 
-    graph_bulk(bulk, os.path.join(graph_dir, "bulk_build.png"))
+    graph_bulk(
+        bulk,
+        os.path.join(graph_dir, "bulk_build_throughput_n2p27.png"))
     graph_insertion(
-        insertion_summary, os.path.join(graph_dir, "batch_insertion.png"))
+        insertion_summary,
+        os.path.join(
+            graph_dir, "batch_insertion_throughput_by_batch_size.png"))
     graph_effective_insertion(
-        insertion, os.path.join(graph_dir, "effective_insertion.png"))
+        insertion,
+        os.path.join(
+            graph_dir, "cumulative_effective_insertion_throughput.png"))
     graph_batch_latency(
-        insertion, os.path.join(graph_dir, "batch_latency_b19.png"))
-    graph_lookup(lookup_summary, os.path.join(graph_dir, "lookup.png"))
-    graph_range(range_summary, os.path.join(graph_dir, "range.png"))
+        insertion,
+        os.path.join(
+            graph_dir, "per_batch_insertion_latency_b2p19.png"))
+    graph_lookup(
+        lookup_summary,
+        os.path.join(
+            graph_dir, "point_lookup_throughput_hits_vs_misses.png"))
+    graph_range(
+        range_summary,
+        os.path.join(
+            graph_dir, "range_enumeration_throughput_l8_vs_l1024.png"))
 
     report_path = os.path.join(result_dir, "REPORT.md")
     with open(report_path, "w", encoding="utf-8") as report:
@@ -389,20 +403,51 @@ def main():
                  "amortized_speedup"])
             report.write("\n")
         report.write("## Figures\n\n")
-        figure_names = (
-            "bulk_build.png",
-            "batch_insertion.png",
-            "effective_insertion.png",
-            "batch_latency_b19.png",
-            "lookup.png",
-            "range.png",
+        figures = (
+            (
+                "bulk_build_throughput_n2p27.png",
+                "Bulk-build throughput at N = 2^27",
+                "GPULSMOpt and LSMu bulk-build throughput for 2^27 records",
+            ),
+            (
+                "batch_insertion_throughput_by_batch_size.png",
+                "Batch-insertion throughput by external batch size",
+                "Minimum, maximum, and harmonic-mean insertion throughput "
+                "across resident states",
+            ),
+            (
+                "cumulative_effective_insertion_throughput.png",
+                "Cumulative effective insertion throughput",
+                "Cumulative insertion throughput versus resident records "
+                "for b in {2^17, 2^18, 2^19, 2^20}",
+            ),
+            (
+                "per_batch_insertion_latency_b2p19.png",
+                "Per-batch insertion latency for b = 2^19",
+                "Insertion latency at every resident state for external "
+                "batch size 2^19",
+            ),
+            (
+                "point_lookup_throughput_hits_vs_misses.png",
+                "Point-lookup throughput: all hits versus all misses",
+                "Point-lookup throughput across resident states, separated "
+                "into all-existing and none-existing probes",
+            ),
+            (
+                "range_enumeration_throughput_l8_vs_l1024.png",
+                "Range-enumeration throughput: L = 8 versus L = 1024",
+                "Range-enumeration-with-checksum throughput across resident "
+                "states for expected result lengths 8 and 1024",
+            ),
         )
-        for name in figure_names:
+        for name, heading, description in figures:
             path = os.path.join(graph_dir, name)
             if not os.path.exists(path):
                 continue
-            label = name.removesuffix(".png").replace("_", " ")
-            report.write(f"### {label}\n\n![{label}](graphs/{name})\n\n")
+            report.write(
+                f"### {heading}\n\n"
+                f"![{description}](graphs/{name})\n\n"
+                f"{description}.\n\n")
     print("Wrote", report_path)
 
 
