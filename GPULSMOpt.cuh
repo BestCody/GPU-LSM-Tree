@@ -127,6 +127,13 @@ inline std::size_t initial_storage_capacity(
   return capacity;
 }
 
+inline std::size_t initial_level_capacity(
+    std::size_t requested, std::size_t fallback,
+    std::size_t maximum) {
+  const std::size_t capacity = requested ? requested : fallback;
+  return std::min(maximum, std::max<std::size_t>(1u, capacity));
+}
+
 inline std::size_t foundation_pool_capacity(std::size_t requested) {
   constexpr std::size_t even_maximum = kMaximumPublicationRows - 1u;
   // Two banks reserve worst-case raw rows.
@@ -5875,17 +5882,19 @@ public:
             std::max<std::size_t>(1u, config.batch_capacity))),
         publication_capacity_(gpulsmopt2_detail::initial_storage_capacity(
             config.max_elements, batch_capacity_)),
+        level_zero_capacity_(gpulsmopt2_detail::initial_level_capacity(
+            config.level_zero_capacity,
+            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch,
+            publication_capacity_)),
         foundation_pool_capacity_(
             gpulsmopt2_detail::foundation_pool_capacity(
                 publication_capacity_)),
         level_pool_capacity_(
             gpulsmopt2_detail::preassigned_level_pool_capacity(
-                publication_capacity_,
-                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
+                publication_capacity_, level_zero_capacity_)),
         level_rank_block_capacity_(
             gpulsmopt2_detail::preassigned_level_rank_blocks(
-                publication_capacity_,
-                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
+                publication_capacity_, level_zero_capacity_)),
         resident_merge_capacity_(
             gpulsmopt2_detail::select_balanced_merge_capacity()),
         resident_merge_workspace_bytes_(
@@ -6581,8 +6590,7 @@ private:
 
 
   std::uint32_t initial_level_for_records(std::size_t count) const {
-    std::size_t capacity =
-        batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch;
+    std::size_t capacity = level_zero_capacity_;
     std::uint32_t level = 0u;
     while (level + 1u < gpulsmopt2_detail::kMaximumLevels &&
            capacity <= count / 2u) {
@@ -6645,9 +6653,7 @@ private:
                gpulsmopt2_detail::kMaximumLevels> rank_spans{};
     std::uint64_t cursor = foundation_pool_capacity_;
     std::uint64_t rank_cursor = 0u;
-    std::size_t capacity = std::min(
-        publication_capacity_,
-        batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
+    std::size_t capacity = level_zero_capacity_;
     for (std::uint32_t level = 0u;
          level < gpulsmopt2_detail::kMaximumLevels; ++level) {
       spans[level] = {cursor, capacity};
@@ -7098,6 +7104,7 @@ private:
     publication_failure_status_ = receipt.status;
     if (receipt.status != gpulsmopt2_detail::kPublicationSuccess) {
       // Keep raw batches when publication fails.
+      publication_failure_receipt_ = receipt;
       publication_failed_ = true;
       failed_epoch_signatures_ready_ = false;
       return;
@@ -7132,6 +7139,7 @@ private:
     std::fill_n(raw_batch_counts_, gpulsmopt2_detail::kBatchesPerEpoch, 0u);
     publication_failed_ = false;
     publication_failure_status_ = gpulsmopt2_detail::kPublicationSuccess;
+    publication_failure_receipt_ = {};
     failed_epoch_signatures_ready_ = false;
     ++stats_.epochs_published;
   }
@@ -7156,9 +7164,18 @@ private:
 
   void reject_updates_after_publication_failure() const {
     if (!publication_failed_) return;
+    const auto &receipt = publication_failure_receipt_;
     throw std::runtime_error(
         "GPULSMOpt publication failed with status " +
         std::to_string(publication_failure_status_) +
+        "; destination=" + std::to_string(receipt.destination_level) +
+        ", selected=" + std::to_string(receipt.selected_count) +
+        ", reservation=" + std::to_string(receipt.raw_reservation) +
+        ", capacity=" + std::to_string(receipt.output_capacity) +
+        ", survivors=" + std::to_string(receipt.survivor_count) +
+        ", jobs=" + std::to_string(receipt.job_count) +
+        ", routes=" + std::to_string(receipt.route_count) +
+        ", ranks=" + std::to_string(receipt.rank_block_count) +
         "; pending updates were preserved");
   }
 
@@ -7206,6 +7223,7 @@ private:
     publication_receipt_pending_ = false;
     publication_failed_ = false;
     publication_failure_status_ = gpulsmopt2_detail::kPublicationSuccess;
+    publication_failure_receipt_ = {};
     failed_epoch_signatures_ready_ = false;
     active_levels_ = 0u;
     host_occupied_level_mask_ = 0u;
@@ -7298,6 +7316,11 @@ private:
       publication_failed_ = true;
       publication_failure_status_ =
           gpulsmopt2_detail::kPublicationOutputOverflow;
+      publication_failure_receipt_ = {};
+      publication_failure_receipt_.selected_count =
+          static_cast<std::uint32_t>(pending_records_);
+      publication_failure_receipt_.output_capacity = publication_capacity_;
+      publication_failure_receipt_.status = publication_failure_status_;
       failed_epoch_signatures_ready_ = true;
       return;
     }
@@ -7637,6 +7660,7 @@ private:
   }
   std::size_t batch_capacity_{};
   std::size_t publication_capacity_{};
+  std::size_t level_zero_capacity_{};
   std::size_t foundation_pool_capacity_{};
   std::size_t level_pool_capacity_{};
   std::size_t level_rank_block_capacity_{};
@@ -7653,6 +7677,8 @@ private:
   bool publication_failed_{};
   bool failed_epoch_signatures_ready_{};
   std::uint32_t publication_failure_status_{};
+  gpulsmopt2_detail::ResidentPublicationPlan
+      publication_failure_receipt_{};
   std::size_t radix_id_capacity_{};
   std::uint32_t *radix_input_ids_{};
   void *radix_workspace_{};

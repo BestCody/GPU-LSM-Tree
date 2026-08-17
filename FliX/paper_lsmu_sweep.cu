@@ -1,7 +1,16 @@
+#include <iostream>
+
+#include "utilities.cuh"
+
+#if defined(PAPER_SWEEP_GPULSMOPT)
+#include "impl_gpulsmopt.cuh"
+#else
 #include "impl_lsm_tree.cuh"
+#endif
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -22,6 +31,16 @@ namespace
 
 using key_type = std::uint32_t;
 using clock_type = std::chrono::steady_clock;
+
+#if defined(PAPER_SWEEP_GPULSMOPT)
+constexpr const char *index_name = "GPULSMOpt";
+template <unsigned BatchLog>
+using paper_index_type = gpulsmopt<key_type>;
+#else
+constexpr const char *index_name = "LSMu";
+template <unsigned BatchLog>
+using paper_index_type = lsm_tree_ashkiani<key_type, BatchLog>;
+#endif
 
 constexpr unsigned batch_log = PAPER_LSM_BATCH_LOG;
 constexpr std::uint64_t key_domain = std::uint64_t{1} << 30;
@@ -64,6 +83,13 @@ __global__ void fill_insert_batch(
         return;
     keys[tid] = key_for_index(begin + tid);
     values[tid] = 1;
+}
+
+__global__ void fill_build_keys(key_type *keys, std::uint32_t size)
+{
+    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < size)
+        keys[tid] = key_for_index(tid);
 }
 
 __global__ void fill_lookup_queries(
@@ -122,6 +148,22 @@ __global__ void validate_lookup_results(
         atomicAdd(errors, 1ull);
 }
 
+__global__ void validate_lookup_presence(
+    const smallsize *results,
+    std::uint32_t size,
+    bool hits,
+    unsigned long long *errors)
+{
+    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= size)
+        return;
+    const bool found = results[tid] != not_found;
+    if (found != hits)
+        atomicAdd(errors, 1ull);
+}
+
+#if !defined(PAPER_SWEEP_GPULSMOPT)
+
 __global__ void compare_results(
     const smallsize *left,
     const smallsize *right,
@@ -133,7 +175,50 @@ __global__ void compare_results(
         atomicAdd(errors, 1ull);
 }
 
-__global__ void fill_cleanup_batch(
+#endif
+
+__device__ std::uint64_t digest_mix(std::uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+    return value ^ (value >> 31);
+}
+
+__global__ void digest_range_results(
+    const smallsize *results,
+    std::uint32_t size,
+    std::uint32_t query_offset,
+    unsigned long long *digest)
+{
+    __shared__ unsigned long long sums[threads];
+    __shared__ unsigned long long xors[threads];
+    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = tid < size;
+    const std::uint64_t query = std::uint64_t{query_offset} + tid;
+    const std::uint64_t result = active ? results[tid] : 0;
+    sums[threadIdx.x] = result;
+    xors[threadIdx.x] = active
+        ? digest_mix((query << 32) | result)
+        : 0;
+    __syncthreads();
+    for (std::uint32_t stride = threads / 2; stride; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+        {
+            sums[threadIdx.x] += sums[threadIdx.x + stride];
+            xors[threadIdx.x] ^= xors[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        atomicAdd(digest, sums[0]);
+        atomicXor(digest + 1, xors[0]);
+    }
+}
+
+[[maybe_unused]] __global__ void fill_cleanup_batch(
     key_type *keys,
     smallsize *values,
     std::uint32_t begin,
@@ -191,6 +276,12 @@ struct options
     std::uint32_t stop_after_r = 0;
     bool main_sweep = true;
     bool cleanup_sweep = false;
+    bool bulk_sweep = false;
+#if defined(PAPER_SWEEP_GPULSMOPT)
+    bool include_count = false;
+#else
+    bool include_count = true;
+#endif
 };
 
 unsigned parse_unsigned(const char *value, const char *name)
@@ -232,12 +323,22 @@ options parse_options(int argc, char **argv)
         {
             result.main_sweep = true;
             result.cleanup_sweep = false;
+            result.bulk_sweep = false;
         }
         else if (argument == "--cleanup-only")
         {
             result.main_sweep = false;
             result.cleanup_sweep = true;
+            result.bulk_sweep = false;
         }
+        else if (argument == "--bulk-only")
+        {
+            result.main_sweep = false;
+            result.cleanup_sweep = false;
+            result.bulk_sweep = true;
+        }
+        else if (argument == "--range-only")
+            result.include_count = false;
         else
             throw std::invalid_argument("unknown argument: " + argument);
     }
@@ -262,11 +363,20 @@ void write_metadata(const options &configuration)
     cudaDeviceProp properties{};
     PAPER_CUDA(cudaGetDeviceProperties(&properties, 0));
     output << "paper=1707.05354v2.pdf\n";
+    output << "index=" << index_name << '\n';
     output << "gpu=" << properties.name << '\n';
     output << "batch_log=" << batch_log << '\n';
     output << "insert_limit_log=" << configuration.insert_limit_log << '\n';
     output << "query_limit_log=" << configuration.query_limit_log << '\n';
     output << "range_chunk_log=" << configuration.range_chunk_log << '\n';
+    output << "count_enabled=" << configuration.include_count << '\n';
+    output << "range_implementation=enumeration_checksum\n";
+#if defined(PAPER_SWEEP_GPULSMOPT)
+    output << "gpulsmopt_maximum_batch_capacity="
+           << gpulsmopt_adapter_detail::batch_capacity() << '\n';
+    output << "gpulsmopt_level_zero_capacity="
+           << gpulsmopt_adapter_detail::level_zero_capacity() << '\n';
+#endif
 }
 
 template <typename Index>
@@ -294,23 +404,38 @@ double run_lookup(
     return milliseconds;
 }
 
+struct range_measurement
+{
+    double count_ms = std::numeric_limits<double>::quiet_NaN();
+    double range_ms = 0;
+    std::uint64_t checksum_sum = 0;
+    std::uint64_t checksum_xor = 0;
+};
+
 template <typename Index>
-std::pair<double, double> run_count_and_range(
+range_measurement run_count_and_range(
     Index &index,
     cuda_buffer<key_type> &lower,
     cuda_buffer<key_type> &upper,
     cuda_buffer<smallsize> &count_results,
     cuda_buffer<smallsize> &range_results,
+    cuda_buffer<unsigned long long> &range_digest,
     cuda_buffer<unsigned long long> &errors,
     std::uint32_t total_queries,
     std::uint32_t resident,
     std::uint32_t expected_hits,
     std::uint32_t chunk_size,
     std::uint32_t seed,
+    bool include_count,
     gpu_timer &timer)
 {
-    double count_ms = 0;
-    double range_ms = 0;
+#if defined(PAPER_SWEEP_GPULSMOPT)
+    (void)count_results;
+    (void)errors;
+    (void)include_count;
+#endif
+    range_measurement measurement;
+    range_digest.zero();
     for (std::uint32_t offset = 0; offset < total_queries;)
     {
         const std::uint32_t current =
@@ -320,28 +445,119 @@ std::pair<double, double> run_count_and_range(
                 lower.ptr(), upper.ptr(), current, resident,
                 expected_hits, seed + offset);
         PAPER_CUDA(cudaGetLastError());
-        count_ms += timer.measure([&] {
-            index.count(
-                lower.ptr(), upper.ptr(), count_results.ptr(), current, 0);
-        });
-        range_ms += timer.measure([&] {
+#if defined(PAPER_SWEEP_GPULSMOPT)
+        measurement.range_ms += timer.measure([&] {
             index.range_lookup_sum(
                 lower.ptr(), upper.ptr(), range_results.ptr(), current, 0);
         });
-        compare_results<<<
+#else
+        if (include_count)
+        {
+            if (!std::isfinite(measurement.count_ms))
+                measurement.count_ms = 0;
+            measurement.count_ms += timer.measure([&] {
+                index.count(
+                    lower.ptr(), upper.ptr(), count_results.ptr(), current, 0);
+            });
+        }
+        measurement.range_ms += timer.measure([&] {
+            index.range_lookup_sum(
+                lower.ptr(), upper.ptr(), range_results.ptr(), current, 0);
+        });
+        if (include_count)
+        {
+            compare_results<<<
+                (current + threads - 1) / threads, threads>>>(
+                    count_results.ptr(), range_results.ptr(), current,
+                    errors.ptr());
+            PAPER_CUDA(cudaGetLastError());
+        }
+#endif
+        digest_range_results<<<
             (current + threads - 1) / threads, threads>>>(
-                count_results.ptr(), range_results.ptr(), current,
-                errors.ptr());
+                range_results.ptr(), current, offset,
+                range_digest.ptr());
         PAPER_CUDA(cudaGetLastError());
         offset += current;
     }
-    return {count_ms, range_ms};
+    const auto digest = range_digest.download(2);
+    measurement.checksum_sum = digest[0];
+    measurement.checksum_xor = digest[1];
+    return measurement;
+}
+
+template <unsigned BatchLog>
+void run_bulk_build(const options &configuration)
+{
+    using index_type = paper_index_type<BatchLog>;
+    const std::uint32_t element_count =
+        std::uint32_t{1} << configuration.insert_limit_log;
+    cuda_buffer<key_type> keys;
+    keys.alloc(element_count);
+    fill_build_keys<<<(element_count + threads - 1) / threads, threads>>>(
+        keys.ptr(), element_count);
+    PAPER_CUDA(cudaGetLastError());
+    PAPER_CUDA(cudaDeviceSynchronize());
+
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    PAPER_CUDA(cudaMemGetInfo(&free_memory, &total_memory));
+    index_type index;
+    double gpu_time_ms = 0;
+    size_t resident_bytes = 0;
+    const double wall_time_ms = measure_wall_ms([&] {
+        index.build(
+            keys.ptr(), element_count, element_count, free_memory,
+            &gpu_time_ms, &resident_bytes);
+    });
+    PAPER_CUDA(cudaDeviceSynchronize());
+
+    const std::uint32_t validation_count =
+        std::min<std::uint32_t>(element_count, std::uint32_t{1} << 18);
+    cuda_buffer<key_type> queries;
+    cuda_buffer<smallsize> results;
+    cuda_buffer<unsigned long long> errors;
+    queries.alloc(validation_count);
+    results.alloc(validation_count);
+    errors.alloc(1);
+    errors.zero();
+    for (const bool hits : {true, false})
+    {
+        fill_lookup_queries<<<
+            (validation_count + threads - 1) / threads, threads>>>(
+                queries.ptr(), validation_count, element_count, hits,
+                hits ? 0x71000u : 0x72000u);
+        index.lookup(queries.ptr(), results.ptr(), validation_count, 0);
+        validate_lookup_presence<<<
+            (validation_count + threads - 1) / threads, threads>>>(
+                results.ptr(), validation_count, hits, errors.ptr());
+    }
+    PAPER_CUDA(cudaDeviceSynchronize());
+    const unsigned long long error_count = errors.download_first_item();
+    if (error_count != 0)
+        throw std::runtime_error(
+            "bulk-build lookup validation failures: " +
+            std::to_string(error_count));
+
+    const auto output_path = configuration.output_directory / "bulk_build.csv";
+    std::ofstream output(output_path);
+    output << "system,batch_log,elements,gpu_time_ms,wall_time_ms,"
+              "rate_mops,gpu_resident_bytes\n";
+    output << std::setprecision(12)
+           << index_name << ',' << BatchLog << ',' << element_count << ','
+           << gpu_time_ms << ',' << wall_time_ms << ','
+           << element_count / gpu_time_ms / 1000.0 << ','
+           << resident_bytes << '\n';
+    output.flush();
+    std::ofstream complete(
+        configuration.output_directory / "complete_bulk");
+    complete << "ok\n";
 }
 
 template <unsigned BatchLog>
 void run_main_sweep(const options &configuration)
 {
-    using index_type = lsm_tree_ashkiani<key_type, BatchLog>;
+    using index_type = paper_index_type<BatchLog>;
     constexpr std::uint32_t batch_size = std::uint32_t{1} << BatchLog;
     if (configuration.insert_limit_log < BatchLog)
         return;
@@ -369,14 +585,16 @@ void run_main_sweep(const options &configuration)
         configuration.output_directory / ("insertion" + suffix));
     std::ofstream lookup_file(
         configuration.output_directory / ("lookup" + suffix));
+    const std::string range_prefix =
+        configuration.include_count ? "count_range" : "range";
     std::ofstream range_file(
-        configuration.output_directory / ("count_range" + suffix));
-    insertion_file << "batch_log,r,resident_elements,time_ms,rate_mops,"
+        configuration.output_directory / (range_prefix + suffix));
+    insertion_file << "system,batch_log,r,resident_elements,time_ms,rate_mops,"
                       "cumulative_ms,effective_rate_mops\n";
-    lookup_file << "batch_log,r,resident_elements,scenario,time_ms,"
+    lookup_file << "system,batch_log,r,resident_elements,scenario,time_ms,"
                    "rate_mops\n";
-    range_file << "batch_log,r,resident_elements,operation,expected_hits,"
-                  "time_ms,rate_mops,chunk_size\n";
+    range_file << "system,batch_log,r,resident_elements,operation,expected_hits,"
+                  "time_ms,rate_mops,chunk_size,checksum_sum,checksum_xor\n";
     insertion_file << std::setprecision(12);
     lookup_file << std::setprecision(12);
     range_file << std::setprecision(12);
@@ -388,22 +606,26 @@ void run_main_sweep(const options &configuration)
 
     cuda_buffer<key_type> lookup_queries;
     cuda_buffer<smallsize> lookup_results;
-    if (run_lookups)
-    {
-        lookup_queries.alloc(query_maximum);
-        lookup_results.alloc(query_maximum);
-    }
+    const std::uint32_t validation_count =
+        std::min(maximum_elements, std::uint32_t{1} << 18);
+    const std::uint32_t lookup_capacity =
+        std::max(query_maximum, validation_count);
+    lookup_queries.alloc(lookup_capacity);
+    lookup_results.alloc(lookup_capacity);
 
     cuda_buffer<key_type> lower;
     cuda_buffer<key_type> upper;
     cuda_buffer<smallsize> count_results;
     cuda_buffer<smallsize> range_results;
+    cuda_buffer<unsigned long long> range_digest;
     if (run_ranges)
     {
         lower.alloc(range_chunk);
         upper.alloc(range_chunk);
-        count_results.alloc(range_chunk);
+        if (configuration.include_count)
+            count_results.alloc(range_chunk);
         range_results.alloc(range_chunk);
+        range_digest.alloc(2);
     }
 
     cuda_buffer<unsigned long long> errors;
@@ -439,7 +661,8 @@ void run_main_sweep(const options &configuration)
         const double insert_rate = batch_size / insert_ms / 1000.0;
         const double effective_rate =
             resident / cumulative_insert_ms / 1000.0;
-        insertion_file << BatchLog << ',' << r << ',' << resident << ','
+        insertion_file << index_name << ',' << BatchLog << ',' << r << ','
+                       << resident << ','
                        << insert_ms << ',' << insert_rate << ','
                        << cumulative_insert_ms << ',' << effective_rate << '\n';
         insertion_file.flush();
@@ -452,10 +675,12 @@ void run_main_sweep(const options &configuration)
             const double miss_ms = run_lookup(
                 index, lookup_queries, lookup_results, errors,
                 resident, resident, false, 0x20000u + r, timer);
-            lookup_file << BatchLog << ',' << r << ',' << resident
+            lookup_file << index_name << ',' << BatchLog << ',' << r << ','
+                        << resident
                         << ",all_existing," << hit_ms << ','
                         << resident / hit_ms / 1000.0 << '\n';
-            lookup_file << BatchLog << ',' << r << ',' << resident
+            lookup_file << index_name << ',' << BatchLog << ',' << r << ','
+                        << resident
                         << ",none_existing," << miss_ms << ','
                         << resident / miss_ms / 1000.0 << '\n';
             lookup_file.flush();
@@ -467,18 +692,24 @@ void run_main_sweep(const options &configuration)
             {
                 const auto times = run_count_and_range(
                     index, lower, upper, count_results, range_results,
-                    errors, resident, resident, expected_hits,
-                    range_chunk, 0x30000u + r + expected_hits, timer);
-                range_file << BatchLog << ',' << r << ',' << resident
-                           << ",count," << expected_hits << ','
-                           << times.first << ','
-                           << resident / times.first / 1000.0 << ','
-                           << range_chunk << '\n';
-                range_file << BatchLog << ',' << r << ',' << resident
+                    range_digest, errors, resident, resident, expected_hits,
+                    range_chunk, 0x30000u + r + expected_hits,
+                    configuration.include_count, timer);
+                if (configuration.include_count)
+                {
+                    range_file << index_name << ',' << BatchLog << ',' << r
+                               << ',' << resident << ",count," << expected_hits
+                               << ',' << times.count_ms << ','
+                               << resident / times.count_ms / 1000.0 << ','
+                               << range_chunk << ",0,0\n";
+                }
+                range_file << index_name << ',' << BatchLog << ',' << r << ','
+                           << resident
                            << ",range," << expected_hits << ','
-                           << times.second << ','
-                           << resident / times.second / 1000.0 << ','
-                           << range_chunk << '\n';
+                           << times.range_ms << ','
+                           << resident / times.range_ms / 1000.0 << ','
+                           << range_chunk << ',' << times.checksum_sum << ','
+                           << times.checksum_xor << '\n';
                 range_file.flush();
             }
         }
@@ -495,17 +726,31 @@ void run_main_sweep(const options &configuration)
         }
     }
 
+    const std::uint32_t final_resident = insertion_count * batch_size;
+    run_lookup(
+        index, lookup_queries, lookup_results, errors,
+        validation_count, final_resident, true, 0x61000u, timer);
+    run_lookup(
+        index, lookup_queries, lookup_results, errors,
+        validation_count, final_resident, false, 0x62000u, timer);
     PAPER_CUDA(cudaDeviceSynchronize());
     const unsigned long long error_count = errors.download_first_item();
     if (error_count != 0)
         throw std::runtime_error(
             "paper sweep validation failures: " +
             std::to_string(error_count));
-    std::ofstream complete(
-        configuration.output_directory /
-        ("complete_b" + std::to_string(BatchLog)));
+    const std::string marker_prefix = configuration.include_count
+        ? ""
+        : "range_";
+    const std::string marker = insertion_count == paper_insertion_count
+        ? "complete_" + marker_prefix + "b" + std::to_string(BatchLog)
+        : "partial_" + marker_prefix + "b" + std::to_string(BatchLog) + "_r" +
+              std::to_string(insertion_count);
+    std::ofstream complete(configuration.output_directory / marker);
     complete << "ok\n";
 }
+
+#if !defined(PAPER_SWEEP_GPULSMOPT)
 
 template <unsigned BatchLog>
 void run_cleanup_case(
@@ -580,7 +825,7 @@ void run_cleanup_case(
     const bool write_header = !std::filesystem::exists(output_path);
     std::ofstream output(output_path, std::ios::app);
     if (write_header)
-        output << "batch_log,resident_batches,resident_elements,"
+        output << "system,batch_log,resident_batches,resident_elements,"
                   "stale_percent,survivors,cleanup_wall_ms,"
                   "cleanup_rate_mops,query_count,before_lookup_ms,"
                   "after_lookup_ms,speedup,amortized_speedup\n";
@@ -592,7 +837,8 @@ void run_cleanup_case(
         ? before_lookup_ms / (cleanup_wall_ms + after_lookup_ms)
         : 0;
     output << std::setprecision(12)
-           << BatchLog << ',' << resident_batches << ',' << resident << ','
+           << index_name << ',' << BatchLog << ',' << resident_batches << ','
+           << resident << ','
            << stale_percent << ',' << survivors << ',' << cleanup_wall_ms
            << ',' << rate << ',' << (query_benefit ? benefit_queries : 0)
            << ',' << before_lookup_ms << ',' << after_lookup_ms << ','
@@ -620,6 +866,16 @@ void run_cleanup_sweep(const options &configuration)
         run_cleanup_case<18>(configuration, 127, 10, true);
 }
 
+#else
+
+void run_cleanup_sweep(const options &)
+{
+    throw std::invalid_argument(
+        "GPULSMOpt has no paper-equivalent explicit cleanup operation");
+}
+
+#endif
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -630,6 +886,8 @@ int main(int argc, char **argv)
         PAPER_CUDA(cudaSetDevice(0));
         PAPER_CUDA(cudaFree(0));
         write_metadata(configuration);
+        if (configuration.bulk_sweep)
+            run_bulk_build<batch_log>(configuration);
         if (configuration.main_sweep)
             run_main_sweep<batch_log>(configuration);
         if (configuration.cleanup_sweep)

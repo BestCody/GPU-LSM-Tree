@@ -1,4 +1,9 @@
 tuning_results/
 /FliX/bench_*/
 /build/
+
+# Generated benchmark and paper-experiment output.
 /results/
+**/paper_sweep_results/
+**/flix_lsm_paper_*/
+/scripts/__pycache__/

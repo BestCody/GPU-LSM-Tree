@@ -59,6 +59,16 @@ constexpr size_t batch_capacity() {
   return capacity;
 }
 
+constexpr size_t level_zero_capacity() {
+  size_t batch = batch_capacity();
+#ifdef PAPER_LSM_BATCH_LOG
+  constexpr size_t paper_batch =
+      size_t{1} << static_cast<size_t>(PAPER_LSM_BATCH_LOG);
+  batch = batch < paper_batch ? batch : paper_batch;
+#endif
+  return batch * gpulsmopt2_detail::kBatchesPerEpoch;
+}
+
 inline void check_cuda(cudaError_t err) {
   if (err != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(err));
@@ -155,6 +165,8 @@ public:
     return {
         {"batch_capacity",
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
+        {"level_zero_capacity",
+         std::to_string(gpulsmopt_adapter_detail::level_zero_capacity())},
         {"structure", "quotient_local_binary_epochs"},
         {"range", "visible_row_fragments"},
         {"epoch_batches",
@@ -198,6 +210,8 @@ public:
     DictionaryConfig config;
     config.max_elements = configured_max_size;
     config.batch_capacity = config_batch_capacity;
+    config.level_zero_capacity =
+        gpulsmopt_adapter_detail::level_zero_capacity();
     gpulsmopt_adapter_detail::scoped_cuda_event_timer timer(0, build_time_ms);
     dictionary_ = std::make_unique<GPULSMOpt>(config);
     gpulsmopt_adapter_detail::fill_sequence(

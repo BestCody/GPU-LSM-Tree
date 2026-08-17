@@ -9,9 +9,13 @@ set(CMAKE_CUDA_STANDARD 17)
 option(FLIX_USE_KEY_CACHE "Reuse generated benchmark key caches" OFF)
 option(FLIX_BUILD_LSMU_PAPER_SWEEP
        "Build the standalone GPU LSM paper sweep" OFF)
+option(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP
+       "Build the GPULSMOpt GPU LSM paper sweep" OFF)
 
 set(FLIX_NEEDS_OPTIX ON)
-if(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
+if(FLIX_BUILD_LSMU_PAPER_SWEEP OR FLIX_BUILD_GPULSMOPT_PAPER_SWEEP)
+  set(FLIX_NEEDS_OPTIX OFF)
+elseif(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
    IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB)")
   set(FLIX_NEEDS_OPTIX OFF)
 endif()
@@ -103,22 +107,35 @@ add_executable(index_prototype
         impl_opt_binsearch.cuh
 )
 
-if(FLIX_BUILD_LSMU_PAPER_SWEEP)
-  add_executable(lsmu_paper_sweep paper_lsmu_sweep.cu)
-  set_target_properties(lsmu_paper_sweep PROPERTIES
+function(configure_paper_sweep_target target_name)
+  set_target_properties(${target_name} PROPERTIES
           CUDA_SEPARABLE_COMPILATION ON
           CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-  target_compile_options(lsmu_paper_sweep PRIVATE
+  target_compile_options(${target_name} PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:
           --generate-line-info --extended-lambda
           --use_fast_math --expt-relaxed-constexpr -O3
           -Xcompiler=-fopenmp>)
-  target_link_libraries(lsmu_paper_sweep PRIVATE
+  target_link_libraries(${target_name} PRIVATE
           CUDA::cudart OpenMP::OpenMP_CXX)
   if(FLIX_NVTX_FALLBACK_INCLUDE_DIR)
-    target_include_directories(lsmu_paper_sweep PRIVATE
+    target_include_directories(${target_name} PRIVATE
             "${FLIX_NVTX_FALLBACK_INCLUDE_DIR}")
   endif()
+endfunction()
+
+if(FLIX_BUILD_LSMU_PAPER_SWEEP)
+  add_executable(lsmu_paper_sweep paper_lsmu_sweep.cu)
+  target_compile_definitions(lsmu_paper_sweep PRIVATE LSM_TREE)
+  configure_paper_sweep_target(lsmu_paper_sweep)
+endif()
+
+if(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP)
+  add_executable(gpulsmopt_paper_sweep paper_lsmu_sweep.cu)
+  target_compile_definitions(gpulsmopt_paper_sweep PRIVATE
+          GPULSMOPT PAPER_SWEEP_GPULSMOPT UNSORTED_PROBES_CHECKS
+          GPULSMOPT_BATCH_CAPACITY=1048576)
+  configure_paper_sweep_target(gpulsmopt_paper_sweep)
 endif()
 
 set_target_properties(index_prototype PROPERTIES
