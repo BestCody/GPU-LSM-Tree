@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -193,8 +194,9 @@ __host__ __device__ constexpr std::size_t canonical_align_bytes(
   return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-inline std::size_t canonical_tournament_dynamic_shared_bytes(
-    std::uint32_t capacity, std::uint32_t source_count) {
+inline std::size_t canonical_tournament_layout_bytes(
+    std::uint32_t capacity, std::uint32_t source_count,
+    bool cached_sources) {
   const std::uint32_t leaves = canonical_next_power_of_two(source_count);
   std::size_t bytes = 0u;
   const auto reserve = [&bytes](std::size_t count, std::size_t item_bytes,
@@ -204,11 +206,26 @@ inline std::size_t canonical_tournament_dynamic_shared_bytes(
   };
   const std::size_t states =
       std::size_t{kCanonicalTournamentChains} * source_count;
-  reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
-  reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
-  if (kCanonicalCompactMultiway)
+  if (cached_sources) {
+    // One packed (remaining, position) cursor replaces the two 16-bit
+    // arrays.  Cell-local positions live in unused head bits, so the compact
+    // reference path no longer needs a per-chain slice-base array.
+    reserve(states, sizeof(std::uint32_t), alignof(std::uint32_t));
+  } else {
     reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
+    reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
+    if (kCanonicalCompactMultiway)
+      reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
+  }
   reserve(states, sizeof(std::uint32_t), alignof(std::uint32_t));
+  if (cached_sources) {
+    const std::size_t source_quotients =
+        std::size_t{kCanonicalJobQuotients} * source_count;
+    reserve(source_quotients, sizeof(std::uint64_t),
+            alignof(std::uint64_t));
+    reserve(source_quotients, sizeof(std::uint32_t),
+            alignof(std::uint32_t));
+  }
   reserve(std::size_t{kCanonicalTournamentChains} * leaves,
           sizeof(std::uint8_t), alignof(std::uint8_t));
   reserve(capacity, sizeof(CanonicalTournamentReference),
@@ -218,6 +235,16 @@ inline std::size_t canonical_tournament_dynamic_shared_bytes(
   reserve(kCanonicalTournamentTasks + 1u, sizeof(std::uint16_t),
           alignof(std::uint16_t));
   return canonical_align_bytes(bytes, 16u);
+}
+
+inline std::size_t canonical_tournament_dynamic_shared_bytes(
+    std::uint32_t capacity, std::uint32_t source_count) {
+  // Keep the old layout as a sizing floor.  The cache overlay therefore does
+  // not silently enlarge jobs just because it repurposes shared memory.  A
+  // larger occupancy-selected grid can still result from lower register use.
+  return std::max(
+      canonical_tournament_layout_bytes(capacity, source_count, false),
+      canonical_tournament_layout_bytes(capacity, source_count, true));
 }
 #if defined(GPULSMOPT_FORCE_UNIFIED_MERGE)
 constexpr bool kForceUnifiedMergeExperiment = true;
@@ -593,6 +620,7 @@ enum ResidentPublicationStatus : std::uint32_t {
   kPublicationRouteOverflow = 1u << 1u,
   kPublicationOutputOverflow = 1u << 3u,
   kPublicationJobTooLarge = 1u << 4u,
+  kPublicationLevelOverflow = 1u << 5u,
 };
 
 struct ResidentPublicationPlan {
@@ -4413,7 +4441,8 @@ __global__ void initialize_device_manifest_kernel(
 __global__ void choose_canonical_publication_path_kernel(
     const std::uint32_t *selected_count,
     const DeviceManifest *manifests, const std::uint32_t *active_manifest,
-    const LevelStorageSpan *level_spans, std::uint32_t job_capacity,
+    const LevelStorageSpan *level_spans, std::uint32_t level_count,
+    std::uint32_t job_capacity, bool top_level_rollover,
     ResidentPublicationPlan *plan) {
   if (blockIdx.x || threadIdx.x) return;
   const std::uint32_t active = atomicAdd(
@@ -4421,37 +4450,59 @@ __global__ void choose_canonical_publication_path_kernel(
   const DeviceManifest *manifest = manifests + active;
   const std::uint64_t occupied = manifest->occupied_level_mask;
   const std::uint64_t empty = ~occupied;
-  const std::uint32_t destination = empty
+  const std::uint32_t natural_destination = empty
       ? static_cast<std::uint32_t>(__ffsll(empty) - 1)
       : kMaximumLevels;
+  const bool valid_rollover = top_level_rollover && level_count &&
+      level_count <= kMaximumLevels && natural_destination >= level_count;
+  const std::uint32_t destination = valid_rollover
+      ? level_count - 1u : natural_destination;
   ResidentPublicationPlan next{};
   next.selected_count = *selected_count;
   next.active_manifest = active;
   next.inactive_manifest = active ^ 1u;
   next.destination_level = destination;
-  next.source_level_limit = destination ? destination - 1u : 0u;
-  const std::uint64_t consumed = destination == kMaximumLevels
-      ? ~std::uint64_t{0}
-      : destination ? (std::uint64_t{1} << destination) - 1u : 0u;
+  next.source_level_limit = valid_rollover
+      ? destination : destination ? destination - 1u : 0u;
+  const std::uint64_t consumed = valid_rollover
+      ? destination == kMaximumLevels - 1u
+          ? ~std::uint64_t{0}
+          : (std::uint64_t{1} << (destination + 1u)) - 1u
+      : destination == kMaximumLevels
+          ? ~std::uint64_t{0}
+          : destination ? (std::uint64_t{1} << destination) - 1u : 0u;
   next.source_count = 1u + static_cast<std::uint32_t>(
       __popcll(occupied & consumed));
-  next.destination_is_foundation =
-      destination < kMaximumLevels &&
+  next.destination_is_foundation = valid_rollover ||
+      (destination < kMaximumLevels &&
       (manifest->foundation_level == kMaximumLevels ||
-       destination > manifest->foundation_level);
+       destination > manifest->foundation_level));
   next.keep_tombstones = !next.destination_is_foundation;
-  next.output_generation = manifest->generation + 1u;
+  next.output_generation = valid_rollover
+      ? (manifest->levels[destination].storage_generation ^ 1u) & 1u
+      : 0u;
   next.job_capacity = job_capacity;
-  next.status = destination < kMaximumLevels
-      ? kPublicationSuccess : kPublicationJobOverflow;
-  if (destination < kMaximumLevels) {
+  const bool valid_destination = destination < level_count &&
+      destination < kMaximumLevels;
+  next.status = valid_destination
+      ? kPublicationSuccess : kPublicationLevelOverflow;
+  if (valid_destination) {
     const LevelStorageSpan span = level_spans[destination];
-    next.output_begin = span.begin;
+    next.output_begin = span.begin +
+        std::uint64_t{next.output_generation} * span.capacity;
     next.output_capacity = span.capacity;
   }
   if (next.selected_count > next.output_capacity)
     next.status |= kPublicationOutputOverflow;
   *plan = next;
+}
+
+__device__ __forceinline__ std::uint64_t canonical_source_level_mask(
+    const ResidentPublicationPlan *plan) {
+  if (plan->source_count <= 1u) return 0u;
+  return plan->source_level_limit >= kMaximumLevels - 1u
+      ? ~std::uint64_t{0}
+      : (std::uint64_t{1} << (plan->source_level_limit + 1u)) - 1u;
 }
 
 __global__ void count_canonical_merge_work_kernel(
@@ -4464,12 +4515,8 @@ __global__ void count_canonical_merge_work_kernel(
   const DeviceManifestSnapshot manifest = load_active_manifest(
       manifests, active_manifest);
   std::uint64_t total = epoch_counts[q];
-  std::uint64_t levels = manifest.occupied_level_mask;
-  if (plan->destination_level < kMaximumLevels) {
-    const std::uint64_t carried = plan->destination_level
-        ? (std::uint64_t{1} << plan->destination_level) - 1u : 0u;
-    levels &= carried;
-  }
+  std::uint64_t levels = manifest.occupied_level_mask &
+      canonical_source_level_mask(plan);
   while (levels) {
     const std::uint32_t level =
         static_cast<std::uint32_t>(__ffsll(levels) - 1);
@@ -4622,8 +4669,10 @@ __device__ __forceinline__ std::uint32_t canonical_combined_prefix_warp(
     total = lower_bound_rows(
         epoch_rows + begin, epoch_counts[q], suffix);
   }
+  const std::uint32_t source_end = plan->source_count > 1u
+      ? min(kMaximumLevels, plan->source_level_limit + 1u) : 0u;
   for (std::uint32_t level = lane;
-       level < plan->destination_level; level += 32u) {
+       level < source_end; level += 32u) {
     if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
     const Descriptor rows = descriptors[descriptor_index(q, level)];
     total += lower_bound_rows(
@@ -4649,8 +4698,10 @@ __device__ __forceinline__ std::uint32_t canonical_cell_prefix_warp(
         ? epoch_cell_ranks[
               std::size_t{q} * kFoundationCells + cell]
         : epoch_counts[q];
+  const std::uint32_t source_end = plan->source_count > 1u
+      ? min(kMaximumLevels, plan->source_level_limit + 1u) : 0u;
   for (std::uint32_t level = lane;
-       level < plan->destination_level; level += 32u) {
+       level < source_end; level += 32u) {
     if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
     const Descriptor rows = descriptors[descriptor_index(q, level)];
     total += cell < kFoundationCells
@@ -4686,8 +4737,10 @@ canonical_combined_cell_prefix_warp(
     total = begin + lower_bound_rows(
         epoch_rows + section_begin + begin, end - begin, suffix);
   }
+  const std::uint32_t source_end = plan->source_count > 1u
+      ? min(kMaximumLevels, plan->source_level_limit + 1u) : 0u;
   for (std::uint32_t level = lane;
-       level < plan->destination_level; level += 32u) {
+       level < source_end; level += 32u) {
     if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
     const Descriptor rows = descriptors[descriptor_index(q, level)];
     const std::uint16_t *ranks = cell_ranks +
@@ -5014,10 +5067,8 @@ __global__ void canonical_carry_jobs_kernel(
           ? StaticSources : plan->source_count;
       std::uint32_t source_count = 0u;
       source_levels[source_count++] = kMaximumLevels;
-      std::uint64_t levels = manifest.occupied_level_mask;
-      const std::uint64_t carried = plan->destination_level
-          ? (std::uint64_t{1} << plan->destination_level) - 1u : 0u;
-      levels &= carried;
+      std::uint64_t levels = manifest.occupied_level_mask &
+          canonical_source_level_mask(plan);
       while (levels && source_count < kSourceSlots) {
         const std::uint32_t level =
             static_cast<std::uint32_t>(__ffsll(levels) - 1);
@@ -5278,8 +5329,15 @@ __global__ void canonical_carry_jobs_kernel(
       output_prefix_shared = prefix;
       if (job_index + 1u == plan->job_count)
         plan->survivor_count = prefix + job_output_count;
+      if (plan->source_level_limit == plan->destination_level &&
+          prefix + job_output_count > plan->output_capacity) {
+        job_valid_shared = 0u;
+        atomicOr(&plan->status, kPublicationOutputOverflow);
+      }
     }
     __syncthreads();
+
+    if (!job_valid_shared) continue;
 
     constexpr unsigned full_warp = 0xffffffffu;
     const std::uint32_t lane = threadIdx.x & 31u;
@@ -5296,9 +5354,9 @@ __global__ void canonical_carry_jobs_kernel(
           candidate, local_q, source_count_shared,
           source_candidate_offsets, source_q_offsets,
           source_q_positions, epoch_rows, arena);
-      const std::uint64_t output = plan->output_begin +
-          output_prefix_shared + thread_output + local;
-      arena.store(output, row);
+      arena.store(
+          plan->output_begin + output_prefix_shared + thread_output + local,
+          row);
       const std::uint32_t q = job.quotient_begin + local_q;
       const std::uint32_t cell =
           q * kFoundationCells + row.key / kFoundationCellKeys;
@@ -5315,29 +5373,29 @@ struct CanonicalTournamentSlice {
   std::uint32_t count{};
 };
 
+// The cache overlay resolves the physical source location once for each
+// source/quotient pair.  Cell discovery can then start directly from that
+// base instead of following source -> level -> descriptor -> offset again.
 __device__ __forceinline__ CanonicalTournamentSlice
 canonical_tournament_cell_slice(
     std::uint32_t source, std::uint32_t level, std::uint32_t q,
     std::uint32_t cell, std::uint32_t suffix_begin,
-    std::uint32_t suffix_end, const Row *epoch_rows,
-    const std::uint32_t *epoch_offsets,
-    const std::uint32_t *epoch_counts,
+    std::uint32_t suffix_end, std::uint64_t source_base,
+    std::uint32_t section_count, const Row *epoch_rows,
     const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
-    const Descriptor *descriptors, const std::uint16_t *cell_ranks) {
+    const std::uint16_t *cell_ranks) {
   const std::uint32_t cell_suffix_begin = cell * kFoundationCellKeys;
   const std::uint32_t cell_suffix_end =
       cell_suffix_begin + kFoundationCellKeys;
-  std::uint32_t section_count = 0u;
-  std::uint32_t begin = 0u;
-  std::uint32_t end = 0u;
+  const std::uint16_t *ranks = source == 0u
+      ? epoch_cell_ranks + std::size_t{q} * kFoundationCells
+      : cell_ranks + std::size_t{level} * kLocalRankEntries +
+            std::size_t{q} * kFoundationCells;
+  std::uint32_t begin = ranks[cell];
+  std::uint32_t end = cell + 1u < kFoundationCells
+      ? ranks[cell + 1u] : section_count;
   if (source == 0u) {
-    section_count = epoch_counts[q];
-    const std::uint16_t *ranks = epoch_cell_ranks +
-        std::size_t{q} * kFoundationCells;
-    begin = ranks[cell];
-    end = cell + 1u < kFoundationCells
-        ? ranks[cell + 1u] : section_count;
-    const Row *rows = epoch_rows + epoch_offsets[q];
+    const Row *rows = epoch_rows + source_base;
     if (suffix_begin > cell_suffix_begin)
       begin += lower_bound_rows(
           rows + begin, end - begin, suffix_begin);
@@ -5345,20 +5403,13 @@ canonical_tournament_cell_slice(
       end = begin + lower_bound_rows(
           rows + begin, end - begin, suffix_end);
   } else {
-    const Descriptor rows = descriptors[descriptor_index(q, level)];
-    section_count = rows.count();
-    const std::uint16_t *ranks = cell_ranks +
-        std::size_t{level} * kLocalRankEntries +
-        std::size_t{q} * kFoundationCells;
-    begin = ranks[cell];
-    end = cell + 1u < kFoundationCells
-        ? ranks[cell + 1u] : section_count;
+    const ResidentRows rows = arena + source_base;
     if (suffix_begin > cell_suffix_begin)
       begin += lower_bound_rows(
-          arena + rows.offset() + begin, end - begin, suffix_begin);
+          rows + begin, end - begin, suffix_begin);
     if (suffix_end < cell_suffix_end)
       end = begin + lower_bound_rows(
-          arena + rows.offset() + begin, end - begin, suffix_end);
+          rows + begin, end - begin, suffix_end);
   }
   return {begin, end - begin};
 }
@@ -5367,10 +5418,9 @@ __device__ __forceinline__ std::uint32_t
 canonical_tournament_slice_begin(
     std::uint32_t source, std::uint32_t level, std::uint32_t q,
     std::uint32_t cell, const BalancedMergeJob &job,
-    const Row *epoch_rows, const std::uint32_t *epoch_offsets,
-    const std::uint32_t *epoch_counts,
-    const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
-    const Descriptor *descriptors, const std::uint16_t *cell_ranks) {
+    std::uint64_t source_base, std::uint32_t section_count,
+    const Row *epoch_rows, const std::uint16_t *epoch_cell_ranks,
+    ResidentRows arena, const std::uint16_t *cell_ranks) {
   const std::uint64_t quotient_key = std::uint64_t{q} << 16u;
   const std::uint64_t cell_key_begin =
       quotient_key + std::uint64_t{cell} * kFoundationCellKeys;
@@ -5389,21 +5439,36 @@ canonical_tournament_slice_begin(
       source, level, q, cell,
       static_cast<std::uint32_t>(clipped_begin - quotient_key),
       static_cast<std::uint32_t>(clipped_end - quotient_key),
-      epoch_rows, epoch_offsets, epoch_counts, epoch_cell_ranks,
-      arena, descriptors, cell_ranks).begin;
+      source_base, section_count, epoch_rows, epoch_cell_ranks,
+      arena, cell_ranks).begin;
 }
 
 __device__ __forceinline__ Row canonical_tournament_source_row(
-    std::uint32_t source, std::uint32_t level, std::uint32_t q,
+    std::uint32_t source, std::uint64_t source_base,
     std::uint32_t section_position, const Row *epoch_rows,
-    const std::uint32_t *epoch_offsets,
-    const std::uint32_t *epoch_counts, ResidentRows arena,
-    const Descriptor *descriptors) {
-  (void)epoch_counts;
+    ResidentRows arena) {
   if (source == 0u)
-    return epoch_rows[epoch_offsets[q] + section_position];
-  return arena[
-      descriptors[descriptor_index(q, level)].offset() + section_position];
+    return epoch_rows[source_base + section_position];
+  return arena[source_base + section_position];
+}
+
+__device__ __forceinline__ std::uint32_t
+canonical_tournament_source_head(
+    std::uint32_t source, std::uint64_t source_base,
+    std::uint32_t section_position, const Row *epoch_rows,
+    ResidentRows arena, std::uint32_t local_position) {
+  std::uint32_t packed = 0u;
+  if (source == 0u) {
+    const Row *row = epoch_rows + source_base + section_position;
+    packed = std::uint32_t{row->key} |
+        (std::uint32_t{row->flags} << 16u);
+  } else {
+    packed = arena.key_flags[source_base + section_position];
+  }
+  return (packed & 0xffffu) |
+      ((packed & (std::uint32_t{kTombstone} << 16u))
+           ? (1u << 17u) : 0u) |
+      (local_position << 18u);
 }
 
 __device__ __forceinline__ std::uint8_t canonical_tournament_choose(
@@ -5470,6 +5535,23 @@ void canonical_tournament_carry_jobs_kernel(
 
   const DeviceManifestSnapshot manifest = load_active_manifest(
       manifests, active_manifest);
+  // The source set is fixed for the publication, so build it once per block
+  // instead of once for every dynamically claimed job.
+  if (threadIdx.x == 0u) {
+    std::uint32_t source_count = 0u;
+    source_levels[source_count++] = kMaximumLevels;
+    std::uint64_t levels = manifest.occupied_level_mask &
+        canonical_source_level_mask(plan);
+    while (levels && source_count < kMaximumMergeSources) {
+      const std::uint32_t level =
+          static_cast<std::uint32_t>(__ffsll(levels) - 1);
+      levels &= levels - 1u;
+      source_levels[source_count++] = static_cast<std::uint16_t>(level);
+    }
+    source_count_shared = source_count;
+    leaves_shared = canonical_next_power_of_two(source_count);
+  }
+  __syncthreads();
   for (;;) {
     if (threadIdx.x == 0u)
       job_index_shared = atomicAdd(next_job, 1u);
@@ -5479,26 +5561,12 @@ void canonical_tournament_carry_jobs_kernel(
     const BalancedMergeJob job = jobs[job_index];
 
     if (threadIdx.x == 0u) {
-      std::uint32_t source_count = 0u;
-      source_levels[source_count++] = kMaximumLevels;
-      std::uint64_t levels = manifest.occupied_level_mask;
-      const std::uint64_t carried = plan->destination_level
-          ? (std::uint64_t{1} << plan->destination_level) - 1u : 0u;
-      levels &= carried;
-      while (levels && source_count < kMaximumMergeSources) {
-        const std::uint32_t level =
-            static_cast<std::uint32_t>(__ffsll(levels) - 1);
-        levels &= levels - 1u;
-        source_levels[source_count++] = static_cast<std::uint16_t>(level);
-      }
-      source_count_shared = source_count;
-      leaves_shared = canonical_next_power_of_two(source_count);
       task_count_shared =
           (job.quotient_end - job.quotient_begin) * kFoundationCells;
       next_task_shared = 0u;
       tape_cursor_shared = 0u;
-      job_valid_shared = source_count == plan->source_count &&
-          source_count <= kMaximumMergeSources && task_count_shared &&
+      job_valid_shared = source_count_shared == plan->source_count &&
+          source_count_shared <= kMaximumMergeSources && task_count_shared &&
           task_count_shared <= kCanonicalTournamentTasks;
     }
     __syncthreads();
@@ -5508,24 +5576,24 @@ void canonical_tournament_carry_jobs_kernel(
     std::size_t offset = 0u;
     const std::size_t states =
         std::size_t{kCanonicalTournamentChains} * source_count;
-    offset = canonical_align_bytes(offset, alignof(std::uint16_t));
-    std::uint16_t *positions =
-        reinterpret_cast<std::uint16_t *>(workspace + offset);
-    offset += states * sizeof(std::uint16_t);
-    offset = canonical_align_bytes(offset, alignof(std::uint16_t));
-    std::uint16_t *remaining =
-        reinterpret_cast<std::uint16_t *>(workspace + offset);
-    offset += states * sizeof(std::uint16_t);
-    std::uint16_t *slice_bases = nullptr;
-    if constexpr (kCanonicalCompactMultiway) {
-      offset = canonical_align_bytes(offset, alignof(std::uint16_t));
-      slice_bases = reinterpret_cast<std::uint16_t *>(workspace + offset);
-      offset += states * sizeof(std::uint16_t);
-    }
+    offset = canonical_align_bytes(offset, alignof(std::uint32_t));
+    std::uint32_t *cursors =
+        reinterpret_cast<std::uint32_t *>(workspace + offset);
+    offset += states * sizeof(std::uint32_t);
     offset = canonical_align_bytes(offset, alignof(std::uint32_t));
     std::uint32_t *heads =
         reinterpret_cast<std::uint32_t *>(workspace + offset);
     offset += states * sizeof(std::uint32_t);
+    const std::size_t source_quotients =
+        std::size_t{kCanonicalJobQuotients} * source_count;
+    offset = canonical_align_bytes(offset, alignof(std::uint64_t));
+    std::uint64_t *source_bases =
+        reinterpret_cast<std::uint64_t *>(workspace + offset);
+    offset += source_quotients * sizeof(std::uint64_t);
+    offset = canonical_align_bytes(offset, alignof(std::uint32_t));
+    std::uint32_t *source_section_counts =
+        reinterpret_cast<std::uint32_t *>(workspace + offset);
+    offset += source_quotients * sizeof(std::uint32_t);
     std::uint8_t *tree = workspace + offset;
     offset += std::size_t{kCanonicalTournamentChains} * leaves;
     offset = canonical_align_bytes(
@@ -5550,6 +5618,27 @@ void canonical_tournament_carry_jobs_kernel(
       __syncthreads();
       continue;
     }
+
+    const std::uint32_t quotient_count =
+        job.quotient_end - job.quotient_begin;
+    const std::uint32_t active_source_quotients =
+        quotient_count * source_count;
+    for (std::uint32_t entry = threadIdx.x;
+         entry < active_source_quotients; entry += blockDim.x) {
+      const std::uint32_t local_q = entry / source_count;
+      const std::uint32_t source = entry - local_q * source_count;
+      const std::uint32_t q = job.quotient_begin + local_q;
+      if (source == 0u) {
+        source_bases[entry] = epoch_offsets[q];
+        source_section_counts[entry] = epoch_counts[q];
+      } else {
+        const Descriptor descriptor = descriptors[
+            descriptor_index(q, source_levels[source])];
+        source_bases[entry] = descriptor.offset();
+        source_section_counts[entry] = descriptor.count();
+      }
+    }
+    __syncthreads();
 
     if (threadIdx.x < kCanonicalTournamentChains) {
       const std::uint32_t chain = threadIdx.x;
@@ -5576,25 +5665,22 @@ void canonical_tournament_carry_jobs_kernel(
         for (std::uint32_t source = 0u;
              source < source_count; ++source) {
           const std::uint32_t level = source_levels[source];
+          const std::uint32_t local_q = q - job.quotient_begin;
+          const std::size_t entry =
+              std::size_t{local_q} * source_count + source;
+          const std::uint64_t source_base = source_bases[entry];
           const CanonicalTournamentSlice slice =
               canonical_tournament_cell_slice(
                   source, level, q, cell, suffix_begin, suffix_end,
-                  epoch_rows, epoch_offsets, epoch_counts,
-                  epoch_cell_ranks, arena,
-                  descriptors, cell_ranks);
+                  source_base, source_section_counts[entry], epoch_rows,
+                  epoch_cell_ranks, arena, cell_ranks);
           const std::size_t state =
               std::size_t{source} * kCanonicalTournamentChains + chain;
-          positions[state] = static_cast<std::uint16_t>(slice.begin);
-          remaining[state] = static_cast<std::uint16_t>(slice.count);
-          if constexpr (kCanonicalCompactMultiway)
-            slice_bases[state] = static_cast<std::uint16_t>(slice.begin);
+          cursors[state] = (slice.count << 16u) | slice.begin;
           raw_count += slice.count;
           if (slice.count) {
-            const Row row = canonical_tournament_source_row(
-                source, level, q, slice.begin, epoch_rows, epoch_offsets,
-                epoch_counts, arena, descriptors);
-            heads[state] = std::uint32_t{row.key} |
-                ((row.flags & kTombstone) ? (1u << 17u) : 0u);
+            heads[state] = canonical_tournament_source_head(
+                source, source_base, slice.begin, epoch_rows, arena, 0u);
           } else {
             heads[state] = 1u << 16u;
           }
@@ -5630,7 +5716,26 @@ void canonical_tournament_carry_jobs_kernel(
           const std::uint32_t head = heads[state];
           const std::uint32_t key = head & 0x1ffffu;
           if (key == (1u << 16u)) break;
-          const std::uint32_t position = positions[state];
+          const std::uint32_t cursor = cursors[state];
+          const std::uint32_t position = cursor & 0xffffu;
+          const std::uint32_t count_before = cursor >> 16u;
+          const std::uint32_t local_position =
+              (head >> 18u) & kCanonicalTournamentReferenceMask;
+          const std::uint32_t left = count_before - 1u;
+          const std::uint32_t next_position = position + 1u;
+          const std::uint32_t local_q = q - job.quotient_begin;
+          const std::uint64_t source_base = source_bases[
+              std::size_t{local_q} * source_count + source];
+
+          // This is the next required row, not a speculative read.  Issue it
+          // before survivor bookkeeping so its latency can overlap the
+          // duplicate and tombstone work below.
+          std::uint32_t advanced_head = 1u << 16u;
+          if (left)
+            advanced_head = canonical_tournament_source_head(
+                source, source_base, next_position, epoch_rows, arena,
+                local_position + 1u);
+
           if (key != previous_key) {
             if (plan->keep_tombstones || !(head & (1u << 17u))) {
               if constexpr (kCanonicalCompactMultiway) {
@@ -5639,12 +5744,10 @@ void canonical_tournament_carry_jobs_kernel(
                 // the 512 key positions in one cell.  Duplicate user writes
                 // are resolved before this merge; they are not an external
                 // unique-key requirement.
-                const std::uint32_t local =
-                    position - slice_bases[state];
                 survivor_tape[tape_begin + survivor_count++] =
                     static_cast<std::uint16_t>(
                         (source << kCanonicalTournamentReferenceBits) |
-                        local);
+                        local_position);
               } else {
                 survivor_tape[tape_begin + survivor_count++] =
                     (source << 16u) | position;
@@ -5653,21 +5756,9 @@ void canonical_tournament_carry_jobs_kernel(
             previous_key = key;
           }
 
-          std::uint32_t left = remaining[state];
-          --left;
-          remaining[state] = static_cast<std::uint16_t>(left);
-          if (left) {
-            const std::uint32_t next_position = position + 1u;
-            positions[state] = static_cast<std::uint16_t>(next_position);
-            const Row row = canonical_tournament_source_row(
-                source, source_levels[source], q, next_position,
-                epoch_rows, epoch_offsets, epoch_counts, arena,
-                descriptors);
-            heads[state] = std::uint32_t{row.key} |
-                ((row.flags & kTombstone) ? (1u << 17u) : 0u);
-          } else {
-            heads[state] = 1u << 16u;
-          }
+          cursors[state] = (left << 16u) |
+              (left ? next_position : position);
+          heads[state] = advanced_head;
 
           if (leaves > 1u) {
             std::uint32_t node = (leaves + source) >> 1u;
@@ -5736,8 +5827,15 @@ void canonical_tournament_carry_jobs_kernel(
                 static_cast<unsigned long long>(tape_cursor_shared));
       if (job_index + 1u == plan->job_count)
         plan->survivor_count = prefix + job_output_count;
+      if (plan->source_level_limit == plan->destination_level &&
+          prefix + job_output_count > plan->output_capacity) {
+        job_valid_shared = 0u;
+        atomicOr(&plan->status, kPublicationOutputOverflow);
+      }
     }
     __syncthreads();
+
+    if (!job_valid_shared) continue;
 
     // Each warp materializes contiguous output positions.  Besides coalescing
     // the final stores, lanes that need the same source slice share one rank
@@ -5774,8 +5872,15 @@ void canonical_tournament_carry_jobs_kernel(
         const std::uint32_t cell = task % kFoundationCells;
         std::uint32_t source = 0u;
         std::uint32_t position = 0u;
+        std::uint64_t source_base = 0u;
+        std::uint32_t source_section_count = 0u;
         if constexpr (kCanonicalCompactMultiway) {
           source = reference >> kCanonicalTournamentReferenceBits;
+          const std::uint32_t local_q = q - job.quotient_begin;
+          const std::size_t entry =
+              std::size_t{local_q} * source_count + source;
+          source_base = source_bases[entry];
+          source_section_count = source_section_counts[entry];
           const unsigned peers = __match_any_sync(
               active, (task << kMergeSourceBits) | source);
           const std::uint32_t leader =
@@ -5783,19 +5888,21 @@ void canonical_tournament_carry_jobs_kernel(
           std::uint32_t slice_begin = 0u;
           if (lane == leader)
             slice_begin = canonical_tournament_slice_begin(
-                source, source_levels[source], q, cell, job, epoch_rows,
-                epoch_offsets, epoch_counts, epoch_cell_ranks, arena,
-                descriptors, cell_ranks);
+                source, source_levels[source], q, cell, job,
+                source_base, source_section_count, epoch_rows,
+                epoch_cell_ranks, arena, cell_ranks);
           slice_begin = __shfl_sync(active, slice_begin, leader);
           position = slice_begin +
               (reference & kCanonicalTournamentReferenceMask);
         } else {
           source = reference >> 16u;
           position = reference & 0xffffu;
+          const std::uint32_t local_q = q - job.quotient_begin;
+          source_base = source_bases[
+              std::size_t{local_q} * source_count + source];
         }
         const Row row = canonical_tournament_source_row(
-            source, source_levels[source], q, position, epoch_rows,
-            epoch_offsets, epoch_counts, arena, descriptors);
+            source, source_base, position, epoch_rows, arena);
         arena.store(
             plan->output_begin + output_prefix_shared + logical, row);
       }
@@ -5872,7 +5979,7 @@ __global__ void finalize_canonical_level_metadata_kernel(
   if (q == kQuotients) return;
   const std::uint32_t count = quotient_offsets[q + 1u] - offset;
   const Descriptor descriptor = Descriptor::make(
-      level_spans[level].begin + offset, count);
+      plan->output_begin + offset, count);
   const std::size_t mapping = descriptor_index(q, level);
   descriptors[mapping] = descriptor;
   const std::uint32_t route = level * route_stride + q;
@@ -5907,7 +6014,7 @@ __global__ void finalize_canonical_section_metadata_kernel(
   if (q == kQuotients) return;
   const std::uint32_t count = section_counts[q];
   const Descriptor descriptor = Descriptor::make(
-      level_spans[level].begin + begin, count);
+      plan->output_begin + begin, count);
   const std::size_t mapping = descriptor_index(q, level);
   descriptors[mapping] = descriptor;
   const std::uint32_t route = level * route_stride + q;
@@ -10206,7 +10313,11 @@ public:
   std::size_t gpu_resident_bytes() const {
     std::lock_guard<std::mutex> lock(operation_mutex_);
     const_cast<GPULSMOpt *>(this)->resolve_publication_receipt();
-    return local_rank_.size() * sizeof(std::uint16_t) +
+    const std::size_t rollover_rank_bytes = canonical_rollover_epoch_ranks_
+        ? canonical_rollover_epoch_ranks_->size() * sizeof(std::uint16_t)
+        : 0u;
+    return rollover_rank_bytes +
+        local_rank_.size() * sizeof(std::uint16_t) +
         level_guides_.size() * sizeof(std::uint16_t) +
         arena_key_flags_.size() * sizeof(std::uint32_t) +
         arena_values_.size() * sizeof(std::uint32_t) +
@@ -10328,6 +10439,30 @@ private:
       capacity = capacity > publication_capacity_ / 2u
           ? publication_capacity_ : capacity * 2u;
     return capacity;
+  }
+
+  void ensure_canonical_top_rollover_bank(cudaStream_t stream) {
+    if (!canonical_level_count_)
+      throw std::logic_error("GPULSMOpt has no canonical levels");
+    const std::uint32_t top = canonical_level_count_ - 1u;
+    const std::uint64_t required = level_begin(top) +
+        2u * level_capacity(top);
+    const bool rows_ready = required <= arena_key_flags_.size() &&
+        required <= arena_values_.size();
+    if (rows_ready && canonical_rollover_epoch_ranks_)
+      return;
+
+    // VMM mapping is paid only on the first rollover. Normal construction and
+    // all carries that still have an unused level keep their previous cost.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!rows_ready) {
+      arena_key_flags_.grow(required);
+      arena_values_.grow(required);
+    }
+    if (!canonical_rollover_epoch_ranks_)
+      canonical_rollover_epoch_ranks_ = std::make_unique<
+          gpulsmopt2_detail::Buffer<std::uint16_t>>(
+              gpulsmopt2_detail::kLocalRankEntries);
   }
 
   void refresh_active_levels() {
@@ -10660,7 +10795,8 @@ private:
     CUDA_CHECK(cudaStreamBeginCapture(
         capture_stream, cudaStreamCaptureModeGlobal));
     launch_canonical_publication_commands(
-        capture_stream, destination, source_count, direct_epoch, true);
+        capture_stream, destination, source_count, direct_epoch, true,
+        false);
     cudaGraph_t graph{};
     CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
     cudaGraphExec_t graph_exec{};
@@ -11636,10 +11772,15 @@ private:
     }
 
     const std::uint32_t destination = receipt.destination_level;
-    if (destination >= gpulsmopt2_detail::kMaximumLevels) {
+    if (destination >= gpulsmopt2_detail::kMaximumLevels ||
+        (gpulsmopt2_detail::kCanonicalCarry &&
+         destination >= canonical_level_count_)) {
       publication_failed_ = true;
       publication_failure_status_ =
-          gpulsmopt2_detail::kPublicationJobOverflow;
+          gpulsmopt2_detail::kPublicationLevelOverflow;
+      publication_failure_receipt_ = receipt;
+      publication_failure_receipt_.status |=
+          gpulsmopt2_detail::kPublicationLevelOverflow;
       failed_epoch_signatures_ready_ = false;
       return;
     }
@@ -11691,8 +11832,13 @@ private:
   void reject_updates_after_publication_failure() const {
     if (!publication_failed_) return;
     const auto &receipt = publication_failure_receipt_;
+    const std::string reason =
+        publication_failure_status_ &
+                gpulsmopt2_detail::kPublicationLevelOverflow
+            ? "canonical carry capacity exhausted"
+            : "publication failed";
     throw std::runtime_error(
-        "GPULSMOpt publication failed with status " +
+        "GPULSMOpt " + reason + " with status " +
         std::to_string(publication_failure_status_) +
         "; destination=" + std::to_string(receipt.destination_level) +
         ", selected=" + std::to_string(receipt.selected_count) +
@@ -11840,7 +11986,8 @@ private:
 
   void launch_canonical_epoch_resolution(
       cudaStream_t stream, bool materialize_resident,
-      std::uint32_t destination_level) {
+      std::uint32_t destination_level,
+      std::uint16_t *rank_output = nullptr) {
     if (canonical_local_epoch_enabled_) {
       CUDA_CHECK(cudaMemsetAsync(
           publication_selected_count_.data(), 0, sizeof(std::uint32_t),
@@ -11869,9 +12016,11 @@ private:
           foundation_section_output_counts_.data(),
           foundation_source_offsets_.data(),
           gpulsmopt2_detail::kQuotients + 1u, stream));
-      std::uint16_t *epoch_ranks = canonical_cell_ranks_.data() +
-          std::size_t{destination_level} *
-              gpulsmopt2_detail::kLocalRankEntries;
+      std::uint16_t *epoch_ranks = rank_output
+          ? rank_output
+          : canonical_cell_ranks_.data() +
+                std::size_t{destination_level} *
+                    gpulsmopt2_detail::kLocalRankEntries;
       if (materialize_resident) {
         gpulsmopt2_detail::resolve_canonical_epoch_local_kernel<true><<<
             gpulsmopt2_detail::kQuotients,
@@ -12002,16 +12151,49 @@ private:
           gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
               publication_rows_a_.data(),
               foundation_source_offsets_.data(),
-              canonical_cell_ranks_.data() +
-                  std::size_t{destination_level} *
-                      gpulsmopt2_detail::kLocalRankEntries);
+              rank_output
+                  ? rank_output
+                  : canonical_cell_ranks_.data() +
+                        std::size_t{destination_level} *
+                            gpulsmopt2_detail::kLocalRankEntries);
   }
 
   void launch_canonical_publication_commands(
       cudaStream_t stream, std::uint32_t destination,
       std::uint32_t source_count, bool direct_epoch,
-      bool include_receipt) {
-    launch_canonical_epoch_resolution(stream, direct_epoch, destination);
+      bool include_receipt, bool top_level_rollover) {
+    // This check must precede epoch resolution: that stage indexes the rank
+    // directory with destination and therefore cannot safely discover the
+    // capacity error itself.
+    if (destination >= canonical_level_count_) {
+      auto &failure = publication_receipt_.data()[0];
+      failure = {};
+      failure.selected_count = pending_records_;
+      failure.destination_level = destination;
+      failure.source_count = source_count;
+      failure.output_capacity = publication_capacity_;
+      failure.status = gpulsmopt2_detail::kPublicationLevelOverflow;
+      CUDA_CHECK(cudaMemcpyAsync(
+          resident_plan_.data(), &failure, sizeof(failure),
+          cudaMemcpyHostToDevice, stream));
+      if (include_receipt) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            publication_receipt_.data(), resident_plan_.data(),
+            sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
+            cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            raw_epoch_signatures_.data(), 0,
+            raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+      }
+      return;
+    }
+    std::uint16_t *epoch_ranks = top_level_rollover
+        ? canonical_rollover_epoch_ranks_->data()
+        : canonical_cell_ranks_.data() +
+              std::size_t{destination} *
+                  gpulsmopt2_detail::kLocalRankEntries;
+    launch_canonical_epoch_resolution(
+        stream, direct_epoch, destination, epoch_ranks);
     const std::uint32_t job_capacity =
         source_count < canonical_job_capacities_.size() &&
                 canonical_job_capacities_[source_count]
@@ -12021,7 +12203,8 @@ private:
         1, 1, 0, stream>>>(
             publication_selected_count_.data(), device_manifests_.data(),
             active_device_manifest_.data(), level_storage_spans_.data(),
-            job_capacity, resident_plan_.data());
+            canonical_level_count_, job_capacity, top_level_rollover,
+            resident_plan_.data());
 
     if (direct_epoch) {
       if (!canonical_local_epoch_enabled_)
@@ -12099,9 +12282,7 @@ private:
               resident_job_raw_reservations_.data(), resident_plan_.data(),
               publication_rows_a_.data(), foundation_source_offsets_.data(),
               foundation_section_output_counts_.data(),
-              canonical_cell_ranks_.data() +
-                  std::size_t{destination} *
-                      gpulsmopt2_detail::kLocalRankEntries,
+              epoch_ranks,
               resident_rows(), descriptors_.data(),
               canonical_cell_ranks_.data(), device_manifests_.data(),
               active_device_manifest_.data());
@@ -12118,9 +12299,7 @@ private:
                 resident_plan_.data(), publication_rows_a_.data(),
                 foundation_source_offsets_.data(),
                 foundation_section_output_counts_.data(),
-                canonical_cell_ranks_.data() +
-                    std::size_t{destination} *
-                        gpulsmopt2_detail::kLocalRankEntries,
+                epoch_ranks,
                 resident_rows(), descriptors_.data(),
                 level_storage_spans_.data(), canonical_cell_ranks_.data(),
                 device_manifests_.data(), active_device_manifest_.data(),
@@ -12202,8 +12381,10 @@ private:
     destination = empty
         ? static_cast<std::uint32_t>(__builtin_ctzll(empty))
         : gpulsmopt2_detail::kMaximumLevels;
-    const std::uint64_t carried = destination
-        ? (std::uint64_t{1} << destination) - 1u : 0u;
+    const std::uint64_t carried = destination >=
+            gpulsmopt2_detail::kMaximumLevels
+        ? ~std::uint64_t{0}
+        : destination ? (std::uint64_t{1} << destination) - 1u : 0u;
     source_count = 1u + static_cast<std::uint32_t>(
         __builtin_popcountll(host_occupied_level_mask_ & carried));
     direct_epoch = destination == 0u &&
@@ -12216,16 +12397,34 @@ private:
     bool direct_epoch = false;
     canonical_publication_parameters(
         destination, source_count, direct_epoch);
+    const bool top_level_rollover =
+        destination >= canonical_level_count_;
+    if (top_level_rollover) {
+      // Recycle the full hierarchy into the alternate bank of its top level.
+      // This is what lets arbitrarily many partially filled epochs proceed
+      // while the number of live rows still fits the configured capacity.
+      ensure_canonical_top_rollover_bank(stream);
+      destination = canonical_level_count_ - 1u;
+      const std::uint64_t source_mask = destination ==
+              gpulsmopt2_detail::kMaximumLevels - 1u
+          ? ~std::uint64_t{0}
+          : (std::uint64_t{1} << (destination + 1u)) - 1u;
+      source_count = 1u + static_cast<std::uint32_t>(
+          __builtin_popcountll(host_occupied_level_mask_ & source_mask));
+      direct_epoch = false;
+    }
     cudaGraphExec_t graph_exec = direct_epoch
         ? canonical_direct_publication_graph_exec_
-        : source_count < canonical_publication_graph_execs_.size()
+        : !top_level_rollover &&
+              source_count < canonical_publication_graph_execs_.size()
             ? canonical_publication_graph_execs_[source_count] : nullptr;
     if (gpulsmopt2_detail::kCanonicalPublicationGraph && graph_exec) {
       CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
       return true;
     }
     launch_canonical_publication_commands(
-        stream, destination, source_count, direct_epoch, false);
+        stream, destination, source_count, direct_epoch, false,
+        top_level_rollover);
     return false;
   }
 
@@ -12699,6 +12898,8 @@ private:
   gpulsmopt2_detail::Buffer<std::uint16_t> level_cell_ranks_;
   gpulsmopt2_detail::Buffer<std::uint16_t> publication_cell_ranks_;
   gpulsmopt2_detail::Buffer<std::uint16_t> canonical_cell_ranks_;
+  std::unique_ptr<gpulsmopt2_detail::Buffer<std::uint16_t>>
+      canonical_rollover_epoch_ranks_;
   gpulsmopt2_detail::Buffer<std::uint32_t> canonical_cell_counts_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::CanonicalJobPrefix>
       canonical_job_prefixes_;

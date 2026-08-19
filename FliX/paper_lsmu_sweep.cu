@@ -548,11 +548,6 @@ void write_metadata(const options &configuration)
 
 void run_forced_unified_validation(const options &configuration)
 {
-#if !defined(GPULSMOPT_FORCE_UNIFIED_MERGE)
-    (void)configuration;
-    throw std::invalid_argument(
-        "--forced-unified-validation-only requires the forced-unified build");
-#else
     using index_type = paper_index_type<batch_log>;
     constexpr std::uint32_t maximum_batch = 4096u;
     constexpr std::uint32_t sparse_batch = 2048u;
@@ -701,10 +696,115 @@ void run_forced_unified_validation(const options &configuration)
     PAPER_CUDA(cudaDeviceSynchronize());
     validate("tombstone_visibility");
 
+    // Exercise rollover with several occupied levels. Repeated updates keep
+    // the live set bounded while two complete hierarchy cycles are consumed.
+    {
+        DictionaryConfig rollover_config;
+        rollover_config.max_elements = 512u;
+        rollover_config.batch_capacity = 4u;
+        rollover_config.level_zero_capacity = 64u;
+        GPULSMOpt rollover_index(rollover_config);
+        cuda_buffer<std::uint32_t> rollover_keys;
+        cuda_buffer<std::uint32_t> rollover_values;
+        rollover_keys.alloc(256u);
+        rollover_values.alloc(256u);
+        std::array<std::uint32_t, 4u> key_chunk{};
+        std::array<std::uint32_t, 4u> value_chunk{};
+        std::array<std::uint32_t, 256u> expected_values{};
+        for (std::uint32_t batch = 0u; batch < 32u * 16u; ++batch)
+        {
+            for (std::uint32_t i = 0u; i < 4u; ++i)
+            {
+                const std::uint32_t ordinal = batch * 4u + i;
+                key_chunk[i] = ordinal % expected_values.size();
+                value_chunk[i] = 0x28000000u + ordinal;
+                expected_values[key_chunk[i]] = value_chunk[i];
+            }
+            rollover_keys.upload(key_chunk.data(), key_chunk.size());
+            rollover_values.upload(value_chunk.data(), value_chunk.size());
+            rollover_index.insert(
+                {rollover_keys.ptr(), rollover_values.ptr(), 4u}, 0);
+        }
+        PAPER_CUDA(cudaDeviceSynchronize());
+        std::array<std::uint32_t, 256u> query_keys{};
+        for (std::uint32_t i = 0u; i < query_keys.size(); ++i)
+            query_keys[i] = i;
+        rollover_keys.upload(query_keys.data(), query_keys.size());
+        rollover_index.lookup(
+            {rollover_keys.ptr(), query_keys.size(),
+             rollover_values.ptr(), nullptr}, 0);
+        PAPER_CUDA(cudaDeviceSynchronize());
+        const auto actual_values =
+            rollover_values.download(query_keys.size());
+        std::uint32_t rollover_errors = 0u;
+        for (std::uint32_t i = 0u; i < query_keys.size(); ++i)
+            rollover_errors += actual_values[i] != expected_values[i];
+        const auto rollover_stats = rollover_index.canonical_carry_stats();
+        std::cout << "CANONICAL_MULTILEVEL_ROLLOVER_VALIDATION"
+                  << " status=" << rollover_stats.status
+                  << " errors=" << rollover_errors << std::endl;
+        if (rollover_stats.status || rollover_errors)
+            throw std::runtime_error(
+                "canonical multi-level rollover validation failed");
+    }
+
+    // A one-level dictionary must recycle its top level for partial epochs,
+    // then fail cleanly (without corrupting the resident level) once unique
+    // survivors actually exceed its configured capacity.
+    {
+        DictionaryConfig capacity_config;
+        capacity_config.max_elements = 1024u;
+        capacity_config.batch_capacity = 4u;
+        capacity_config.level_zero_capacity = 1024u;
+        GPULSMOpt capacity_index(capacity_config);
+        cuda_buffer<std::uint32_t> capacity_keys;
+        cuda_buffer<std::uint32_t> capacity_values;
+        capacity_keys.alloc(4u);
+        capacity_values.alloc(4u);
+        std::array<std::uint32_t, 4u> key_chunk{};
+        std::array<std::uint32_t, 4u> value_chunk{};
+        for (std::uint32_t batch = 0u; batch < 17u * 16u; ++batch)
+        {
+            for (std::uint32_t i = 0u; i < 4u; ++i)
+            {
+                key_chunk[i] = batch * 4u + i;
+                value_chunk[i] = 0x30000000u + key_chunk[i];
+            }
+            capacity_keys.upload(key_chunk.data(), key_chunk.size());
+            capacity_values.upload(value_chunk.data(), value_chunk.size());
+            capacity_index.insert(
+                {capacity_keys.ptr(), capacity_values.ptr(), 4u}, 0);
+        }
+        PAPER_CUDA(cudaDeviceSynchronize());
+        const auto capacity_stats = capacity_index.canonical_carry_stats();
+        const bool controlled_status =
+            (capacity_stats.status &
+             gpulsmopt2_detail::kPublicationOutputOverflow) != 0u;
+        bool controlled_exception = false;
+        try
+        {
+            capacity_index.insert(
+                {capacity_keys.ptr(), capacity_values.ptr(), 4u}, 0);
+        }
+        catch (const std::runtime_error &error)
+        {
+            controlled_exception =
+                std::string(error.what()).find("capacity") !=
+                std::string::npos;
+        }
+        std::cout << "CANONICAL_CAPACITY_VALIDATION"
+                  << " status=" << capacity_stats.status
+                  << " controlled_status=" << controlled_status
+                  << " controlled_exception=" << controlled_exception
+                  << std::endl;
+        if (!controlled_status || !controlled_exception)
+            throw std::runtime_error(
+                "canonical capacity exhaustion was not controlled");
+    }
+
     std::ofstream complete(
         configuration.output_directory / "complete_forced_unified_validation");
     complete << "ok\n";
-#endif
 }
 
 void run_construction_probe(const options &configuration)
