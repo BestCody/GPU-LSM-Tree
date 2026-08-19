@@ -514,6 +514,10 @@ void write_metadata(const options &configuration)
            << gpulsmopt2_detail::kCanonicalTournamentMerge << '\n';
     output << "gpulsmopt_canonical_tournament_minimum_sources="
            << gpulsmopt2_detail::kCanonicalTournamentMinimumSources << '\n';
+    output << "gpulsmopt_canonical_compact_multiway="
+           << gpulsmopt2_detail::kCanonicalCompactMultiway << '\n';
+    output << "gpulsmopt_canonical_tournament_capacity_ceiling="
+           << gpulsmopt2_detail::kCanonicalTournamentCapacityCeiling << '\n';
     output << "gpulsmopt_canonical_publication_graph="
            << gpulsmopt2_detail::kCanonicalPublicationGraph << '\n';
 #if defined(GPULSMOPT_FORCE_UNIFIED_MERGE)

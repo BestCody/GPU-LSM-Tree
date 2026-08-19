@@ -133,7 +133,7 @@ constexpr bool kCanonicalLocalEpoch =
 constexpr bool kCanonicalTournamentMerge =
     GPULSMOPT_CANONICAL_TOURNAMENT_MERGE != 0;
 #ifndef GPULSMOPT_CANONICAL_TOURNAMENT_MINIMUM_SOURCES
-#define GPULSMOPT_CANONICAL_TOURNAMENT_MINIMUM_SOURCES 5
+#define GPULSMOPT_CANONICAL_TOURNAMENT_MINIMUM_SOURCES 3
 #endif
 constexpr std::uint32_t kCanonicalTournamentMinimumSources =
     GPULSMOPT_CANONICAL_TOURNAMENT_MINIMUM_SOURCES;
@@ -165,6 +165,21 @@ constexpr std::uint32_t kCanonicalTournamentReferenceMask =
     (1u << kCanonicalTournamentReferenceBits) - 1u;
 static_assert(kFoundationCellKeys ==
               (1u << kCanonicalTournamentReferenceBits));
+#ifndef GPULSMOPT_CANONICAL_COMPACT_MULTIWAY
+#define GPULSMOPT_CANONICAL_COMPACT_MULTIWAY 1
+#endif
+constexpr bool kCanonicalCompactMultiway =
+    GPULSMOPT_CANONICAL_COMPACT_MULTIWAY != 0;
+using CanonicalTournamentReference = std::conditional_t<
+    kCanonicalCompactMultiway, std::uint16_t, std::uint32_t>;
+// The actual capacity is selected per source count from the device's
+// occupancy limits.  This is only the structural limit imposed by the
+// 16-bit per-task offsets, not a workload-specific tuning constant.
+constexpr std::uint32_t kCanonicalTournamentCapacityCeiling =
+    std::numeric_limits<std::uint16_t>::max();
+constexpr std::uint32_t kMergeSourceBits = 7u;
+static_assert(kMaximumMergeSources <= (1u << kMergeSourceBits));
+static_assert(kMergeSourceBits + kCanonicalTournamentReferenceBits <= 16u);
 
 __host__ __device__ constexpr std::uint32_t canonical_next_power_of_two(
     std::uint32_t value) {
@@ -191,10 +206,13 @@ inline std::size_t canonical_tournament_dynamic_shared_bytes(
       std::size_t{kCanonicalTournamentChains} * source_count;
   reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
   reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
+  if (kCanonicalCompactMultiway)
+    reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
   reserve(states, sizeof(std::uint32_t), alignof(std::uint32_t));
   reserve(std::size_t{kCanonicalTournamentChains} * leaves,
           sizeof(std::uint8_t), alignof(std::uint8_t));
-  reserve(capacity, sizeof(std::uint32_t), alignof(std::uint32_t));
+  reserve(capacity, sizeof(CanonicalTournamentReference),
+          alignof(CanonicalTournamentReference));
   reserve(kCanonicalTournamentTasks, sizeof(std::uint16_t),
           alignof(std::uint16_t));
   reserve(kCanonicalTournamentTasks + 1u, sizeof(std::uint16_t),
@@ -214,8 +232,29 @@ constexpr bool kForceUnifiedCompileElision = true;
 constexpr bool kForceUnifiedCompileElision = false;
 #endif
 // Bound for splitting a maximally dense quotient.
-constexpr std::uint32_t kMergeSourceBits = 7u;
 constexpr std::uint64_t kResidentWorkFlag = std::uint64_t{1} << 63u;
+constexpr std::uint64_t kCanonicalHotJobFlag = std::uint64_t{1} << 63u;
+
+__host__ __device__ __forceinline__ std::uint64_t canonical_hot_job(
+    std::uint32_t first_job, std::uint32_t pieces) {
+  return kCanonicalHotJobFlag |
+      (std::uint64_t{pieces} << 32u) | first_job;
+}
+
+__host__ __device__ __forceinline__ bool canonical_job_is_hot(
+    std::uint64_t encoded) {
+  return (encoded & kCanonicalHotJobFlag) != 0u;
+}
+
+__host__ __device__ __forceinline__ std::uint32_t
+canonical_hot_first_job(std::uint64_t encoded) {
+  return static_cast<std::uint32_t>(encoded);
+}
+
+__host__ __device__ __forceinline__ std::uint32_t
+canonical_hot_pieces(std::uint64_t encoded) {
+  return static_cast<std::uint32_t>((encoded >> 32u) & 0xffffu);
+}
 
 __host__ __device__ __forceinline__ std::uint64_t resident_work_count(
     std::uint64_t encoded) {
@@ -4494,7 +4533,7 @@ __global__ void count_canonical_planning_jobs_kernel(
 }
 
 __global__ void emit_canonical_planning_jobs_kernel(
-    const std::uint64_t *counts, const std::uint32_t *tile_job_offsets,
+    std::uint64_t *counts, const std::uint32_t *tile_job_offsets,
     ResidentPublicationPlan *plan, std::uint32_t maximum_jobs,
     BalancedMergeJob *jobs, std::uint64_t *reservations) {
   __shared__ std::uint64_t tile_counts[kPlanningTileQuotients];
@@ -4528,14 +4567,19 @@ __global__ void emit_canonical_planning_jobs_kernel(
         run_begin, run_end, run_rows, 0u, 0u);
     run_rows = 0u;
   };
+  // The raw counts are no longer needed after the tile snapshot.  Reuse that
+  // buffer as a sparse quotient-to-hot-job directory so boundary discovery
+  // visits each oversized quotient once instead of rediscovering it per job.
   for (std::uint32_t local_q = 0u;
        local_q < kPlanningTileQuotients; ++local_q) {
     const std::uint32_t q = first + local_q;
     const std::uint64_t count = tile_counts[local_q];
+    counts[q] = 0u;
     if (count > plan->job_capacity) {
       flush();
       const std::uint32_t pieces = static_cast<std::uint32_t>(
           (count + safe - 1u) / safe);
+      const std::uint32_t first_job = global;
       for (std::uint32_t piece = 0u; piece < pieces; ++piece)
         emit_resident_job(
             jobs, reservations, global++,
@@ -4543,6 +4587,7 @@ __global__ void emit_canonical_planning_jobs_kernel(
             std::uint64_t{q + 1u} << 16u,
             q, q + 1u, 0u, static_cast<std::uint16_t>(piece),
             static_cast<std::uint16_t>(pieces));
+      counts[q] = canonical_hot_job(first_job, pieces);
       continue;
     }
     if (!count) continue;
@@ -4659,7 +4704,12 @@ canonical_combined_cell_prefix_warp(
   return __shfl_sync(mask, total, 0u);
 }
 
-__device__ __forceinline__ std::uint32_t canonical_boundary_warp(
+struct CanonicalBoundary {
+  std::uint32_t suffix{};
+  std::uint32_t prefix{};
+};
+
+__device__ __forceinline__ CanonicalBoundary canonical_boundary_warp(
     std::uint32_t q, std::uint32_t target,
     const Row *epoch_rows, const std::uint32_t *epoch_offsets,
     const std::uint32_t *epoch_counts,
@@ -4667,7 +4717,7 @@ __device__ __forceinline__ std::uint32_t canonical_boundary_warp(
     const Descriptor *descriptors, const std::uint16_t *cell_ranks,
     const DeviceManifestSnapshot &manifest,
     const ResidentPublicationPlan *plan) {
-  if (!target) return 0u;
+  if (!target) return {};
   std::uint32_t low_cell = 1u, high_cell = kFoundationCells;
   while (low_cell < high_cell) {
     const std::uint32_t middle = (low_cell + high_cell) >> 1u;
@@ -4684,7 +4734,7 @@ __device__ __forceinline__ std::uint32_t canonical_boundary_warp(
       q, begin_cell, epoch_counts, epoch_cell_ranks, descriptors,
       cell_ranks, manifest, plan);
   if (begin_prefix >= target)
-    return begin_cell * kFoundationCellKeys;
+    return {begin_cell * kFoundationCellKeys, begin_prefix};
   std::uint32_t low = begin_cell * kFoundationCellKeys + 1u;
   std::uint32_t high = end_cell * kFoundationCellKeys;
   while (low < high) {
@@ -4698,11 +4748,15 @@ __device__ __forceinline__ std::uint32_t canonical_boundary_warp(
     else
       high = middle;
   }
-  return low;
+  const std::uint32_t prefix = canonical_combined_cell_prefix_warp(
+      q, begin_cell, low, epoch_rows, epoch_offsets, epoch_counts,
+      epoch_cell_ranks, arena, descriptors, cell_ranks, manifest, plan);
+  return {low, prefix};
 }
 
 __global__ void resolve_canonical_job_boundaries_kernel(
-    BalancedMergeJob *jobs, std::uint64_t *reservations,
+    const std::uint64_t *hot_jobs, BalancedMergeJob *jobs,
+    std::uint64_t *reservations,
     ResidentPublicationPlan *plan, const Row *epoch_rows,
     const std::uint32_t *epoch_offsets,
     const std::uint32_t *epoch_counts,
@@ -4711,55 +4765,53 @@ __global__ void resolve_canonical_job_boundaries_kernel(
     const DeviceManifest *manifests,
     const std::uint32_t *active_manifest) {
   const std::uint32_t lane = threadIdx.x & 31u;
-  constexpr unsigned mask = 0xffffffffu;
   const DeviceManifestSnapshot manifest = load_active_manifest(
       manifests, active_manifest);
-  for (std::uint32_t index = blockIdx.x;
-       index < plan->job_count && !plan->status; index += gridDim.x) {
-    BalancedMergeJob job = jobs[index];
-    const std::uint32_t pieces = __shfl_sync(
-        mask, lane == 0u ? job.hot_pieces : 0u, 0u);
-    if (!pieces) {
-      if (lane == 0u && reservations[index] > plan->job_capacity)
+  // One warp owns all pieces of an oversized quotient.  It computes the
+  // total once and carries each exact boundary prefix into the next piece.
+  for (std::uint32_t q = blockIdx.x;
+       q < kQuotients && !plan->status; q += gridDim.x) {
+    const std::uint64_t encoded = hot_jobs[q];
+    if (!canonical_job_is_hot(encoded)) continue;
+    const std::uint32_t first_job = canonical_hot_first_job(encoded);
+    const std::uint32_t pieces = canonical_hot_pieces(encoded);
+    if (!pieces || first_job + pieces > plan->job_count) {
+      if (lane == 0u)
         atomicOr(&plan->status, kPublicationJobTooLarge);
       continue;
     }
-    const std::uint32_t q = job.quotient_begin;
     const std::uint32_t total = canonical_combined_prefix_warp(
         q, 1u << 16u, epoch_rows, epoch_offsets, epoch_counts,
         arena, descriptors,
         manifest, plan);
-    const std::uint32_t low_target = static_cast<std::uint32_t>(
-        (std::uint64_t{total} * job.hot_piece + pieces - 1u) / pieces);
-    const std::uint32_t high_target = static_cast<std::uint32_t>(
-        (std::uint64_t{total} * (job.hot_piece + 1u) + pieces - 1u) /
-        pieces);
-    const std::uint32_t low = job.hot_piece
-        ? canonical_boundary_warp(
-              q, low_target, epoch_rows, epoch_offsets, epoch_counts,
-              epoch_cell_ranks, arena, descriptors, cell_ranks,
-              manifest, plan)
-        : 0u;
-    const std::uint32_t high = job.hot_piece + 1u == pieces
-        ? (1u << 16u)
-        : canonical_boundary_warp(
-              q, high_target, epoch_rows, epoch_offsets, epoch_counts,
-              epoch_cell_ranks, arena, descriptors, cell_ranks,
-              manifest, plan);
-    const std::uint32_t exact = canonical_combined_prefix_warp(
-        q, high, epoch_rows, epoch_offsets, epoch_counts,
-        arena, descriptors,
-        manifest, plan) - canonical_combined_prefix_warp(
-            q, low, epoch_rows, epoch_offsets, epoch_counts,
-            arena, descriptors,
+    std::uint32_t previous_suffix = 0u;
+    std::uint32_t previous_prefix = 0u;
+    for (std::uint32_t piece = 0u; piece < pieces; ++piece) {
+      CanonicalBoundary high{1u << 16u, total};
+      if (piece + 1u < pieces) {
+        const std::uint32_t target = static_cast<std::uint32_t>(
+            (std::uint64_t{total} * (piece + 1u) + pieces - 1u) /
+            pieces);
+        high = canonical_boundary_warp(
+            q, target, epoch_rows, epoch_offsets, epoch_counts,
+            epoch_cell_ranks, arena, descriptors, cell_ranks,
             manifest, plan);
-    if (lane == 0u) {
-      job.key_begin = (std::uint64_t{q} << 16u) + low;
-      job.key_end = (std::uint64_t{q} << 16u) + high;
-      reservations[index] = exact;
-      jobs[index] = job;
-      if (low >= high || exact > plan->job_capacity)
-        atomicOr(&plan->status, kPublicationJobTooLarge);
+      }
+      if (lane == 0u) {
+        const std::uint32_t index = first_job + piece;
+        BalancedMergeJob job = jobs[index];
+        const std::uint32_t exact = high.prefix - previous_prefix;
+        job.key_begin = (std::uint64_t{q} << 16u) + previous_suffix;
+        job.key_end = (std::uint64_t{q} << 16u) + high.suffix;
+        reservations[index] = exact;
+        jobs[index] = job;
+        if (previous_suffix >= high.suffix ||
+            high.prefix < previous_prefix ||
+            exact > plan->job_capacity)
+          atomicOr(&plan->status, kPublicationJobTooLarge);
+      }
+      previous_suffix = high.suffix;
+      previous_prefix = high.prefix;
     }
   }
 }
@@ -5108,8 +5160,10 @@ __global__ void canonical_carry_jobs_kernel(
         if (row.flags & kTombstone)
           atomicOr(tombstone_words + (candidate >> 5u),
                    1u << (candidate & 31u));
-        if (physical + 1u == physical_run_count_shared)
-          plane_b[destination + position] = record;
+        if constexpr (StaticSources != 2u) {
+          if (physical + 1u == physical_run_count_shared)
+            plane_b[destination + position] = record;
+        }
       }
     }
     __syncthreads();
@@ -5194,12 +5248,16 @@ __global__ void canonical_carry_jobs_kernel(
         thread_begin + items_per_thread, task_rows_shared);
     std::uint32_t local_live = 0u;
     std::uint32_t live_records[kMaximumItemsPerThread]{};
+    std::uint32_t previous_logical_key =
+        thread_begin && thread_begin < thread_end
+        ? sorted[thread_begin - 1u] >> kCanonicalCandidateBits
+        : std::numeric_limits<std::uint32_t>::max();
     for (std::uint32_t position = thread_begin;
          position < thread_end; ++position) {
       const std::uint32_t record = sorted[position];
       const std::uint32_t logical_key = record >> kCanonicalCandidateBits;
-      const bool first = position == 0u ||
-          (sorted[position - 1u] >> kCanonicalCandidateBits) != logical_key;
+      const bool first = previous_logical_key != logical_key;
+      previous_logical_key = logical_key;
       if (!first) continue;
       const std::uint32_t candidate =
           record & (kCanonicalCandidateLimit - 1u);
@@ -5303,6 +5361,36 @@ canonical_tournament_cell_slice(
           arena + rows.offset() + begin, end - begin, suffix_end);
   }
   return {begin, end - begin};
+}
+
+__device__ __forceinline__ std::uint32_t
+canonical_tournament_slice_begin(
+    std::uint32_t source, std::uint32_t level, std::uint32_t q,
+    std::uint32_t cell, const BalancedMergeJob &job,
+    const Row *epoch_rows, const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts,
+    const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
+    const Descriptor *descriptors, const std::uint16_t *cell_ranks) {
+  const std::uint64_t quotient_key = std::uint64_t{q} << 16u;
+  const std::uint64_t cell_key_begin =
+      quotient_key + std::uint64_t{cell} * kFoundationCellKeys;
+  const std::uint64_t cell_key_end = cell_key_begin + kFoundationCellKeys;
+  if (job.key_begin <= cell_key_begin && job.key_end >= cell_key_end) {
+    if (source == 0u)
+      return epoch_cell_ranks[
+          std::size_t{q} * kFoundationCells + cell];
+    return cell_ranks[
+        std::size_t{level} * kLocalRankEntries +
+        std::size_t{q} * kFoundationCells + cell];
+  }
+  const std::uint64_t clipped_begin = max(cell_key_begin, job.key_begin);
+  const std::uint64_t clipped_end = min(cell_key_end, job.key_end);
+  return canonical_tournament_cell_slice(
+      source, level, q, cell,
+      static_cast<std::uint32_t>(clipped_begin - quotient_key),
+      static_cast<std::uint32_t>(clipped_end - quotient_key),
+      epoch_rows, epoch_offsets, epoch_counts, epoch_cell_ranks,
+      arena, descriptors, cell_ranks).begin;
 }
 
 __device__ __forceinline__ Row canonical_tournament_source_row(
@@ -5428,16 +5516,24 @@ void canonical_tournament_carry_jobs_kernel(
     std::uint16_t *remaining =
         reinterpret_cast<std::uint16_t *>(workspace + offset);
     offset += states * sizeof(std::uint16_t);
+    std::uint16_t *slice_bases = nullptr;
+    if constexpr (kCanonicalCompactMultiway) {
+      offset = canonical_align_bytes(offset, alignof(std::uint16_t));
+      slice_bases = reinterpret_cast<std::uint16_t *>(workspace + offset);
+      offset += states * sizeof(std::uint16_t);
+    }
     offset = canonical_align_bytes(offset, alignof(std::uint32_t));
     std::uint32_t *heads =
         reinterpret_cast<std::uint32_t *>(workspace + offset);
     offset += states * sizeof(std::uint32_t);
     std::uint8_t *tree = workspace + offset;
     offset += std::size_t{kCanonicalTournamentChains} * leaves;
-    offset = canonical_align_bytes(offset, alignof(std::uint32_t));
-    std::uint32_t *survivor_tape =
-        reinterpret_cast<std::uint32_t *>(workspace + offset);
-    offset += std::size_t{plan->job_capacity} * sizeof(std::uint32_t);
+    offset = canonical_align_bytes(
+        offset, alignof(CanonicalTournamentReference));
+    CanonicalTournamentReference *survivor_tape =
+        reinterpret_cast<CanonicalTournamentReference *>(workspace + offset);
+    offset += std::size_t{plan->job_capacity} *
+        sizeof(CanonicalTournamentReference);
     offset = canonical_align_bytes(offset, alignof(std::uint16_t));
     std::uint16_t *task_tape_bases =
         reinterpret_cast<std::uint16_t *>(workspace + offset);
@@ -5490,6 +5586,8 @@ void canonical_tournament_carry_jobs_kernel(
               std::size_t{source} * kCanonicalTournamentChains + chain;
           positions[state] = static_cast<std::uint16_t>(slice.begin);
           remaining[state] = static_cast<std::uint16_t>(slice.count);
+          if constexpr (kCanonicalCompactMultiway)
+            slice_bases[state] = static_cast<std::uint16_t>(slice.begin);
           raw_count += slice.count;
           if (slice.count) {
             const Row row = canonical_tournament_source_row(
@@ -5534,9 +5632,24 @@ void canonical_tournament_carry_jobs_kernel(
           if (key == (1u << 16u)) break;
           const std::uint32_t position = positions[state];
           if (key != previous_key) {
-            if (plan->keep_tombstones || !(head & (1u << 17u)))
-              survivor_tape[tape_begin + survivor_count++] =
-                  (source << 16u) | position;
+            if (plan->keep_tombstones || !(head & (1u << 17u))) {
+              if constexpr (kCanonicalCompactMultiway) {
+                // Canonical epoch and level runs contain at most one row for
+                // each logical key.  Therefore a source contributes at most
+                // the 512 key positions in one cell.  Duplicate user writes
+                // are resolved before this merge; they are not an external
+                // unique-key requirement.
+                const std::uint32_t local =
+                    position - slice_bases[state];
+                survivor_tape[tape_begin + survivor_count++] =
+                    static_cast<std::uint16_t>(
+                        (source << kCanonicalTournamentReferenceBits) |
+                        local);
+              } else {
+                survivor_tape[tape_begin + survivor_count++] =
+                    (source << 16u) | position;
+              }
+            }
             previous_key = key;
           }
 
@@ -5626,38 +5739,67 @@ void canonical_tournament_carry_jobs_kernel(
     }
     __syncthreads();
 
-    const std::uint32_t items_per_thread =
-        (job_output_count + kThreads - 1u) / kThreads;
-    const std::uint32_t output_begin = threadIdx.x * items_per_thread;
-    const std::uint32_t output_end =
-        min(output_begin + items_per_thread, job_output_count);
-    if (output_begin < output_end) {
+    // Each warp materializes contiguous output positions.  Besides coalescing
+    // the final stores, lanes that need the same source slice share one rank
+    // lookup.  This works for every source count and avoids a per-source
+    // register array.
+    constexpr unsigned kFullWarp = 0xffffffffu;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    std::uint32_t logical = warp * 32u + lane;
+    std::uint32_t task = 0u;
+    if (logical < job_output_count) {
       std::uint32_t low = 0u, high = task_count_shared;
       while (low < high) {
         const std::uint32_t middle = (low + high) >> 1u;
-        if (task_output_offsets[middle + 1u] <= output_begin)
+        if (task_output_offsets[middle + 1u] <= logical)
           low = middle + 1u;
         else
           high = middle;
       }
-      std::uint32_t task = low;
-      for (std::uint32_t logical = output_begin;
-           logical < output_end; ++logical) {
+      task = low;
+    }
+    for (;;) {
+      const unsigned active = __ballot_sync(
+          kFullWarp, logical < job_output_count);
+      if (!active) break;
+      if (logical < job_output_count) {
         while (task + 1u < task_count_shared &&
                task_output_offsets[task + 1u] <= logical)
           ++task;
         const std::uint32_t reference = survivor_tape[
             task_tape_bases[task] + logical - task_output_offsets[task]];
-        const std::uint32_t source = reference >> 16u;
-        const std::uint32_t position = reference & 0xffffu;
         const std::uint32_t q =
             job.quotient_begin + task / kFoundationCells;
+        const std::uint32_t cell = task % kFoundationCells;
+        std::uint32_t source = 0u;
+        std::uint32_t position = 0u;
+        if constexpr (kCanonicalCompactMultiway) {
+          source = reference >> kCanonicalTournamentReferenceBits;
+          const unsigned peers = __match_any_sync(
+              active, (task << kMergeSourceBits) | source);
+          const std::uint32_t leader =
+              static_cast<std::uint32_t>(__ffs(peers) - 1);
+          std::uint32_t slice_begin = 0u;
+          if (lane == leader)
+            slice_begin = canonical_tournament_slice_begin(
+                source, source_levels[source], q, cell, job, epoch_rows,
+                epoch_offsets, epoch_counts, epoch_cell_ranks, arena,
+                descriptors, cell_ranks);
+          slice_begin = __shfl_sync(active, slice_begin, leader);
+          position = slice_begin +
+              (reference & kCanonicalTournamentReferenceMask);
+        } else {
+          source = reference >> 16u;
+          position = reference & 0xffffu;
+        }
         const Row row = canonical_tournament_source_row(
             source, source_levels[source], q, position, epoch_rows,
             epoch_offsets, epoch_counts, arena, descriptors);
         arena.store(
             plan->output_begin + output_prefix_shared + logical, row);
       }
+      logical += kThreads;
     }
     __syncthreads();
   }
@@ -10414,17 +10556,51 @@ private:
         optin_shared_bytes > tournament_attributes.sharedSizeBytes
             ? optin_shared_bytes - tournament_attributes.sharedSizeBytes
             : 0u;
+    canonical_job_capacities_.fill(resident_merge_capacity_);
     std::size_t tournament_attribute_bytes = 0u;
     if (gpulsmopt2_detail::kCanonicalTournamentMerge) {
       for (std::uint32_t source_count =
                gpulsmopt2_detail::kCanonicalTournamentMinimumSources;
            source_count <= maximum_sources; ++source_count) {
+        const auto active_blocks = [&](std::uint32_t capacity) {
+          const std::size_t shared_bytes =
+              gpulsmopt2_detail::canonical_tournament_dynamic_shared_bytes(
+                  capacity, source_count);
+          if (shared_bytes > maximum_dynamic_shared_bytes) return 0;
+          int blocks = 0;
+          CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &blocks,
+              gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
+              gpulsmopt2_detail::kFoundationCompactionThreads,
+              shared_bytes));
+          return blocks;
+        };
+        const int baseline_blocks = active_blocks(resident_merge_capacity_);
+        if (!baseline_blocks) break;
+        // Grow jobs only while preserving the occupancy supported by the
+        // original capacity on this device.
+        const int desired_blocks = baseline_blocks;
+        std::uint32_t low = resident_merge_capacity_;
+        std::uint32_t high = gpulsmopt2_detail::kCanonicalCompactMultiway
+            ? std::max(low,
+                  gpulsmopt2_detail::kCanonicalTournamentCapacityCeiling)
+            : low;
+        while (low < high) {
+          const std::uint32_t middle =
+              low + (high - low + 1u) / 2u;
+          if (active_blocks(middle) >= desired_blocks)
+            low = middle;
+          else
+            high = middle - 1u;
+        }
+        const std::uint32_t capacity = low;
         const std::size_t shared_bytes =
             gpulsmopt2_detail::canonical_tournament_dynamic_shared_bytes(
-                resident_merge_capacity_, source_count);
-        if (shared_bytes > maximum_dynamic_shared_bytes) break;
+                capacity, source_count);
+        canonical_job_capacities_[source_count] = capacity;
         canonical_tournament_shared_bytes_[source_count] = shared_bytes;
-        tournament_attribute_bytes = shared_bytes;
+        tournament_attribute_bytes =
+            std::max(tournament_attribute_bytes, shared_bytes);
       }
     }
     if (tournament_attribute_bytes)
@@ -10444,10 +10620,10 @@ private:
           gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
           gpulsmopt2_detail::kFoundationCompactionThreads,
           shared_bytes));
+      if (!blocks_per_sm) continue;
       canonical_tournament_blocks_[source_count] =
           static_cast<std::uint32_t>(
-              std::max(1, blocks_per_sm) *
-              properties.multiProcessorCount);
+              blocks_per_sm * properties.multiProcessorCount);
     }
 
     blocks_per_sm = 0;
@@ -11836,11 +12012,16 @@ private:
       std::uint32_t source_count, bool direct_epoch,
       bool include_receipt) {
     launch_canonical_epoch_resolution(stream, direct_epoch, destination);
+    const std::uint32_t job_capacity =
+        source_count < canonical_job_capacities_.size() &&
+                canonical_job_capacities_[source_count]
+            ? canonical_job_capacities_[source_count]
+            : resident_merge_capacity_;
     gpulsmopt2_detail::choose_canonical_publication_path_kernel<<<
         1, 1, 0, stream>>>(
             publication_selected_count_.data(), device_manifests_.data(),
             active_device_manifest_.data(), level_storage_spans_.data(),
-            resident_merge_capacity_, resident_plan_.data());
+            job_capacity, resident_plan_.data());
 
     if (direct_epoch) {
       if (!canonical_local_epoch_enabled_)
@@ -11914,7 +12095,7 @@ private:
           static_cast<std::uint32_t>(maximum_resident_jobs_));
       gpulsmopt2_detail::resolve_canonical_job_boundaries_kernel<<<
           resident_planner_blocks_, 32u, 0, stream>>>(
-              balanced_merge_jobs_.data(),
+              balanced_merge_raw_counts_.data(), balanced_merge_jobs_.data(),
               resident_job_raw_reservations_.data(), resident_plan_.data(),
               publication_rows_a_.data(), foundation_source_offsets_.data(),
               foundation_section_output_counts_.data(),
@@ -12460,6 +12641,9 @@ private:
   std::array<std::uint32_t,
              gpulsmopt2_detail::kMaximumMergeSources + 1u>
       canonical_tournament_blocks_{};
+  std::array<std::uint32_t,
+             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+      canonical_job_capacities_{};
   std::uint32_t canonical_epoch_resolver_blocks_{};
   std::uint32_t canonical_epoch_workspace_slots_{};
   std::array<std::size_t,
