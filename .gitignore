@@ -1,6 +1,7 @@
 tuning_results/
 /FliX/bench_*/
 /build/
+/profiling/
 
 # Generated benchmark and paper-experiment output.
 /results/

@@ -9,8 +9,10 @@
 #endif
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -21,6 +23,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #ifndef PAPER_LSM_BATCH_LOG
 #define PAPER_LSM_BATCH_LOG 16
@@ -106,10 +110,14 @@ __global__ void fill_lookup_queries(
     if (hits)
         queries[tid] = key_for_index(random % resident);
     else
+    {
+        const std::uint32_t miss_begin = resident > paper_insert_limit
+            ? resident : static_cast<std::uint32_t>(paper_insert_limit);
         queries[tid] = key_for_index(
-            static_cast<std::uint32_t>(paper_insert_limit) +
+            miss_begin +
             random % static_cast<std::uint32_t>(
-                key_domain - paper_insert_limit));
+                key_domain - miss_begin));
+    }
 }
 
 __global__ void fill_range_queries(
@@ -218,6 +226,40 @@ __global__ void digest_range_results(
     }
 }
 
+__global__ void digest_expected_insert_rows(
+    std::uint32_t size, unsigned long long *digest)
+{
+    __shared__ unsigned long long sums[threads];
+    __shared__ unsigned long long xors[threads];
+    unsigned long long sum = 0;
+    unsigned long long xorsum = 0;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < size; index += gridDim.x * blockDim.x)
+    {
+        const std::uint64_t key = key_for_index(index);
+        const std::uint64_t mixed = digest_mix((key << 32u) ^ 2u);
+        sum += mixed;
+        xorsum ^= mixed;
+    }
+    sums[threadIdx.x] = sum;
+    xors[threadIdx.x] = xorsum;
+    __syncthreads();
+    for (std::uint32_t stride = threads / 2; stride; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+        {
+            sums[threadIdx.x] += sums[threadIdx.x + stride];
+            xors[threadIdx.x] ^= xors[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        atomicAdd(digest, sums[0]);
+        atomicXor(digest + 1, xors[0]);
+    }
+}
+
 [[maybe_unused]] __global__ void fill_cleanup_batch(
     key_type *keys,
     smallsize *values,
@@ -277,6 +319,16 @@ struct options
     bool main_sweep = true;
     bool cleanup_sweep = false;
     bool bulk_sweep = false;
+    std::uint32_t profile_insert_r = 0;
+    std::uint32_t profile_rank_cell_standalone_r = 0;
+    std::uint32_t profile_direct_standalone_r = 0;
+    bool profile_allow_validation_failure = false;
+    bool profile_all_inserts = false;
+    bool profile_summary_only = false;
+    bool audit_direct_correctness = false;
+    bool audit_partition_sweep = false;
+    bool forced_unified_validation = false;
+    bool construction_only = false;
 #if defined(PAPER_SWEEP_GPULSMOPT)
     bool include_count = false;
 #else
@@ -319,6 +371,39 @@ options parse_options(int argc, char **argv)
         else if (argument == "--stop-after-r")
             result.stop_after_r = static_cast<std::uint32_t>(
                 std::stoul(require_value()));
+        else if (argument == "--profile-insert-r")
+            result.profile_insert_r = static_cast<std::uint32_t>(
+                std::stoul(require_value()));
+        else if (argument == "--profile-rank-cell-standalone-r")
+            result.profile_rank_cell_standalone_r = static_cast<std::uint32_t>(
+                std::stoul(require_value()));
+        else if (argument == "--profile-direct-standalone-r")
+            result.profile_direct_standalone_r = static_cast<std::uint32_t>(
+                std::stoul(require_value()));
+        else if (argument == "--profile-allow-validation-failure")
+            result.profile_allow_validation_failure = true;
+        else if (argument == "--profile-all-inserts")
+            result.profile_all_inserts = true;
+        else if (argument == "--profile-summary-only")
+            result.profile_summary_only = true;
+        else if (argument == "--audit-direct-correctness")
+            result.audit_direct_correctness = true;
+        else if (argument == "--audit-partition-sweep")
+            result.audit_partition_sweep = true;
+        else if (argument == "--forced-unified-validation-only")
+        {
+            result.main_sweep = false;
+            result.cleanup_sweep = false;
+            result.bulk_sweep = false;
+            result.forced_unified_validation = true;
+        }
+        else if (argument == "--construction-only")
+        {
+            result.main_sweep = false;
+            result.cleanup_sweep = false;
+            result.bulk_sweep = false;
+            result.construction_only = true;
+        }
         else if (argument == "--main-only")
         {
             result.main_sweep = true;
@@ -342,6 +427,38 @@ options parse_options(int argc, char **argv)
         else
             throw std::invalid_argument("unknown argument: " + argument);
     }
+    if (result.profile_insert_r != 0 && result.profile_all_inserts)
+        throw std::invalid_argument(
+            "--profile-insert-r and --profile-all-inserts are mutually exclusive");
+    if (result.profile_rank_cell_standalone_r != 0 &&
+        result.profile_all_inserts)
+        throw std::invalid_argument(
+            "--profile-rank-cell-standalone-r and --profile-all-inserts are mutually exclusive");
+    if (result.profile_insert_r != 0 &&
+        result.profile_rank_cell_standalone_r != 0)
+        throw std::invalid_argument(
+            "--profile-insert-r and --profile-rank-cell-standalone-r are mutually exclusive");
+    if (result.profile_direct_standalone_r != 0 &&
+        (result.profile_insert_r != 0 ||
+         result.profile_rank_cell_standalone_r != 0 ||
+         result.profile_all_inserts))
+        throw std::invalid_argument(
+            "--profile-direct-standalone-r is mutually exclusive with other profiling modes");
+    if (result.profile_allow_validation_failure &&
+        result.profile_direct_standalone_r == 0)
+        throw std::invalid_argument(
+            "--profile-allow-validation-failure requires --profile-direct-standalone-r");
+    if (result.audit_direct_correctness &&
+        result.profile_direct_standalone_r == 0)
+        throw std::invalid_argument(
+            "--audit-direct-correctness requires --profile-direct-standalone-r");
+    if (result.audit_partition_sweep &&
+        (result.profile_insert_r != 0 ||
+         result.profile_rank_cell_standalone_r != 0 ||
+         result.profile_direct_standalone_r != 0 ||
+         result.profile_all_inserts))
+        throw std::invalid_argument(
+            "--audit-partition-sweep is mutually exclusive with profiling modes");
     return result;
 }
 
@@ -371,13 +488,255 @@ void write_metadata(const options &configuration)
     output << "range_chunk_log=" << configuration.range_chunk_log << '\n';
     output << "count_enabled=" << configuration.include_count << '\n';
     output << "range_implementation=enumeration_checksum\n";
+    output << "profile_insert_r=" << configuration.profile_insert_r << '\n';
+    output << "profile_rank_cell_standalone_r="
+           << configuration.profile_rank_cell_standalone_r << '\n';
+    output << "profile_direct_standalone_r="
+           << configuration.profile_direct_standalone_r << '\n';
+    output << "profile_allow_validation_failure="
+           << configuration.profile_allow_validation_failure << '\n';
+    output << "profile_all_inserts=" << configuration.profile_all_inserts << '\n';
+    output << "profile_summary_only="
+           << configuration.profile_summary_only << '\n';
+    output << "audit_direct_correctness="
+           << configuration.audit_direct_correctness << '\n';
+    output << "audit_partition_sweep="
+           << configuration.audit_partition_sweep << '\n';
+    output << "forced_unified_validation="
+           << configuration.forced_unified_validation << '\n';
+    output << "construction_only=" << configuration.construction_only << '\n';
 #if defined(PAPER_SWEEP_GPULSMOPT)
+    output << "gpulsmopt_canonical_carry="
+           << gpulsmopt2_detail::kCanonicalCarry << '\n';
+    output << "gpulsmopt_canonical_local_epoch="
+           << gpulsmopt2_detail::kCanonicalLocalEpoch << '\n';
+    output << "gpulsmopt_canonical_tournament_merge="
+           << gpulsmopt2_detail::kCanonicalTournamentMerge << '\n';
+    output << "gpulsmopt_canonical_tournament_minimum_sources="
+           << gpulsmopt2_detail::kCanonicalTournamentMinimumSources << '\n';
+    output << "gpulsmopt_canonical_publication_graph="
+           << gpulsmopt2_detail::kCanonicalPublicationGraph << '\n';
+#if defined(GPULSMOPT_FORCE_UNIFIED_MERGE)
+    output << "gpulsmopt_force_unified_merge=1\n";
+#else
+    output << "gpulsmopt_force_unified_merge=0\n";
+#endif
+#if defined(GPULSMOPT_FORCE_UNIFIED_COMPILE_ELIDE)
+    output << "gpulsmopt_force_unified_compile_elision=1\n";
+#else
+    output << "gpulsmopt_force_unified_compile_elision=0\n";
+#endif
     output << "gpulsmopt_maximum_batch_capacity="
            << gpulsmopt_adapter_detail::batch_capacity() << '\n';
     output << "gpulsmopt_level_zero_capacity="
            << gpulsmopt_adapter_detail::level_zero_capacity() << '\n';
 #endif
 }
+
+#if defined(PAPER_SWEEP_GPULSMOPT)
+
+[[maybe_unused]] key_type sparse_validation_key(std::uint32_t quotient)
+{
+    const std::uint32_t suffix =
+        (quotient * 40503u + 17u) & 0xffffu;
+    return (quotient << 16u) | suffix;
+}
+
+void run_forced_unified_validation(const options &configuration)
+{
+#if !defined(GPULSMOPT_FORCE_UNIFIED_MERGE)
+    (void)configuration;
+    throw std::invalid_argument(
+        "--forced-unified-validation-only requires the forced-unified build");
+#else
+    using index_type = paper_index_type<batch_log>;
+    constexpr std::uint32_t maximum_batch = 4096u;
+    constexpr std::uint32_t sparse_batch = 2048u;
+    constexpr std::uint32_t dense_batch = 4096u;
+    constexpr std::uint32_t duplicate_batch = 4096u;
+    constexpr std::uint32_t duplicate_keys = 1024u;
+    constexpr std::uint32_t dense_quotient = 30000u;
+
+    cuda_buffer<key_type> keys;
+    cuda_buffer<smallsize> values;
+    keys.alloc(maximum_batch);
+    values.alloc(maximum_batch);
+
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    PAPER_CUDA(cudaMemGetInfo(&free_memory, &total_memory));
+    index_type index;
+    index.build(
+        nullptr, 0, std::uint32_t{1} << 20u, free_memory,
+        nullptr, nullptr);
+
+    std::unordered_map<key_type, smallsize> expected;
+    std::vector<key_type> removed;
+    std::ofstream results(
+        configuration.output_directory / "forced_unified_validation.csv");
+    results << "scenario,live_keys,queries,errors\n";
+
+    auto validate = [&](const char *scenario) {
+        std::vector<key_type> host_queries;
+        std::vector<smallsize> host_expected;
+        host_queries.reserve(expected.size() + removed.size() + 4096u);
+        host_expected.reserve(host_queries.capacity());
+        for (const auto &[key, value] : expected)
+        {
+            host_queries.push_back(key);
+            host_expected.push_back(value);
+        }
+        for (const key_type key : removed)
+        {
+            host_queries.push_back(key);
+            host_expected.push_back(not_found);
+        }
+        for (std::uint32_t suffix = 0u;
+             host_queries.size() < expected.size() + removed.size() + 4096u;
+             ++suffix)
+        {
+            const key_type key = (25000u << 16u) | (suffix & 0xffffu);
+            if (expected.find(key) != expected.end())
+                continue;
+            host_queries.push_back(key);
+            host_expected.push_back(not_found);
+        }
+
+        cuda_buffer<key_type> query_keys;
+        cuda_buffer<smallsize> query_results;
+        query_keys.alloc_and_upload(host_queries);
+        query_results.alloc(host_queries.size());
+        index.lookup(
+            query_keys.ptr(), query_results.ptr(), host_queries.size(), 0);
+        PAPER_CUDA(cudaDeviceSynchronize());
+        const auto actual = query_results.download(host_queries.size());
+        std::uint64_t errors = 0u;
+        for (std::size_t i = 0u; i < actual.size(); ++i)
+            errors += actual[i] != host_expected[i];
+        results << scenario << ',' << expected.size() << ','
+                << host_queries.size() << ',' << errors << '\n';
+        results.flush();
+        std::cout << "FORCED_UNIFIED_VALIDATION"
+                  << " scenario=" << scenario
+                  << " live_keys=" << expected.size()
+                  << " queries=" << host_queries.size()
+                  << " errors=" << errors << std::endl;
+        if (errors)
+            throw std::runtime_error(
+                std::string("forced-unified validation failed in ") +
+                scenario + ": " + std::to_string(errors));
+    };
+
+    std::vector<key_type> host_keys(maximum_batch);
+    std::vector<smallsize> host_values(maximum_batch);
+
+    // One key in each of 32,768 quotients: deliberately sparse rows.
+    for (std::uint32_t batch = 0u; batch < 16u; ++batch)
+    {
+        for (std::uint32_t i = 0u; i < sparse_batch; ++i)
+        {
+            const std::uint32_t quotient = batch * sparse_batch + i;
+            host_keys[i] = sparse_validation_key(quotient);
+            host_values[i] = 0x01000000u + quotient;
+            expected[host_keys[i]] = host_values[i];
+        }
+        keys.upload(host_keys.data(), sparse_batch);
+        values.upload(host_values.data(), sparse_batch);
+        index.insert(keys.ptr(), values.ptr(), sparse_batch, 0);
+    }
+    PAPER_CUDA(cudaDeviceSynchronize());
+    validate("sparse_unique");
+
+    // Fill every suffix of one quotient: deliberately dense and crowded.
+    for (std::uint32_t batch = 0u; batch < 16u; ++batch)
+    {
+        for (std::uint32_t i = 0u; i < dense_batch; ++i)
+        {
+            const std::uint32_t suffix = batch * dense_batch + i;
+            host_keys[i] = (dense_quotient << 16u) | suffix;
+            host_values[i] = 0x02000000u + suffix;
+            expected[host_keys[i]] = host_values[i];
+        }
+        keys.upload(host_keys.data(), dense_batch);
+        values.upload(host_values.data(), dense_batch);
+        index.insert(keys.ptr(), values.ptr(), dense_batch, 0);
+    }
+    PAPER_CUDA(cudaDeviceSynchronize());
+    validate("dense_unique");
+
+    // Four copies per key in every batch. The final position of the newest
+    // batch is the expected winner.
+    for (std::uint32_t batch = 0u; batch < 16u; ++batch)
+    {
+        for (std::uint32_t i = 0u; i < duplicate_batch; ++i)
+        {
+            const std::uint32_t source = i % duplicate_keys;
+            host_keys[i] = sparse_validation_key(source);
+            host_values[i] = 0x10000000u + batch * duplicate_batch + i;
+            expected[host_keys[i]] = host_values[i];
+        }
+        keys.upload(host_keys.data(), duplicate_batch);
+        values.upload(host_values.data(), duplicate_batch);
+        index.insert(keys.ptr(), values.ptr(), duplicate_batch, 0);
+    }
+    PAPER_CUDA(cudaDeviceSynchronize());
+    validate("duplicate_newest_wins");
+
+    // Repeated tombstones must hide both the newest updates and older rows.
+    removed.clear();
+    removed.reserve(duplicate_keys);
+    for (std::uint32_t i = 0u; i < duplicate_keys; ++i)
+    {
+        host_keys[i] = sparse_validation_key(i);
+        removed.push_back(host_keys[i]);
+        expected.erase(host_keys[i]);
+    }
+    keys.upload(host_keys.data(), duplicate_keys);
+    for (std::uint32_t batch = 0u; batch < 16u; ++batch)
+        index.remove(keys.ptr(), duplicate_keys, 0);
+    PAPER_CUDA(cudaDeviceSynchronize());
+    validate("tombstone_visibility");
+
+    std::ofstream complete(
+        configuration.output_directory / "complete_forced_unified_validation");
+    complete << "ok\n";
+#endif
+}
+
+void run_construction_probe(const options &configuration)
+{
+    using index_type = paper_index_type<batch_log>;
+    const std::uint32_t maximum_elements =
+        std::uint32_t{1} << configuration.insert_limit_log;
+    size_t free_before = 0;
+    size_t total_memory = 0;
+    PAPER_CUDA(cudaMemGetInfo(&free_before, &total_memory));
+    index_type index;
+    const double wall_ms = measure_wall_ms([&] {
+        index.build(
+            nullptr, 0, maximum_elements, free_before,
+            nullptr, nullptr);
+        PAPER_CUDA(cudaDeviceSynchronize());
+    });
+    const std::size_t reported_bytes = index.gpu_resident_bytes();
+    size_t free_after = 0;
+    PAPER_CUDA(cudaMemGetInfo(&free_after, &total_memory));
+    std::ofstream output(
+        configuration.output_directory / "construction_b20.csv");
+    output << "maximum_elements,wall_ms,reported_gpu_resident_bytes,"
+              "free_memory_delta_bytes\n";
+    output << maximum_elements << ',' << std::setprecision(12) << wall_ms
+           << ',' << reported_bytes << ',' << (free_before - free_after)
+           << '\n';
+    std::cout << "CONSTRUCTION_PROBE"
+              << " maximum_elements=" << maximum_elements
+              << " wall_ms=" << wall_ms
+              << " reported_gpu_resident_bytes=" << reported_bytes
+              << " free_memory_delta_bytes=" << (free_before - free_after)
+              << std::endl;
+}
+
+#endif
 
 template <typename Index>
 double run_lookup(
@@ -554,6 +913,150 @@ void run_bulk_build(const options &configuration)
     complete << "ok\n";
 }
 
+#if defined(PAPER_SWEEP_GPULSMOPT)
+
+std::uint32_t audit_expected_source(
+    key_type key, std::uint32_t resident)
+{
+    constexpr std::uint32_t multiplier_inverse = 204209821u;
+    const std::uint32_t insertion_index = static_cast<std::uint32_t>(
+        (std::uint64_t{(key - 289133645u) & key_mask} *
+         multiplier_inverse) & key_mask);
+    const std::uint32_t epoch_rows =
+        (std::uint32_t{1} << batch_log) * 16u;
+    const std::uint32_t epoch = insertion_index / epoch_rows;
+    const std::uint32_t newest_epoch = resident / epoch_rows - 1u;
+    const std::uint32_t distance = newest_epoch - epoch;
+    return distance == 0u
+        ? 0u : 32u - static_cast<std::uint32_t>(__builtin_clz(distance));
+}
+
+template <typename Index>
+unsigned long long run_direct_correctness_lookup_audit(
+    Index &index, cuda_buffer<key_type> &queries,
+    cuda_buffer<smallsize> &production_results,
+    std::uint32_t count, std::uint32_t resident,
+    const GPULSMOpt::DirectMergeProfileStats &profile,
+    const std::filesystem::path &output_directory)
+{
+    cuda_buffer<smallsize> job_results;
+    cuda_buffer<smallsize> route_results;
+    job_results.alloc(count);
+    route_results.alloc(count);
+    std::ofstream failures(output_directory / "correctness_lookup_failures.csv");
+    failures << "scenario,query_index,key,quotient,cell,expected_source,"
+                "hot_piece,expected,production,route_only,jobs_only,"
+                "classification\n";
+
+    std::array<unsigned long long, 2> scenario_errors{};
+    std::array<unsigned long long, 5> classification_errors{};
+    std::array<unsigned long long, 65> source_errors{};
+    std::array<unsigned long long, 128> cell_errors{};
+    std::array<unsigned long long, 16> piece_errors{};
+    unsigned long long job_reference_errors = 0;
+    unsigned long long route_reference_errors = 0;
+
+    for (std::uint32_t scenario = 0; scenario < 2u; ++scenario)
+    {
+        const bool hits = scenario == 0u;
+        fill_lookup_queries<<<(count + threads - 1) / threads, threads>>>(
+            queries.ptr(), count, resident, hits,
+            hits ? 0x61000u : 0x62000u);
+        PAPER_CUDA(cudaGetLastError());
+        index.lookup(queries.ptr(), production_results.ptr(), count, 0);
+        index.audit_direct_lookup(
+            queries.ptr(), job_results.ptr(), route_results.ptr(), count, 0);
+        PAPER_CUDA(cudaDeviceSynchronize());
+        const auto host_queries = queries.download(count);
+        const auto production = production_results.download(count);
+        const auto jobs = job_results.download(count);
+        const auto routes = route_results.download(count);
+        const smallsize expected = hits ? 1u : not_found;
+        for (std::uint32_t i = 0; i < count; ++i)
+        {
+            job_reference_errors += jobs[i] != expected;
+            route_reference_errors += routes[i] != expected;
+            if (production[i] == expected)
+                continue;
+            ++scenario_errors[scenario];
+            const key_type key = host_queries[i];
+            const std::uint32_t q = key >> 16u;
+            const std::uint32_t cell = (key >> 9u) & 127u;
+            const auto job = std::lower_bound(
+                profile.jobs.begin(), profile.jobs.end(),
+                std::uint64_t{key},
+                [](const GPULSMOpt::DirectMergeJobProfile &candidate,
+                   std::uint64_t value) {
+                    return candidate.key_end <= value;
+                });
+            const int piece = job != profile.jobs.end() &&
+                    job->key_begin <= key && key < job->key_end
+                ? static_cast<int>(job->hot_piece) : -1;
+            const int source = hits
+                ? static_cast<int>(audit_expected_source(key, resident)) : -1;
+            std::uint32_t classification = 4u;
+            const char *label = "other_lookup_routing";
+            if (jobs[i] != expected)
+            {
+                classification = 0u;
+                label = "direct_output_or_job_mapping";
+            }
+            else if (routes[i] != expected)
+            {
+                classification = 1u;
+                label = "route_metadata";
+            }
+            else if (hits)
+            {
+                classification = 2u;
+                label = "rank_guide_or_search_bounds";
+            }
+            else
+            {
+                classification = 3u;
+                label = "lookup_false_positive";
+            }
+            ++classification_errors[classification];
+            if (source >= 0 && source < static_cast<int>(source_errors.size()))
+                ++source_errors[source];
+            ++cell_errors[cell];
+            if (piece >= 0 && piece < static_cast<int>(piece_errors.size()))
+                ++piece_errors[piece];
+            failures << (hits ? "hit" : "miss") << ',' << i << ',' << key
+                     << ',' << q << ',' << cell << ',' << source << ','
+                     << piece << ',' << expected << ',' << production[i]
+                     << ',' << routes[i] << ',' << jobs[i] << ',' << label
+                     << '\n';
+        }
+    }
+
+    std::ofstream summary(output_directory / "correctness_lookup_summary.csv");
+    summary << "metric,bucket,count\n";
+    summary << "scenario,hit," << scenario_errors[0] << '\n';
+    summary << "scenario,miss," << scenario_errors[1] << '\n';
+    summary << "reference,jobs_only," << job_reference_errors << '\n';
+    summary << "reference,route_only," << route_reference_errors << '\n';
+    constexpr const char *classification_names[] = {
+        "direct_output_or_job_mapping", "route_metadata",
+        "rank_guide_or_search_bounds", "lookup_false_positive",
+        "other_lookup_routing"};
+    for (std::size_t i = 0; i < classification_errors.size(); ++i)
+        summary << "classification," << classification_names[i] << ','
+                << classification_errors[i] << '\n';
+    for (std::size_t i = 0; i < source_errors.size(); ++i)
+        if (source_errors[i])
+            summary << "source," << i << ',' << source_errors[i] << '\n';
+    for (std::size_t i = 0; i < cell_errors.size(); ++i)
+        if (cell_errors[i])
+            summary << "cell," << i << ',' << cell_errors[i] << '\n';
+    for (std::size_t i = 0; i < piece_errors.size(); ++i)
+        if (piece_errors[i])
+            summary << "piece," << i << ',' << piece_errors[i] << '\n';
+    return scenario_errors[0] + scenario_errors[1];
+}
+
+#endif
+
 template <unsigned BatchLog>
 void run_main_sweep(const options &configuration)
 {
@@ -589,6 +1092,30 @@ void run_main_sweep(const options &configuration)
         configuration.include_count ? "count_range" : "range";
     std::ofstream range_file(
         configuration.output_directory / (range_prefix + suffix));
+    std::ofstream partition_file;
+    std::ofstream source_run_histogram_file;
+    std::ofstream source_count_histogram_file;
+    if (configuration.audit_partition_sweep)
+    {
+        partition_file.open(
+            configuration.output_directory / "partition_audit_b20.csv");
+        source_run_histogram_file.open(
+            configuration.output_directory /
+            "partition_source_run_histogram_b20.csv");
+        source_count_histogram_file.open(
+            configuration.output_directory /
+            "partition_source_count_histogram_b20.csv");
+        partition_file << "r,selected_count,source_count,destination_level,"
+            "rank_cell_mode,job_count,total_rows,direct_rows,resolved_rows,"
+            "rank_supported_rows,eligible_rows,direct_jobs,resolved_jobs,"
+            "rank_supported_jobs,eligible_jobs,packed_word_failure_jobs,"
+            "ordering_equivalence_violations,duplicate_boundary_count,"
+            "maximum_boundary_equal_rows,maximum_source_rows,"
+            "maximum_packed_bits,imbalance_p50,imbalance_p95,"
+            "imbalance_p99,imbalance_maximum\n";
+        source_run_histogram_file << "r,log2_run_rows,count\n";
+        source_count_histogram_file << "r,nonempty_sources,count\n";
+    }
     insertion_file << "system,batch_log,r,resident_elements,time_ms,rate_mops,"
                       "cumulative_ms,effective_rate_mops\n";
     lookup_file << "system,batch_log,r,resident_elements,scenario,time_ms,"
@@ -603,6 +1130,23 @@ void run_main_sweep(const options &configuration)
     cuda_buffer<smallsize> batch_values;
     batch_keys.alloc(batch_size);
     batch_values.alloc(batch_size);
+
+    // Complete-loop profiling pre-generates every input record before the
+    // profiler range.  This keeps input-generation kernels outside the
+    // insertion capture while preserving the normal one-batch path otherwise.
+    cuda_buffer<key_type> profile_all_keys;
+    cuda_buffer<smallsize> profile_all_values;
+    if (configuration.profile_all_inserts)
+    {
+        profile_all_keys.alloc(maximum_elements);
+        profile_all_values.alloc(maximum_elements);
+        fill_insert_batch<<<
+            (maximum_elements + threads - 1) / threads, threads>>>(
+            profile_all_keys.ptr(), profile_all_values.ptr(), 0,
+            maximum_elements);
+        PAPER_CUDA(cudaGetLastError());
+        PAPER_CUDA(cudaDeviceSynchronize());
+    }
 
     cuda_buffer<key_type> lookup_queries;
     cuda_buffer<smallsize> lookup_results;
@@ -639,23 +1183,224 @@ void run_main_sweep(const options &configuration)
     index.build(
         nullptr, 0, maximum_elements, free_memory,
         nullptr, nullptr);
+#if defined(PAPER_SWEEP_GPULSMOPT)
+    if (configuration.audit_partition_sweep)
+        index.set_partition_audit(true);
+    if (configuration.audit_direct_correctness)
+    {
+        // Allocate diagnostic-only storage before any measured insertion,
+        // without forcing earlier publications through the standalone path.
+        index.set_direct_correctness_audit(true);
+        index.set_direct_correctness_audit(false);
+    }
+#endif
 
     gpu_timer timer;
     double cumulative_insert_ms = 0;
     const auto wall_start = clock_type::now();
+    bool profiler_started = false;
+    if (configuration.profile_all_inserts)
+    {
+        PAPER_CUDA(cudaProfilerStart());
+        profiler_started = true;
+    }
 
     for (std::uint32_t r = 1; r <= insertion_count; ++r)
     {
         const std::uint32_t begin = (r - 1) * batch_size;
-        fill_insert_batch<<<
-            (batch_size + threads - 1) / threads, threads>>>(
-                batch_keys.ptr(), batch_values.ptr(), begin, batch_size);
-        PAPER_CUDA(cudaGetLastError());
+        key_type *insert_keys = batch_keys.ptr();
+        smallsize *insert_values = batch_values.ptr();
+        if (configuration.profile_all_inserts)
+        {
+            insert_keys = profile_all_keys.ptr() + begin;
+            insert_values = profile_all_values.ptr() + begin;
+        }
+        else
+        {
+            fill_insert_batch<<<
+                (batch_size + threads - 1) / threads, threads>>>(
+                insert_keys, insert_values, begin, batch_size);
+            PAPER_CUDA(cudaGetLastError());
+        }
+        const bool standalone_rank_cell_insert =
+            configuration.profile_rank_cell_standalone_r == r;
+        const bool standalone_direct_insert =
+            configuration.profile_direct_standalone_r == r;
+        const bool capture_this_insert =
+            configuration.profile_insert_r == r ||
+            standalone_rank_cell_insert || standalone_direct_insert;
+        if (capture_this_insert)
+        {
+            // The fill is deliberately outside a targeted insertion capture.
+            PAPER_CUDA(cudaDeviceSynchronize());
+            PAPER_CUDA(cudaProfilerStart());
+            profiler_started = true;
+        }
+#if defined(PAPER_SWEEP_GPULSMOPT)
+        if (standalone_rank_cell_insert)
+            index.set_rank_cell_standalone_profile(true);
+        if (standalone_direct_insert)
+            index.set_direct_standalone_profile(true);
+        if (standalone_direct_insert &&
+            configuration.audit_direct_correctness)
+            index.set_direct_correctness_audit(true);
+#endif
         const double insert_ms = timer.measure([&] {
             index.insert(
-                batch_keys.ptr(), batch_values.ptr(), batch_size, 0);
+                insert_keys, insert_values, batch_size, 0);
             PAPER_CUDA(cudaDeviceSynchronize());
         });
+#if defined(PAPER_SWEEP_GPULSMOPT)
+        if (standalone_rank_cell_insert)
+        {
+            index.set_rank_cell_standalone_profile(false);
+            const auto profile = index.rank_cell_profile_stats();
+            std::cout << "RANK_CELL_STANDALONE"
+                      << " r=" << r
+                      << " standalone=" << profile.standalone
+                      << " rank_cell_mode=" << profile.rank_cell_mode
+                      << " launch_count=" << profile.launch_count
+                      << " grid_x=" << profile.grid_x
+                      << " block_x=" << profile.block_x
+                      << " dynamic_shared_bytes="
+                      << profile.dynamic_shared_bytes
+                      << " selected_count=" << profile.selected_count
+                      << " destination_level=" << profile.destination_level
+                      << " publication_status="
+                      << profile.publication_status
+                      << " raw_reservation=" << profile.raw_reservation
+                      << " survivor_count=" << profile.survivor_count
+                      << " occupied_level_mask="
+                      << profile.occupied_level_mask << std::endl;
+        }
+        if (standalone_direct_insert)
+        {
+            index.set_direct_standalone_profile(false);
+            const auto profile = index.direct_profile_stats();
+            std::cout << "DIRECT_STANDALONE"
+                      << " r=" << r
+                      << " standalone=" << profile.standalone
+                      << " forced_unified_merge="
+                      << profile.forced_unified_merge
+                      << " forced_unified_compile_elision="
+                      << profile.forced_unified_compile_elision
+                      << " direct_launch_count="
+                      << profile.direct_launch_count
+                      << " rank_cell_mode=" << profile.rank_cell_mode
+                      << " grid_x=" << profile.grid_x
+                      << " block_x=" << profile.block_x
+                      << " dynamic_shared_bytes="
+                      << profile.dynamic_shared_bytes
+                      << " selected_count=" << profile.selected_count
+                      << " source_count=" << profile.source_count
+                      << " destination_level=" << profile.destination_level
+                      << " publication_status="
+                      << profile.publication_status
+                      << " job_count=" << profile.job_count
+                      << " raw_reservation=" << profile.raw_reservation
+                      << " survivor_count=" << profile.survivor_count
+                      << " occupied_level_mask="
+                      << profile.occupied_level_mask << std::endl;
+            if (!configuration.audit_direct_correctness &&
+                !configuration.profile_summary_only)
+            for (const auto &job : profile.jobs)
+                std::cout << "DIRECT_JOB"
+                          << " r=" << r
+                          << " job_index=" << job.job_index
+                          << " quotient_begin=" << job.quotient_begin
+                          << " quotient_end=" << job.quotient_end
+                          << " quotient_count=" << job.quotient_count
+                          << " raw_rows=" << job.raw_rows
+                          << " output_rows=" << job.output_rows
+                          << " existing_capacity="
+                          << job.existing_capacity
+                          << " hot_pieces=" << job.hot_pieces
+                          << " hot_piece=" << job.hot_piece
+                          << " crowded=" << job.crowded
+                          << " cell_owned_shape="
+                          << job.cell_owned_shape << std::endl;
+            if (configuration.audit_direct_correctness)
+            {
+                const auto audit = index.direct_correctness_audit_stats();
+                std::cout << "DIRECT_CORRECTNESS_AUDIT"
+                          << " r=" << r
+                          << " rows=" << audit.row_count
+                          << " digest_sum=" << audit.digest_sum
+                          << " digest_xor=" << audit.digest_xor
+                          << " unsupported_jobs=" << audit.unsupported_jobs
+                          << " count_mismatch_jobs="
+                          << audit.count_mismatch_jobs
+                          << " unsorted_rows=" << audit.unsorted_rows
+                          << " duplicate_rows=" << audit.duplicate_rows
+                          << " value_errors=" << audit.value_errors
+                          << " flag_errors=" << audit.flag_errors
+                          << " range_errors=" << audit.range_errors
+                          << " route_header_errors="
+                          << audit.route_header_errors
+                          << " route_slice_errors="
+                          << audit.route_slice_errors
+                          << " route_logical_errors="
+                          << audit.route_logical_errors
+                          << " descriptor_errors="
+                          << audit.descriptor_errors << std::endl;
+            }
+        }
+        if (configuration.audit_partition_sweep && (r % 16u) == 0u)
+        {
+            const auto audit = index.partition_audit_stats();
+            const auto ratio = [](std::uint32_t ppm) {
+                return static_cast<double>(ppm) / 1000000.0;
+            };
+            partition_file << r << ',' << audit.selected_count << ','
+                << audit.source_count << ',' << audit.destination_level << ','
+                << audit.rank_cell_mode << ',' << audit.job_count << ','
+                << audit.total_rows << ',' << audit.direct_rows << ','
+                << audit.resolved_rows << ',' << audit.rank_supported_rows
+                << ',' << audit.eligible_rows << ',' << audit.direct_jobs
+                << ',' << audit.resolved_jobs << ','
+                << audit.rank_supported_jobs << ',' << audit.eligible_jobs
+                << ',' << audit.packed_word_failure_jobs << ','
+                << audit.ordering_equivalence_violations << ','
+                << audit.duplicate_boundary_count << ','
+                << audit.maximum_boundary_equal_rows << ','
+                << audit.maximum_source_rows << ','
+                << audit.maximum_packed_bits << ','
+                << ratio(audit.imbalance_p50_ppm) << ','
+                << ratio(audit.imbalance_p95_ppm) << ','
+                << ratio(audit.imbalance_p99_ppm) << ','
+                << ratio(audit.imbalance_maximum_ppm) << '\n';
+            for (std::size_t bucket = 0;
+                 bucket < audit.source_run_log2_histogram.size(); ++bucket)
+                if (audit.source_run_log2_histogram[bucket])
+                    source_run_histogram_file << r << ',' << bucket << ','
+                        << audit.source_run_log2_histogram[bucket] << '\n';
+            for (std::size_t bucket = 0;
+                 bucket < audit.nonempty_source_histogram.size(); ++bucket)
+                if (audit.nonempty_source_histogram[bucket])
+                    source_count_histogram_file << r << ',' << bucket << ','
+                        << audit.nonempty_source_histogram[bucket] << '\n';
+            partition_file.flush();
+            source_run_histogram_file.flush();
+            source_count_histogram_file.flush();
+            std::cout << "PARTITION_AUDIT"
+                      << " r=" << r
+                      << " jobs=" << audit.job_count
+                      << " rows=" << audit.total_rows
+                      << " eligible_rows=" << audit.eligible_rows
+                      << " p99=" << ratio(audit.imbalance_p99_ppm)
+                      << " maximum="
+                      << ratio(audit.imbalance_maximum_ppm)
+                      << " packed_failures="
+                      << audit.packed_word_failure_jobs
+                      << " ordering_violations="
+                      << audit.ordering_equivalence_violations << std::endl;
+        }
+#endif
+        if (capture_this_insert)
+        {
+            PAPER_CUDA(cudaProfilerStop());
+            profiler_started = false;
+        }
         cumulative_insert_ms += insert_ms;
         const std::uint32_t resident = r * batch_size;
         const double insert_rate = batch_size / insert_ms / 1000.0;
@@ -726,19 +1471,94 @@ void run_main_sweep(const options &configuration)
         }
     }
 
+    if (profiler_started)
+    {
+        PAPER_CUDA(cudaProfilerStop());
+        profiler_started = false;
+    }
+
     const std::uint32_t final_resident = insertion_count * batch_size;
-    run_lookup(
-        index, lookup_queries, lookup_results, errors,
-        validation_count, final_resident, true, 0x61000u, timer);
-    run_lookup(
-        index, lookup_queries, lookup_results, errors,
-        validation_count, final_resident, false, 0x62000u, timer);
-    PAPER_CUDA(cudaDeviceSynchronize());
-    const unsigned long long error_count = errors.download_first_item();
+    unsigned long long error_count = 0;
+#if defined(PAPER_SWEEP_GPULSMOPT)
+    if (configuration.audit_direct_correctness)
+    {
+        cuda_buffer<unsigned long long> expected_digest;
+        expected_digest.alloc(2);
+        expected_digest.zero();
+        digest_expected_insert_rows<<<4096, threads>>>(
+            final_resident, expected_digest.ptr());
+        PAPER_CUDA(cudaGetLastError());
+        PAPER_CUDA(cudaDeviceSynchronize());
+        const auto expected = expected_digest.download(2);
+        const auto audit = index.direct_correctness_audit_stats();
+        std::ofstream output(
+            configuration.output_directory / "direct_output_audit.csv");
+        output << "row_count,expected_row_count,digest_sum,expected_digest_sum,"
+                  "digest_xor,expected_digest_xor,unsupported_jobs,"
+                  "count_mismatch_jobs,unsorted_rows,duplicate_rows,"
+                  "value_errors,flag_errors,range_errors,route_header_errors,"
+                  "route_slice_errors,route_logical_errors,descriptor_errors,"
+                  "row_count_match,digest_match\n";
+        output << audit.row_count << ',' << final_resident << ','
+               << audit.digest_sum << ',' << expected[0] << ','
+               << audit.digest_xor << ',' << expected[1] << ','
+               << audit.unsupported_jobs << ','
+               << audit.count_mismatch_jobs << ',' << audit.unsorted_rows
+               << ',' << audit.duplicate_rows << ',' << audit.value_errors
+               << ',' << audit.flag_errors << ',' << audit.range_errors
+               << ',' << audit.route_header_errors << ','
+               << audit.route_slice_errors << ','
+               << audit.route_logical_errors << ',' << audit.descriptor_errors
+               << ',' << (audit.row_count == final_resident) << ','
+               << (audit.digest_sum == expected[0] &&
+                   audit.digest_xor == expected[1]) << '\n';
+        std::ofstream histogram(
+            configuration.output_directory / "direct_output_failure_histogram.csv");
+        histogram << "dimension,bucket,count\n";
+        for (std::size_t i = 0; i < audit.cell_errors.size(); ++i)
+            if (audit.cell_errors[i])
+                histogram << "cell," << i << ',' << audit.cell_errors[i]
+                          << '\n';
+        for (std::size_t i = 0; i < audit.piece_errors.size(); ++i)
+            if (audit.piece_errors[i])
+                histogram << "piece," << i << ',' << audit.piece_errors[i]
+                          << '\n';
+        error_count = run_direct_correctness_lookup_audit(
+            index, lookup_queries, lookup_results, validation_count,
+            final_resident, index.direct_profile_stats(),
+            configuration.output_directory);
+        std::cout << "DIRECT_REFERENCE_DIGEST"
+                  << " expected_sum=" << expected[0]
+                  << " actual_sum=" << audit.digest_sum
+                  << " expected_xor=" << expected[1]
+                  << " actual_xor=" << audit.digest_xor
+                  << " match="
+                  << (audit.digest_sum == expected[0] &&
+                      audit.digest_xor == expected[1]) << std::endl;
+    }
+    else
+#endif
+    {
+        run_lookup(
+            index, lookup_queries, lookup_results, errors,
+            validation_count, final_resident, true, 0x61000u, timer);
+        run_lookup(
+            index, lookup_queries, lookup_results, errors,
+            validation_count, final_resident, false, 0x62000u, timer);
+        PAPER_CUDA(cudaDeviceSynchronize());
+        error_count = errors.download_first_item();
+    }
     if (error_count != 0)
+    {
+        std::cerr << "PAPER_VALIDATION_FAILURE count=" << error_count
+                  << std::endl;
+        if (configuration.profile_allow_validation_failure ||
+            configuration.audit_partition_sweep)
+            return;
         throw std::runtime_error(
             "paper sweep validation failures: " +
             std::to_string(error_count));
+    }
     const std::string marker_prefix = configuration.include_count
         ? ""
         : "range_";
@@ -892,6 +1712,12 @@ int main(int argc, char **argv)
             run_main_sweep<batch_log>(configuration);
         if (configuration.cleanup_sweep)
             run_cleanup_sweep(configuration);
+#if defined(PAPER_SWEEP_GPULSMOPT)
+        if (configuration.forced_unified_validation)
+            run_forced_unified_validation(configuration);
+        if (configuration.construction_only)
+            run_construction_probe(configuration);
+#endif
         return 0;
     }
     catch (const std::exception &error)

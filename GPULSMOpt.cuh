@@ -118,6 +118,101 @@ constexpr std::uint32_t kPlanningTileQuotients =
 constexpr std::uint32_t kMaximumMergeSources = kMaximumLevels + 1u;
 constexpr std::uint32_t kBalancedMergeCapacityCeiling =
     kFoundationCompactionThreads * 32u;
+#ifndef GPULSMOPT_CANONICAL_CARRY
+#define GPULSMOPT_CANONICAL_CARRY 1
+#endif
+constexpr bool kCanonicalCarry = GPULSMOPT_CANONICAL_CARRY != 0;
+#ifndef GPULSMOPT_CANONICAL_LOCAL_EPOCH
+#define GPULSMOPT_CANONICAL_LOCAL_EPOCH 1
+#endif
+constexpr bool kCanonicalLocalEpoch =
+    GPULSMOPT_CANONICAL_LOCAL_EPOCH != 0;
+#ifndef GPULSMOPT_CANONICAL_TOURNAMENT_MERGE
+#define GPULSMOPT_CANONICAL_TOURNAMENT_MERGE 1
+#endif
+constexpr bool kCanonicalTournamentMerge =
+    GPULSMOPT_CANONICAL_TOURNAMENT_MERGE != 0;
+#ifndef GPULSMOPT_CANONICAL_TOURNAMENT_MINIMUM_SOURCES
+#define GPULSMOPT_CANONICAL_TOURNAMENT_MINIMUM_SOURCES 5
+#endif
+constexpr std::uint32_t kCanonicalTournamentMinimumSources =
+    GPULSMOPT_CANONICAL_TOURNAMENT_MINIMUM_SOURCES;
+static_assert(kCanonicalTournamentMinimumSources >= 3u &&
+              kCanonicalTournamentMinimumSources <= kMaximumMergeSources);
+#ifndef GPULSMOPT_CANONICAL_PUBLICATION_GRAPH
+#define GPULSMOPT_CANONICAL_PUBLICATION_GRAPH 1
+#endif
+constexpr bool kCanonicalPublicationGraph =
+    GPULSMOPT_CANONICAL_PUBLICATION_GRAPH != 0;
+constexpr std::uint32_t kCanonicalJobQuotients = 16u;
+constexpr std::uint32_t kCanonicalCandidateBits = 12u;
+constexpr std::uint32_t kCanonicalCandidateLimit =
+    1u << kCanonicalCandidateBits;
+constexpr std::uint32_t kCanonicalTombstoneWords =
+    kCanonicalCandidateLimit / 32u;
+constexpr std::uint32_t kCanonicalCapacityAdjustment =
+    (kCanonicalTombstoneWords * sizeof(std::uint32_t) +
+     2u * sizeof(std::uint32_t) - 1u) /
+    (2u * sizeof(std::uint32_t));
+static_assert(kCanonicalJobQuotients == 1u << 4u);
+static_assert(kBalancedMergeCapacityCeiling <= kCanonicalCandidateLimit * 2u);
+constexpr std::uint32_t kCanonicalResolverSuffixes = 1u << 16u;
+constexpr std::uint32_t kCanonicalTournamentChains = 128u;
+constexpr std::uint32_t kCanonicalTournamentTasks =
+    kCanonicalJobQuotients * kFoundationCells;
+constexpr std::uint32_t kCanonicalTournamentReferenceBits = 9u;
+constexpr std::uint32_t kCanonicalTournamentReferenceMask =
+    (1u << kCanonicalTournamentReferenceBits) - 1u;
+static_assert(kFoundationCellKeys ==
+              (1u << kCanonicalTournamentReferenceBits));
+
+__host__ __device__ constexpr std::uint32_t canonical_next_power_of_two(
+    std::uint32_t value) {
+  std::uint32_t result = 1u;
+  while (result < value) result <<= 1u;
+  return result;
+}
+
+__host__ __device__ constexpr std::size_t canonical_align_bytes(
+    std::size_t value, std::size_t alignment) {
+  return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+inline std::size_t canonical_tournament_dynamic_shared_bytes(
+    std::uint32_t capacity, std::uint32_t source_count) {
+  const std::uint32_t leaves = canonical_next_power_of_two(source_count);
+  std::size_t bytes = 0u;
+  const auto reserve = [&bytes](std::size_t count, std::size_t item_bytes,
+                                std::size_t alignment) {
+    bytes = canonical_align_bytes(bytes, alignment);
+    bytes += count * item_bytes;
+  };
+  const std::size_t states =
+      std::size_t{kCanonicalTournamentChains} * source_count;
+  reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
+  reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
+  reserve(states, sizeof(std::uint32_t), alignof(std::uint32_t));
+  reserve(std::size_t{kCanonicalTournamentChains} * leaves,
+          sizeof(std::uint8_t), alignof(std::uint8_t));
+  reserve(capacity, sizeof(std::uint32_t), alignof(std::uint32_t));
+  reserve(kCanonicalTournamentTasks, sizeof(std::uint16_t),
+          alignof(std::uint16_t));
+  reserve(kCanonicalTournamentTasks + 1u, sizeof(std::uint16_t),
+          alignof(std::uint16_t));
+  return canonical_align_bytes(bytes, 16u);
+}
+#if defined(GPULSMOPT_FORCE_UNIFIED_MERGE)
+constexpr bool kForceUnifiedMergeExperiment = true;
+#else
+constexpr bool kForceUnifiedMergeExperiment = false;
+#endif
+#if defined(GPULSMOPT_FORCE_UNIFIED_COMPILE_ELIDE)
+static_assert(kForceUnifiedMergeExperiment,
+              "compile-elided mode requires forced-unified mode");
+constexpr bool kForceUnifiedCompileElision = true;
+#else
+constexpr bool kForceUnifiedCompileElision = false;
+#endif
 // Bound for splitting a maximally dense quotient.
 constexpr std::uint32_t kMergeSourceBits = 7u;
 constexpr std::uint64_t kResidentWorkFlag = std::uint64_t{1} << 63u;
@@ -207,6 +302,18 @@ inline std::size_t preassigned_level_rank_blocks(
         ? maximum_raw_rows : capacity * 2u;
   }
   return result;
+}
+
+inline std::uint32_t canonical_level_count(
+    std::size_t maximum_raw_rows, std::size_t epoch_capacity) {
+  std::uint32_t levels = 1u;
+  std::size_t capacity = std::min(maximum_raw_rows, epoch_capacity);
+  while (capacity < maximum_raw_rows && levels < kMaximumLevels) {
+    capacity = capacity > maximum_raw_rows / 2u
+        ? maximum_raw_rows : capacity * 2u;
+    ++levels;
+  }
+  return levels;
 }
 
 
@@ -639,6 +746,13 @@ struct NewestAssignment {
   }
 };
 
+struct NewestPayload {
+  __host__ __device__ RawPayload operator()(
+      const RawPayload &first, const RawPayload &second) const {
+    return raw_position(second) > raw_position(first) ? second : first;
+  }
+};
+
 struct AssignmentRow {
   __host__ __device__ Row operator()(const RawAssignment &assignment) const {
     return raw_row(assignment);
@@ -692,6 +806,18 @@ struct BalancedMergeJob {
 };
 
 static_assert(sizeof(BalancedMergeJob) == 48u);
+
+struct CanonicalJobPrefix {
+  unsigned long long prefix{};
+  std::uint32_t count{};
+  std::uint32_t ready{};
+};
+
+static_assert(sizeof(CanonicalJobPrefix) == 16u);
+
+__device__ __forceinline__ unsigned long long canonical_job_prefix(
+    std::uint32_t job_index, std::uint32_t count,
+    CanonicalJobPrefix *prefixes);
 
 template <class T> class Buffer {
 public:
@@ -2669,6 +2795,22 @@ __global__ void pack_publication_epoch_kernel(
       {key, payload.value, payload.metadata};
 }
 
+__global__ void pack_canonical_epoch_kernel(
+    const std::uint32_t *pending_keys, const RawPayload *pending_payloads,
+    std::uint32_t batch_stride,
+    const std::uint32_t *batch_offsets,
+    std::uint32_t *keys, RawPayload *payloads) {
+  const std::uint32_t batch = blockIdx.y;
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t count =
+      batch_offsets[batch + 1u] - batch_offsets[batch];
+  if (position >= count) return;
+  const std::uint32_t source = batch * batch_stride + position;
+  const std::uint32_t output = batch_offsets[batch] + position;
+  keys[output] = pending_keys[source];
+  payloads[output] = pending_payloads[source];
+}
+
 // Pad captured sorts with the first assignment.
 __global__ void pad_publication_epoch_kernel(
     std::uint32_t epoch_capacity, const std::uint32_t *batch_offsets,
@@ -2678,6 +2820,32 @@ __global__ void pad_publication_epoch_kernel(
   if (i < count || i >= epoch_capacity || !count) return;
   keys[i] = keys[0];
   assignments[i] = assignments[0];
+}
+
+__global__ void pad_canonical_epoch_kernel(
+    std::uint32_t epoch_capacity, const std::uint32_t *batch_offsets,
+    std::uint32_t *keys, RawPayload *payloads) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t count = batch_offsets[kBatchesPerEpoch];
+  if (i < count || i >= epoch_capacity || !count) return;
+  keys[i] = keys[0];
+  payloads[i] = payloads[0];
+}
+
+__global__ void materialize_canonical_epoch_rows_kernel(
+    const std::uint32_t *keys, const RawPayload *payloads,
+    const std::uint32_t *count, Row *rows) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < *count) rows[i] = raw_row(keys[i], payloads[i]);
+}
+
+__global__ void materialize_canonical_epoch_resident_kernel(
+    const std::uint32_t *keys, const RawPayload *payloads,
+    const std::uint32_t *count, ResidentRows rows,
+    std::uint64_t destination) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < *count)
+    rows.store(destination + i, raw_row(keys[i], payloads[i]));
 }
 
 __device__ __forceinline__ std::uint32_t lower_bound_full_keys(
@@ -2914,6 +3082,320 @@ __global__ void compact_resolved_epoch_sections_kernel(
   }
 }
 
+__global__ void count_canonical_epoch_sections_kernel(
+    const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
+    std::uint32_t *section_counts, std::uint32_t *overflow_quotients,
+    std::uint32_t *overflow_count) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients) return;
+  if (q == kQuotients) {
+    section_counts[q] = 0u;
+    return;
+  }
+  std::uint32_t count = 0u;
+  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+    const std::size_t base =
+        std::size_t{batch} * (kQuotients + 1u) + q;
+    count += raw_offsets[base + 1u] - raw_offsets[base];
+  }
+  section_counts[q] = count;
+  if (count > kLocalEpochCapacity) {
+    const std::uint32_t position = atomicAdd(overflow_count, 1u);
+    overflow_quotients[position] = q;
+  }
+}
+
+__global__ void canonical_section_counts_from_offsets_kernel(
+    const std::uint32_t *section_offsets, std::uint32_t *section_counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients) return;
+  section_counts[q] = q < kQuotients
+      ? section_offsets[q + 1u] - section_offsets[q] : 0u;
+}
+
+__global__ void sum_canonical_section_counts_kernel(
+    const std::uint32_t *section_counts, std::uint32_t *total_count) {
+  __shared__ std::uint32_t partials[kThreads];
+  std::uint32_t total = 0u;
+  for (std::uint32_t q = threadIdx.x; q < kQuotients;
+       q += blockDim.x)
+    total += section_counts[q];
+  partials[threadIdx.x] = total;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x >> 1u; stride; stride >>= 1u) {
+    if (threadIdx.x < stride)
+      partials[threadIdx.x] += partials[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u) *total_count = partials[0];
+}
+
+template <bool ResidentOutput>
+__device__ __forceinline__ void store_canonical_epoch_row(
+    Row *output_rows, ResidentRows resident_rows,
+    std::uint64_t resident_begin, std::uint32_t output,
+    const Row &row) {
+  if constexpr (ResidentOutput)
+    resident_rows.store(resident_begin + output, row);
+  else
+    output_rows[output] = row;
+}
+
+template <bool ResidentOutput>
+__global__ void resolve_canonical_epoch_local_kernel(
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, const std::uint32_t *raw_section_offsets,
+    Row *output_rows, ResidentRows resident_rows,
+    std::uint64_t resident_begin, std::uint32_t *resolved_counts,
+    std::uint16_t *cell_ranks) {
+  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
+  constexpr std::uint32_t kItems = kLocalEpochItemsPerThread;
+  using BlockSort = cub::BlockRadixSort<
+      std::uint32_t, kThreads, kItems, std::uint32_t>;
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  union ResolutionStorage {
+    typename BlockSort::TempStorage sort;
+    unsigned long long winners[kLocalEpochCapacity];
+  };
+  __shared__ ResolutionStorage resolution_storage;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ std::uint32_t batch_prefix[kBatchesPerEpoch + 1u];
+  __shared__ std::uint16_t sorted_suffixes[kLocalEpochCapacity];
+  __shared__ std::uint32_t cell_counts[kFoundationCells];
+  __shared__ std::uint32_t output_count_shared;
+  const std::uint32_t q = blockIdx.x;
+  if (q >= kQuotients) return;
+
+  if (threadIdx.x == 0u) {
+    std::uint32_t total = 0u;
+    batch_prefix[0] = 0u;
+    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+      const std::size_t base =
+          std::size_t{batch} * (kQuotients + 1u) + q;
+      total += raw_offsets[base + 1u] - raw_offsets[base];
+      batch_prefix[batch + 1u] = total;
+    }
+    for (std::uint32_t batch = pending_batches;
+         batch < kBatchesPerEpoch; ++batch)
+      batch_prefix[batch + 1u] = total;
+    output_count_shared = 0u;
+  }
+  if (threadIdx.x < kFoundationCells)
+    cell_counts[threadIdx.x] = 0u;
+  __syncthreads();
+  const std::uint32_t raw_count = batch_prefix[pending_batches];
+  if (!raw_count) {
+    if (threadIdx.x == 0u) resolved_counts[q] = 0u;
+    if (threadIdx.x < kFoundationCells)
+      cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] = 0u;
+    return;
+  }
+  if (raw_count > kLocalEpochCapacity) {
+    if (threadIdx.x == 0u) resolved_counts[q] = kInvalid;
+    if (threadIdx.x < kFoundationCells)
+      cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] = 0u;
+    return;
+  }
+
+  std::uint32_t sort_keys[kItems];
+  std::uint32_t sort_sources[kItems];
+  constexpr std::uint32_t kInvalidSortKey = 1u << 16u;
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    const std::uint32_t local = threadIdx.x * kItems + item;
+    sort_keys[item] = kInvalidSortKey;
+    sort_sources[item] = 0u;
+    if (local >= raw_count) continue;
+    std::uint32_t batch = 0u;
+    while (batch + 1u < pending_batches &&
+           local >= batch_prefix[batch + 1u])
+      ++batch;
+    const std::size_t base =
+        std::size_t{batch} * (kQuotients + 1u) + q;
+    const std::uint32_t source = static_cast<std::uint32_t>(
+        std::size_t{batch} * batch_stride + raw_offsets[base] +
+        local - batch_prefix[batch]);
+    sort_keys[item] = key_suffix(raw_keys[source]);
+    sort_sources[item] = source;
+  }
+  BlockSort(resolution_storage.sort).Sort(
+      sort_keys, sort_sources, 0, 17);
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    const std::uint32_t local = threadIdx.x * kItems + item;
+    sorted_suffixes[local] = static_cast<std::uint16_t>(sort_keys[item]);
+  }
+  __syncthreads();
+
+  bool leaders[kItems];
+  std::uint32_t leader_count = 0u;
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    const std::uint32_t local = threadIdx.x * kItems + item;
+    const bool valid = sort_keys[item] != kInvalidSortKey;
+    leaders[item] = valid &&
+        (!local || sorted_suffixes[local - 1u] != sorted_suffixes[local]);
+    leader_count += leaders[item];
+  }
+  std::uint32_t output_prefix = 0u, output_count = 0u;
+  BlockScan(scan_storage).ExclusiveSum(
+      leader_count, output_prefix, output_count);
+  if (threadIdx.x == 0u) {
+    output_count_shared = output_count;
+    resolved_counts[q] = output_count;
+  }
+  for (std::uint32_t group = threadIdx.x; group < output_count;
+       group += blockDim.x)
+    resolution_storage.winners[group] = 0ull;
+  __syncthreads();
+
+  std::uint32_t leaders_seen = 0u;
+  for (std::uint32_t item = 0u; item < kItems; ++item) {
+    if (sort_keys[item] == kInvalidSortKey) continue;
+    const std::uint32_t group = leaders[item]
+        ? output_prefix + leaders_seen
+        : output_prefix + leaders_seen - 1u;
+    if (leaders[item]) {
+      sorted_suffixes[group] = static_cast<std::uint16_t>(sort_keys[item]);
+      ++leaders_seen;
+    }
+    const std::uint32_t source = sort_sources[item];
+    const std::uint32_t age = raw_position(raw_payloads[source]);
+    const unsigned long long token =
+        (static_cast<unsigned long long>(age + 1u) << 32u) | source;
+    atomicMax(resolution_storage.winners + group, token);
+  }
+  __syncthreads();
+
+  const std::uint32_t output_begin = raw_section_offsets[q];
+  for (std::uint32_t group = threadIdx.x;
+       group < output_count_shared; group += blockDim.x) {
+    const std::uint32_t source = static_cast<std::uint32_t>(
+        resolution_storage.winners[group]);
+    const std::uint32_t suffix = sorted_suffixes[group];
+    const Row row = raw_row(full_key(q, suffix), raw_payloads[source]);
+    store_canonical_epoch_row<ResidentOutput>(
+        output_rows, resident_rows, resident_begin,
+        output_begin + group, row);
+    atomicAdd(cell_counts + suffix / kFoundationCellKeys, 1u);
+  }
+  __syncthreads();
+
+  const std::uint32_t cell_count = threadIdx.x < kFoundationCells
+      ? cell_counts[threadIdx.x] : 0u;
+  std::uint32_t cell_prefix = 0u, ignored = 0u;
+  BlockScan(scan_storage).ExclusiveSum(
+      cell_count, cell_prefix, ignored);
+  if (threadIdx.x < kFoundationCells)
+    cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
+        static_cast<std::uint16_t>(cell_prefix);
+}
+
+template <bool ResidentOutput>
+__global__ void resolve_canonical_epoch_oversized_kernel(
+    const std::uint32_t *overflow_quotients,
+    const std::uint32_t *overflow_count, std::uint32_t *next_overflow,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, const std::uint32_t *raw_section_offsets,
+    Row *output_rows, ResidentRows resident_rows,
+    std::uint64_t resident_begin, std::uint32_t *resolved_counts,
+    std::uint16_t *cell_ranks,
+    unsigned long long *oversized_winner_workspace,
+    std::uint32_t *oversized_workspace_locks,
+    std::uint32_t oversized_workspace_slots) {
+  using BlockScan = cub::BlockScan<
+      std::uint32_t, kFoundationCompactionThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ std::uint32_t q_shared;
+  __shared__ std::uint32_t output_count_shared;
+  for (;;) {
+    if (threadIdx.x == 0u) {
+      const std::uint32_t ticket = atomicAdd(next_overflow, 1u);
+      q_shared = ticket < *overflow_count
+          ? overflow_quotients[ticket] : kInvalid;
+    }
+    __syncthreads();
+    const std::uint32_t q = q_shared;
+    if (q == kInvalid) return;
+    const std::uint32_t workspace_slot =
+        blockIdx.x % oversized_workspace_slots;
+    if (threadIdx.x == 0u)
+      while (atomicCAS(
+                 oversized_workspace_locks + workspace_slot, 0u, 1u))
+        __nanosleep(64u);
+    __syncthreads();
+    unsigned long long *winners = oversized_winner_workspace +
+        std::size_t{workspace_slot} * kCanonicalResolverSuffixes;
+    for (std::uint32_t suffix = threadIdx.x;
+         suffix < kCanonicalResolverSuffixes; suffix += blockDim.x)
+      winners[suffix] = 0ull;
+    __syncthreads();
+
+    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+      const std::size_t base =
+          std::size_t{batch} * (kQuotients + 1u) + q;
+      const std::uint32_t begin = raw_offsets[base];
+      const std::uint32_t end = raw_offsets[base + 1u];
+      for (std::uint32_t position = begin + threadIdx.x;
+           position < end; position += blockDim.x) {
+        const std::uint32_t source = batch * batch_stride + position;
+        const std::uint32_t suffix = key_suffix(raw_keys[source]);
+        const std::uint32_t age = raw_position(raw_payloads[source]);
+        const unsigned long long token =
+            (static_cast<unsigned long long>(age + 1u) << 32u) | source;
+        atomicMax(winners + suffix, token);
+      }
+    }
+    __syncthreads();
+
+    const std::uint32_t suffix_begin = threadIdx.x * 256u;
+    std::uint32_t local_count = 0u;
+    for (std::uint32_t suffix = suffix_begin;
+         suffix < suffix_begin + 256u; ++suffix)
+      local_count += winners[suffix] != 0ull;
+    std::uint32_t output_prefix = 0u, output_count = 0u;
+    BlockScan(scan_storage).ExclusiveSum(
+        local_count, output_prefix, output_count);
+    if (threadIdx.x == 0u) {
+      output_count_shared = output_count;
+      resolved_counts[q] = output_count;
+    }
+    __syncthreads();
+
+    const std::uint32_t output_begin = raw_section_offsets[q];
+    std::uint32_t local = 0u;
+    for (std::uint32_t suffix = suffix_begin;
+         suffix < suffix_begin + 256u; ++suffix) {
+      const unsigned long long token = winners[suffix];
+      if (!token) continue;
+      const std::uint32_t source = static_cast<std::uint32_t>(token);
+      const Row row = raw_row(full_key(q, suffix), raw_payloads[source]);
+      store_canonical_epoch_row<ResidentOutput>(
+          output_rows, resident_rows, resident_begin,
+          output_begin + output_prefix + local++, row);
+    }
+    __syncthreads();
+
+    std::uint32_t cell_count = 0u;
+    if (threadIdx.x < kFoundationCells) {
+      const std::uint32_t cell_begin =
+          threadIdx.x * kFoundationCellKeys;
+      for (std::uint32_t suffix = cell_begin;
+           suffix < cell_begin + kFoundationCellKeys; ++suffix)
+        cell_count += winners[suffix] != 0ull;
+    }
+    std::uint32_t cell_prefix = 0u, ignored = 0u;
+    BlockScan(scan_storage).ExclusiveSum(
+        cell_count, cell_prefix, ignored);
+    if (threadIdx.x < kFoundationCells)
+      cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
+          static_cast<std::uint16_t>(cell_prefix);
+    __syncthreads();
+    if (threadIdx.x == 0u)
+      atomicExch(oversized_workspace_locks + workspace_slot, 0u);
+    __syncthreads();
+  }
+}
+
 __global__ void set_resolved_epoch_count_kernel(
     const std::uint32_t *resolved_offsets, std::uint32_t *selected_count) {
   if (!blockIdx.x && !threadIdx.x)
@@ -3005,7 +3487,8 @@ __global__ void initialize_rank_cell_mode_kernel(
     const std::uint32_t *staged_epoch_mode,
     std::uint32_t *rank_cell_mode) {
   if (blockIdx.x || threadIdx.x) return;
-  const bool eligible = !plan->status && *staged_epoch_mode &&
+  const bool eligible = !kForceUnifiedMergeExperiment &&
+      !plan->status && *staged_epoch_mode &&
       plan->source_count <= kRankCellMaximumSources;
   *rank_cell_mode = eligible ? 1u : 0u;
 }
@@ -3883,6 +4366,1514 @@ __global__ void initialize_device_manifest_kernel(
   *query_occupied_level_mask = manifest.occupied_level_mask;
 }
 
+// Canonical quotient-run carry.  Every occupied level is one immutable,
+// quotient-major run.  The persistent directory is a quotient prefix plus
+// 128 exact cell starts per quotient; routes and guides are not consulted by
+// the canonical point path.
+
+__global__ void choose_canonical_publication_path_kernel(
+    const std::uint32_t *selected_count,
+    const DeviceManifest *manifests, const std::uint32_t *active_manifest,
+    const LevelStorageSpan *level_spans, std::uint32_t job_capacity,
+    ResidentPublicationPlan *plan) {
+  if (blockIdx.x || threadIdx.x) return;
+  const std::uint32_t active = atomicAdd(
+      const_cast<std::uint32_t *>(active_manifest), 0u) & 1u;
+  const DeviceManifest *manifest = manifests + active;
+  const std::uint64_t occupied = manifest->occupied_level_mask;
+  const std::uint64_t empty = ~occupied;
+  const std::uint32_t destination = empty
+      ? static_cast<std::uint32_t>(__ffsll(empty) - 1)
+      : kMaximumLevels;
+  ResidentPublicationPlan next{};
+  next.selected_count = *selected_count;
+  next.active_manifest = active;
+  next.inactive_manifest = active ^ 1u;
+  next.destination_level = destination;
+  next.source_level_limit = destination ? destination - 1u : 0u;
+  const std::uint64_t consumed = destination == kMaximumLevels
+      ? ~std::uint64_t{0}
+      : destination ? (std::uint64_t{1} << destination) - 1u : 0u;
+  next.source_count = 1u + static_cast<std::uint32_t>(
+      __popcll(occupied & consumed));
+  next.destination_is_foundation =
+      destination < kMaximumLevels &&
+      (manifest->foundation_level == kMaximumLevels ||
+       destination > manifest->foundation_level);
+  next.keep_tombstones = !next.destination_is_foundation;
+  next.output_generation = manifest->generation + 1u;
+  next.job_capacity = job_capacity;
+  next.status = destination < kMaximumLevels
+      ? kPublicationSuccess : kPublicationJobOverflow;
+  if (destination < kMaximumLevels) {
+    const LevelStorageSpan span = level_spans[destination];
+    next.output_begin = span.begin;
+    next.output_capacity = span.capacity;
+  }
+  if (next.selected_count > next.output_capacity)
+    next.status |= kPublicationOutputOverflow;
+  *plan = next;
+}
+
+__global__ void count_canonical_merge_work_kernel(
+    const std::uint32_t *epoch_counts, const Descriptor *descriptors,
+    const DeviceManifest *manifests,
+    const std::uint32_t *active_manifest,
+    const ResidentPublicationPlan *plan, std::uint64_t *counts) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= kQuotients || plan->status) return;
+  const DeviceManifestSnapshot manifest = load_active_manifest(
+      manifests, active_manifest);
+  std::uint64_t total = epoch_counts[q];
+  std::uint64_t levels = manifest.occupied_level_mask;
+  if (plan->destination_level < kMaximumLevels) {
+    const std::uint64_t carried = plan->destination_level
+        ? (std::uint64_t{1} << plan->destination_level) - 1u : 0u;
+    levels &= carried;
+  }
+  while (levels) {
+    const std::uint32_t level =
+        static_cast<std::uint32_t>(__ffsll(levels) - 1);
+    levels &= levels - 1u;
+    total += descriptors[descriptor_index(q, level)].count();
+  }
+  counts[q] = total;
+}
+
+__device__ __forceinline__ std::uint32_t canonical_tile_job_count(
+    const std::uint64_t *counts, std::uint32_t capacity,
+    std::uint32_t safe_capacity) {
+  std::uint32_t jobs = 0u;
+  std::uint64_t run_rows = 0u;
+  std::uint32_t run_begin = 0u;
+  for (std::uint32_t local_q = 0u;
+       local_q < kPlanningTileQuotients; ++local_q) {
+    const std::uint64_t count = counts[local_q];
+    if (count > capacity) {
+      if (run_rows) {
+        ++jobs;
+        run_rows = 0u;
+      }
+      jobs += static_cast<std::uint32_t>(
+          (count + safe_capacity - 1u) / safe_capacity);
+      continue;
+    }
+    if (!count) continue;
+    if (!run_rows) run_begin = local_q;
+    if (run_rows &&
+        (run_rows + count > capacity ||
+         local_q - run_begin >= kCanonicalJobQuotients)) {
+      ++jobs;
+      run_rows = 0u;
+      run_begin = local_q;
+    }
+    run_rows += count;
+  }
+  return jobs + (run_rows != 0u);
+}
+
+__global__ void count_canonical_planning_jobs_kernel(
+    const std::uint64_t *counts, const ResidentPublicationPlan *plan,
+    std::uint32_t *tile_job_counts) {
+  __shared__ std::uint64_t tile_counts[kPlanningTileQuotients];
+  const std::uint32_t tile = blockIdx.x;
+  if (tile >= kPlanningTiles) return;
+  const std::uint32_t first = tile * kPlanningTileQuotients;
+  tile_counts[threadIdx.x] = counts[first + threadIdx.x];
+  tile_counts[threadIdx.x + blockDim.x] =
+      counts[first + threadIdx.x + blockDim.x];
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    const std::uint32_t safe = plan->job_capacity > plan->source_count
+        ? plan->job_capacity - (plan->source_count - 1u) : 1u;
+    tile_job_counts[tile] = plan->status ? 0u :
+        canonical_tile_job_count(tile_counts, plan->job_capacity, safe);
+    if (tile + 1u == kPlanningTiles)
+      tile_job_counts[kPlanningTiles] = 0u;
+  }
+}
+
+__global__ void emit_canonical_planning_jobs_kernel(
+    const std::uint64_t *counts, const std::uint32_t *tile_job_offsets,
+    ResidentPublicationPlan *plan, std::uint32_t maximum_jobs,
+    BalancedMergeJob *jobs, std::uint64_t *reservations) {
+  __shared__ std::uint64_t tile_counts[kPlanningTileQuotients];
+  const std::uint32_t tile = blockIdx.x;
+  if (tile >= kPlanningTiles) return;
+  const std::uint32_t first = tile * kPlanningTileQuotients;
+  tile_counts[threadIdx.x] = counts[first + threadIdx.x];
+  tile_counts[threadIdx.x + blockDim.x] =
+      counts[first + threadIdx.x + blockDim.x];
+  __syncthreads();
+  if (threadIdx.x != 0u || plan->status) return;
+  const std::uint32_t total_jobs = tile_job_offsets[kPlanningTiles];
+  if (tile == 0u) {
+    plan->job_count = total_jobs;
+    if (total_jobs > maximum_jobs)
+      atomicOr(&plan->status, kPublicationJobOverflow);
+  }
+  if (total_jobs > maximum_jobs) return;
+  const std::uint32_t safe = plan->job_capacity > plan->source_count
+      ? plan->job_capacity - (plan->source_count - 1u) : 1u;
+  std::uint32_t global = tile_job_offsets[tile];
+  std::uint64_t run_rows = 0u;
+  std::uint32_t run_begin = first;
+  std::uint32_t run_end = first;
+  const auto flush = [&]() {
+    if (!run_rows) return;
+    emit_resident_job(
+        jobs, reservations, global++,
+        std::uint64_t{run_begin} << 16u,
+        std::uint64_t{run_end} << 16u,
+        run_begin, run_end, run_rows, 0u, 0u);
+    run_rows = 0u;
+  };
+  for (std::uint32_t local_q = 0u;
+       local_q < kPlanningTileQuotients; ++local_q) {
+    const std::uint32_t q = first + local_q;
+    const std::uint64_t count = tile_counts[local_q];
+    if (count > plan->job_capacity) {
+      flush();
+      const std::uint32_t pieces = static_cast<std::uint32_t>(
+          (count + safe - 1u) / safe);
+      for (std::uint32_t piece = 0u; piece < pieces; ++piece)
+        emit_resident_job(
+            jobs, reservations, global++,
+            std::uint64_t{q} << 16u,
+            std::uint64_t{q + 1u} << 16u,
+            q, q + 1u, 0u, static_cast<std::uint16_t>(piece),
+            static_cast<std::uint16_t>(pieces));
+      continue;
+    }
+    if (!count) continue;
+    if (!run_rows) {
+      run_begin = q;
+      run_end = q + 1u;
+    }
+    if (run_rows &&
+        (run_rows + count > plan->job_capacity ||
+         q - run_begin >= kCanonicalJobQuotients)) {
+      flush();
+      run_begin = q;
+    }
+    run_rows += count;
+    run_end = q + 1u;
+  }
+  flush();
+}
+
+__device__ __forceinline__ std::uint32_t canonical_combined_prefix_warp(
+    std::uint32_t q, std::uint32_t suffix,
+    const Row *epoch_rows, const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts, ResidentRows arena,
+    const Descriptor *descriptors,
+    const DeviceManifestSnapshot &manifest,
+    const ResidentPublicationPlan *plan) {
+  constexpr unsigned mask = 0xffffffffu;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  std::uint32_t total = 0u;
+  if (lane == 0u) {
+    const std::uint32_t begin = epoch_offsets[q];
+    total = lower_bound_rows(
+        epoch_rows + begin, epoch_counts[q], suffix);
+  }
+  for (std::uint32_t level = lane;
+       level < plan->destination_level; level += 32u) {
+    if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
+    const Descriptor rows = descriptors[descriptor_index(q, level)];
+    total += lower_bound_rows(
+        arena + rows.offset(), rows.count(), suffix);
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    total += __shfl_down_sync(mask, total, offset);
+  return __shfl_sync(mask, total, 0u);
+}
+
+__device__ __forceinline__ std::uint32_t canonical_cell_prefix_warp(
+    std::uint32_t q, std::uint32_t cell,
+    const std::uint32_t *epoch_counts,
+    const std::uint16_t *epoch_cell_ranks,
+    const Descriptor *descriptors, const std::uint16_t *cell_ranks,
+    const DeviceManifestSnapshot &manifest,
+    const ResidentPublicationPlan *plan) {
+  constexpr unsigned mask = 0xffffffffu;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  std::uint32_t total = 0u;
+  if (lane == 0u)
+    total = cell < kFoundationCells
+        ? epoch_cell_ranks[
+              std::size_t{q} * kFoundationCells + cell]
+        : epoch_counts[q];
+  for (std::uint32_t level = lane;
+       level < plan->destination_level; level += 32u) {
+    if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
+    const Descriptor rows = descriptors[descriptor_index(q, level)];
+    total += cell < kFoundationCells
+        ? cell_ranks[
+              std::size_t{level} * kLocalRankEntries +
+              std::size_t{q} * kFoundationCells + cell]
+        : rows.count();
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    total += __shfl_down_sync(mask, total, offset);
+  return __shfl_sync(mask, total, 0u);
+}
+
+__device__ __forceinline__ std::uint32_t
+canonical_combined_cell_prefix_warp(
+    std::uint32_t q, std::uint32_t cell, std::uint32_t suffix,
+    const Row *epoch_rows, const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts,
+    const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
+    const Descriptor *descriptors, const std::uint16_t *cell_ranks,
+    const DeviceManifestSnapshot &manifest,
+    const ResidentPublicationPlan *plan) {
+  constexpr unsigned mask = 0xffffffffu;
+  const std::uint32_t lane = threadIdx.x & 31u;
+  std::uint32_t total = 0u;
+  if (lane == 0u) {
+    const std::uint32_t section_begin = epoch_offsets[q];
+    const std::uint16_t *ranks = epoch_cell_ranks +
+        std::size_t{q} * kFoundationCells;
+    const std::uint32_t begin = ranks[cell];
+    const std::uint32_t end = cell + 1u < kFoundationCells
+        ? ranks[cell + 1u] : epoch_counts[q];
+    total = begin + lower_bound_rows(
+        epoch_rows + section_begin + begin, end - begin, suffix);
+  }
+  for (std::uint32_t level = lane;
+       level < plan->destination_level; level += 32u) {
+    if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
+    const Descriptor rows = descriptors[descriptor_index(q, level)];
+    const std::uint16_t *ranks = cell_ranks +
+        std::size_t{level} * kLocalRankEntries +
+        std::size_t{q} * kFoundationCells;
+    const std::uint32_t begin = ranks[cell];
+    const std::uint32_t end = cell + 1u < kFoundationCells
+        ? ranks[cell + 1u] : rows.count();
+    total += begin + lower_bound_rows(
+        arena + rows.offset() + begin, end - begin, suffix);
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    total += __shfl_down_sync(mask, total, offset);
+  return __shfl_sync(mask, total, 0u);
+}
+
+__device__ __forceinline__ std::uint32_t canonical_boundary_warp(
+    std::uint32_t q, std::uint32_t target,
+    const Row *epoch_rows, const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts,
+    const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
+    const Descriptor *descriptors, const std::uint16_t *cell_ranks,
+    const DeviceManifestSnapshot &manifest,
+    const ResidentPublicationPlan *plan) {
+  if (!target) return 0u;
+  std::uint32_t low_cell = 1u, high_cell = kFoundationCells;
+  while (low_cell < high_cell) {
+    const std::uint32_t middle = (low_cell + high_cell) >> 1u;
+    if (canonical_cell_prefix_warp(
+            q, middle, epoch_counts, epoch_cell_ranks, descriptors,
+            cell_ranks, manifest, plan) < target)
+      low_cell = middle + 1u;
+    else
+      high_cell = middle;
+  }
+  const std::uint32_t end_cell = low_cell;
+  const std::uint32_t begin_cell = end_cell - 1u;
+  const std::uint32_t begin_prefix = canonical_cell_prefix_warp(
+      q, begin_cell, epoch_counts, epoch_cell_ranks, descriptors,
+      cell_ranks, manifest, plan);
+  if (begin_prefix >= target)
+    return begin_cell * kFoundationCellKeys;
+  std::uint32_t low = begin_cell * kFoundationCellKeys + 1u;
+  std::uint32_t high = end_cell * kFoundationCellKeys;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (canonical_combined_cell_prefix_warp(
+            q, begin_cell, middle, epoch_rows, epoch_offsets,
+            epoch_counts, epoch_cell_ranks, arena, descriptors,
+            cell_ranks,
+            manifest, plan) < target)
+      low = middle + 1u;
+    else
+      high = middle;
+  }
+  return low;
+}
+
+__global__ void resolve_canonical_job_boundaries_kernel(
+    BalancedMergeJob *jobs, std::uint64_t *reservations,
+    ResidentPublicationPlan *plan, const Row *epoch_rows,
+    const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts,
+    const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
+    const Descriptor *descriptors, const std::uint16_t *cell_ranks,
+    const DeviceManifest *manifests,
+    const std::uint32_t *active_manifest) {
+  const std::uint32_t lane = threadIdx.x & 31u;
+  constexpr unsigned mask = 0xffffffffu;
+  const DeviceManifestSnapshot manifest = load_active_manifest(
+      manifests, active_manifest);
+  for (std::uint32_t index = blockIdx.x;
+       index < plan->job_count && !plan->status; index += gridDim.x) {
+    BalancedMergeJob job = jobs[index];
+    const std::uint32_t pieces = __shfl_sync(
+        mask, lane == 0u ? job.hot_pieces : 0u, 0u);
+    if (!pieces) {
+      if (lane == 0u && reservations[index] > plan->job_capacity)
+        atomicOr(&plan->status, kPublicationJobTooLarge);
+      continue;
+    }
+    const std::uint32_t q = job.quotient_begin;
+    const std::uint32_t total = canonical_combined_prefix_warp(
+        q, 1u << 16u, epoch_rows, epoch_offsets, epoch_counts,
+        arena, descriptors,
+        manifest, plan);
+    const std::uint32_t low_target = static_cast<std::uint32_t>(
+        (std::uint64_t{total} * job.hot_piece + pieces - 1u) / pieces);
+    const std::uint32_t high_target = static_cast<std::uint32_t>(
+        (std::uint64_t{total} * (job.hot_piece + 1u) + pieces - 1u) /
+        pieces);
+    const std::uint32_t low = job.hot_piece
+        ? canonical_boundary_warp(
+              q, low_target, epoch_rows, epoch_offsets, epoch_counts,
+              epoch_cell_ranks, arena, descriptors, cell_ranks,
+              manifest, plan)
+        : 0u;
+    const std::uint32_t high = job.hot_piece + 1u == pieces
+        ? (1u << 16u)
+        : canonical_boundary_warp(
+              q, high_target, epoch_rows, epoch_offsets, epoch_counts,
+              epoch_cell_ranks, arena, descriptors, cell_ranks,
+              manifest, plan);
+    const std::uint32_t exact = canonical_combined_prefix_warp(
+        q, high, epoch_rows, epoch_offsets, epoch_counts,
+        arena, descriptors,
+        manifest, plan) - canonical_combined_prefix_warp(
+            q, low, epoch_rows, epoch_offsets, epoch_counts,
+            arena, descriptors,
+            manifest, plan);
+    if (lane == 0u) {
+      job.key_begin = (std::uint64_t{q} << 16u) + low;
+      job.key_end = (std::uint64_t{q} << 16u) + high;
+      reservations[index] = exact;
+      jobs[index] = job;
+      if (low >= high || exact > plan->job_capacity)
+        atomicOr(&plan->status, kPublicationJobTooLarge);
+    }
+  }
+}
+
+__global__ void validate_canonical_plan_kernel(
+    ResidentPublicationPlan *plan,
+    const std::uint32_t *tile_job_offsets,
+    std::uint32_t maximum_jobs) {
+  if (blockIdx.x || threadIdx.x) return;
+  plan->job_count = tile_job_offsets[kPlanningTiles];
+  plan->raw_reservation = 0u;
+  if (plan->job_count > maximum_jobs)
+    plan->status |= kPublicationJobOverflow;
+}
+
+__device__ __forceinline__ std::uint64_t canonical_source_bound(
+    std::uint32_t source, std::uint32_t level,
+    std::uint64_t key, const Row *epoch_rows,
+    const std::uint32_t *epoch_offsets, ResidentRows arena,
+    const LevelStorageSpan *level_spans,
+    const std::uint32_t *level_q_offsets) {
+  const std::uint32_t q = static_cast<std::uint32_t>(key >> 16u);
+  if (source == 0u) {
+    if (q >= kQuotients) return epoch_offsets[kQuotients];
+    const std::uint32_t begin = epoch_offsets[q];
+    const std::uint32_t count = epoch_offsets[q + 1u] - begin;
+    return begin + lower_bound_rows(
+        epoch_rows + begin, count,
+        static_cast<std::uint32_t>(key & 0xffffu));
+  }
+  const LevelStorageSpan span = level_spans[level];
+  const std::size_t base =
+      std::size_t{level} * (kQuotients + 1u);
+  if (q >= kQuotients)
+    return span.begin + level_q_offsets[base + kQuotients];
+  const std::uint32_t begin = level_q_offsets[base + q];
+  const std::uint32_t count = level_q_offsets[base + q + 1u] - begin;
+  return span.begin + begin + lower_bound_rows(
+      arena + span.begin + begin, count,
+      static_cast<std::uint32_t>(key & 0xffffu));
+}
+
+__device__ __forceinline__ std::uint32_t canonical_merge_partition(
+    const std::uint32_t *left, std::uint32_t left_count,
+    const std::uint32_t *right, std::uint32_t right_count,
+    std::uint32_t diagonal) {
+  std::uint32_t low = diagonal > right_count
+      ? diagonal - right_count : 0u;
+  std::uint32_t high = min(diagonal, left_count);
+  while (low <= high) {
+    const std::uint32_t li = (low + high) >> 1u;
+    const std::uint32_t ri = diagonal - li;
+    if (li && ri < right_count && right[ri] < left[li - 1u]) {
+      high = li - 1u;
+    } else if (ri && li < left_count && left[li] < right[ri - 1u]) {
+      low = li + 1u;
+    } else {
+      return li;
+    }
+  }
+  return low;
+}
+
+__device__ __forceinline__ void canonical_merge_interval(
+    const std::uint32_t *left, std::uint32_t left_count,
+    const std::uint32_t *right, std::uint32_t right_count,
+    std::uint32_t *output, std::uint32_t begin, std::uint32_t end) {
+  std::uint32_t li = canonical_merge_partition(
+      left, left_count, right, right_count, begin);
+  std::uint32_t ri = begin - li;
+  for (std::uint32_t position = begin; position < end; ++position) {
+    const bool take_left = ri >= right_count ||
+        (li < left_count && left[li] < right[ri]);
+    output[position] = take_left ? left[li++] : right[ri++];
+  }
+}
+
+__device__ __forceinline__ Row canonical_candidate_row(
+    std::uint32_t candidate, std::uint32_t local_q,
+    std::uint32_t source_count,
+    const std::uint16_t *source_candidate_offsets,
+    const std::uint16_t *source_q_offsets,
+    const std::uint64_t *source_q_positions,
+    const Row *epoch_rows, ResidentRows arena) {
+  std::uint32_t low = 1u, high = source_count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (source_candidate_offsets[middle] <= candidate)
+      low = middle + 1u;
+    else
+      high = middle;
+  }
+  const std::uint32_t source = low - 1u;
+  const std::uint32_t source_local =
+      candidate - source_candidate_offsets[source];
+  const std::uint16_t *q_offsets = source_q_offsets +
+      source * (kCanonicalJobQuotients + 1u);
+  const std::uint64_t position = source_q_positions[
+      source * kCanonicalJobQuotients + local_q] +
+      source_local - q_offsets[local_q];
+  return source == 0u ? epoch_rows[position] : arena[position];
+}
+
+// Single-pass output allocation.  State 1 publishes a local count; state 2
+// publishes the exclusive prefix.  A job may accumulate across any number of
+// count-ready predecessors instead of waiting for every predecessor to finish
+// its own prefix handoff.
+__device__ __forceinline__ unsigned long long canonical_job_prefix(
+    std::uint32_t job_index, std::uint32_t count,
+    CanonicalJobPrefix *prefixes) {
+  CanonicalJobPrefix &state = prefixes[job_index];
+  state.count = count;
+  __threadfence();
+  atomicExch(&state.ready, 1u);
+
+  unsigned long long prefix = 0ull;
+  std::uint32_t cursor = job_index;
+  while (cursor) {
+    CanonicalJobPrefix &previous = prefixes[cursor - 1u];
+    const std::uint32_t ready = atomicAdd(&previous.ready, 0u);
+    if (!ready) {
+      __nanosleep(64u);
+      continue;
+    }
+    prefix += previous.count;
+    if (ready >= 2u) {
+      prefix += previous.prefix;
+      break;
+    }
+    --cursor;
+  }
+  state.prefix = prefix;
+  __threadfence();
+  atomicExch(&state.ready, 2u);
+  return prefix;
+}
+
+template <std::uint32_t StaticSources>
+__global__ void canonical_carry_jobs_kernel(
+    BalancedMergeJob *jobs, ResidentPublicationPlan *plan,
+    const Row *epoch_rows, const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts,
+    ResidentRows arena, const Descriptor *descriptors,
+    const LevelStorageSpan *level_spans,
+    const std::uint32_t *level_q_offsets,
+    const DeviceManifest *manifests,
+    const std::uint32_t *active_manifest,
+    CanonicalJobPrefix *prefixes, std::uint32_t *next_job,
+    std::uint32_t *cell_counts) {
+  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
+  constexpr std::uint32_t kSourceSlots =
+      StaticSources ? StaticSources : kMaximumMergeSources;
+  constexpr std::uint32_t kMaximumItemsPerThread =
+      (kCanonicalCandidateLimit + kThreads - 1u) / kThreads;
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  extern __shared__ __align__(16) unsigned char workspace[];
+  std::uint32_t *plane_a = reinterpret_cast<std::uint32_t *>(workspace);
+  std::uint32_t *plane_b = plane_a + plan->job_capacity;
+
+  __shared__ std::uint16_t source_candidate_offsets[kSourceSlots];
+  __shared__ std::uint16_t source_lengths[kSourceSlots];
+  __shared__ std::uint16_t source_levels[kSourceSlots];
+  __shared__ std::uint16_t source_q_offsets[
+      kSourceSlots * (kCanonicalJobQuotients + 1u)];
+  __shared__ std::uint64_t source_q_positions[
+      kSourceSlots * kCanonicalJobQuotients];
+  __shared__ std::uint16_t physical_sources[kSourceSlots];
+  __shared__ std::uint16_t run_offsets[kSourceSlots];
+  __shared__ std::uint16_t run_lengths[kSourceSlots];
+  __shared__ std::uint32_t tombstone_words[kCanonicalTombstoneWords];
+  __shared__ std::uint32_t source_count_shared;
+  __shared__ std::uint32_t physical_run_count_shared;
+  __shared__ std::uint32_t run_count_shared;
+  __shared__ std::uint32_t small_count_shared;
+  __shared__ std::uint32_t largest_count_shared;
+  __shared__ std::uint32_t task_rows_shared;
+  __shared__ std::uint32_t job_valid_shared;
+  __shared__ unsigned long long output_prefix_shared;
+
+  const DeviceManifestSnapshot manifest = load_active_manifest(
+      manifests, active_manifest);
+  while (!plan->status) {
+    __shared__ std::uint32_t job_index_shared;
+    if (threadIdx.x == 0u)
+      job_index_shared = atomicAdd(next_job, 1u);
+    __syncthreads();
+    const std::uint32_t job_index = job_index_shared;
+    if (job_index >= plan->job_count) return;
+    const BalancedMergeJob job = jobs[job_index];
+    const std::uint32_t quotient_count =
+        job.quotient_end - job.quotient_begin;
+    for (std::uint32_t word = threadIdx.x;
+         word < kCanonicalTombstoneWords;
+         word += blockDim.x)
+      tombstone_words[word] = 0u;
+
+    if (threadIdx.x == 0u) {
+      const std::uint32_t expected_sources = StaticSources
+          ? StaticSources : plan->source_count;
+      std::uint32_t source_count = 0u;
+      source_levels[source_count++] = kMaximumLevels;
+      std::uint64_t levels = manifest.occupied_level_mask;
+      const std::uint64_t carried = plan->destination_level
+          ? (std::uint64_t{1} << plan->destination_level) - 1u : 0u;
+      levels &= carried;
+      while (levels && source_count < kSourceSlots) {
+        const std::uint32_t level =
+            static_cast<std::uint32_t>(__ffsll(levels) - 1);
+        levels &= levels - 1u;
+        source_levels[source_count++] = static_cast<std::uint16_t>(level);
+      }
+      source_count_shared = source_count;
+      std::uint32_t candidate_cursor = 0u;
+      std::uint32_t largest_source = 0u;
+      std::uint32_t largest_count = 0u;
+      for (std::uint32_t source = 0u; source < source_count; ++source) {
+        const std::uint32_t level = source_levels[source];
+        std::uint16_t *q_offsets = source_q_offsets +
+            source * (kCanonicalJobQuotients + 1u);
+        std::uint64_t *q_positions = source_q_positions +
+            source * kCanonicalJobQuotients;
+        std::uint32_t count = 0u;
+        for (std::uint32_t local_q = 0u;
+             local_q < quotient_count; ++local_q) {
+          const std::uint32_t q = job.quotient_begin + local_q;
+          const std::uint64_t key_base = std::uint64_t{q} << 16u;
+          const std::uint32_t suffix_begin = local_q == 0u
+              ? static_cast<std::uint32_t>(job.key_begin - key_base) : 0u;
+          const std::uint32_t suffix_end = local_q + 1u == quotient_count
+              ? static_cast<std::uint32_t>(job.key_end - key_base)
+              : (1u << 16u);
+          std::uint64_t section_begin = 0u;
+          std::uint32_t section_count = 0u;
+          if (source == 0u) {
+            section_begin = epoch_offsets[q];
+            section_count = epoch_counts[q];
+          } else {
+            const Descriptor rows =
+                descriptors[descriptor_index(q, level)];
+            section_begin = rows.offset();
+            section_count = rows.count();
+          }
+          std::uint32_t begin = 0u, end = section_count;
+          if (source == 0u) {
+            begin = lower_bound_rows(
+                epoch_rows + section_begin, section_count, suffix_begin);
+            if (suffix_end != (1u << 16u))
+              end = begin + lower_bound_rows(
+                  epoch_rows + section_begin + begin,
+                  section_count - begin, suffix_end);
+          } else {
+            begin = lower_bound_rows(
+                arena + section_begin, section_count, suffix_begin);
+            if (suffix_end != (1u << 16u))
+              end = begin + lower_bound_rows(
+                  arena + section_begin + begin,
+                  section_count - begin, suffix_end);
+          }
+          q_offsets[local_q] = static_cast<std::uint16_t>(count);
+          q_positions[local_q] = section_begin + begin;
+          count += end - begin;
+        }
+        q_offsets[quotient_count] = static_cast<std::uint16_t>(count);
+        source_candidate_offsets[source] =
+            static_cast<std::uint16_t>(candidate_cursor);
+        source_lengths[source] = static_cast<std::uint16_t>(count);
+        candidate_cursor += count;
+        if (count >= largest_count) {
+          largest_count = count;
+          largest_source = source;
+        }
+      }
+      std::uint32_t physical_count = 0u;
+      std::uint32_t physical_cursor = 0u;
+      for (std::uint32_t source = 0u; source < source_count; ++source) {
+        if (source == largest_source || !source_lengths[source]) continue;
+        physical_sources[physical_count] = static_cast<std::uint16_t>(source);
+        run_offsets[physical_count] =
+            static_cast<std::uint16_t>(physical_cursor);
+        run_lengths[physical_count] = source_lengths[source];
+        physical_cursor += source_lengths[source];
+        ++physical_count;
+      }
+      const std::uint32_t small_count = physical_cursor;
+      if (largest_count) {
+        physical_sources[physical_count] =
+            static_cast<std::uint16_t>(largest_source);
+        run_offsets[physical_count] =
+            static_cast<std::uint16_t>(physical_cursor);
+        run_lengths[physical_count] =
+            static_cast<std::uint16_t>(largest_count);
+        ++physical_count;
+      }
+      physical_run_count_shared = physical_count;
+      run_count_shared = physical_count ? physical_count - 1u : 0u;
+      small_count_shared = small_count;
+      largest_count_shared = largest_count;
+      task_rows_shared = candidate_cursor;
+      job_valid_shared = source_count == expected_sources &&
+          quotient_count && quotient_count <= kCanonicalJobQuotients &&
+          candidate_cursor <= plan->job_capacity &&
+          candidate_cursor < kCanonicalCandidateLimit;
+      atomicAdd(reinterpret_cast<unsigned long long *>(
+                    &plan->raw_reservation),
+                static_cast<unsigned long long>(candidate_cursor));
+      if (!job_valid_shared)
+        atomicOr(&plan->status, kPublicationJobTooLarge);
+    }
+    __syncthreads();
+
+    if (!job_valid_shared) {
+      if (threadIdx.x == 0u) {
+        canonical_job_prefix(job_index, 0u, prefixes);
+      }
+      __syncthreads();
+      continue;
+    }
+
+    for (std::uint32_t physical = 0u;
+         physical < physical_run_count_shared; ++physical) {
+      const std::uint32_t source = physical_sources[physical];
+      const std::uint32_t count = source_lengths[source];
+      const std::uint32_t destination = run_offsets[physical];
+      const std::uint16_t *q_offsets = source_q_offsets +
+          source * (kCanonicalJobQuotients + 1u);
+      std::uint32_t local_q = 0u;
+      for (std::uint32_t position = threadIdx.x;
+           position < count; position += blockDim.x) {
+        while (local_q + 1u < quotient_count &&
+               position >= q_offsets[local_q + 1u])
+          ++local_q;
+        const std::uint64_t physical_position = source_q_positions[
+            source * kCanonicalJobQuotients + local_q] +
+            position - q_offsets[local_q];
+        const Row row = source == 0u
+            ? epoch_rows[physical_position]
+            : arena[physical_position];
+        const std::uint32_t candidate =
+            source_candidate_offsets[source] + position;
+        const std::uint32_t record =
+            (local_q << 28u) |
+            (std::uint32_t{row.key} << kCanonicalCandidateBits) |
+            candidate;
+        plane_a[destination + position] = record;
+        if (row.flags & kTombstone)
+          atomicOr(tombstone_words + (candidate >> 5u),
+                   1u << (candidate & 31u));
+        if (physical + 1u == physical_run_count_shared)
+          plane_b[destination + position] = record;
+      }
+    }
+    __syncthreads();
+
+    bool input_is_a = true;
+    while (run_count_shared > 1u) {
+      const std::uint32_t *input = input_is_a ? plane_a : plane_b;
+      std::uint32_t *output = input_is_a ? plane_b : plane_a;
+      const std::uint32_t items =
+          (small_count_shared + kThreads - 1u) / kThreads;
+      std::uint32_t position = threadIdx.x * items;
+      const std::uint32_t thread_end = min(
+          position + items, small_count_shared);
+      while (position < thread_end) {
+        std::uint32_t pair = 0u;
+        while (pair * 2u < run_count_shared) {
+          const std::uint32_t first = pair * 2u;
+          const std::uint32_t pair_rows = run_lengths[first] +
+              (first + 1u < run_count_shared
+                   ? run_lengths[first + 1u] : 0u);
+          if (position < run_offsets[first] + pair_rows) break;
+          ++pair;
+        }
+        const std::uint32_t first = pair * 2u;
+        const std::uint32_t begin = run_offsets[first];
+        const std::uint32_t left_count = run_lengths[first];
+        const std::uint32_t right_count = first + 1u < run_count_shared
+            ? run_lengths[first + 1u] : 0u;
+        const std::uint32_t pair_end = begin + left_count + right_count;
+        const std::uint32_t output_end = min(thread_end, pair_end);
+        if (!right_count) {
+          while (position < output_end) {
+            output[position] = input[position];
+            ++position;
+          }
+        } else {
+          canonical_merge_interval(
+              input + begin, left_count, input + begin + left_count,
+              right_count, output + begin, position - begin,
+              output_end - begin);
+          position = output_end;
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x == 0u) {
+        const std::uint32_t old_count = run_count_shared;
+        const std::uint32_t next_count = (old_count + 1u) >> 1u;
+        for (std::uint32_t next = 0u; next < next_count; ++next) {
+          const std::uint32_t first = next * 2u;
+          run_offsets[next] = run_offsets[first];
+          run_lengths[next] = static_cast<std::uint16_t>(
+              run_lengths[first] +
+              (first + 1u < old_count ? run_lengths[first + 1u] : 0u));
+        }
+        run_count_shared = next_count;
+      }
+      input_is_a = !input_is_a;
+      __syncthreads();
+    }
+
+    const std::uint32_t *small_input = input_is_a ? plane_a : plane_b;
+    std::uint32_t *final_output = input_is_a ? plane_b : plane_a;
+    const std::uint32_t *sorted = small_input;
+    if (small_count_shared && largest_count_shared) {
+      const std::uint32_t items =
+          (task_rows_shared + kThreads - 1u) / kThreads;
+      const std::uint32_t begin = threadIdx.x * items;
+      const std::uint32_t end = min(begin + items, task_rows_shared);
+      if (begin < end)
+        canonical_merge_interval(
+            small_input, small_count_shared,
+            small_input + small_count_shared, largest_count_shared,
+            final_output, begin, end);
+      sorted = final_output;
+    }
+    __syncthreads();
+
+    const std::uint32_t items_per_thread =
+        (task_rows_shared + kThreads - 1u) / kThreads;
+    const std::uint32_t thread_begin = threadIdx.x * items_per_thread;
+    const std::uint32_t thread_end = min(
+        thread_begin + items_per_thread, task_rows_shared);
+    std::uint32_t local_live = 0u;
+    std::uint32_t live_records[kMaximumItemsPerThread]{};
+    for (std::uint32_t position = thread_begin;
+         position < thread_end; ++position) {
+      const std::uint32_t record = sorted[position];
+      const std::uint32_t logical_key = record >> kCanonicalCandidateBits;
+      const bool first = position == 0u ||
+          (sorted[position - 1u] >> kCanonicalCandidateBits) != logical_key;
+      if (!first) continue;
+      const std::uint32_t candidate =
+          record & (kCanonicalCandidateLimit - 1u);
+      if (!plan->keep_tombstones &&
+          (tombstone_words[candidate >> 5u] &
+           (1u << (candidate & 31u))))
+        continue;
+      live_records[local_live++] = record;
+    }
+    std::uint32_t thread_output{}, job_output_count{};
+    BlockScan(scan_storage).ExclusiveSum(
+        local_live, thread_output, job_output_count);
+    if (threadIdx.x == 0u) {
+      const unsigned long long prefix = canonical_job_prefix(
+          job_index, job_output_count, prefixes);
+      jobs[job_index].existing_offset = plan->output_begin + prefix;
+      jobs[job_index].output_count = job_output_count;
+      output_prefix_shared = prefix;
+      if (job_index + 1u == plan->job_count)
+        plan->survivor_count = prefix + job_output_count;
+    }
+    __syncthreads();
+
+    constexpr unsigned full_warp = 0xffffffffu;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    for (std::uint32_t local = 0u;
+         local < kMaximumItemsPerThread; ++local) {
+      const bool valid = local < local_live;
+      const unsigned active = __ballot_sync(full_warp, valid);
+      if (!valid) continue;
+      const std::uint32_t record = live_records[local];
+      const std::uint32_t candidate =
+          record & (kCanonicalCandidateLimit - 1u);
+      const std::uint32_t local_q = record >> 28u;
+      const Row row = canonical_candidate_row(
+          candidate, local_q, source_count_shared,
+          source_candidate_offsets, source_q_offsets,
+          source_q_positions, epoch_rows, arena);
+      const std::uint64_t output = plan->output_begin +
+          output_prefix_shared + thread_output + local;
+      arena.store(output, row);
+      const std::uint32_t q = job.quotient_begin + local_q;
+      const std::uint32_t cell =
+          q * kFoundationCells + row.key / kFoundationCellKeys;
+      const unsigned peers = __match_any_sync(active, cell);
+      if (lane == static_cast<std::uint32_t>(__ffs(peers) - 1u))
+        atomicAdd(cell_counts + cell, __popc(peers));
+    }
+    __syncthreads();
+  }
+}
+
+struct CanonicalTournamentSlice {
+  std::uint32_t begin{};
+  std::uint32_t count{};
+};
+
+__device__ __forceinline__ CanonicalTournamentSlice
+canonical_tournament_cell_slice(
+    std::uint32_t source, std::uint32_t level, std::uint32_t q,
+    std::uint32_t cell, std::uint32_t suffix_begin,
+    std::uint32_t suffix_end, const Row *epoch_rows,
+    const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts,
+    const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
+    const Descriptor *descriptors, const std::uint16_t *cell_ranks) {
+  const std::uint32_t cell_suffix_begin = cell * kFoundationCellKeys;
+  const std::uint32_t cell_suffix_end =
+      cell_suffix_begin + kFoundationCellKeys;
+  std::uint32_t section_count = 0u;
+  std::uint32_t begin = 0u;
+  std::uint32_t end = 0u;
+  if (source == 0u) {
+    section_count = epoch_counts[q];
+    const std::uint16_t *ranks = epoch_cell_ranks +
+        std::size_t{q} * kFoundationCells;
+    begin = ranks[cell];
+    end = cell + 1u < kFoundationCells
+        ? ranks[cell + 1u] : section_count;
+    const Row *rows = epoch_rows + epoch_offsets[q];
+    if (suffix_begin > cell_suffix_begin)
+      begin += lower_bound_rows(
+          rows + begin, end - begin, suffix_begin);
+    if (suffix_end < cell_suffix_end)
+      end = begin + lower_bound_rows(
+          rows + begin, end - begin, suffix_end);
+  } else {
+    const Descriptor rows = descriptors[descriptor_index(q, level)];
+    section_count = rows.count();
+    const std::uint16_t *ranks = cell_ranks +
+        std::size_t{level} * kLocalRankEntries +
+        std::size_t{q} * kFoundationCells;
+    begin = ranks[cell];
+    end = cell + 1u < kFoundationCells
+        ? ranks[cell + 1u] : section_count;
+    if (suffix_begin > cell_suffix_begin)
+      begin += lower_bound_rows(
+          arena + rows.offset() + begin, end - begin, suffix_begin);
+    if (suffix_end < cell_suffix_end)
+      end = begin + lower_bound_rows(
+          arena + rows.offset() + begin, end - begin, suffix_end);
+  }
+  return {begin, end - begin};
+}
+
+__device__ __forceinline__ Row canonical_tournament_source_row(
+    std::uint32_t source, std::uint32_t level, std::uint32_t q,
+    std::uint32_t section_position, const Row *epoch_rows,
+    const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts, ResidentRows arena,
+    const Descriptor *descriptors) {
+  (void)epoch_counts;
+  if (source == 0u)
+    return epoch_rows[epoch_offsets[q] + section_position];
+  return arena[
+      descriptors[descriptor_index(q, level)].offset() + section_position];
+}
+
+__device__ __forceinline__ std::uint8_t canonical_tournament_choose(
+    std::uint8_t left, std::uint8_t right,
+    const std::uint32_t *heads, std::uint32_t chain) {
+  if (left == 0xffu) return right;
+  if (right == 0xffu) return left;
+  const std::uint32_t left_key =
+      heads[std::size_t{left} * kCanonicalTournamentChains + chain] &
+      0x1ffffu;
+  const std::uint32_t right_key =
+      heads[std::size_t{right} * kCanonicalTournamentChains + chain] &
+      0x1ffffu;
+  return right_key < left_key ||
+          (right_key == left_key && right < left)
+      ? right : left;
+}
+
+__device__ __forceinline__ std::uint8_t canonical_tournament_child(
+    std::uint32_t node, std::uint32_t leaves, std::uint32_t source_count,
+    const std::uint8_t *tree, std::uint32_t chain) {
+  if (node < leaves)
+    return tree[std::size_t{node} * kCanonicalTournamentChains + chain];
+  const std::uint32_t source = node - leaves;
+  return source < source_count
+      ? static_cast<std::uint8_t>(source) : 0xffu;
+}
+
+// A cell is one independent sorted merge chain.  One hundred twenty-eight
+// chains execute in
+// parallel and dynamically claim cells.  Each chain keeps one head per source
+// and an updateable tournament tree; advancing a source changes only O(log k)
+// comparisons.  The algorithm is identical for every k up to the structural
+// level bound, and reads each selected row only once after survivor offsets are
+// known.
+__global__ __launch_bounds__(kFoundationCompactionThreads)
+void canonical_tournament_carry_jobs_kernel(
+    BalancedMergeJob *jobs, const std::uint64_t *reservations,
+    ResidentPublicationPlan *plan, const Row *epoch_rows,
+    const std::uint32_t *epoch_offsets,
+    const std::uint32_t *epoch_counts,
+    const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
+    const Descriptor *descriptors, const LevelStorageSpan *level_spans,
+    const std::uint16_t *cell_ranks, const DeviceManifest *manifests,
+    const std::uint32_t *active_manifest,
+    CanonicalJobPrefix *prefixes, std::uint32_t *next_job,
+    std::uint32_t *cell_counts) {
+  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
+  constexpr std::uint32_t kScanItems =
+      kCanonicalTournamentTasks / kThreads;
+  static_assert(kScanItems * kThreads == kCanonicalTournamentTasks);
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ std::uint16_t source_levels[kMaximumMergeSources];
+  __shared__ std::uint32_t source_count_shared;
+  __shared__ std::uint32_t leaves_shared;
+  __shared__ std::uint32_t job_index_shared;
+  __shared__ std::uint32_t task_count_shared;
+  __shared__ std::uint32_t next_task_shared;
+  __shared__ std::uint32_t tape_cursor_shared;
+  __shared__ std::uint32_t job_valid_shared;
+  __shared__ unsigned long long output_prefix_shared;
+  extern __shared__ __align__(16) unsigned char workspace[];
+
+  const DeviceManifestSnapshot manifest = load_active_manifest(
+      manifests, active_manifest);
+  for (;;) {
+    if (threadIdx.x == 0u)
+      job_index_shared = atomicAdd(next_job, 1u);
+    __syncthreads();
+    const std::uint32_t job_index = job_index_shared;
+    if (job_index >= plan->job_count) return;
+    const BalancedMergeJob job = jobs[job_index];
+
+    if (threadIdx.x == 0u) {
+      std::uint32_t source_count = 0u;
+      source_levels[source_count++] = kMaximumLevels;
+      std::uint64_t levels = manifest.occupied_level_mask;
+      const std::uint64_t carried = plan->destination_level
+          ? (std::uint64_t{1} << plan->destination_level) - 1u : 0u;
+      levels &= carried;
+      while (levels && source_count < kMaximumMergeSources) {
+        const std::uint32_t level =
+            static_cast<std::uint32_t>(__ffsll(levels) - 1);
+        levels &= levels - 1u;
+        source_levels[source_count++] = static_cast<std::uint16_t>(level);
+      }
+      source_count_shared = source_count;
+      leaves_shared = canonical_next_power_of_two(source_count);
+      task_count_shared =
+          (job.quotient_end - job.quotient_begin) * kFoundationCells;
+      next_task_shared = 0u;
+      tape_cursor_shared = 0u;
+      job_valid_shared = source_count == plan->source_count &&
+          source_count <= kMaximumMergeSources && task_count_shared &&
+          task_count_shared <= kCanonicalTournamentTasks;
+    }
+    __syncthreads();
+
+    const std::uint32_t source_count = source_count_shared;
+    const std::uint32_t leaves = leaves_shared;
+    std::size_t offset = 0u;
+    const std::size_t states =
+        std::size_t{kCanonicalTournamentChains} * source_count;
+    offset = canonical_align_bytes(offset, alignof(std::uint16_t));
+    std::uint16_t *positions =
+        reinterpret_cast<std::uint16_t *>(workspace + offset);
+    offset += states * sizeof(std::uint16_t);
+    offset = canonical_align_bytes(offset, alignof(std::uint16_t));
+    std::uint16_t *remaining =
+        reinterpret_cast<std::uint16_t *>(workspace + offset);
+    offset += states * sizeof(std::uint16_t);
+    offset = canonical_align_bytes(offset, alignof(std::uint32_t));
+    std::uint32_t *heads =
+        reinterpret_cast<std::uint32_t *>(workspace + offset);
+    offset += states * sizeof(std::uint32_t);
+    std::uint8_t *tree = workspace + offset;
+    offset += std::size_t{kCanonicalTournamentChains} * leaves;
+    offset = canonical_align_bytes(offset, alignof(std::uint32_t));
+    std::uint32_t *survivor_tape =
+        reinterpret_cast<std::uint32_t *>(workspace + offset);
+    offset += std::size_t{plan->job_capacity} * sizeof(std::uint32_t);
+    offset = canonical_align_bytes(offset, alignof(std::uint16_t));
+    std::uint16_t *task_tape_bases =
+        reinterpret_cast<std::uint16_t *>(workspace + offset);
+    offset += std::size_t{kCanonicalTournamentTasks} *
+        sizeof(std::uint16_t);
+    std::uint16_t *task_output_offsets =
+        reinterpret_cast<std::uint16_t *>(workspace + offset);
+
+    if (!job_valid_shared) {
+      if (threadIdx.x == 0u) {
+        atomicOr(&plan->status, kPublicationJobTooLarge);
+        canonical_job_prefix(job_index, 0u, prefixes);
+      }
+      __syncthreads();
+      continue;
+    }
+
+    if (threadIdx.x < kCanonicalTournamentChains) {
+      const std::uint32_t chain = threadIdx.x;
+      for (;;) {
+        const std::uint32_t task = atomicAdd(&next_task_shared, 1u);
+        if (task >= task_count_shared) break;
+        const std::uint32_t q =
+            job.quotient_begin + task / kFoundationCells;
+        const std::uint32_t cell = task % kFoundationCells;
+        const std::uint64_t cell_key_begin =
+            (std::uint64_t{q} << 16u) +
+            std::uint64_t{cell} * kFoundationCellKeys;
+        const std::uint64_t cell_key_end =
+            cell_key_begin + kFoundationCellKeys;
+        const std::uint64_t clipped_begin =
+            max(cell_key_begin, job.key_begin);
+        const std::uint64_t clipped_end = min(cell_key_end, job.key_end);
+        const std::uint32_t suffix_begin = static_cast<std::uint32_t>(
+            clipped_begin - (std::uint64_t{q} << 16u));
+        const std::uint32_t suffix_end = static_cast<std::uint32_t>(
+            clipped_end - (std::uint64_t{q} << 16u));
+
+        std::uint32_t raw_count = 0u;
+        for (std::uint32_t source = 0u;
+             source < source_count; ++source) {
+          const std::uint32_t level = source_levels[source];
+          const CanonicalTournamentSlice slice =
+              canonical_tournament_cell_slice(
+                  source, level, q, cell, suffix_begin, suffix_end,
+                  epoch_rows, epoch_offsets, epoch_counts,
+                  epoch_cell_ranks, arena,
+                  descriptors, cell_ranks);
+          const std::size_t state =
+              std::size_t{source} * kCanonicalTournamentChains + chain;
+          positions[state] = static_cast<std::uint16_t>(slice.begin);
+          remaining[state] = static_cast<std::uint16_t>(slice.count);
+          raw_count += slice.count;
+          if (slice.count) {
+            const Row row = canonical_tournament_source_row(
+                source, level, q, slice.begin, epoch_rows, epoch_offsets,
+                epoch_counts, arena, descriptors);
+            heads[state] = std::uint32_t{row.key} |
+                ((row.flags & kTombstone) ? (1u << 17u) : 0u);
+          } else {
+            heads[state] = 1u << 16u;
+          }
+        }
+
+        const std::uint32_t tape_begin =
+            atomicAdd(&tape_cursor_shared, raw_count);
+        task_tape_bases[task] = static_cast<std::uint16_t>(tape_begin);
+        if (tape_begin + raw_count > plan->job_capacity) {
+          atomicExch(&job_valid_shared, 0u);
+          task_output_offsets[task] = 0u;
+          continue;
+        }
+
+        if (leaves > 1u) {
+          for (std::uint32_t node = leaves - 1u; node; --node) {
+            const std::uint8_t left = canonical_tournament_child(
+                node << 1u, leaves, source_count, tree, chain);
+            const std::uint8_t right = canonical_tournament_child(
+                (node << 1u) + 1u, leaves, source_count, tree, chain);
+            tree[std::size_t{node} * kCanonicalTournamentChains + chain] =
+                canonical_tournament_choose(left, right, heads, chain);
+          }
+        }
+
+        std::uint32_t survivor_count = 0u;
+        std::uint32_t previous_key = 1u << 16u;
+        for (;;) {
+          const std::uint32_t source = leaves == 1u ? 0u :
+              tree[kCanonicalTournamentChains + chain];
+          const std::size_t state =
+              std::size_t{source} * kCanonicalTournamentChains + chain;
+          const std::uint32_t head = heads[state];
+          const std::uint32_t key = head & 0x1ffffu;
+          if (key == (1u << 16u)) break;
+          const std::uint32_t position = positions[state];
+          if (key != previous_key) {
+            if (plan->keep_tombstones || !(head & (1u << 17u)))
+              survivor_tape[tape_begin + survivor_count++] =
+                  (source << 16u) | position;
+            previous_key = key;
+          }
+
+          std::uint32_t left = remaining[state];
+          --left;
+          remaining[state] = static_cast<std::uint16_t>(left);
+          if (left) {
+            const std::uint32_t next_position = position + 1u;
+            positions[state] = static_cast<std::uint16_t>(next_position);
+            const Row row = canonical_tournament_source_row(
+                source, source_levels[source], q, next_position,
+                epoch_rows, epoch_offsets, epoch_counts, arena,
+                descriptors);
+            heads[state] = std::uint32_t{row.key} |
+                ((row.flags & kTombstone) ? (1u << 17u) : 0u);
+          } else {
+            heads[state] = 1u << 16u;
+          }
+
+          if (leaves > 1u) {
+            std::uint32_t node = (leaves + source) >> 1u;
+            while (node) {
+              const std::uint8_t left_source =
+                  canonical_tournament_child(
+                      node << 1u, leaves, source_count, tree, chain);
+              const std::uint8_t right_source =
+                  canonical_tournament_child(
+                      (node << 1u) + 1u, leaves, source_count, tree, chain);
+              tree[std::size_t{node} *
+                       kCanonicalTournamentChains + chain] =
+                  canonical_tournament_choose(
+                      left_source, right_source, heads, chain);
+              node >>= 1u;
+            }
+          }
+        }
+        task_output_offsets[task] =
+            static_cast<std::uint16_t>(survivor_count);
+        atomicAdd(cell_counts +
+                      std::size_t{q} * kFoundationCells + cell,
+                  survivor_count);
+      }
+    }
+    __syncthreads();
+
+    if (!job_valid_shared ||
+        tape_cursor_shared != reservations[job_index]) {
+      if (threadIdx.x == 0u) {
+        atomicOr(&plan->status, kPublicationJobTooLarge);
+        canonical_job_prefix(job_index, 0u, prefixes);
+      }
+      __syncthreads();
+      continue;
+    }
+
+    std::uint32_t local_prefixes[kScanItems];
+    std::uint32_t thread_total = 0u;
+    for (std::uint32_t item = 0u; item < kScanItems; ++item) {
+      const std::uint32_t task = threadIdx.x * kScanItems + item;
+      const std::uint32_t count = task < task_count_shared
+          ? task_output_offsets[task] : 0u;
+      local_prefixes[item] = thread_total;
+      thread_total += count;
+    }
+    std::uint32_t thread_prefix = 0u, job_output_count = 0u;
+    BlockScan(scan_storage).ExclusiveSum(
+        thread_total, thread_prefix, job_output_count);
+    for (std::uint32_t item = 0u; item < kScanItems; ++item) {
+      const std::uint32_t task = threadIdx.x * kScanItems + item;
+      if (task < task_count_shared)
+        task_output_offsets[task] = static_cast<std::uint16_t>(
+            thread_prefix + local_prefixes[item]);
+    }
+    if (threadIdx.x == 0u) {
+      task_output_offsets[task_count_shared] =
+          static_cast<std::uint16_t>(job_output_count);
+      const unsigned long long prefix = canonical_job_prefix(
+          job_index, job_output_count, prefixes);
+      jobs[job_index].existing_offset = plan->output_begin + prefix;
+      jobs[job_index].output_count = job_output_count;
+      output_prefix_shared = prefix;
+      atomicAdd(reinterpret_cast<unsigned long long *>(
+                    &plan->raw_reservation),
+                static_cast<unsigned long long>(tape_cursor_shared));
+      if (job_index + 1u == plan->job_count)
+        plan->survivor_count = prefix + job_output_count;
+    }
+    __syncthreads();
+
+    const std::uint32_t items_per_thread =
+        (job_output_count + kThreads - 1u) / kThreads;
+    const std::uint32_t output_begin = threadIdx.x * items_per_thread;
+    const std::uint32_t output_end =
+        min(output_begin + items_per_thread, job_output_count);
+    if (output_begin < output_end) {
+      std::uint32_t low = 0u, high = task_count_shared;
+      while (low < high) {
+        const std::uint32_t middle = (low + high) >> 1u;
+        if (task_output_offsets[middle + 1u] <= output_begin)
+          low = middle + 1u;
+        else
+          high = middle;
+      }
+      std::uint32_t task = low;
+      for (std::uint32_t logical = output_begin;
+           logical < output_end; ++logical) {
+        while (task + 1u < task_count_shared &&
+               task_output_offsets[task + 1u] <= logical)
+          ++task;
+        const std::uint32_t reference = survivor_tape[
+            task_tape_bases[task] + logical - task_output_offsets[task]];
+        const std::uint32_t source = reference >> 16u;
+        const std::uint32_t position = reference & 0xffffu;
+        const std::uint32_t q =
+            job.quotient_begin + task / kFoundationCells;
+        const Row row = canonical_tournament_source_row(
+            source, source_levels[source], q, position, epoch_rows,
+            epoch_offsets, epoch_counts, arena, descriptors);
+        arena.store(
+            plan->output_begin + output_prefix_shared + logical, row);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void copy_canonical_epoch_kernel(
+    const Row *rows, const std::uint32_t *count,
+    ResidentRows arena, std::uint64_t destination) {
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < *count; i += gridDim.x * blockDim.x)
+    arena.store(destination + i, rows[i]);
+}
+
+__global__ void build_canonical_rank_from_run_kernel(
+    ResidentRows arena, std::uint64_t run_begin,
+    const std::uint32_t *quotient_offsets, std::uint32_t level,
+    std::uint16_t *cell_ranks) {
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t cell = threadIdx.x;
+  const std::uint32_t begin = quotient_offsets[q];
+  const std::uint32_t count = quotient_offsets[q + 1u] - begin;
+  const std::uint32_t rank = lower_bound_rows(
+      arena + run_begin + begin, count, cell * kFoundationCellKeys);
+  cell_ranks[std::size_t{level} * kLocalRankEntries +
+             std::size_t{q} * kFoundationCells + cell] =
+      static_cast<std::uint16_t>(rank);
+}
+
+__global__ void build_canonical_rank_from_counts_kernel(
+    const std::uint32_t *cell_counts,
+    const ResidentPublicationPlan *plan, std::uint32_t level_count,
+    std::uint16_t *cell_ranks, std::uint32_t *quotient_counts) {
+  using Scan = cub::BlockScan<std::uint32_t, kFoundationCells>;
+  __shared__ typename Scan::TempStorage storage;
+  const std::uint32_t q = blockIdx.x;
+  const std::uint32_t cell = threadIdx.x;
+  if (plan->status || plan->destination_level >= level_count) {
+    if (threadIdx.x == 0u) quotient_counts[q] = 0u;
+    if (q == 0u && threadIdx.x == 0u)
+      quotient_counts[kQuotients] = 0u;
+    return;
+  }
+  const std::uint32_t level = plan->destination_level;
+  const std::uint32_t count =
+      cell_counts[std::size_t{q} * kFoundationCells + cell];
+  std::uint32_t rank{}, total{};
+  Scan(storage).ExclusiveSum(count, rank, total);
+  cell_ranks[std::size_t{level} * kLocalRankEntries +
+             std::size_t{q} * kFoundationCells + cell] =
+      static_cast<std::uint16_t>(rank);
+  if (threadIdx.x == 0u) quotient_counts[q] = total;
+  if (q == 0u && threadIdx.x == 0u)
+    quotient_counts[kQuotients] = 0u;
+}
+
+__global__ void finalize_canonical_level_metadata_kernel(
+    const std::uint32_t *quotient_offsets,
+    const LevelStorageSpan *level_spans,
+    ResidentPublicationPlan *plan, Descriptor *descriptors,
+    std::uint32_t route_stride, RouteHeader *route_headers,
+    RouteSlice *route_slices, std::uint32_t *route_logical_begins,
+    std::uint16_t *route_quotients,
+    std::uint32_t *level_q_logical_offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients || plan->status) return;
+  const std::uint32_t level = plan->destination_level;
+  const std::uint32_t offset = quotient_offsets[q];
+  level_q_logical_offsets[
+      std::size_t{level} * (kQuotients + 1u) + q] = offset;
+  if (q == kQuotients) return;
+  const std::uint32_t count = quotient_offsets[q + 1u] - offset;
+  const Descriptor descriptor = Descriptor::make(
+      level_spans[level].begin + offset, count);
+  const std::size_t mapping = descriptor_index(q, level);
+  descriptors[mapping] = descriptor;
+  const std::uint32_t route = level * route_stride + q;
+  route_headers[mapping] = {route, count ? 1u : 0u};
+  route_slices[route] = {descriptor, 0u, 1u << 16u};
+  route_logical_begins[route] = offset;
+  route_quotients[route] = static_cast<std::uint16_t>(q);
+  if (q == 0u) {
+    const std::uint64_t total = quotient_offsets[kQuotients];
+    plan->survivor_count = total;
+    if (total > plan->output_capacity)
+      atomicOr(&plan->status, kPublicationOutputOverflow);
+  }
+}
+
+__global__ void finalize_canonical_section_metadata_kernel(
+    const std::uint32_t *section_begins,
+    const std::uint32_t *section_counts,
+    const std::uint32_t *selected_count,
+    const LevelStorageSpan *level_spans,
+    ResidentPublicationPlan *plan, Descriptor *descriptors,
+    std::uint32_t route_stride, RouteHeader *route_headers,
+    RouteSlice *route_slices, std::uint32_t *route_logical_begins,
+    std::uint16_t *route_quotients,
+    std::uint32_t *level_q_logical_offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients || plan->status) return;
+  const std::uint32_t level = plan->destination_level;
+  const std::uint32_t begin = section_begins[q];
+  level_q_logical_offsets[
+      std::size_t{level} * (kQuotients + 1u) + q] = begin;
+  if (q == kQuotients) return;
+  const std::uint32_t count = section_counts[q];
+  const Descriptor descriptor = Descriptor::make(
+      level_spans[level].begin + begin, count);
+  const std::size_t mapping = descriptor_index(q, level);
+  descriptors[mapping] = descriptor;
+  const std::uint32_t route = level * route_stride + q;
+  route_headers[mapping] = {route, count ? 1u : 0u};
+  route_slices[route] = {descriptor, 0u, 1u << 16u};
+  route_logical_begins[route] = begin;
+  route_quotients[route] = static_cast<std::uint16_t>(q);
+  if (q == 0u) {
+    plan->survivor_count = *selected_count;
+    if (*selected_count > plan->output_capacity)
+      atomicOr(&plan->status, kPublicationOutputOverflow);
+  }
+}
+
+__device__ __forceinline__ void canonical_lookup_resident_only(
+    std::uint32_t key, std::uint32_t query_index,
+    std::uint32_t *out_values, std::uint8_t *out_found,
+    ResidentRows arena, const Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, std::uint64_t levels,
+    const std::uint32_t *query_ids) {
+  const std::uint32_t q = key >> 16u;
+  const std::uint32_t suffix = key_suffix(key);
+  while (levels) {
+    const std::uint32_t level =
+        static_cast<std::uint32_t>(__ffsll(levels) - 1);
+    levels &= levels - 1u;
+    const Descriptor rows = descriptors[descriptor_index(q, level)];
+    if (!rows.count()) continue;
+    const std::uint32_t cell = suffix / kFoundationCellKeys;
+    const std::uint16_t *ranks = cell_ranks +
+        std::size_t{level} * kLocalRankEntries +
+        std::size_t{q} * kFoundationCells;
+    const std::uint32_t begin = ranks[cell];
+    const std::uint32_t end = cell + 1u < kFoundationCells
+        ? ranks[cell + 1u] : rows.count();
+    Row winner{};
+    if (!find_unique_point_row(
+            arena + rows.offset() + begin, end - begin, suffix, winner))
+      continue;
+    const bool live = (winner.flags & kTombstone) == 0u;
+    const std::uint32_t destination =
+        query_ids ? query_ids[query_index] : query_index;
+    out_values[destination] = live ? winner.value : out_found ? 0u : kInvalid;
+    if (out_found) out_found[destination] = live;
+    return;
+  }
+  const std::uint32_t destination =
+      query_ids ? query_ids[query_index] : query_index;
+  out_values[destination] = out_found ? 0u : kInvalid;
+  if (out_found) out_found[destination] = 0u;
+}
+
+__global__ void canonical_lookup_with_pending_kernel(
+    const std::uint32_t *queries, std::uint32_t *out_values,
+    std::uint8_t *out_found, std::uint32_t count,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, const std::uint64_t *batch_signatures,
+    const std::uint64_t *epoch_signatures, ResidentRows arena,
+    const Descriptor *descriptors, const std::uint16_t *cell_ranks,
+    const std::uint32_t *query_ids,
+    const std::uint64_t *occupied_mask) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t key = queries[i];
+  const std::uint32_t q = key >> 16u;
+  const std::uint32_t suffix = key_suffix(key);
+  const std::uint64_t signature_bits = pending_signature_bits(key);
+  if (pending_batches &&
+      (epoch_signatures[q] & signature_bits) == signature_bits) {
+    for (int batch = static_cast<int>(pending_batches) - 1;
+         batch >= 0; --batch) {
+      const std::uint32_t b = static_cast<std::uint32_t>(batch);
+      const std::uint64_t signature =
+          batch_signatures[std::size_t{b} * kQuotients + q];
+      if ((signature & signature_bits) != signature_bits) continue;
+      const std::size_t oi = std::size_t{b} * (kQuotients + 1u) + q;
+      const std::uint32_t begin = raw_offsets[oi];
+      const std::uint32_t end = raw_offsets[oi + 1u];
+      bool matched = false;
+      std::uint32_t newest = 0u;
+      Row winner{};
+      for (std::uint32_t position = begin; position < end; ++position) {
+        const std::uint32_t record = b * batch_stride + position;
+        if (key_suffix(raw_keys[record]) != suffix) continue;
+        const RawPayload payload = raw_payloads[record];
+        const std::uint32_t age = raw_position(payload);
+        if (!matched || age > newest) {
+          winner = raw_row(key, payload);
+          newest = age;
+          matched = true;
+        }
+      }
+      if (matched) {
+        const bool live = (winner.flags & kTombstone) == 0u;
+        const std::uint32_t destination = query_ids ? query_ids[i] : i;
+        out_values[destination] =
+            live ? winner.value : out_found ? 0u : kInvalid;
+        if (out_found) out_found[destination] = live;
+        return;
+      }
+    }
+  }
+  canonical_lookup_resident_only(
+      key, i, out_values, out_found, arena, descriptors, cell_ranks,
+      __ldg(occupied_mask), query_ids);
+}
+
 __global__ void initialize_single_route_auxiliary_kernel(
     const std::uint32_t *section_offsets, std::uint32_t level,
     std::uint32_t route_stride, std::uint32_t *route_logical_begins,
@@ -4491,7 +6482,12 @@ __global__ void compact_direct_epoch_jobs_kernel(
     std::uint32_t *section_output_counts, std::uint32_t *overflow_flag,
     std::uint32_t *level_cell_rank_blocks,
     std::uint16_t *level_cell_ranks, std::uint16_t *local_rank,
-    std::uint16_t *level_guides) {
+    std::uint16_t *level_guides
+#if defined(GPULSMOPT_FORCE_UNIFIED_MERGE) && \
+    !defined(GPULSMOPT_FORCE_UNIFIED_COMPILE_ELIDE)
+    , bool force_unified_merge
+#endif
+    ) {
   constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
   using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
   __shared__ typename BlockScan::TempStorage block_scan_storage;
@@ -4547,8 +6543,18 @@ __global__ void compact_direct_epoch_jobs_kernel(
     const std::uint32_t q_end = job.quotient_end;
     const std::uint32_t quotient_count = q_end - q_begin;
     const bool crowded_piece = job.hot_pieces != 0u;
+#if defined(GPULSMOPT_FORCE_UNIFIED_MERGE) && \
+    !defined(GPULSMOPT_FORCE_UNIFIED_COMPILE_ELIDE)
+    // A kernel argument keeps the production cell-owned implementation in
+    // the compiled resource shape while the experiment forces it off.
     const bool cell_owned_shape =
-        !crowded_piece && quotient_count <= kCellOwnedQuotients;
+        !force_unified_merge && !crowded_piece &&
+        quotient_count <= kCellOwnedQuotients;
+#else
+    const bool cell_owned_shape =
+        !kForceUnifiedMergeExperiment && !crowded_piece &&
+        quotient_count <= kCellOwnedQuotients;
+#endif
     const bool updates_are_resolved = staged_epoch || crowded_piece;
     if (threadIdx.x == 0u) {
       std::uint32_t total = 0u;
@@ -5876,6 +7882,418 @@ __global__ void compact_direct_epoch_jobs_kernel(
   }
 }
 
+constexpr std::uint32_t kPartitionAuditWarps = 8u;
+constexpr std::uint32_t kDirectAuditPieceBuckets = 16u;
+
+struct DirectOutputAuditDevice {
+  unsigned long long row_count{};
+  unsigned long long digest_sum{};
+  unsigned long long digest_xor{};
+  unsigned long long unsupported_jobs{};
+  unsigned long long count_mismatch_jobs{};
+  unsigned long long unsorted_rows{};
+  unsigned long long duplicate_rows{};
+  unsigned long long value_errors{};
+  unsigned long long flag_errors{};
+  unsigned long long range_errors{};
+  unsigned long long cell_errors[kFoundationCells]{};
+  unsigned long long piece_errors[kDirectAuditPieceBuckets]{};
+};
+
+struct PartitionAuditDeviceJob {
+  std::uint32_t task_rows{};
+  std::uint32_t max_source_rows{};
+  std::uint32_t imbalance_ppm{};
+  std::uint16_t source_count{};
+  std::uint16_t nonempty_sources{};
+  std::uint16_t rank_supported_sources{};
+  std::uint16_t quotient_width{};
+  std::uint16_t packed_bits{};
+  std::uint16_t duplicate_boundaries{};
+  std::uint16_t maximum_boundary_equal_rows{};
+  std::uint16_t partition_rows[kPartitionAuditWarps]{};
+  std::uint8_t resolved{};
+  std::uint8_t rank_supported{};
+  std::uint8_t direct_path{};
+  std::uint8_t eligible{};
+};
+
+__host__ __device__ __forceinline__ std::uint64_t direct_audit_mix(
+    std::uint64_t value) {
+  value += 0x9e3779b97f4a7c15ull;
+  value = (value ^ (value >> 30u)) * 0xbf58476d1ce4e5b9ull;
+  value = (value ^ (value >> 27u)) * 0x94d049bb133111ebull;
+  return value ^ (value >> 31u);
+}
+
+__device__ __forceinline__ unsigned long long warp_sum_u64(
+    unsigned long long value) {
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    value += __shfl_down_sync(0xffffffffu, value, offset);
+  return value;
+}
+
+__device__ __forceinline__ unsigned long long warp_xor_u64(
+    unsigned long long value) {
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    value ^= __shfl_down_sync(0xffffffffu, value, offset);
+  return value;
+}
+
+// Audits the physical output immediately after the production direct merge.
+// The paper experiment uses unique live values, so strict ordering, value=1,
+// and flags=0 are intentional workload-specific reference checks.
+__global__ void audit_direct_output_kernel(
+    const BalancedMergeJob *jobs, const ResidentPublicationPlan *plan,
+    const std::uint64_t *raw_rows, ResidentRows arena,
+    DirectOutputAuditDevice *audit) {
+  const std::uint32_t lane = threadIdx.x & 31u;
+  for (std::uint32_t job_index = blockIdx.x;
+       job_index < plan->job_count && !plan->status;
+       job_index += gridDim.x) {
+    const BalancedMergeJob job = jobs[job_index];
+    const bool supported = job.hot_pieces != 0u &&
+        job.quotient_end == job.quotient_begin + 1u;
+    if (!supported) {
+      if (threadIdx.x == 0u)
+        atomicAdd(&audit->unsupported_jobs, 1ull);
+      __syncthreads();
+      continue;
+    }
+    if (threadIdx.x == 0u) {
+      atomicAdd(&audit->row_count,
+                static_cast<unsigned long long>(job.output_count));
+      if (raw_rows && raw_rows[job_index] != job.output_count)
+        atomicAdd(&audit->count_mismatch_jobs, 1ull);
+    }
+
+    unsigned long long local_sum = 0ull, local_xor = 0ull;
+    unsigned long long local_unsorted = 0ull, local_duplicate = 0ull;
+    unsigned long long local_value = 0ull, local_flags = 0ull;
+    unsigned long long local_range = 0ull;
+    for (std::uint32_t position = threadIdx.x;
+         position < job.output_count; position += blockDim.x) {
+      const Row row = arena[job.existing_offset + position];
+      const std::uint64_t key =
+          (std::uint64_t{job.quotient_begin} << 16u) | row.key;
+      const bool value_error = row.value != 1u;
+      const bool flag_error = row.flags != 0u;
+      const bool range_error = key < job.key_begin || key >= job.key_end;
+      bool unsorted = false, duplicate = false;
+      if (position) {
+        const std::uint16_t previous =
+            arena.key_at(job.existing_offset + position - 1u);
+        unsorted = previous > row.key;
+        duplicate = previous == row.key;
+      }
+      local_unsorted += unsorted;
+      local_duplicate += duplicate;
+      local_value += value_error;
+      local_flags += flag_error;
+      local_range += range_error;
+      const std::uint64_t mixed = direct_audit_mix(
+          (key << 32u) ^ (std::uint64_t{row.value} << 1u) ^ row.flags);
+      local_sum += mixed;
+      local_xor ^= mixed;
+      if (value_error || flag_error || range_error || unsorted || duplicate) {
+        atomicAdd(&audit->cell_errors[row.key / kFoundationCellKeys], 1ull);
+        const std::uint32_t piece = min(
+            static_cast<std::uint32_t>(job.hot_piece),
+            kDirectAuditPieceBuckets - 1u);
+        atomicAdd(&audit->piece_errors[piece], 1ull);
+      }
+    }
+    local_sum = warp_sum_u64(local_sum);
+    local_xor = warp_xor_u64(local_xor);
+    local_unsorted = warp_sum_u64(local_unsorted);
+    local_duplicate = warp_sum_u64(local_duplicate);
+    local_value = warp_sum_u64(local_value);
+    local_flags = warp_sum_u64(local_flags);
+    local_range = warp_sum_u64(local_range);
+    if (lane == 0u) {
+      atomicAdd(&audit->digest_sum, local_sum);
+      atomicXor(&audit->digest_xor, local_xor);
+      atomicAdd(&audit->unsorted_rows, local_unsorted);
+      atomicAdd(&audit->duplicate_rows, local_duplicate);
+      atomicAdd(&audit->value_errors, local_value);
+      atomicAdd(&audit->flag_errors, local_flags);
+      atomicAdd(&audit->range_errors, local_range);
+    }
+    __syncthreads();
+  }
+}
+
+__device__ __forceinline__ std::uint32_t audit_bit_width(
+    std::uint32_t value) {
+  return value <= 1u ? 0u : 32u - __clz(value - 1u);
+}
+
+// Simulates eight half-open key partitions without changing the merge.  One
+// warp owns one job and uses the production source/routing representation.
+__global__ void audit_partition_feasibility_kernel(
+    const BalancedMergeJob *jobs, const ResidentPublicationPlan *plan,
+    const Row *current_rows, const std::uint32_t *current_offsets,
+    const std::uint32_t *raw_offsets, std::uint32_t raw_batches,
+    const std::uint16_t *current_ranks, ResidentRows arena,
+    const DeviceManifest *manifests, const std::uint32_t *active_manifest,
+    const Descriptor *descriptors, const RouteHeader *route_headers,
+    const RouteSlice *route_slices,
+    const std::uint32_t *route_logical_begins,
+    const std::uint32_t *level_q_logical_offsets,
+    const std::uint32_t *level_cell_rank_blocks,
+    const std::uint16_t *level_cell_ranks,
+    const std::uint16_t *local_rank, const std::uint32_t *staged_epoch_mode,
+    const std::uint32_t *rank_cell_mode,
+    PartitionAuditDeviceJob *output, std::uint16_t *source_rows) {
+  const std::uint32_t lane = threadIdx.x & 31u;
+  constexpr unsigned mask = 0xffffffffu;
+  const DeviceManifestSnapshot manifest = load_active_manifest(
+      manifests, active_manifest);
+  // These flags are written by kernels immediately preceding this audit.
+  // Use coherent atomic reads rather than the read-only cache so every
+  // publication is classified using its current mode.
+  const bool staged = atomicAdd(
+      const_cast<std::uint32_t *>(staged_epoch_mode), 0u) != 0u;
+  const bool direct_path = atomicAdd(
+      const_cast<std::uint32_t *>(rank_cell_mode), 0u) == 0u;
+  for (std::uint32_t job_index = blockIdx.x;
+       job_index < plan->job_count && !plan->status;
+       job_index += gridDim.x) {
+    const BalancedMergeJob job = jobs[job_index];
+    std::uint16_t *job_sources = source_rows +
+        std::size_t{job_index} * kMaximumMergeSources;
+    for (std::uint32_t source = lane; source < kMaximumMergeSources;
+         source += 32u)
+      job_sources[source] = 0u;
+    __syncwarp();
+
+    const std::uint32_t q = job.quotient_begin;
+    const std::uint32_t quotient_width =
+        job.quotient_end - job.quotient_begin;
+    const bool crowded = job.hot_pieces != 0u;
+    const bool resolved = staged || crowded;
+    std::uint32_t local_total = 0u, local_max = 0u;
+    std::uint32_t local_nonempty = 0u, local_ranked = 0u;
+    bool local_supported = true;
+    if (lane == 0u) {
+      std::uint32_t raw = 0u;
+      if (resolved && crowded) {
+        const std::uint32_t low =
+            static_cast<std::uint32_t>(job.key_begin & 0xffffu);
+        const std::uint32_t high = static_cast<std::uint32_t>(
+            job.key_end - (std::uint64_t{q} << 16u));
+        const std::uint32_t begin = current_offsets[q];
+        const std::uint32_t count = current_offsets[q + 1u] - begin;
+        raw = lower_bound_rows(current_rows + begin, count, high) -
+            lower_bound_rows(current_rows + begin, count, low);
+      } else if (resolved) {
+        raw = current_offsets[job.quotient_end] - current_offsets[q];
+      } else {
+        for (std::uint32_t batch = 0u; batch < raw_batches; ++batch) {
+          const std::size_t base =
+              std::size_t{batch} * (kQuotients + 1u);
+          raw += raw_offsets[base + job.quotient_end] -
+              raw_offsets[base + q];
+        }
+      }
+      job_sources[0] = static_cast<std::uint16_t>(raw);
+      local_total = raw;
+      local_max = raw;
+      local_nonempty = raw != 0u;
+      const std::uint32_t raw_section = resolved && quotient_width == 1u
+          ? current_offsets[q + 1u] - current_offsets[q] : 0u;
+      const bool ranked = resolved && quotient_width == 1u &&
+          cell_rank_supported(raw_section);
+      local_ranked = raw != 0u && ranked;
+      local_supported = raw == 0u || ranked;
+    }
+    for (std::uint32_t level = lane;
+         level <= plan->source_level_limit; level += 32u) {
+      if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
+      std::uint32_t count = 0u;
+      if (crowded) {
+        const std::uint32_t low =
+            static_cast<std::uint32_t>(job.key_begin & 0xffffu);
+        const std::uint32_t high = static_cast<std::uint32_t>(
+            job.key_end - (std::uint64_t{q} << 16u));
+        count = logical_section_bound(
+            q, level, high, false, arena, route_headers, route_slices,
+            route_logical_begins, level_q_logical_offsets) -
+            logical_section_bound(
+                q, level, low, false, arena, route_headers, route_slices,
+                route_logical_begins, level_q_logical_offsets);
+      } else {
+        for (std::uint32_t section = q;
+             section < job.quotient_end; ++section)
+          count += descriptors[descriptor_index(section, level)].count();
+      }
+      job_sources[level + 1u] = static_cast<std::uint16_t>(count);
+      local_total += count;
+      local_max = max(local_max, count);
+      local_nonempty += count != 0u;
+      bool ranked = quotient_width == 1u;
+      if (ranked) {
+        const std::uint32_t section_count =
+            descriptors[descriptor_index(q, level)].count();
+        ranked = cell_rank_supported(section_count);
+        if (ranked && level != manifest.foundation_level)
+          ranked = level_cell_rank_blocks[descriptor_index(q, level)] !=
+              kInvalid;
+      }
+      local_ranked += count != 0u && ranked;
+      local_supported &= count == 0u || ranked;
+    }
+    for (std::uint32_t offset = 16u; offset; offset >>= 1u) {
+      local_total += __shfl_down_sync(mask, local_total, offset);
+      local_max = max(local_max,
+                      __shfl_down_sync(mask, local_max, offset));
+      local_nonempty += __shfl_down_sync(mask, local_nonempty, offset);
+      local_ranked += __shfl_down_sync(mask, local_ranked, offset);
+      local_supported &= __shfl_down_sync(mask, local_supported, offset);
+    }
+    const std::uint32_t total = __shfl_sync(mask, local_total, 0u);
+    const std::uint32_t maximum_source = __shfl_sync(mask, local_max, 0u);
+    const std::uint32_t nonempty = __shfl_sync(mask, local_nonempty, 0u);
+    const std::uint32_t ranked_sources =
+        __shfl_sync(mask, local_ranked, 0u);
+    const bool ranks_supported =
+        __shfl_sync(mask, local_supported, 0u);
+
+    std::uint32_t partitions[kPartitionAuditWarps]{};
+    std::uint32_t duplicate_boundaries = 0u;
+    std::uint32_t maximum_equal = 0u;
+    if (resolved && quotient_width == 1u && total) {
+      const std::uint32_t low_suffix =
+          static_cast<std::uint32_t>(job.key_begin & 0xffffu);
+      const std::uint32_t high_suffix = static_cast<std::uint32_t>(
+          job.key_end - (std::uint64_t{q} << 16u));
+      const std::uint32_t base = balanced_merge_prefix_count_warp(
+          q, low_suffix, current_rows, current_offsets, arena,
+          route_headers, route_slices, route_logical_begins,
+          level_q_logical_offsets, plan->source_level_limit,
+          manifest.occupied_level_mask);
+      std::uint32_t previous = base;
+      for (std::uint32_t partition = 0u;
+           partition + 1u < kPartitionAuditWarps; ++partition) {
+        const std::uint32_t target = base + static_cast<std::uint32_t>(
+            (std::uint64_t{total} * (partition + 1u) +
+             kPartitionAuditWarps - 1u) / kPartitionAuditWarps);
+        std::uint32_t boundary = resident_hot_boundary_warp(
+            q, target, current_rows, current_offsets, arena,
+            route_headers, route_slices, route_logical_begins,
+            level_q_logical_offsets, plan->source_level_limit,
+            manifest.occupied_level_mask);
+        boundary = min(max(boundary, low_suffix), high_suffix);
+        const std::uint32_t prefix = balanced_merge_prefix_count_warp(
+            q, boundary, current_rows, current_offsets, arena,
+            route_headers, route_slices, route_logical_begins,
+            level_q_logical_offsets, plan->source_level_limit,
+            manifest.occupied_level_mask);
+        if (lane == 0u) partitions[partition] = prefix - previous;
+        previous = prefix;
+        if (boundary > low_suffix) {
+          const std::uint32_t before = balanced_merge_prefix_count_warp(
+              q, boundary - 1u, current_rows, current_offsets, arena,
+              route_headers, route_slices, route_logical_begins,
+              level_q_logical_offsets, plan->source_level_limit,
+              manifest.occupied_level_mask);
+          const std::uint32_t equal = prefix - before;
+          if (lane == 0u) {
+            duplicate_boundaries += equal > 1u;
+            maximum_equal = max(maximum_equal, equal);
+          }
+        }
+      }
+      if (lane == 0u)
+        partitions[kPartitionAuditWarps - 1u] = base + total - previous;
+    }
+    if (lane == 0u) {
+      PartitionAuditDeviceJob item{};
+      item.task_rows = total;
+      item.max_source_rows = maximum_source;
+      item.source_count = static_cast<std::uint16_t>(plan->source_count);
+      item.nonempty_sources = static_cast<std::uint16_t>(nonempty);
+      item.rank_supported_sources =
+          static_cast<std::uint16_t>(ranked_sources);
+      item.quotient_width = static_cast<std::uint16_t>(quotient_width);
+      item.packed_bits = static_cast<std::uint16_t>(
+          16u + audit_bit_width(quotient_width) +
+          audit_bit_width(plan->job_capacity));
+      item.duplicate_boundaries =
+          static_cast<std::uint16_t>(duplicate_boundaries);
+      item.maximum_boundary_equal_rows =
+          static_cast<std::uint16_t>(maximum_equal);
+      std::uint32_t maximum_partition = 0u;
+      for (std::uint32_t partition = 0u;
+           partition < kPartitionAuditWarps; ++partition) {
+        item.partition_rows[partition] =
+            static_cast<std::uint16_t>(partitions[partition]);
+        maximum_partition = max(maximum_partition, partitions[partition]);
+      }
+      item.imbalance_ppm = total
+          ? static_cast<std::uint32_t>(
+                std::uint64_t{maximum_partition} *
+                kPartitionAuditWarps * 1000000ull / total)
+          : 0u;
+      item.resolved = resolved;
+      item.rank_supported = ranks_supported;
+      item.direct_path = direct_path;
+      item.eligible = direct_path && resolved && ranks_supported &&
+          quotient_width <= 16u && item.packed_bits <= 32u && total >= 1024u;
+      output[job_index] = item;
+    }
+  }
+}
+
+__global__ void audit_lookup_jobs_kernel(
+    const std::uint32_t *queries, std::uint32_t count,
+    const BalancedMergeJob *jobs, const ResidentPublicationPlan *plan,
+    ResidentRows arena, std::uint32_t *results) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint64_t key = queries[i];
+  std::uint32_t low = 0u, high = plan->job_count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (jobs[middle].key_end <= key) low = middle + 1u;
+    else high = middle;
+  }
+  if (low == plan->job_count || jobs[low].key_begin > key ||
+      key >= jobs[low].key_end) {
+    results[i] = kInvalid;
+    return;
+  }
+  const BalancedMergeJob job = jobs[low];
+  Row row{};
+  const bool matched = find_leftmost_point_row(
+      arena + job.existing_offset, job.output_count,
+      key_suffix(static_cast<std::uint32_t>(key)), row);
+  results[i] = matched && !(row.flags & kTombstone) ? row.value : kInvalid;
+}
+
+__global__ void audit_lookup_routes_kernel(
+    const std::uint32_t *queries, std::uint32_t count,
+    const ResidentPublicationPlan *plan, ResidentRows arena,
+    const Descriptor *descriptors, const RouteHeader *route_headers,
+    const RouteSlice *route_slices, std::uint32_t *results) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const std::uint32_t key = queries[i];
+  const std::uint32_t q = key >> 16u;
+  const std::uint32_t suffix = key_suffix(key);
+  const std::size_t mapping = descriptor_index(q, plan->destination_level);
+  const Descriptor logical = descriptors[mapping];
+  const RoutedSliceSelection selection = logical.split()
+      ? routed_slice_for_suffix(
+            q, plan->destination_level, suffix,
+            route_headers, route_slices)
+      : RoutedSliceSelection{logical, 0u, logical.count() != 0u};
+  Row row{};
+  const bool matched = selection.valid && find_leftmost_point_row(
+      arena + selection.rows.offset(), selection.rows.count(), suffix, row);
+  results[i] = matched && !(row.flags & kTombstone) ? row.value : kInvalid;
+}
+
 inline std::uint32_t select_balanced_merge_capacity() {
   int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));
@@ -6301,6 +8719,8 @@ __global__ void lookup_with_dense_router_kernel(
     const std::uint32_t *level_cell_rank_blocks,
     const std::uint16_t *level_cell_ranks,
     const std::uint32_t *query_ids,
+    const std::uint16_t *canonical_cell_ranks,
+    bool canonical,
     const std::uint64_t *query_occupied_level_mask) {
   __shared__ std::uint32_t router_owners[kLookupRouterSlots];
   __shared__ std::uint32_t router_query_keys[kThreads];
@@ -6327,13 +8747,19 @@ __global__ void lookup_with_dense_router_kernel(
     possible = (epoch_signatures[q] & bits) == bits;
   }
   if (!__syncthreads_or(possible)) {
-    if (valid)
-      lookup_resident_only(
-          key, i, out_values, out_found, arena, descriptors,
-          route_headers, route_slices, route_logical_begins,
-          level_q_logical_offsets, local_rank, level_guides,
-          level_cell_rank_blocks, level_cell_ranks,
-          active_levels, foundation_level, occupied_levels, query_ids);
+    if (valid) {
+      if (canonical)
+        canonical_lookup_resident_only(
+            key, i, out_values, out_found, arena, descriptors,
+            canonical_cell_ranks, occupied_levels, query_ids);
+      else
+        lookup_resident_only(
+            key, i, out_values, out_found, arena, descriptors,
+            route_headers, route_slices, route_logical_begins,
+            level_q_logical_offsets, local_rank, level_guides,
+            level_cell_rank_blocks, level_cell_ranks,
+            active_levels, foundation_level, occupied_levels, query_ids);
+    }
     return;
   }
 
@@ -6448,12 +8874,17 @@ __global__ void lookup_with_dense_router_kernel(
     if (out_found) out_found[destination] = live;
     return;
   }
-  lookup_resident_only(
-      key, i, out_values, out_found, arena, descriptors,
-      route_headers, route_slices, route_logical_begins,
-      level_q_logical_offsets, local_rank, level_guides,
-      level_cell_rank_blocks, level_cell_ranks,
-      active_levels, foundation_level, occupied_levels, query_ids);
+  if (canonical)
+    canonical_lookup_resident_only(
+        key, i, out_values, out_found, arena, descriptors,
+        canonical_cell_ranks, occupied_levels, query_ids);
+  else
+    lookup_resident_only(
+        key, i, out_values, out_found, arena, descriptors,
+        route_headers, route_slices, route_logical_begins,
+        level_q_logical_offsets, local_rank, level_guides,
+        level_cell_rank_blocks, level_cell_ranks,
+        active_levels, foundation_level, occupied_levels, query_ids);
 }
 
 
@@ -6644,6 +9075,126 @@ public:
     std::uint32_t active_levels = 0u;
   };
 
+  struct CanonicalCarryStats {
+    std::uint32_t destination_level = 0u;
+    std::uint32_t source_count = 0u;
+    std::uint32_t status = 0u;
+    std::uint32_t job_count = 0u;
+    std::uint32_t claimed_jobs = 0u;
+    std::uint64_t selected_count = 0u;
+    std::uint64_t input_count = 0u;
+    std::uint64_t survivor_count = 0u;
+    std::uint64_t quotient_total = 0u;
+  };
+
+  struct DirectMergeJobProfile {
+    std::uint32_t job_index = 0u;
+    std::uint64_t key_begin = 0u;
+    std::uint64_t key_end = 0u;
+    std::uint64_t existing_offset = 0u;
+    std::uint32_t quotient_begin = 0u;
+    std::uint32_t quotient_end = 0u;
+    std::uint32_t quotient_count = 0u;
+    std::uint64_t raw_rows = 0u;
+    std::uint32_t output_rows = 0u;
+    std::uint32_t existing_capacity = 0u;
+    std::uint32_t route_ordinal = 0u;
+    std::uint32_t hot_pieces = 0u;
+    std::uint32_t hot_piece = 0u;
+    bool crowded = false;
+    bool cell_owned_shape = false;
+  };
+
+  struct DirectMergeProfileStats {
+    bool standalone = false;
+    bool forced_unified_merge = false;
+    bool forced_unified_compile_elision = false;
+    std::uint32_t direct_launch_count = 0u;
+    std::uint32_t rank_cell_mode = 0u;
+    std::uint32_t grid_x = 0u;
+    std::uint32_t block_x = 0u;
+    std::size_t dynamic_shared_bytes = 0u;
+    std::uint32_t selected_count = 0u;
+    std::uint32_t source_count = 0u;
+    std::uint32_t destination_level = 0u;
+    std::uint32_t publication_status = 0u;
+    std::uint32_t job_count = 0u;
+    std::uint64_t raw_reservation = 0u;
+    std::uint64_t survivor_count = 0u;
+    std::uint64_t occupied_level_mask = 0u;
+    std::vector<DirectMergeJobProfile> jobs;
+  };
+
+  struct DirectCorrectnessAuditStats {
+    bool enabled = false;
+    std::uint64_t row_count = 0u;
+    std::uint64_t digest_sum = 0u;
+    std::uint64_t digest_xor = 0u;
+    std::uint64_t unsupported_jobs = 0u;
+    std::uint64_t count_mismatch_jobs = 0u;
+    std::uint64_t unsorted_rows = 0u;
+    std::uint64_t duplicate_rows = 0u;
+    std::uint64_t value_errors = 0u;
+    std::uint64_t flag_errors = 0u;
+    std::uint64_t range_errors = 0u;
+    std::uint64_t route_header_errors = 0u;
+    std::uint64_t route_slice_errors = 0u;
+    std::uint64_t route_logical_errors = 0u;
+    std::uint64_t descriptor_errors = 0u;
+    std::array<std::uint64_t,
+               gpulsmopt2_detail::kFoundationCells> cell_errors{};
+    std::array<std::uint64_t,
+               gpulsmopt2_detail::kDirectAuditPieceBuckets> piece_errors{};
+  };
+
+  struct PartitionAuditStats {
+    bool enabled = false;
+    std::uint32_t selected_count = 0u;
+    std::uint32_t source_count = 0u;
+    std::uint32_t destination_level = 0u;
+    std::uint32_t rank_cell_mode = 0u;
+    std::uint32_t job_count = 0u;
+    std::uint64_t total_rows = 0u;
+    std::uint64_t direct_rows = 0u;
+    std::uint64_t resolved_rows = 0u;
+    std::uint64_t rank_supported_rows = 0u;
+    std::uint64_t eligible_rows = 0u;
+    std::uint64_t direct_jobs = 0u;
+    std::uint64_t resolved_jobs = 0u;
+    std::uint64_t rank_supported_jobs = 0u;
+    std::uint64_t eligible_jobs = 0u;
+    std::uint64_t packed_word_failure_jobs = 0u;
+    std::uint64_t ordering_equivalence_violations = 0u;
+    std::uint64_t duplicate_boundary_count = 0u;
+    std::uint32_t maximum_boundary_equal_rows = 0u;
+    std::uint32_t maximum_source_rows = 0u;
+    std::uint32_t maximum_packed_bits = 0u;
+    std::uint32_t imbalance_p50_ppm = 0u;
+    std::uint32_t imbalance_p95_ppm = 0u;
+    std::uint32_t imbalance_p99_ppm = 0u;
+    std::uint32_t imbalance_maximum_ppm = 0u;
+    std::array<std::uint64_t, 17u> source_run_log2_histogram{};
+    std::array<std::uint64_t,
+               gpulsmopt2_detail::kMaximumMergeSources + 1u>
+        nonempty_source_histogram{};
+  };
+
+  // Retained for the earlier rank-cell standalone evidence.
+  struct RankCellProfileStats {
+    bool standalone = false;
+    std::uint32_t rank_cell_mode = 0u;
+    std::uint32_t launch_count = 0u;
+    std::uint32_t grid_x = 0u;
+    std::uint32_t block_x = 0u;
+    std::size_t dynamic_shared_bytes = 0u;
+    std::uint32_t selected_count = 0u;
+    std::uint32_t destination_level = 0u;
+    std::uint32_t publication_status = 0u;
+    std::uint64_t raw_reservation = 0u;
+    std::uint64_t survivor_count = 0u;
+    std::uint64_t occupied_level_mask = 0u;
+  };
+
   explicit GPULSMOpt(const DictionaryConfig &config)
       : batch_capacity_(std::min(
             gpulsmopt2_detail::kMaximumOperationTile,
@@ -6655,6 +9206,7 @@ public:
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch,
             publication_capacity_)),
         foundation_pool_capacity_(
+            gpulsmopt2_detail::kCanonicalCarry ? 0u :
             gpulsmopt2_detail::foundation_pool_capacity(
                 publication_capacity_)),
         level_pool_capacity_(
@@ -6663,22 +9215,33 @@ public:
         level_rank_block_capacity_(
             gpulsmopt2_detail::preassigned_level_rank_blocks(
                 publication_capacity_, level_zero_capacity_)),
+        canonical_level_count_(gpulsmopt2_detail::canonical_level_count(
+            publication_capacity_, level_zero_capacity_)),
         resident_merge_capacity_(
-            gpulsmopt2_detail::select_balanced_merge_capacity()),
+            gpulsmopt2_detail::select_balanced_merge_capacity() -
+            (gpulsmopt2_detail::kCanonicalCarry
+                 ? gpulsmopt2_detail::kCanonicalCapacityAdjustment : 0u)),
         resident_merge_workspace_bytes_(
             gpulsmopt2_detail::balanced_merge_dynamic_shared_bytes(
                 resident_merge_capacity_)),
+        canonical_merge_workspace_bytes_(
+            std::size_t{resident_merge_capacity_} *
+            sizeof(std::uint32_t) * 2u),
         maximum_resident_jobs_(
             gpulsmopt2_detail::maximum_resident_merge_jobs(
                 publication_capacity_, resident_merge_capacity_)),
-        route_stride_(gpulsmopt2_detail::adaptive_route_stride(
-            publication_capacity_, resident_merge_capacity_)),
-        local_rank_(gpulsmopt2_detail::kLocalRankEntries),
+        route_stride_(gpulsmopt2_detail::kCanonicalCarry
+            ? gpulsmopt2_detail::kQuotients
+            : gpulsmopt2_detail::adaptive_route_stride(
+                  publication_capacity_, resident_merge_capacity_)),
+        local_rank_(gpulsmopt2_detail::kCanonicalCarry
+            ? 1u : gpulsmopt2_detail::kLocalRankEntries),
         level_guides_(
             gpulsmopt2_detail::kMaximumLevels *
                 gpulsmopt2_detail::kGuideEntriesPerLevel,
-            gpulsmopt2_detail::kMaximumLevels *
-                gpulsmopt2_detail::kGuideEntriesPerLevel),
+            gpulsmopt2_detail::kCanonicalCarry ? 1u :
+                gpulsmopt2_detail::kMaximumLevels *
+                    gpulsmopt2_detail::kGuideEntriesPerLevel),
         arena_key_flags_(gpulsmopt2_detail::maximum_resident_elements<
                              gpulsmopt2_detail::Row>(),
                          foundation_pool_capacity_ + level_pool_capacity_),
@@ -6690,14 +9253,24 @@ public:
         route_headers_(std::size_t{gpulsmopt2_detail::kQuotients} *
                        gpulsmopt2_detail::kMaximumLevels),
         route_slices_(
-            route_stride_ * gpulsmopt2_detail::kMaximumLevels,
-            route_stride_ * gpulsmopt2_detail::kMaximumLevels),
+            route_stride_ * (gpulsmopt2_detail::kCanonicalCarry
+                ? canonical_level_count_
+                : gpulsmopt2_detail::kMaximumLevels),
+            route_stride_ * (gpulsmopt2_detail::kCanonicalCarry
+                ? canonical_level_count_
+                : gpulsmopt2_detail::kMaximumLevels)),
         route_logical_begins_(
-            route_stride_ * gpulsmopt2_detail::kMaximumLevels),
+            route_stride_ * (gpulsmopt2_detail::kCanonicalCarry
+                ? canonical_level_count_
+                : gpulsmopt2_detail::kMaximumLevels)),
         route_quotients_(
-            route_stride_ * gpulsmopt2_detail::kMaximumLevels),
+            route_stride_ * (gpulsmopt2_detail::kCanonicalCarry
+                ? canonical_level_count_
+                : gpulsmopt2_detail::kMaximumLevels)),
         level_q_logical_offsets_(
-            std::size_t{gpulsmopt2_detail::kMaximumLevels} *
+            std::size_t{gpulsmopt2_detail::kCanonicalCarry
+                ? canonical_level_count_
+                : gpulsmopt2_detail::kMaximumLevels} *
             (gpulsmopt2_detail::kQuotients + 1u)),
         device_manifests_(2u),
         active_device_manifest_(1u),
@@ -6709,14 +9282,27 @@ public:
         level_storage_spans_(gpulsmopt2_detail::kMaximumLevels),
         level_rank_spans_(gpulsmopt2_detail::kMaximumLevels),
         level_cell_rank_blocks_(
-            std::size_t{gpulsmopt2_detail::kQuotients} *
-            gpulsmopt2_detail::kMaximumLevels),
+            gpulsmopt2_detail::kCanonicalCarry ? 1u :
+                std::size_t{gpulsmopt2_detail::kQuotients} *
+                    gpulsmopt2_detail::kMaximumLevels),
         level_cell_ranks_(
-            level_rank_block_capacity_ *
-            gpulsmopt2_detail::kFoundationCells),
+            gpulsmopt2_detail::kCanonicalCarry ? 1u :
+                level_rank_block_capacity_ *
+                    gpulsmopt2_detail::kFoundationCells),
         publication_cell_ranks_(
-            std::size_t{gpulsmopt2_detail::kQuotients} *
-            gpulsmopt2_detail::kFoundationCells),
+            gpulsmopt2_detail::kCanonicalCarry ? 1u :
+                std::size_t{gpulsmopt2_detail::kQuotients} *
+                    gpulsmopt2_detail::kFoundationCells),
+        canonical_cell_ranks_(
+            gpulsmopt2_detail::kCanonicalCarry
+                ? std::size_t{canonical_level_count_} *
+                      gpulsmopt2_detail::kLocalRankEntries
+                : 1u),
+        canonical_cell_counts_(gpulsmopt2_detail::kCanonicalCarry
+            ? gpulsmopt2_detail::kLocalRankEntries : 1u),
+        canonical_job_prefixes_(gpulsmopt2_detail::kCanonicalCarry
+            ? maximum_resident_jobs_ : 1u),
+        canonical_next_job_(1u),
         raw_keys_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_payloads_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
@@ -6729,26 +9315,52 @@ public:
         publication_epoch_keys_b_(
             batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
         publication_epoch_assignments_a_(
-            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
+            gpulsmopt2_detail::kCanonicalCarry ? 1u :
+                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
         publication_epoch_assignments_b_(
-            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
+            gpulsmopt2_detail::kCanonicalCarry ? 1u :
+                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch),
+        publication_epoch_payloads_a_(
+            gpulsmopt2_detail::kCanonicalCarry
+                ? batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch
+                : 1u),
+        publication_epoch_payloads_b_(
+            gpulsmopt2_detail::kCanonicalCarry
+                ? std::max<std::size_t>(
+                      batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch,
+                      gpulsmopt2_detail::kCanonicalResolverSuffixes)
+                : 1u),
         publication_keys_a_(gpulsmopt2_detail::kMaximumPublicationRows,
-                            publication_capacity_),
+            gpulsmopt2_detail::kCanonicalCarry
+                ? std::min(publication_capacity_,
+                      batch_capacity_ *
+                          gpulsmopt2_detail::kBatchesPerEpoch)
+                : publication_capacity_),
         publication_rows_a_(gpulsmopt2_detail::kMaximumPublicationRows,
-                            publication_capacity_),
+            gpulsmopt2_detail::kCanonicalCarry
+                ? std::min(publication_capacity_,
+                      batch_capacity_ *
+                          gpulsmopt2_detail::kBatchesPerEpoch)
+                : publication_capacity_),
         publication_selected_count_(1u),
         publication_batch_offsets_(gpulsmopt2_detail::kBatchesPerEpoch + 1u),
         foundation_source_offsets_(gpulsmopt2_detail::kQuotients + 1u),
-        foundation_next_route_headers_(gpulsmopt2_detail::kQuotients),
+        foundation_next_route_headers_(gpulsmopt2_detail::kCanonicalCarry
+            ? 1u : gpulsmopt2_detail::kQuotients),
         foundation_section_output_counts_(gpulsmopt2_detail::kQuotients + 1u),
         balanced_merge_raw_counts_(gpulsmopt2_detail::kQuotients),
         resident_tile_job_counts_(gpulsmopt2_detail::kPlanningTiles + 1u),
         resident_tile_job_offsets_(gpulsmopt2_detail::kPlanningTiles + 1u),
         resident_job_raw_reservations_(maximum_resident_jobs_ + 1u),
-        resident_job_output_offsets_(maximum_resident_jobs_ + 1u),
-        resident_route_counts_(gpulsmopt2_detail::kQuotients + 1u),
-        resident_route_offsets_(gpulsmopt2_detail::kQuotients + 1u),
-        resident_section_logical_offsets_(gpulsmopt2_detail::kQuotients + 1u),
+        resident_job_output_offsets_(gpulsmopt2_detail::kCanonicalCarry
+            ? 1u : maximum_resident_jobs_ + 1u),
+        resident_route_counts_(gpulsmopt2_detail::kCanonicalCarry
+            ? 1u : gpulsmopt2_detail::kQuotients + 1u),
+        resident_route_offsets_(gpulsmopt2_detail::kCanonicalCarry
+            ? 1u : gpulsmopt2_detail::kQuotients + 1u),
+        resident_section_logical_offsets_(
+            gpulsmopt2_detail::kCanonicalCarry
+                ? 1u : gpulsmopt2_detail::kQuotients + 1u),
         balanced_merge_jobs_(maximum_resident_jobs_),
         foundation_overflow_flag_(1u),
         local_epoch_overflow_flag_(1u),
@@ -6779,7 +9391,12 @@ public:
     admission_temp_.resize(admission_scan_bytes);
     initialize_publication_workspace();
     initialize_resident_workspace();
-    initialize_resident_publication_graph();
+    if (gpulsmopt2_detail::kCanonicalCarry) {
+      initialize_canonical_workspace();
+      if (gpulsmopt2_detail::kCanonicalPublicationGraph)
+        initialize_canonical_publication_graphs();
+    } else
+      initialize_resident_publication_graph();
     CUDA_CHECK(cudaEventRecord(operation_done_, 0));
     reset_updates(0);
     CUDA_CHECK(cudaMemset(local_rank_.data(), 0,
@@ -6799,6 +9416,10 @@ public:
       cudaGraphExecDestroy(resident_publication_graph_exec_);
     if (resident_publication_graph_)
       cudaGraphDestroy(resident_publication_graph_);
+    if (canonical_direct_publication_graph_exec_)
+      cudaGraphExecDestroy(canonical_direct_publication_graph_exec_);
+    for (cudaGraphExec_t graph_exec : canonical_publication_graph_execs_)
+      if (graph_exec) cudaGraphExecDestroy(graph_exec);
   }
 
   void clear(cudaStream_t stream) {
@@ -6870,6 +9491,48 @@ public:
         gpulsmopt2_detail::kThreads, 0, stream>>>(
             publication_keys_a_.data(), base_count,
             foundation_source_offsets_.data());
+    if (gpulsmopt2_detail::kCanonicalCarry) {
+      const std::uint64_t destination = level_begin(level);
+      const std::uint64_t capacity = level_capacity(level);
+      if (base_count > capacity)
+        throw std::bad_alloc();
+      gpulsmopt2_detail::copy_canonical_epoch_kernel<<<
+          blocks(base_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              publication_rows_a_.data(), selected_count.data(),
+              resident_rows(), destination);
+      gpulsmopt2_detail::ResidentPublicationPlan build_plan{};
+      build_plan.destination_level = level;
+      build_plan.output_begin = destination;
+      build_plan.output_capacity = capacity;
+      build_plan.status = gpulsmopt2_detail::kPublicationSuccess;
+      CUDA_CHECK(cudaMemcpyAsync(
+          resident_plan_.data(), &build_plan, sizeof(build_plan),
+          cudaMemcpyHostToDevice, stream));
+      gpulsmopt2_detail::build_canonical_rank_from_run_kernel<<<
+          gpulsmopt2_detail::kQuotients,
+          gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+              resident_rows(), destination,
+              foundation_source_offsets_.data(), level,
+              canonical_cell_ranks_.data());
+      gpulsmopt2_detail::finalize_canonical_level_metadata_kernel<<<
+          blocks(gpulsmopt2_detail::kQuotients + 1u),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              foundation_source_offsets_.data(), level_storage_spans_.data(),
+              resident_plan_.data(), descriptors_.data(),
+              static_cast<std::uint32_t>(route_stride_),
+              route_headers_.data(), route_slices_.data(),
+              route_logical_begins_.data(), route_quotients_.data(),
+              level_q_logical_offsets_.data());
+      level_counts_[level] = base_count;
+      host_occupied_level_mask_ = std::uint64_t{1} << level;
+      gpulsmopt2_detail::initialize_device_manifest_kernel<<<1, 1, 0, stream>>>(
+          device_manifests_.data(), active_device_manifest_.data(),
+          query_occupied_level_mask_.data(), level, base_count, 0u);
+      refresh_active_levels();
+      CUDA_CHECK(cudaGetLastError());
+      end_operation(stream);
+      return;
+    }
     if (base_count > foundation_pool_capacity_ / 2u)
       throw std::bad_alloc();
     gpulsmopt2_detail::store_resident_rows_kernel<<<
@@ -6940,6 +9603,97 @@ public:
     successor_locked(batch, stream);
   }
 
+  void set_rank_cell_standalone_profile(bool enabled) {
+    rank_cell_standalone_profile_ = enabled;
+  }
+
+  RankCellProfileStats rank_cell_profile_stats() const {
+    return rank_cell_profile_stats_;
+  }
+
+  void set_direct_standalone_profile(bool enabled) {
+    direct_standalone_profile_ = enabled;
+  }
+
+  DirectMergeProfileStats direct_profile_stats() const {
+    return direct_profile_stats_;
+  }
+
+  void set_direct_correctness_audit(bool enabled) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    direct_correctness_audit_enabled_ = enabled;
+    if (enabled && !direct_output_audit_device_.size()) {
+      direct_output_audit_device_.resize(1u);
+      direct_audit_raw_rows_.resize(maximum_resident_jobs_);
+    }
+  }
+
+  DirectCorrectnessAuditStats direct_correctness_audit_stats() const {
+    return direct_correctness_audit_stats_;
+  }
+
+  void set_partition_audit(bool enabled) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    partition_audit_enabled_ = enabled;
+    if (enabled && !partition_audit_device_jobs_.size()) {
+      partition_audit_device_jobs_.resize(maximum_resident_jobs_);
+      partition_audit_source_rows_.resize(
+          maximum_resident_jobs_ * gpulsmopt2_detail::kMaximumMergeSources);
+    }
+  }
+
+  PartitionAuditStats partition_audit_stats() const {
+    return partition_audit_stats_;
+  }
+
+  CanonicalCarryStats canonical_carry_stats() const {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    auto *self = const_cast<GPULSMOpt *>(this);
+    self->resolve_publication_receipt();
+    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    std::uint32_t claimed = 0u;
+    std::uint32_t total = 0u;
+    CUDA_CHECK(cudaMemcpy(
+        &plan, self->resident_plan_.data(), sizeof(plan),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &claimed, self->canonical_next_job_.data(), sizeof(claimed),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &total,
+        self->foundation_source_offsets_.data() +
+            gpulsmopt2_detail::kQuotients,
+        sizeof(total), cudaMemcpyDeviceToHost));
+    return {plan.destination_level, plan.source_count, plan.status,
+            plan.job_count, claimed, plan.selected_count,
+            plan.raw_reservation, plan.survivor_count, total};
+  }
+
+  void audit_direct_lookup(
+      const std::uint32_t *queries, std::size_t count,
+      std::uint32_t *job_results, std::uint32_t *route_results,
+      cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    if (!count) return;
+    if (!direct_correctness_audit_enabled_ || !queries || !job_results ||
+        !route_results)
+      throw std::invalid_argument("invalid GPULSMOpt direct audit lookup");
+    begin_operation(stream);
+    const std::uint32_t n = static_cast<std::uint32_t>(count);
+    gpulsmopt2_detail::audit_lookup_jobs_kernel<<<
+        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            queries, n, balanced_merge_jobs_.data(), resident_plan_.data(),
+            resident_rows(), job_results);
+    gpulsmopt2_detail::audit_lookup_routes_kernel<<<
+        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            queries, n, resident_plan_.data(), resident_rows(),
+            descriptors_.data(), route_headers_.data(), route_slices_.data(),
+            route_results);
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+  }
+
 private:
 
   void lookup_locked(const DeviceLookupBatch &batch, cudaStream_t stream,
@@ -6993,6 +9747,36 @@ private:
     const bool use_dense_router = grouped &&
         pending_batches_ >= gpulsmopt2_detail::kLookupRouterMinimumBatches &&
         std::uint64_t{pending_records_} >= dense_router_threshold;
+    if (gpulsmopt2_detail::kCanonicalCarry) {
+      if (use_dense_router) {
+        gpulsmopt2_detail::lookup_with_dense_router_kernel<<<
+            blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+                queries, batch.out_values, batch.out_found, count,
+                raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+                static_cast<std::uint32_t>(batch_capacity_),
+                pending_batches_, raw_epoch_signatures_.data(),
+                resident_rows(), descriptors_.data(), route_headers_.data(),
+                route_slices_.data(), route_logical_begins_.data(),
+                level_q_logical_offsets_.data(), local_rank_.data(),
+                level_guides_.data(), level_cell_rank_blocks_.data(),
+                level_cell_ranks_.data(), query_ids,
+                canonical_cell_ranks_.data(), true,
+                query_occupied_level_mask_.data());
+      } else {
+        gpulsmopt2_detail::canonical_lookup_with_pending_kernel<<<
+            blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+                queries, batch.out_values, batch.out_found, count,
+                raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+                static_cast<std::uint32_t>(batch_capacity_),
+                pending_batches_, raw_signatures_.data(),
+                raw_epoch_signatures_.data(), resident_rows(),
+                descriptors_.data(), canonical_cell_ranks_.data(),
+                query_ids, query_occupied_level_mask_.data());
+      }
+      CUDA_CHECK(cudaGetLastError());
+      end_operation(stream);
+      return;
+    }
     if (grouped) {
       if (use_dense_router) {
         gpulsmopt2_detail::lookup_with_dense_router_kernel<<<
@@ -7005,7 +9789,8 @@ private:
             route_logical_begins_.data(), level_q_logical_offsets_.data(),
             local_rank_.data(), level_guides_.data(),
             level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
-            query_ids, query_occupied_level_mask_.data());
+            query_ids, nullptr, false,
+            query_occupied_level_mask_.data());
       } else {
         gpulsmopt2_detail::lookup_with_pending_kernel<<<
             blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -7304,6 +10089,11 @@ public:
         level_cell_rank_blocks_.size() * sizeof(std::uint32_t) +
         level_cell_ranks_.size() * sizeof(std::uint16_t) +
         publication_cell_ranks_.size() * sizeof(std::uint16_t) +
+        canonical_cell_ranks_.size() * sizeof(std::uint16_t) +
+        canonical_cell_counts_.size() * sizeof(std::uint32_t) +
+        canonical_job_prefixes_.size() *
+            sizeof(gpulsmopt2_detail::CanonicalJobPrefix) +
+        canonical_next_job_.size() * sizeof(std::uint32_t) +
         raw_keys_.size() * sizeof(std::uint32_t) +
         raw_payloads_.size() * sizeof(gpulsmopt2_detail::RawPayload) +
         raw_offsets_.size() * sizeof(std::uint32_t) +
@@ -7314,6 +10104,9 @@ public:
         (publication_epoch_assignments_a_.size() +
          publication_epoch_assignments_b_.size()) *
             sizeof(gpulsmopt2_detail::RawAssignment) +
+        (publication_epoch_payloads_a_.size() +
+         publication_epoch_payloads_b_.size()) *
+            sizeof(gpulsmopt2_detail::RawPayload) +
         publication_rows_a_.size() * sizeof(gpulsmopt2_detail::Row) +
         (publication_keys_a_.size() +
          publication_selected_count_.size() +
@@ -7376,6 +10169,25 @@ private:
     return level;
   }
 
+  std::uint64_t level_begin(std::uint32_t target) const {
+    std::uint64_t begin = foundation_pool_capacity_;
+    std::size_t capacity = level_zero_capacity_;
+    for (std::uint32_t level = 0u; level < target; ++level) {
+      begin += capacity;
+      capacity = capacity > publication_capacity_ / 2u
+          ? publication_capacity_ : capacity * 2u;
+    }
+    return begin;
+  }
+
+  std::uint64_t level_capacity(std::uint32_t target) const {
+    std::size_t capacity = level_zero_capacity_;
+    for (std::uint32_t level = 0u; level < target; ++level)
+      capacity = capacity > publication_capacity_ / 2u
+          ? publication_capacity_ : capacity * 2u;
+    return capacity;
+  }
+
   void refresh_active_levels() {
     active_levels_ = 0u;
     for (std::uint32_t level = 0u;
@@ -7407,18 +10219,34 @@ private:
     const std::uint32_t epoch_capacity = static_cast<std::uint32_t>(
         batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
     std::size_t sort_bytes{}, raw_reduce_bytes{};
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, sort_bytes, publication_epoch_keys_a_.data(),
-        publication_epoch_keys_b_.data(),
-        publication_epoch_assignments_a_.data(),
-        publication_epoch_assignments_b_.data(), epoch_capacity, 0, 32, 0));
-    auto row_output = thrust::make_transform_output_iterator(
-        publication_rows_a_.data(), gpulsmopt2_detail::AssignmentRow{});
-    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
-        nullptr, raw_reduce_bytes, publication_epoch_keys_b_.data(),
-        publication_keys_a_.data(), publication_epoch_assignments_b_.data(),
-        row_output, publication_selected_count_.data(),
-        gpulsmopt2_detail::NewestAssignment{}, epoch_capacity, 0));
+    if (gpulsmopt2_detail::kCanonicalCarry) {
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          nullptr, sort_bytes, publication_epoch_keys_a_.data(),
+          publication_epoch_keys_b_.data(),
+          publication_epoch_payloads_a_.data(),
+          publication_epoch_payloads_b_.data(), epoch_capacity, 0, 32, 0));
+      CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+          nullptr, raw_reduce_bytes, publication_epoch_keys_b_.data(),
+          publication_keys_a_.data(), publication_epoch_payloads_b_.data(),
+          publication_epoch_payloads_a_.data(),
+          publication_selected_count_.data(),
+          gpulsmopt2_detail::NewestPayload{}, epoch_capacity, 0));
+    } else {
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+          nullptr, sort_bytes, publication_epoch_keys_a_.data(),
+          publication_epoch_keys_b_.data(),
+          publication_epoch_assignments_a_.data(),
+          publication_epoch_assignments_b_.data(), epoch_capacity, 0, 32,
+          0));
+      auto row_output = thrust::make_transform_output_iterator(
+          publication_rows_a_.data(), gpulsmopt2_detail::AssignmentRow{});
+      CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+          nullptr, raw_reduce_bytes, publication_epoch_keys_b_.data(),
+          publication_keys_a_.data(),
+          publication_epoch_assignments_b_.data(), row_output,
+          publication_selected_count_.data(),
+          gpulsmopt2_detail::NewestAssignment{}, epoch_capacity, 0));
+    }
     publication_temp_.resize(std::max(sort_bytes, raw_reduce_bytes));
   }
 
@@ -7475,24 +10303,33 @@ private:
         resident_tile_job_offsets_.data(),
         gpulsmopt2_detail::kPlanningTiles + 1u, 0));
     maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
-    bytes = 0u;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, bytes, resident_job_raw_reservations_.data(),
-        resident_job_output_offsets_.data(), maximum_resident_jobs_ + 1u,
-        0));
-    maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
-    bytes = 0u;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, bytes, resident_route_counts_.data(),
-        resident_route_offsets_.data(), gpulsmopt2_detail::kQuotients + 1u,
-        0));
-    maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
-    bytes = 0u;
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, bytes, foundation_section_output_counts_.data(),
-        resident_section_logical_offsets_.data(),
-        gpulsmopt2_detail::kQuotients + 1u, 0));
-    maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
+    if (gpulsmopt2_detail::kCanonicalCarry) {
+      bytes = 0u;
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          nullptr, bytes, foundation_section_output_counts_.data(),
+          foundation_source_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, 0));
+      maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
+    } else {
+      bytes = 0u;
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          nullptr, bytes, resident_job_raw_reservations_.data(),
+          resident_job_output_offsets_.data(), maximum_resident_jobs_ + 1u,
+          0));
+      maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
+      bytes = 0u;
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          nullptr, bytes, resident_route_counts_.data(),
+          resident_route_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, 0));
+      maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
+      bytes = 0u;
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          nullptr, bytes, foundation_section_output_counts_.data(),
+          resident_section_logical_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, 0));
+      maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
+    }
     resident_scan_temp_.resize(maximum_scan_bytes);
 
     int device = 0;
@@ -7500,22 +10337,24 @@ private:
     cudaDeviceProp properties{};
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     int blocks_per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm,
-        gpulsmopt2_detail::compact_direct_epoch_jobs_kernel,
-        gpulsmopt2_detail::kFoundationCompactionThreads,
-        resident_merge_workspace_bytes_));
-    resident_merge_blocks_ = static_cast<std::uint32_t>(
-        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
-    blocks_per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm,
-        gpulsmopt2_detail::compact_rank_cell_sections_kernel,
-        gpulsmopt2_detail::kRankCellThreads,
-        gpulsmopt2_detail::kRankCellDynamicSharedBytes));
-    resident_rank_cell_blocks_ = static_cast<std::uint32_t>(
-        std::max(1, std::min(4, blocks_per_sm)) *
-        properties.multiProcessorCount);
+    if (!gpulsmopt2_detail::kCanonicalCarry) {
+      CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &blocks_per_sm,
+          gpulsmopt2_detail::compact_direct_epoch_jobs_kernel,
+          gpulsmopt2_detail::kFoundationCompactionThreads,
+          resident_merge_workspace_bytes_));
+      resident_merge_blocks_ = static_cast<std::uint32_t>(
+          std::max(1, blocks_per_sm) * properties.multiProcessorCount);
+      blocks_per_sm = 0;
+      CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &blocks_per_sm,
+          gpulsmopt2_detail::compact_rank_cell_sections_kernel,
+          gpulsmopt2_detail::kRankCellThreads,
+          gpulsmopt2_detail::kRankCellDynamicSharedBytes));
+      resident_rank_cell_blocks_ = static_cast<std::uint32_t>(
+          std::max(1, std::min(4, blocks_per_sm)) *
+          properties.multiProcessorCount);
+    }
     resident_planner_blocks_ = static_cast<std::uint32_t>(std::max<std::size_t>(
         1u, std::min<std::size_t>(maximum_resident_jobs_,
             static_cast<std::size_t>(properties.multiProcessorCount) * 4u)));
@@ -7529,27 +10368,167 @@ private:
         std::max(1, blocks_per_sm) * properties.multiProcessorCount);
   }
 
-  cudaGraph_t capture_resident_merge_pre_graph(
-      cudaStream_t capture_stream) {
-    cudaGraph_t graph{};
+  void initialize_canonical_workspace() {
+    if (resident_merge_capacity_ >=
+        gpulsmopt2_detail::kCanonicalCandidateLimit)
+      throw std::logic_error(
+          "GPULSMOpt canonical job capacity does not fit 12 bits");
+    CUDA_CHECK(cudaFuncSetAttribute(
+        gpulsmopt2_detail::canonical_carry_jobs_kernel<2u>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(canonical_merge_workspace_bytes_)));
+    CUDA_CHECK(cudaFuncSetAttribute(
+        gpulsmopt2_detail::canonical_carry_jobs_kernel<0u>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(canonical_merge_workspace_bytes_)));
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    int blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm,
+        gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<false>,
+        gpulsmopt2_detail::kFoundationCompactionThreads, 0u));
+    canonical_epoch_resolver_blocks_ = static_cast<std::uint32_t>(
+        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
+    canonical_epoch_workspace_slots_ = static_cast<std::uint32_t>(
+        publication_epoch_payloads_b_.size() /
+        gpulsmopt2_detail::kCanonicalResolverSuffixes);
+    canonical_epoch_workspace_slots_ =
+        std::max(1u, canonical_epoch_workspace_slots_);
+
+    const std::uint32_t maximum_sources = std::min(
+        gpulsmopt2_detail::kMaximumMergeSources,
+        std::max(1u, canonical_level_count_));
+    canonical_local_epoch_enabled_ =
+        gpulsmopt2_detail::kCanonicalLocalEpoch;
+    cudaFuncAttributes tournament_attributes{};
+    CUDA_CHECK(cudaFuncGetAttributes(
+        &tournament_attributes,
+        gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel));
+    const std::size_t optin_shared_bytes = std::max<std::size_t>(
+        properties.sharedMemPerBlock,
+        properties.sharedMemPerBlockOptin);
+    const std::size_t maximum_dynamic_shared_bytes =
+        optin_shared_bytes > tournament_attributes.sharedSizeBytes
+            ? optin_shared_bytes - tournament_attributes.sharedSizeBytes
+            : 0u;
+    std::size_t tournament_attribute_bytes = 0u;
+    if (gpulsmopt2_detail::kCanonicalTournamentMerge) {
+      for (std::uint32_t source_count =
+               gpulsmopt2_detail::kCanonicalTournamentMinimumSources;
+           source_count <= maximum_sources; ++source_count) {
+        const std::size_t shared_bytes =
+            gpulsmopt2_detail::canonical_tournament_dynamic_shared_bytes(
+                resident_merge_capacity_, source_count);
+        if (shared_bytes > maximum_dynamic_shared_bytes) break;
+        canonical_tournament_shared_bytes_[source_count] = shared_bytes;
+        tournament_attribute_bytes = shared_bytes;
+      }
+    }
+    if (tournament_attribute_bytes)
+      CUDA_CHECK(cudaFuncSetAttribute(
+          gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(tournament_attribute_bytes)));
+    for (std::uint32_t source_count =
+             gpulsmopt2_detail::kCanonicalTournamentMinimumSources;
+         source_count <= maximum_sources; ++source_count) {
+      const std::size_t shared_bytes =
+          canonical_tournament_shared_bytes_[source_count];
+      if (!shared_bytes) break;
+      blocks_per_sm = 0;
+      CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &blocks_per_sm,
+          gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
+          gpulsmopt2_detail::kFoundationCompactionThreads,
+          shared_bytes));
+      canonical_tournament_blocks_[source_count] =
+          static_cast<std::uint32_t>(
+              std::max(1, blocks_per_sm) *
+              properties.multiProcessorCount);
+    }
+
+    blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm,
+        gpulsmopt2_detail::canonical_carry_jobs_kernel<2u>,
+        gpulsmopt2_detail::kFoundationCompactionThreads,
+        canonical_merge_workspace_bytes_));
+    canonical_two_way_blocks_ = static_cast<std::uint32_t>(
+        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
+
+    blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm,
+        gpulsmopt2_detail::canonical_carry_jobs_kernel<0u>,
+        gpulsmopt2_detail::kFoundationCompactionThreads,
+        canonical_merge_workspace_bytes_));
+    canonical_merge_blocks_ = static_cast<std::uint32_t>(
+        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
+    CUDA_CHECK(cudaMemset(
+        canonical_cell_counts_.data(), 0,
+        canonical_cell_counts_.size() * sizeof(std::uint32_t)));
+    CUDA_CHECK(cudaMemset(
+        canonical_job_prefixes_.data(), 0,
+        canonical_job_prefixes_.size() *
+            sizeof(gpulsmopt2_detail::CanonicalJobPrefix)));
+    CUDA_CHECK(cudaMemset(
+        canonical_next_job_.data(), 0, sizeof(std::uint32_t)));
+  }
+
+  cudaGraphExec_t capture_canonical_publication_graph(
+      cudaStream_t capture_stream, std::uint32_t destination,
+      std::uint32_t source_count, bool direct_epoch) {
     CUDA_CHECK(cudaStreamBeginCapture(
-        capture_stream, cudaStreamCaptureModeThreadLocal));
+        capture_stream, cudaStreamCaptureModeGlobal));
+    launch_canonical_publication_commands(
+        capture_stream, destination, source_count, direct_epoch, true);
+    cudaGraph_t graph{};
+    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
+    cudaGraphExec_t graph_exec{};
+    CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, 0ull));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    return graph_exec;
+  }
+
+  void initialize_canonical_publication_graphs() {
+    cudaStream_t capture_stream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(
+        &capture_stream, cudaStreamNonBlocking));
+    canonical_direct_publication_graph_exec_ =
+        capture_canonical_publication_graph(
+            capture_stream, 0u, 1u, true);
+    const std::uint32_t maximum_sources = std::min<std::uint32_t>(
+        canonical_level_count_,
+        static_cast<std::uint32_t>(
+            canonical_publication_graph_execs_.size() - 1u));
+    for (std::uint32_t source_count = 1u;
+         source_count <= maximum_sources; ++source_count)
+      canonical_publication_graph_execs_[source_count] =
+          capture_canonical_publication_graph(
+              capture_stream, source_count - 1u, source_count, false);
+    CUDA_CHECK(cudaStreamDestroy(capture_stream));
+  }
+
+  void launch_resident_merge_pre(cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(
         foundation_overflow_flag_.data(), 0, sizeof(std::uint32_t),
-        capture_stream));
+        stream));
     CUDA_CHECK(cudaMemsetAsync(
         local_epoch_overflow_flag_.data(), 0, sizeof(std::uint32_t),
-        capture_stream));
+        stream));
     CUDA_CHECK(cudaMemsetAsync(
         foundation_section_output_counts_.data(), 0,
         foundation_section_output_counts_.size() * sizeof(std::uint32_t),
-        capture_stream));
+        stream));
     CUDA_CHECK(cudaMemsetAsync(
         staged_epoch_mode_.data(), 0, sizeof(std::uint32_t),
-        capture_stream));
+        stream));
     gpulsmopt2_detail::count_direct_epoch_merge_work_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
-        gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
             raw_offsets_.data(), gpulsmopt2_detail::kBatchesPerEpoch,
             descriptors_.data(), device_manifests_.data(),
             active_device_manifest_.data(), resident_plan_.data(),
@@ -7557,22 +10536,26 @@ private:
             foundation_section_output_counts_.data(),
             foundation_overflow_flag_.data(),
             local_epoch_overflow_flag_.data());
-    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
-    return graph;
   }
 
-  cudaGraph_t capture_crowded_epoch_stage_graph(
+  cudaGraph_t capture_resident_merge_pre_graph(
       cudaStream_t capture_stream) {
     cudaGraph_t graph{};
     CUDA_CHECK(cudaStreamBeginCapture(
         capture_stream, cudaStreamCaptureModeThreadLocal));
+    launch_resident_merge_pre(capture_stream);
+    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
+    return graph;
+  }
+
+  void launch_crowded_epoch_stage(cudaStream_t stream) {
     gpulsmopt2_detail::build_publication_batch_offsets_kernel<<<
-        1, 1, 0, capture_stream>>>(
+        1, 1, 0, stream>>>(
             raw_offsets_.data(), publication_batch_offsets_.data());
     const dim3 publication_grid(
         blocks(batch_capacity_), gpulsmopt2_detail::kBatchesPerEpoch);
     gpulsmopt2_detail::pack_publication_epoch_kernel<<<
-        publication_grid, gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+        publication_grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
             raw_keys_.data(), raw_payloads_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             publication_batch_offsets_.data(),
@@ -7582,7 +10565,7 @@ private:
         batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
     gpulsmopt2_detail::pad_publication_epoch_kernel<<<
         blocks(epoch_capacity), gpulsmopt2_detail::kThreads, 0,
-        capture_stream>>>(
+        stream>>>(
             epoch_capacity, publication_batch_offsets_.data(),
             publication_epoch_keys_a_.data(),
             publication_epoch_assignments_a_.data());
@@ -7592,7 +10575,7 @@ private:
         publication_epoch_keys_a_.data(), publication_epoch_keys_b_.data(),
         publication_epoch_assignments_a_.data(),
         publication_epoch_assignments_b_.data(), epoch_capacity, 0, 32,
-        capture_stream));
+        stream));
     auto row_output = thrust::make_transform_output_iterator(
         publication_rows_a_.data(), gpulsmopt2_detail::AssignmentRow{});
     workspace_bytes = publication_temp_.size();
@@ -7602,46 +10585,50 @@ private:
         publication_epoch_assignments_b_.data(), row_output,
         publication_selected_count_.data(),
         gpulsmopt2_detail::NewestAssignment{}, epoch_capacity,
-        capture_stream));
+        stream));
     gpulsmopt2_detail::set_staged_epoch_mode_kernel<<<
-        1, 1, 0, capture_stream>>>(staged_epoch_mode_.data());
+        1, 1, 0, stream>>>(staged_epoch_mode_.data());
     gpulsmopt2_detail::build_query_quotient_offsets_device_count_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients + 1u),
-        gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
             publication_keys_a_.data(), publication_selected_count_.data(),
             foundation_source_offsets_.data());
     gpulsmopt2_detail::build_staged_rank_directory_kernel<<<
         gpulsmopt2_detail::kQuotients,
-        gpulsmopt2_detail::kFoundationCells, 0, capture_stream>>>(
+        gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
             publication_rows_a_.data(), foundation_source_offsets_.data(),
             publication_cell_ranks_.data());
     gpulsmopt2_detail::count_resident_merge_work_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
-        gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
             foundation_source_offsets_.data(), descriptors_.data(),
             device_manifests_.data(), active_device_manifest_.data(),
             resident_plan_.data(), balanced_merge_raw_counts_.data());
-    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
-    return graph;
   }
 
-  cudaGraph_t capture_local_epoch_stage_graph(
+  cudaGraph_t capture_crowded_epoch_stage_graph(
       cudaStream_t capture_stream) {
     cudaGraph_t graph{};
     CUDA_CHECK(cudaStreamBeginCapture(
         capture_stream, cudaStreamCaptureModeThreadLocal));
+    launch_crowded_epoch_stage(capture_stream);
+    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
+    return graph;
+  }
+
+  void launch_local_epoch_stage(cudaStream_t stream) {
     std::size_t scan_bytes = resident_scan_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         resident_scan_temp_.data(), scan_bytes,
         foundation_section_output_counts_.data(),
         resident_section_logical_offsets_.data(),
-        gpulsmopt2_detail::kQuotients + 1u, capture_stream));
+        gpulsmopt2_detail::kQuotients + 1u, stream));
     auto *scratch_rows = reinterpret_cast<gpulsmopt2_detail::Row *>(
         publication_epoch_assignments_a_.data());
     gpulsmopt2_detail::resolve_epoch_sections_kernel<<<
         gpulsmopt2_detail::kQuotients,
         gpulsmopt2_detail::kFoundationCompactionThreads,
-        0, capture_stream>>>(
+        0, stream>>>(
             raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             gpulsmopt2_detail::kBatchesPerEpoch,
@@ -7654,35 +10641,40 @@ private:
         resident_scan_temp_.data(), scan_bytes,
         foundation_section_output_counts_.data(),
         foundation_source_offsets_.data(),
-        gpulsmopt2_detail::kQuotients + 1u, capture_stream));
+        gpulsmopt2_detail::kQuotients + 1u, stream));
     gpulsmopt2_detail::set_resolved_epoch_count_kernel<<<
-        1, 1, 0, capture_stream>>>(
+        1, 1, 0, stream>>>(
             foundation_source_offsets_.data(),
             publication_selected_count_.data());
     gpulsmopt2_detail::compact_resolved_epoch_sections_kernel<<<
         gpulsmopt2_detail::kQuotients,
-        gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
             publication_epoch_keys_a_.data(), scratch_rows,
             resident_section_logical_offsets_.data(),
             foundation_source_offsets_.data(), publication_keys_a_.data(),
             publication_rows_a_.data());
     gpulsmopt2_detail::set_staged_epoch_mode_kernel<<<
-        1, 1, 0, capture_stream>>>(staged_epoch_mode_.data());
+        1, 1, 0, stream>>>(staged_epoch_mode_.data());
     gpulsmopt2_detail::count_resident_merge_work_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients),
-        gpulsmopt2_detail::kThreads, 0, capture_stream>>>(
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
             foundation_source_offsets_.data(), descriptors_.data(),
             device_manifests_.data(), active_device_manifest_.data(),
             resident_plan_.data(), balanced_merge_raw_counts_.data());
-    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
-    return graph;
   }
 
-  cudaGraph_t capture_resident_merge_finish_graph(
+  cudaGraph_t capture_local_epoch_stage_graph(
       cudaStream_t capture_stream) {
     cudaGraph_t graph{};
     CUDA_CHECK(cudaStreamBeginCapture(
         capture_stream, cudaStreamCaptureModeThreadLocal));
+    launch_local_epoch_stage(capture_stream);
+    CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
+    return graph;
+  }
+
+  void launch_resident_merge_finish(cudaStream_t stream) {
+    cudaStream_t capture_stream = stream;
     CUDA_CHECK(cudaMemsetAsync(
         resident_job_raw_reservations_.data(), 0,
         resident_job_raw_reservations_.size() * sizeof(std::uint64_t),
@@ -7752,6 +10744,53 @@ private:
             balanced_merge_jobs_.data(),
             resident_job_output_offsets_.data(),
             resident_job_raw_reservations_.data(), resident_plan_.data());
+
+    if (partition_audit_enabled_) {
+      gpulsmopt2_detail::audit_partition_feasibility_kernel<<<
+          resident_planner_blocks_, 32u, 0, capture_stream>>>(
+              balanced_merge_jobs_.data(), resident_plan_.data(),
+              publication_rows_a_.data(), foundation_source_offsets_.data(),
+              raw_offsets_.data(), gpulsmopt2_detail::kBatchesPerEpoch,
+              publication_cell_ranks_.data(), resident_rows(),
+              device_manifests_.data(), active_device_manifest_.data(),
+              descriptors_.data(), route_headers_.data(),
+              route_slices_.data(), route_logical_begins_.data(),
+              level_q_logical_offsets_.data(),
+              level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
+              local_rank_.data(), staged_epoch_mode_.data(),
+              rank_cell_mode_.data(), partition_audit_device_jobs_.data(),
+              partition_audit_source_rows_.data());
+    }
+
+    // The rank-cell reservation preparation below intentionally reuses the
+    // planner reservation buffer.  Preserve the direct planner's per-job
+    // raw rows for the profiling-only report before that reuse.
+    direct_profile_raw_rows_.clear();
+    if (direct_standalone_profile_ || direct_correctness_audit_enabled_) {
+      CUDA_CHECK(cudaStreamSynchronize(capture_stream));
+      gpulsmopt2_detail::ResidentPublicationPlan planned{};
+      CUDA_CHECK(cudaMemcpy(
+          &planned, resident_plan_.data(), sizeof(planned),
+          cudaMemcpyDeviceToHost));
+      direct_profile_raw_rows_.resize(planned.job_count);
+      if (!direct_profile_raw_rows_.empty())
+        CUDA_CHECK(cudaMemcpy(
+            direct_profile_raw_rows_.data(), resident_job_raw_reservations_.data(),
+            direct_profile_raw_rows_.size() * sizeof(std::uint64_t),
+            cudaMemcpyDeviceToHost));
+      if (direct_correctness_audit_enabled_ &&
+          !direct_profile_raw_rows_.empty())
+        CUDA_CHECK(cudaMemcpyAsync(
+            direct_audit_raw_rows_.data(), direct_profile_raw_rows_.data(),
+            direct_profile_raw_rows_.size() * sizeof(std::uint64_t),
+            cudaMemcpyHostToDevice, capture_stream));
+    }
+
+    if (direct_correctness_audit_enabled_)
+      CUDA_CHECK(cudaMemsetAsync(
+          direct_output_audit_device_.data(), 0,
+          sizeof(gpulsmopt2_detail::DirectOutputAuditDevice),
+          capture_stream));
 
     gpulsmopt2_detail::count_resident_route_slots_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients + 1u),
@@ -7835,7 +10874,20 @@ private:
             foundation_section_output_counts_.data(),
             foundation_overflow_flag_.data(),
             level_cell_rank_blocks_.data(), level_cell_ranks_.data(),
-            local_rank_.data(), level_guides_.data());
+            local_rank_.data(), level_guides_.data()
+#if defined(GPULSMOPT_FORCE_UNIFIED_MERGE) && \
+    !defined(GPULSMOPT_FORCE_UNIFIED_COMPILE_ELIDE)
+            , true
+#endif
+            );
+    if (direct_correctness_audit_enabled_)
+      gpulsmopt2_detail::audit_direct_output_kernel<<<
+          resident_merge_blocks_,
+          gpulsmopt2_detail::kFoundationCompactionThreads, 0,
+          capture_stream>>>(
+              balanced_merge_jobs_.data(), resident_plan_.data(),
+              direct_audit_raw_rows_.data(), resident_rows(),
+              direct_output_audit_device_.data());
     gpulsmopt2_detail::fold_resident_merge_status_kernel<<<
         1, 1, 0, capture_stream>>>(
             resident_plan_.data(), foundation_overflow_flag_.data());
@@ -7871,8 +10923,360 @@ private:
             resident_plan_.data(), device_manifests_.data(),
             active_device_manifest_.data(),
             query_occupied_level_mask_.data());
+  }
+
+  cudaGraph_t capture_resident_merge_finish_graph(
+      cudaStream_t capture_stream) {
+    cudaGraph_t graph{};
+    CUDA_CHECK(cudaStreamBeginCapture(
+        capture_stream, cudaStreamCaptureModeThreadLocal));
+    launch_resident_merge_finish(capture_stream);
     CUDA_CHECK(cudaStreamEndCapture(capture_stream, &graph));
     return graph;
+  }
+
+  void launch_normal_epoch_stage(cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(
+        staged_epoch_mode_.data(), 0, sizeof(std::uint32_t), stream));
+  }
+
+  void collect_partition_audit(
+      const gpulsmopt2_detail::ResidentPublicationPlan &plan,
+      std::uint32_t rank_cell_mode) {
+    partition_audit_stats_ = {};
+    auto &stats = partition_audit_stats_;
+    stats.enabled = partition_audit_enabled_;
+    stats.selected_count = plan.selected_count;
+    stats.source_count = plan.source_count;
+    stats.destination_level = plan.destination_level;
+    stats.rank_cell_mode = rank_cell_mode;
+    // In rank-cell mode finalize_rank_cell_plan_kernel repurposes job_count as
+    // the route-cell count.  No BalancedMergeJob entries execute in that mode,
+    // so do not mistake stale planner slots for direct/general-merge jobs.
+    stats.job_count = rank_cell_mode ? 0u : plan.job_count;
+    if (!partition_audit_enabled_ || rank_cell_mode || !plan.job_count ||
+        plan.status)
+      return;
+
+    std::vector<gpulsmopt2_detail::PartitionAuditDeviceJob> jobs(
+        plan.job_count);
+    std::vector<std::uint16_t> source_rows(
+        std::size_t{plan.job_count} *
+        gpulsmopt2_detail::kMaximumMergeSources);
+    CUDA_CHECK(cudaMemcpy(
+        jobs.data(), partition_audit_device_jobs_.data(),
+        jobs.size() * sizeof(jobs[0]), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        source_rows.data(), partition_audit_source_rows_.data(),
+        source_rows.size() * sizeof(source_rows[0]),
+        cudaMemcpyDeviceToHost));
+
+    std::vector<std::uint32_t> imbalances;
+    imbalances.reserve(jobs.size());
+    const std::uint32_t locator_bits = plan.job_capacity <= 1u
+        ? 0u : 32u - static_cast<std::uint32_t>(
+              __builtin_clz(plan.job_capacity - 1u));
+    const std::uint32_t locator_limit =
+        locator_bits >= 32u ? ~0u : std::uint32_t{1} << locator_bits;
+    for (std::size_t job_index = 0u; job_index < jobs.size(); ++job_index) {
+      const auto &job = jobs[job_index];
+      stats.total_rows += job.task_rows;
+      stats.direct_rows += job.direct_path ? job.task_rows : 0u;
+      stats.resolved_rows += job.resolved ? job.task_rows : 0u;
+      stats.rank_supported_rows += job.rank_supported ? job.task_rows : 0u;
+      stats.eligible_rows += job.eligible ? job.task_rows : 0u;
+      stats.direct_jobs += job.direct_path;
+      stats.resolved_jobs += job.resolved;
+      stats.rank_supported_jobs += job.rank_supported;
+      stats.eligible_jobs += job.eligible;
+      stats.packed_word_failure_jobs += job.packed_bits > 32u;
+      stats.duplicate_boundary_count += job.duplicate_boundaries;
+      stats.maximum_boundary_equal_rows = std::max<std::uint32_t>(
+          stats.maximum_boundary_equal_rows,
+          job.maximum_boundary_equal_rows);
+      stats.maximum_source_rows = std::max(
+          stats.maximum_source_rows, job.max_source_rows);
+      stats.maximum_packed_bits = std::max<std::uint32_t>(
+          stats.maximum_packed_bits, job.packed_bits);
+      if (job.imbalance_ppm) imbalances.push_back(job.imbalance_ppm);
+      const std::uint32_t nonempty_bucket = std::min<std::uint32_t>(
+          job.nonempty_sources,
+          gpulsmopt2_detail::kMaximumMergeSources);
+      ++stats.nonempty_source_histogram[nonempty_bucket];
+
+      const std::uint16_t *runs = source_rows.data() +
+          job_index * gpulsmopt2_detail::kMaximumMergeSources;
+      std::vector<std::pair<std::uint32_t, std::uint32_t>> sources;
+      std::uint32_t candidate = 0u;
+      for (std::uint32_t source = 0u;
+           source < gpulsmopt2_detail::kMaximumMergeSources; ++source) {
+        const std::uint32_t count = runs[source];
+        if (!count) continue;
+        const std::uint32_t bucket = std::min<std::uint32_t>(
+            16u, 31u - static_cast<std::uint32_t>(__builtin_clz(count)));
+        ++stats.source_run_log2_histogram[bucket];
+        sources.emplace_back(source, candidate);
+        candidate += count;
+      }
+      if (candidate > locator_limit)
+        ++stats.ordering_equivalence_violations;
+      constexpr std::uint32_t key = 0x5a5au;
+      for (std::size_t left = 0u; left < sources.size(); ++left) {
+        for (std::size_t right = left + 1u;
+             right < sources.size(); ++right) {
+          const std::uint32_t left_source = sources[left].first;
+          const std::uint32_t right_source = sources[right].first;
+          const std::uint32_t left_id = sources[left].second;
+          const std::uint32_t right_id = sources[right].second;
+          const auto left_token = gpulsmopt2_detail::make_candidate_token(
+              0u, key, left_source);
+          const auto right_token = gpulsmopt2_detail::make_candidate_token(
+              0u, key, right_source);
+          const bool current_less = left_token != right_token
+              ? left_token < right_token : left_id < right_id;
+          const std::uint32_t left_packed =
+              (key << locator_bits) | left_id;
+          const std::uint32_t right_packed =
+              (key << locator_bits) | right_id;
+          if (current_less != (left_packed < right_packed))
+            ++stats.ordering_equivalence_violations;
+        }
+      }
+    }
+    if (!imbalances.empty()) {
+      std::sort(imbalances.begin(), imbalances.end());
+      const auto percentile = [&](std::uint32_t percent) {
+        const std::size_t rank =
+            (imbalances.size() * percent + 99u) / 100u;
+        return imbalances[std::min(imbalances.size() - 1u, rank - 1u)];
+      };
+      stats.imbalance_p50_ppm = percentile(50u);
+      stats.imbalance_p95_ppm = percentile(95u);
+      stats.imbalance_p99_ppm = percentile(99u);
+      stats.imbalance_maximum_ppm = imbalances.back();
+    }
+  }
+
+  void collect_direct_correctness_audit(
+      const gpulsmopt2_detail::ResidentPublicationPlan &plan) {
+    direct_correctness_audit_stats_ = {};
+    auto &stats = direct_correctness_audit_stats_;
+    stats.enabled = direct_correctness_audit_enabled_;
+    if (!direct_correctness_audit_enabled_ || plan.status) return;
+    gpulsmopt2_detail::DirectOutputAuditDevice device{};
+    CUDA_CHECK(cudaMemcpy(
+        &device, direct_output_audit_device_.data(), sizeof(device),
+        cudaMemcpyDeviceToHost));
+    stats.row_count = device.row_count;
+    stats.digest_sum = device.digest_sum;
+    stats.digest_xor = device.digest_xor;
+    stats.unsupported_jobs = device.unsupported_jobs;
+    stats.count_mismatch_jobs = device.count_mismatch_jobs;
+    stats.unsorted_rows = device.unsorted_rows;
+    stats.duplicate_rows = device.duplicate_rows;
+    stats.value_errors = device.value_errors;
+    stats.flag_errors = device.flag_errors;
+    stats.range_errors = device.range_errors;
+    std::copy(std::begin(device.cell_errors), std::end(device.cell_errors),
+              stats.cell_errors.begin());
+    std::copy(std::begin(device.piece_errors), std::end(device.piece_errors),
+              stats.piece_errors.begin());
+    if (direct_profile_stats_.jobs.empty()) return;
+
+    std::vector<gpulsmopt2_detail::Descriptor> descriptors(
+        gpulsmopt2_detail::kQuotients);
+    std::vector<gpulsmopt2_detail::RouteHeader> headers(
+        gpulsmopt2_detail::kQuotients);
+    std::vector<std::uint32_t> section_offsets(
+        gpulsmopt2_detail::kQuotients + 1u);
+    CUDA_CHECK(cudaMemcpy2D(
+        descriptors.data(), sizeof(descriptors[0]),
+        descriptors_.data() + plan.destination_level,
+        gpulsmopt2_detail::kMaximumLevels * sizeof(descriptors[0]),
+        sizeof(descriptors[0]), descriptors.size(), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy2D(
+        headers.data(), sizeof(headers[0]),
+        route_headers_.data() + plan.destination_level,
+        gpulsmopt2_detail::kMaximumLevels * sizeof(headers[0]),
+        sizeof(headers[0]), headers.size(), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        section_offsets.data(), level_q_logical_offsets_.data() +
+            std::size_t{plan.destination_level} *
+                (gpulsmopt2_detail::kQuotients + 1u),
+        section_offsets.size() * sizeof(section_offsets[0]),
+        cudaMemcpyDeviceToHost));
+    const std::size_t route_base =
+        std::size_t{plan.destination_level} * route_stride_;
+    std::vector<gpulsmopt2_detail::RouteSlice> slices(route_stride_);
+    std::vector<std::uint32_t> logical_begins(route_stride_);
+    CUDA_CHECK(cudaMemcpy(
+        slices.data(), route_slices_.data() + route_base,
+        slices.size() * sizeof(slices[0]), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        logical_begins.data(), route_logical_begins_.data() + route_base,
+        logical_begins.size() * sizeof(logical_begins[0]),
+        cudaMemcpyDeviceToHost));
+
+    std::size_t begin = 0u;
+    while (begin < direct_profile_stats_.jobs.size()) {
+      const std::uint32_t q =
+          direct_profile_stats_.jobs[begin].quotient_begin;
+      std::size_t end = begin;
+      std::uint32_t total = 0u;
+      while (end < direct_profile_stats_.jobs.size() &&
+             direct_profile_stats_.jobs[end].quotient_begin == q) {
+        total += direct_profile_stats_.jobs[end].output_rows;
+        ++end;
+      }
+      const auto header = headers[q];
+      if (header.count != end - begin || header.begin < route_base ||
+          header.begin + header.count > route_base + route_stride_)
+        ++stats.route_header_errors;
+      const auto descriptor = descriptors[q];
+      if (descriptor.count() != total ||
+          descriptor.split() != ((end - begin) > 1u))
+        ++stats.descriptor_errors;
+      std::uint32_t prefix = 0u;
+      for (std::size_t index = begin; index < end; ++index) {
+        const auto &job = direct_profile_stats_.jobs[index];
+        const std::size_t route = header.begin + job.route_ordinal;
+        if (route < route_base || route >= route_base + route_stride_) {
+          ++stats.route_slice_errors;
+          continue;
+        }
+        const std::size_t local = route - route_base;
+        const auto slice = slices[local];
+        const std::uint32_t suffix_begin = static_cast<std::uint32_t>(
+            job.key_begin - (std::uint64_t{q} << 16u));
+        const std::uint32_t suffix_end = static_cast<std::uint32_t>(
+            job.key_end - (std::uint64_t{q} << 16u));
+        if (slice.rows.offset() != job.existing_offset ||
+            slice.rows.count() != job.output_rows ||
+            slice.suffix_begin != suffix_begin ||
+            slice.suffix_end != suffix_end)
+          ++stats.route_slice_errors;
+        if (logical_begins[local] != section_offsets[q] + prefix)
+          ++stats.route_logical_errors;
+        prefix += job.output_rows;
+      }
+      begin = end;
+    }
+  }
+
+  void launch_resident_merge_standalone(cudaStream_t stream) {
+    const std::uint64_t bank_capacity = foundation_pool_capacity_ / 2u;
+    const std::uint32_t job_capacity = resident_merge_capacity_;
+    gpulsmopt2_detail::choose_resident_publication_path_kernel<<<
+        1, 1, 0, stream>>>(
+            publication_selected_count_.data(), device_manifests_.data(),
+            active_device_manifest_.data(), level_storage_spans_.data(),
+            bank_capacity, job_capacity, resident_plan_.data());
+    launch_resident_merge_pre(stream);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::uint32_t crowded = 0u;
+    std::uint32_t local_overflow = 0u;
+    CUDA_CHECK(cudaMemcpy(
+        &crowded, foundation_overflow_flag_.data(), sizeof(crowded),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &local_overflow, local_epoch_overflow_flag_.data(),
+        sizeof(local_overflow), cudaMemcpyDeviceToHost));
+    if (crowded) {
+      if (local_overflow)
+        launch_crowded_epoch_stage(stream);
+      else
+        launch_local_epoch_stage(stream);
+    } else {
+      launch_normal_epoch_stage(stream);
+    }
+    launch_resident_merge_finish(stream);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    std::uint32_t rank_cell_mode = 0u;
+    std::uint64_t occupied_level_mask = 0u;
+    CUDA_CHECK(cudaMemcpy(
+        &plan, resident_plan_.data(), sizeof(plan), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &rank_cell_mode, rank_cell_mode_.data(), sizeof(rank_cell_mode),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &occupied_level_mask, query_occupied_level_mask_.data(),
+        sizeof(occupied_level_mask), cudaMemcpyDeviceToHost));
+
+    rank_cell_profile_stats_ = {};
+    rank_cell_profile_stats_.standalone = rank_cell_standalone_profile_;
+    rank_cell_profile_stats_.rank_cell_mode = rank_cell_mode;
+    rank_cell_profile_stats_.launch_count = 1u;
+    rank_cell_profile_stats_.grid_x = resident_rank_cell_blocks_;
+    rank_cell_profile_stats_.block_x = gpulsmopt2_detail::kRankCellThreads;
+    rank_cell_profile_stats_.dynamic_shared_bytes =
+        gpulsmopt2_detail::kRankCellDynamicSharedBytes;
+    rank_cell_profile_stats_.selected_count = plan.selected_count;
+    rank_cell_profile_stats_.destination_level = plan.destination_level;
+    rank_cell_profile_stats_.publication_status = plan.status;
+    rank_cell_profile_stats_.raw_reservation = plan.raw_reservation;
+    rank_cell_profile_stats_.survivor_count = plan.survivor_count;
+    rank_cell_profile_stats_.occupied_level_mask = occupied_level_mask;
+
+    direct_profile_stats_ = {};
+    direct_profile_stats_.standalone = direct_standalone_profile_;
+    direct_profile_stats_.forced_unified_merge =
+        gpulsmopt2_detail::kForceUnifiedMergeExperiment;
+    direct_profile_stats_.forced_unified_compile_elision =
+        gpulsmopt2_detail::kForceUnifiedCompileElision;
+    direct_profile_stats_.direct_launch_count = 1u;
+    direct_profile_stats_.rank_cell_mode = rank_cell_mode;
+    direct_profile_stats_.grid_x = resident_merge_blocks_;
+    direct_profile_stats_.block_x = gpulsmopt2_detail::kFoundationCompactionThreads;
+    direct_profile_stats_.dynamic_shared_bytes = resident_merge_workspace_bytes_;
+    direct_profile_stats_.selected_count = plan.selected_count;
+    direct_profile_stats_.source_count = plan.source_count;
+    direct_profile_stats_.destination_level = plan.destination_level;
+    direct_profile_stats_.publication_status = plan.status;
+    direct_profile_stats_.job_count = plan.job_count;
+    direct_profile_stats_.raw_reservation = plan.raw_reservation;
+    direct_profile_stats_.survivor_count = plan.survivor_count;
+    direct_profile_stats_.occupied_level_mask = occupied_level_mask;
+    if ((direct_standalone_profile_ || direct_correctness_audit_enabled_) &&
+        plan.job_count) {
+      std::vector<gpulsmopt2_detail::BalancedMergeJob> jobs(plan.job_count);
+      std::vector<std::uint64_t> raw(plan.job_count);
+      CUDA_CHECK(cudaMemcpy(
+          jobs.data(), balanced_merge_jobs_.data(),
+          jobs.size() * sizeof(jobs[0]), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(
+          raw.data(), resident_job_raw_reservations_.data(),
+          raw.size() * sizeof(raw[0]), cudaMemcpyDeviceToHost));
+      direct_profile_stats_.jobs.reserve(plan.job_count);
+      for (std::uint32_t i = 0u; i < plan.job_count; ++i) {
+        const auto &job = jobs[i];
+        DirectMergeJobProfile item;
+        item.job_index = i;
+        item.key_begin = job.key_begin;
+        item.key_end = job.key_end;
+        item.existing_offset = job.existing_offset;
+        item.quotient_begin = job.quotient_begin;
+        item.quotient_end = job.quotient_end;
+        item.quotient_count = job.quotient_end - job.quotient_begin;
+        item.raw_rows = i < direct_profile_raw_rows_.size()
+            ? direct_profile_raw_rows_[i] : raw[i];
+        item.output_rows = job.output_count;
+        item.existing_capacity = job.existing_capacity;
+        item.route_ordinal = job.route_ordinal;
+        item.hot_pieces = job.hot_pieces;
+        item.hot_piece = job.hot_piece;
+        item.crowded = job.hot_pieces != 0u;
+        item.cell_owned_shape = !item.crowded &&
+            item.quotient_count <= gpulsmopt2_detail::kCellOwnedQuotients;
+        direct_profile_stats_.jobs.push_back(item);
+      }
+    }
+    collect_partition_audit(plan, rank_cell_mode);
+    collect_direct_correctness_audit(plan);
   }
 
   cudaGraph_t capture_resident_merge_graph(cudaStream_t capture_stream) {
@@ -7890,9 +11294,7 @@ private:
       crowded_graph = capture_crowded_epoch_stage_graph(capture_stream);
       CUDA_CHECK(cudaStreamBeginCapture(
           capture_stream, cudaStreamCaptureModeThreadLocal));
-      CUDA_CHECK(cudaMemsetAsync(
-          staged_epoch_mode_.data(), 0, sizeof(std::uint32_t),
-          capture_stream));
+      launch_normal_epoch_stage(capture_stream);
       CUDA_CHECK(cudaStreamEndCapture(capture_stream, &normal_graph));
       finish_graph = capture_resident_merge_finish_graph(capture_stream);
 
@@ -8032,14 +11434,14 @@ private:
 
   void ensure_publication_capacity(std::size_t count,
                                    cudaStream_t stream) {
-    if (count <= publication_capacity_) return;
+    const std::size_t current =
+        std::min(publication_keys_a_.size(), publication_rows_a_.size());
+    if (count <= current) return;
     if (count > gpulsmopt2_detail::kMaximumPublicationRows)
       throw std::bad_alloc();
     CUDA_CHECK(cudaStreamSynchronize(stream));
     publication_keys_a_.grow(count);
     publication_rows_a_.grow(count);
-    publication_capacity_ =
-        std::min(publication_keys_a_.size(), publication_rows_a_.size());
     initialize_publication_workspace();
   }
 
@@ -8083,6 +11485,7 @@ private:
 
     pending_batches_ = 0u;
     pending_records_ = 0u;
+    pending_has_tombstones_ = false;
     std::fill_n(raw_batch_counts_, gpulsmopt2_detail::kBatchesPerEpoch, 0u);
     publication_failed_ = false;
     publication_failure_status_ = gpulsmopt2_detail::kPublicationSuccess;
@@ -8167,6 +11570,7 @@ private:
         admission_counts_.size() * sizeof(std::uint32_t), stream));
     pending_batches_ = 0u;
     pending_records_ = 0u;
+    pending_has_tombstones_ = false;
     publication_receipt_pending_ = false;
     publication_failed_ = false;
     publication_failure_status_ = gpulsmopt2_detail::kPublicationSuccess;
@@ -8219,6 +11623,7 @@ private:
                   cudaStream_t stream) {
     const std::uint32_t slot = pending_batches_;
     pending_records_ += n;
+    pending_has_tombstones_ |= tombstone;
     std::uint64_t *batch_signatures = raw_signatures_.data() +
         std::size_t{slot} * gpulsmopt2_detail::kQuotients;
     CUDA_CHECK(cudaMemsetAsync(
@@ -8257,6 +11662,396 @@ private:
       publish_epoch(stream);
   }
 
+  void launch_canonical_epoch_resolution(
+      cudaStream_t stream, bool materialize_resident,
+      std::uint32_t destination_level) {
+    if (canonical_local_epoch_enabled_) {
+      CUDA_CHECK(cudaMemsetAsync(
+          publication_selected_count_.data(), 0, sizeof(std::uint32_t),
+          stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          local_epoch_overflow_flag_.data(), 0, sizeof(std::uint32_t),
+          stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          canonical_next_job_.data(), 0, sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          canonical_cell_counts_.data(), 0,
+          std::size_t{canonical_epoch_workspace_slots_} *
+              sizeof(std::uint32_t),
+          stream));
+      gpulsmopt2_detail::count_canonical_epoch_sections_kernel<<<
+          blocks(gpulsmopt2_detail::kQuotients + 1u),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              raw_offsets_.data(), gpulsmopt2_detail::kBatchesPerEpoch,
+              foundation_section_output_counts_.data(),
+              reinterpret_cast<std::uint32_t *>(
+                  balanced_merge_raw_counts_.data()),
+              local_epoch_overflow_flag_.data());
+      std::size_t scan_bytes = resident_scan_temp_.size();
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          resident_scan_temp_.data(), scan_bytes,
+          foundation_section_output_counts_.data(),
+          foundation_source_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, stream));
+      std::uint16_t *epoch_ranks = canonical_cell_ranks_.data() +
+          std::size_t{destination_level} *
+              gpulsmopt2_detail::kLocalRankEntries;
+      if (materialize_resident) {
+        gpulsmopt2_detail::resolve_canonical_epoch_local_kernel<true><<<
+            gpulsmopt2_detail::kQuotients,
+            gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+                raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+                static_cast<std::uint32_t>(batch_capacity_),
+                gpulsmopt2_detail::kBatchesPerEpoch,
+                foundation_source_offsets_.data(),
+                publication_rows_a_.data(), resident_rows(),
+                level_zero_begin(), foundation_section_output_counts_.data(),
+                epoch_ranks);
+        gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<true><<<
+            canonical_epoch_resolver_blocks_,
+            gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+                reinterpret_cast<std::uint32_t *>(
+                    balanced_merge_raw_counts_.data()),
+                local_epoch_overflow_flag_.data(),
+                canonical_next_job_.data(), raw_keys_.data(),
+                raw_payloads_.data(), raw_offsets_.data(),
+                static_cast<std::uint32_t>(batch_capacity_),
+                gpulsmopt2_detail::kBatchesPerEpoch,
+                foundation_source_offsets_.data(),
+                publication_rows_a_.data(), resident_rows(),
+                level_zero_begin(), foundation_section_output_counts_.data(),
+                epoch_ranks,
+                reinterpret_cast<unsigned long long *>(
+                    publication_epoch_payloads_b_.data()),
+                canonical_cell_counts_.data(),
+                canonical_epoch_workspace_slots_);
+      } else {
+        gpulsmopt2_detail::resolve_canonical_epoch_local_kernel<false><<<
+            gpulsmopt2_detail::kQuotients,
+            gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+                raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+                static_cast<std::uint32_t>(batch_capacity_),
+                gpulsmopt2_detail::kBatchesPerEpoch,
+                foundation_source_offsets_.data(),
+                publication_rows_a_.data(), resident_rows(),
+                level_zero_begin(), foundation_section_output_counts_.data(),
+                epoch_ranks);
+        gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<false><<<
+            canonical_epoch_resolver_blocks_,
+            gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+                reinterpret_cast<std::uint32_t *>(
+                    balanced_merge_raw_counts_.data()),
+                local_epoch_overflow_flag_.data(),
+                canonical_next_job_.data(), raw_keys_.data(),
+                raw_payloads_.data(), raw_offsets_.data(),
+                static_cast<std::uint32_t>(batch_capacity_),
+                gpulsmopt2_detail::kBatchesPerEpoch,
+                foundation_source_offsets_.data(),
+                publication_rows_a_.data(), resident_rows(),
+                level_zero_begin(), foundation_section_output_counts_.data(),
+                epoch_ranks,
+                reinterpret_cast<unsigned long long *>(
+                    publication_epoch_payloads_b_.data()),
+                canonical_cell_counts_.data(),
+                canonical_epoch_workspace_slots_);
+      }
+      gpulsmopt2_detail::sum_canonical_section_counts_kernel<<<
+          1, gpulsmopt2_detail::kThreads, 0, stream>>>(
+              foundation_section_output_counts_.data(),
+              publication_selected_count_.data());
+      return;
+    }
+    gpulsmopt2_detail::build_publication_batch_offsets_kernel<<<
+        1, 1, 0, stream>>>(
+            raw_offsets_.data(), publication_batch_offsets_.data());
+    const dim3 publication_grid(
+        blocks(batch_capacity_), gpulsmopt2_detail::kBatchesPerEpoch);
+    gpulsmopt2_detail::pack_canonical_epoch_kernel<<<
+        publication_grid, gpulsmopt2_detail::kThreads, 0, stream>>>(
+            raw_keys_.data(), raw_payloads_.data(),
+            static_cast<std::uint32_t>(batch_capacity_),
+            publication_batch_offsets_.data(),
+            publication_epoch_keys_a_.data(),
+            publication_epoch_payloads_a_.data());
+    const std::uint32_t epoch_capacity = static_cast<std::uint32_t>(
+        batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
+    gpulsmopt2_detail::pad_canonical_epoch_kernel<<<
+        blocks(epoch_capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
+            epoch_capacity, publication_batch_offsets_.data(),
+            publication_epoch_keys_a_.data(),
+            publication_epoch_payloads_a_.data());
+    std::size_t workspace_bytes = publication_temp_.size();
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        publication_temp_.data(), workspace_bytes,
+        publication_epoch_keys_a_.data(), publication_epoch_keys_b_.data(),
+        publication_epoch_payloads_a_.data(),
+        publication_epoch_payloads_b_.data(), epoch_capacity, 0, 32,
+        stream));
+    workspace_bytes = publication_temp_.size();
+    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
+        publication_temp_.data(), workspace_bytes,
+        publication_epoch_keys_b_.data(), publication_keys_a_.data(),
+        publication_epoch_payloads_b_.data(),
+        publication_epoch_payloads_a_.data(),
+        publication_selected_count_.data(),
+        gpulsmopt2_detail::NewestPayload{}, epoch_capacity, stream));
+    if (materialize_resident) {
+      gpulsmopt2_detail::materialize_canonical_epoch_resident_kernel<<<
+          blocks(epoch_capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              publication_keys_a_.data(),
+              publication_epoch_payloads_a_.data(),
+              publication_selected_count_.data(), resident_rows(),
+              level_zero_begin());
+    } else {
+      gpulsmopt2_detail::materialize_canonical_epoch_rows_kernel<<<
+          blocks(epoch_capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              publication_keys_a_.data(),
+              publication_epoch_payloads_a_.data(),
+              publication_selected_count_.data(),
+              publication_rows_a_.data());
+    }
+    gpulsmopt2_detail::build_query_quotient_offsets_device_count_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            publication_keys_a_.data(), publication_selected_count_.data(),
+            foundation_source_offsets_.data());
+    gpulsmopt2_detail::canonical_section_counts_from_offsets_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            foundation_source_offsets_.data(),
+            foundation_section_output_counts_.data());
+    if (!materialize_resident)
+      gpulsmopt2_detail::build_staged_rank_directory_kernel<<<
+          gpulsmopt2_detail::kQuotients,
+          gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+              publication_rows_a_.data(),
+              foundation_source_offsets_.data(),
+              canonical_cell_ranks_.data() +
+                  std::size_t{destination_level} *
+                      gpulsmopt2_detail::kLocalRankEntries);
+  }
+
+  void launch_canonical_publication_commands(
+      cudaStream_t stream, std::uint32_t destination,
+      std::uint32_t source_count, bool direct_epoch,
+      bool include_receipt) {
+    launch_canonical_epoch_resolution(stream, direct_epoch, destination);
+    gpulsmopt2_detail::choose_canonical_publication_path_kernel<<<
+        1, 1, 0, stream>>>(
+            publication_selected_count_.data(), device_manifests_.data(),
+            active_device_manifest_.data(), level_storage_spans_.data(),
+            resident_merge_capacity_, resident_plan_.data());
+
+    if (direct_epoch) {
+      if (!canonical_local_epoch_enabled_)
+        gpulsmopt2_detail::build_canonical_rank_from_run_kernel<<<
+            gpulsmopt2_detail::kQuotients,
+            gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+                resident_rows(), level_zero_begin(),
+                foundation_source_offsets_.data(), destination,
+                canonical_cell_ranks_.data());
+      if (canonical_local_epoch_enabled_)
+        gpulsmopt2_detail::finalize_canonical_section_metadata_kernel<<<
+            blocks(gpulsmopt2_detail::kQuotients + 1u),
+            gpulsmopt2_detail::kThreads, 0, stream>>>(
+                foundation_source_offsets_.data(),
+                foundation_section_output_counts_.data(),
+                publication_selected_count_.data(),
+                level_storage_spans_.data(), resident_plan_.data(),
+                descriptors_.data(),
+                static_cast<std::uint32_t>(route_stride_),
+                route_headers_.data(), route_slices_.data(),
+                route_logical_begins_.data(), route_quotients_.data(),
+                level_q_logical_offsets_.data());
+      else
+        gpulsmopt2_detail::finalize_canonical_level_metadata_kernel<<<
+            blocks(gpulsmopt2_detail::kQuotients + 1u),
+            gpulsmopt2_detail::kThreads, 0, stream>>>(
+                foundation_source_offsets_.data(),
+                level_storage_spans_.data(), resident_plan_.data(),
+                descriptors_.data(),
+                static_cast<std::uint32_t>(route_stride_),
+                route_headers_.data(), route_slices_.data(),
+                route_logical_begins_.data(), route_quotients_.data(),
+                level_q_logical_offsets_.data());
+    } else {
+      CUDA_CHECK(cudaMemsetAsync(
+          canonical_cell_counts_.data(), 0,
+          canonical_cell_counts_.size() * sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          canonical_job_prefixes_.data(), 0,
+          canonical_job_prefixes_.size() *
+              sizeof(gpulsmopt2_detail::CanonicalJobPrefix), stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          canonical_next_job_.data(), 0, sizeof(std::uint32_t), stream));
+      gpulsmopt2_detail::count_canonical_merge_work_kernel<<<
+          blocks(gpulsmopt2_detail::kQuotients),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              foundation_section_output_counts_.data(), descriptors_.data(),
+              device_manifests_.data(), active_device_manifest_.data(),
+              resident_plan_.data(), balanced_merge_raw_counts_.data());
+      gpulsmopt2_detail::count_canonical_planning_jobs_kernel<<<
+          gpulsmopt2_detail::kPlanningTiles,
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              balanced_merge_raw_counts_.data(), resident_plan_.data(),
+              resident_tile_job_counts_.data());
+      std::size_t scan_bytes = resident_scan_temp_.size();
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          resident_scan_temp_.data(), scan_bytes,
+          resident_tile_job_counts_.data(),
+          resident_tile_job_offsets_.data(),
+          gpulsmopt2_detail::kPlanningTiles + 1u, stream));
+      gpulsmopt2_detail::emit_canonical_planning_jobs_kernel<<<
+          gpulsmopt2_detail::kPlanningTiles,
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              balanced_merge_raw_counts_.data(),
+              resident_tile_job_offsets_.data(), resident_plan_.data(),
+              static_cast<std::uint32_t>(maximum_resident_jobs_),
+              balanced_merge_jobs_.data(),
+              resident_job_raw_reservations_.data());
+      gpulsmopt2_detail::validate_canonical_plan_kernel<<<1, 1, 0, stream>>>(
+          resident_plan_.data(), resident_tile_job_offsets_.data(),
+          static_cast<std::uint32_t>(maximum_resident_jobs_));
+      gpulsmopt2_detail::resolve_canonical_job_boundaries_kernel<<<
+          resident_planner_blocks_, 32u, 0, stream>>>(
+              balanced_merge_jobs_.data(),
+              resident_job_raw_reservations_.data(), resident_plan_.data(),
+              publication_rows_a_.data(), foundation_source_offsets_.data(),
+              foundation_section_output_counts_.data(),
+              canonical_cell_ranks_.data() +
+                  std::size_t{destination} *
+                      gpulsmopt2_detail::kLocalRankEntries,
+              resident_rows(), descriptors_.data(),
+              canonical_cell_ranks_.data(), device_manifests_.data(),
+              active_device_manifest_.data());
+      if (source_count < canonical_tournament_blocks_.size() &&
+          canonical_tournament_blocks_[source_count]) {
+        const std::size_t tournament_shared_bytes =
+            canonical_tournament_shared_bytes_[source_count];
+        gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel<<<
+            canonical_tournament_blocks_[source_count],
+            gpulsmopt2_detail::kFoundationCompactionThreads,
+            tournament_shared_bytes, stream>>>(
+                balanced_merge_jobs_.data(),
+                resident_job_raw_reservations_.data(),
+                resident_plan_.data(), publication_rows_a_.data(),
+                foundation_source_offsets_.data(),
+                foundation_section_output_counts_.data(),
+                canonical_cell_ranks_.data() +
+                    std::size_t{destination} *
+                        gpulsmopt2_detail::kLocalRankEntries,
+                resident_rows(), descriptors_.data(),
+                level_storage_spans_.data(), canonical_cell_ranks_.data(),
+                device_manifests_.data(), active_device_manifest_.data(),
+                canonical_job_prefixes_.data(), canonical_next_job_.data(),
+                canonical_cell_counts_.data());
+      } else if (source_count == 2u) {
+        gpulsmopt2_detail::canonical_carry_jobs_kernel<2u><<<
+            canonical_two_way_blocks_,
+            gpulsmopt2_detail::kFoundationCompactionThreads,
+            canonical_merge_workspace_bytes_, stream>>>(
+                balanced_merge_jobs_.data(), resident_plan_.data(),
+                publication_rows_a_.data(),
+                foundation_source_offsets_.data(),
+                foundation_section_output_counts_.data(), resident_rows(),
+                descriptors_.data(), level_storage_spans_.data(),
+                level_q_logical_offsets_.data(), device_manifests_.data(),
+                active_device_manifest_.data(),
+                canonical_job_prefixes_.data(), canonical_next_job_.data(),
+                canonical_cell_counts_.data());
+      } else {
+        gpulsmopt2_detail::canonical_carry_jobs_kernel<0u><<<
+            canonical_merge_blocks_,
+            gpulsmopt2_detail::kFoundationCompactionThreads,
+            canonical_merge_workspace_bytes_, stream>>>(
+                balanced_merge_jobs_.data(), resident_plan_.data(),
+                publication_rows_a_.data(),
+                foundation_source_offsets_.data(),
+                foundation_section_output_counts_.data(), resident_rows(),
+                descriptors_.data(), level_storage_spans_.data(),
+                level_q_logical_offsets_.data(), device_manifests_.data(),
+                active_device_manifest_.data(),
+                canonical_job_prefixes_.data(), canonical_next_job_.data(),
+                canonical_cell_counts_.data());
+      }
+      gpulsmopt2_detail::build_canonical_rank_from_counts_kernel<<<
+          gpulsmopt2_detail::kQuotients,
+          gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+              canonical_cell_counts_.data(), resident_plan_.data(),
+              canonical_level_count_,
+              canonical_cell_ranks_.data(),
+              foundation_section_output_counts_.data());
+      scan_bytes = resident_scan_temp_.size();
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          resident_scan_temp_.data(), scan_bytes,
+          foundation_section_output_counts_.data(),
+          foundation_source_offsets_.data(),
+          gpulsmopt2_detail::kQuotients + 1u, stream));
+      gpulsmopt2_detail::finalize_canonical_level_metadata_kernel<<<
+          blocks(gpulsmopt2_detail::kQuotients + 1u),
+          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              foundation_source_offsets_.data(), level_storage_spans_.data(),
+              resident_plan_.data(), descriptors_.data(),
+              static_cast<std::uint32_t>(route_stride_),
+              route_headers_.data(), route_slices_.data(),
+              route_logical_begins_.data(), route_quotients_.data(),
+              level_q_logical_offsets_.data());
+    }
+    gpulsmopt2_detail::publish_resident_manifest_kernel<<<
+        1, gpulsmopt2_detail::kMaximumLevels, 0, stream>>>(
+            resident_plan_.data(), device_manifests_.data(),
+            active_device_manifest_.data(),
+            query_occupied_level_mask_.data());
+    if (include_receipt) {
+      CUDA_CHECK(cudaMemcpyAsync(
+          publication_receipt_.data(), resident_plan_.data(),
+          sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
+          cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          raw_epoch_signatures_.data(), 0,
+          raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+    }
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  void canonical_publication_parameters(
+      std::uint32_t &destination, std::uint32_t &source_count,
+      bool &direct_epoch) const {
+    const std::uint64_t empty = ~host_occupied_level_mask_;
+    destination = empty
+        ? static_cast<std::uint32_t>(__builtin_ctzll(empty))
+        : gpulsmopt2_detail::kMaximumLevels;
+    const std::uint64_t carried = destination
+        ? (std::uint64_t{1} << destination) - 1u : 0u;
+    source_count = 1u + static_cast<std::uint32_t>(
+        __builtin_popcountll(host_occupied_level_mask_ & carried));
+    direct_epoch = destination == 0u &&
+        (host_occupied_level_mask_ != 0u || !pending_has_tombstones_) &&
+        pending_records_ <= level_zero_capacity_;
+  }
+
+  bool launch_canonical_publication(cudaStream_t stream) {
+    std::uint32_t destination = 0u, source_count = 0u;
+    bool direct_epoch = false;
+    canonical_publication_parameters(
+        destination, source_count, direct_epoch);
+    cudaGraphExec_t graph_exec = direct_epoch
+        ? canonical_direct_publication_graph_exec_
+        : source_count < canonical_publication_graph_execs_.size()
+            ? canonical_publication_graph_execs_[source_count] : nullptr;
+    if (gpulsmopt2_detail::kCanonicalPublicationGraph && graph_exec) {
+      CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+      return true;
+    }
+    launch_canonical_publication_commands(
+        stream, destination, source_count, direct_epoch, false);
+    return false;
+  }
+
+  std::uint64_t level_zero_begin() const {
+    return foundation_pool_capacity_;
+  }
+
   void publish_epoch(cudaStream_t stream) {
     if (pending_records_ > publication_capacity_) {
       // Preserve an epoch that cannot reserve output.
@@ -8271,20 +12066,31 @@ private:
       failed_epoch_signatures_ready_ = true;
       return;
     }
-    gpulsmopt2_detail::count_direct_epoch_records_kernel<<<1, 1, 0, stream>>>(
-        raw_offsets_.data(), gpulsmopt2_detail::kBatchesPerEpoch,
-        publication_selected_count_.data());
-    CUDA_CHECK(cudaGraphLaunch(resident_publication_graph_exec_, stream));
+    bool receipt_in_graph = false;
+    if (gpulsmopt2_detail::kCanonicalCarry) {
+      receipt_in_graph = launch_canonical_publication(stream);
+    } else {
+      gpulsmopt2_detail::count_direct_epoch_records_kernel<<<1, 1, 0, stream>>>(
+          raw_offsets_.data(), gpulsmopt2_detail::kBatchesPerEpoch,
+          publication_selected_count_.data());
+      if (rank_cell_standalone_profile_ || direct_standalone_profile_ ||
+          direct_correctness_audit_enabled_ || partition_audit_enabled_)
+        launch_resident_merge_standalone(stream);
+      else
+        CUDA_CHECK(cudaGraphLaunch(resident_publication_graph_exec_, stream));
+    }
     CUDA_CHECK(cudaGetLastError());
 
-    // Copy the receipt to pinned host memory.
-    CUDA_CHECK(cudaMemcpyAsync(
-        publication_receipt_.data(), resident_plan_.data(),
-        sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
-        cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        raw_epoch_signatures_.data(), 0,
-        raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+    if (!receipt_in_graph) {
+      // Copy the receipt to pinned host memory.
+      CUDA_CHECK(cudaMemcpyAsync(
+          publication_receipt_.data(), resident_plan_.data(),
+          sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
+          cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          raw_epoch_signatures_.data(), 0,
+          raw_epoch_signatures_.size() * sizeof(std::uint64_t), stream));
+    }
     publication_receipt_pending_ = true;
     failed_epoch_signatures_ready_ = false;
     return;
@@ -8463,6 +12269,11 @@ private:
     CUDA_CHECK(cudaGetLastError());
   }
   void launch_section_ranges(cudaStream_t stream, bool hot_ready) {
+    const std::uint16_t *foundation_ranks = local_rank_.data();
+    if (gpulsmopt2_detail::kCanonicalCarry && active_levels_)
+      foundation_ranks = canonical_cell_ranks_.data() +
+          std::size_t{foundation_level()} *
+              gpulsmopt2_detail::kLocalRankEntries;
     gpulsmopt2_detail::cooperative_section_owned_range_kernel<
         gpulsmopt2_detail::SumRowsAggregate>
         <<<range_section_blocks_, gpulsmopt2_detail::kSectionRangeThreads,
@@ -8472,7 +12283,7 @@ private:
             range_section_task_offsets_.data() +
                 gpulsmopt2_detail::kQuotients,
             resident_rows(), descriptors_.data(), route_headers_.data(),
-            route_slices_.data(), local_rank_.data(),
+            route_slices_.data(), foundation_ranks,
             publication_rows_a_.data(),
             range_hot_descriptors_.data(), hot_ready,
             raw_keys_.data(),
@@ -8611,8 +12422,10 @@ private:
   std::size_t foundation_pool_capacity_{};
   std::size_t level_pool_capacity_{};
   std::size_t level_rank_block_capacity_{};
+  std::uint32_t canonical_level_count_{};
   std::uint32_t resident_merge_capacity_{};
   std::size_t resident_merge_workspace_bytes_{};
+  std::size_t canonical_merge_workspace_bytes_{};
   std::size_t maximum_resident_jobs_{};
   std::size_t route_stride_{};
   mutable std::mutex operation_mutex_;
@@ -8620,6 +12433,7 @@ private:
   std::uint32_t pending_batches_{};
   std::uint32_t pending_records_{};
   std::uint32_t active_levels_{};
+  bool pending_has_tombstones_{};
   bool publication_receipt_pending_{};
   bool publication_failed_{};
   bool failed_epoch_signatures_ready_{};
@@ -8636,10 +12450,41 @@ private:
   cudaEvent_t operation_done_{};
   cudaGraph_t resident_publication_graph_{};
   cudaGraphExec_t resident_publication_graph_exec_{};
+  cudaGraphExec_t canonical_direct_publication_graph_exec_{};
+  std::array<cudaGraphExec_t,
+             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+      canonical_publication_graph_execs_{};
   std::uint32_t resident_merge_blocks_{};
+  std::uint32_t canonical_merge_blocks_{};
+  std::uint32_t canonical_two_way_blocks_{};
+  std::array<std::uint32_t,
+             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+      canonical_tournament_blocks_{};
+  std::uint32_t canonical_epoch_resolver_blocks_{};
+  std::uint32_t canonical_epoch_workspace_slots_{};
+  std::array<std::size_t,
+             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+      canonical_tournament_shared_bytes_{};
+  bool canonical_local_epoch_enabled_{};
   std::uint32_t resident_rank_cell_blocks_{};
   std::uint32_t resident_planner_blocks_{};
   std::uint32_t range_section_blocks_{};
+  bool rank_cell_standalone_profile_ = false;
+  bool direct_standalone_profile_ = false;
+  bool direct_correctness_audit_enabled_ = false;
+  bool partition_audit_enabled_ = false;
+  RankCellProfileStats rank_cell_profile_stats_{};
+  DirectMergeProfileStats direct_profile_stats_{};
+  DirectCorrectnessAuditStats direct_correctness_audit_stats_{};
+  PartitionAuditStats partition_audit_stats_{};
+  std::vector<std::uint64_t> direct_profile_raw_rows_;
+
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::DirectOutputAuditDevice>
+      direct_output_audit_device_;
+  gpulsmopt2_detail::Buffer<std::uint64_t> direct_audit_raw_rows_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::PartitionAuditDeviceJob>
+      partition_audit_device_jobs_;
+  gpulsmopt2_detail::Buffer<std::uint16_t> partition_audit_source_rows_;
 
   gpulsmopt2_detail::Buffer<std::uint16_t> local_rank_;
   gpulsmopt2_detail::VirtualBuffer<std::uint16_t> level_guides_;
@@ -8669,6 +12514,11 @@ private:
   gpulsmopt2_detail::Buffer<std::uint32_t> level_cell_rank_blocks_;
   gpulsmopt2_detail::Buffer<std::uint16_t> level_cell_ranks_;
   gpulsmopt2_detail::Buffer<std::uint16_t> publication_cell_ranks_;
+  gpulsmopt2_detail::Buffer<std::uint16_t> canonical_cell_ranks_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> canonical_cell_counts_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::CanonicalJobPrefix>
+      canonical_job_prefixes_;
+  gpulsmopt2_detail::Buffer<std::uint32_t> canonical_next_job_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_keys_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawPayload> raw_payloads_;
   gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
@@ -8678,6 +12528,8 @@ private:
       publication_epoch_keys_b_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawAssignment>
       publication_epoch_assignments_a_, publication_epoch_assignments_b_;
+  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawPayload>
+      publication_epoch_payloads_a_, publication_epoch_payloads_b_;
   gpulsmopt2_detail::VirtualBuffer<std::uint32_t> publication_keys_a_;
   gpulsmopt2_detail::Buffer<std::uint32_t> publication_selected_count_,
       publication_batch_offsets_;
