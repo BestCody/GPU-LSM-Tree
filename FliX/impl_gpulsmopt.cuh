@@ -167,23 +167,14 @@ public:
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
         {"level_zero_capacity",
          std::to_string(gpulsmopt_adapter_detail::level_zero_capacity())},
-        {"structure", gpulsmopt2_detail::kCanonicalCarry
-             ? "canonical_quotient_run_binary_carry"
-             : "quotient_local_binary_epochs"},
-        {"carry_crossover", gpulsmopt2_detail::kCanonicalCarry
-             ? "pairwise_below_" + std::to_string(
-                   gpulsmopt2_detail::kCanonicalTournamentMinimumSources) +
-                   "_sources_tournament_at_and_above"
-             : "legacy_conditional_paths"},
+        {"structure", "canonical_quotient_run_binary_carry"},
+        {"carry_crossover", "pairwise_below_" + std::to_string(
+             gpulsmopt2_detail::kCanonicalTournamentMinimumSources) +
+             "_sources_tournament_at_and_above"},
         {"tournament_workspace", "elastic_by_job_shape"},
-        {"epoch_resolution", gpulsmopt2_detail::kCanonicalLocalEpoch
-             ? "quotient_local_direct_with_oversized_fallback"
-             : "global_sort_reduce"},
-        {"publication_graph", gpulsmopt2_detail::kCanonicalPublicationGraph
-             ? "enabled" : "disabled"},
-        {"resident_directory", gpulsmopt2_detail::kCanonicalCarry
-             ? "quotient_offsets_and_128_cell_starts"
-             : "routes_ranks_and_guides"},
+        {"epoch_resolution", "quotient_local_direct_with_oversized_fallback"},
+        {"publication_graph", "enabled"},
+        {"resident_directory", "quotient_offsets_and_128_cell_starts"},
         {"range", "visible_row_fragments"},
         {"epoch_batches",
          std::to_string(static_cast<size_t>(
@@ -298,57 +289,6 @@ public:
     batch.values = reinterpret_cast<const std::uint32_t *>(offsets);
     batch.count = size;
     dictionary_->insert(batch, stream);
-  }
-
-  void set_rank_cell_standalone_profile(bool enabled) {
-    ensure_built();
-    dictionary_->set_rank_cell_standalone_profile(enabled);
-  }
-
-  GPULSMOpt::RankCellProfileStats rank_cell_profile_stats() const {
-    ensure_built();
-    return dictionary_->rank_cell_profile_stats();
-  }
-
-  void set_direct_standalone_profile(bool enabled) {
-    ensure_built();
-    dictionary_->set_direct_standalone_profile(enabled);
-  }
-
-  GPULSMOpt::DirectMergeProfileStats direct_profile_stats() const {
-    ensure_built();
-    return dictionary_->direct_profile_stats();
-  }
-
-  void set_direct_correctness_audit(bool enabled) {
-    ensure_built();
-    dictionary_->set_direct_correctness_audit(enabled);
-  }
-
-  GPULSMOpt::DirectCorrectnessAuditStats
-  direct_correctness_audit_stats() const {
-    ensure_built();
-    return dictionary_->direct_correctness_audit_stats();
-  }
-
-  void set_partition_audit(bool enabled) {
-    ensure_built();
-    dictionary_->set_partition_audit(enabled);
-  }
-
-  GPULSMOpt::PartitionAuditStats partition_audit_stats() const {
-    ensure_built();
-    return dictionary_->partition_audit_stats();
-  }
-
-  void audit_direct_lookup(
-      const key_type *queries, smallsize *job_results,
-      smallsize *route_results, size_t size, cudaStream_t stream) {
-    ensure_built();
-    dictionary_->audit_direct_lookup(
-        reinterpret_cast<const std::uint32_t *>(queries), size,
-        reinterpret_cast<std::uint32_t *>(job_results),
-        reinterpret_cast<std::uint32_t *>(route_results), stream);
   }
 
   void remove(const key_type *update_list, size_t size, cudaStream_t stream) {
