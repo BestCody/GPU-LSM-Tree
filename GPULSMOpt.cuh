@@ -2464,10 +2464,16 @@ __global__ void gather_initial_level_kernel(
   level_rows[i] = make_row(key, sorted_values[source], 0u);
 }
 
-__global__ void count_canonical_epoch_sections_kernel(
+__device__ __forceinline__ std::uint64_t pack_canonical_epoch_job(
+    std::uint32_t q, std::uint32_t count) {
+  return (static_cast<std::uint64_t>(count) << 32u) | q;
+}
+
+__global__ void count_canonical_epoch_jobs_kernel(
     const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
-    std::uint32_t *section_counts, std::uint32_t *overflow_quotients,
-    std::uint32_t *overflow_count) {
+    std::uint32_t *section_counts, std::uint64_t *epoch_jobs,
+    std::uint32_t *local_job_count,
+    std::uint32_t *oversized_job_count) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q > kQuotients) return;
   if (q == kQuotients) {
@@ -2481,9 +2487,14 @@ __global__ void count_canonical_epoch_sections_kernel(
     count += raw_offsets[base + 1u] - raw_offsets[base];
   }
   section_counts[q] = count;
-  if (count > kLocalEpochCapacity) {
-    const std::uint32_t position = atomicAdd(overflow_count, 1u);
-    overflow_quotients[position] = q;
+  if (!count) return;
+  const std::uint64_t job = pack_canonical_epoch_job(q, count);
+  if (count <= kLocalEpochCapacity) {
+    const std::uint32_t position = atomicAdd(local_job_count, 1u);
+    epoch_jobs[position] = job;
+  } else {
+    const std::uint32_t position = atomicAdd(oversized_job_count, 1u);
+    epoch_jobs[kQuotients - 1u - position] = job;
   }
 }
 
@@ -2515,68 +2526,42 @@ __device__ __forceinline__ void store_canonical_epoch_row(
     output_rows[output] = row;
 }
 
-template <bool ResidentOutput>
-__global__ void resolve_canonical_epoch_local_kernel(
+template <std::uint32_t Items>
+using ActiveEpochBlockSort = cub::BlockRadixSort<
+    std::uint32_t, kFoundationCompactionThreads, Items, std::uint32_t>;
+
+using ActiveEpochBlockScan =
+    cub::BlockScan<std::uint32_t, kFoundationCompactionThreads>;
+
+union ActiveEpochResolutionStorage {
+  typename ActiveEpochBlockSort<1u>::TempStorage sort_1;
+  typename ActiveEpochBlockSort<2u>::TempStorage sort_2;
+  typename ActiveEpochBlockSort<3u>::TempStorage sort_3;
+  typename ActiveEpochBlockSort<4u>::TempStorage sort_4;
+  typename ActiveEpochBlockSort<5u>::TempStorage sort_5;
+  unsigned long long winners[kLocalEpochCapacity];
+};
+
+template <std::uint32_t Items, bool ResidentOutput>
+__device__ __forceinline__ void resolve_canonical_epoch_active_job(
+    std::uint32_t q, std::uint32_t raw_count,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches, const std::uint32_t *raw_section_offsets,
     Row *output_rows, ResidentRows resident_rows,
     std::uint64_t resident_begin, std::uint32_t *resolved_counts,
-    std::uint16_t *cell_ranks) {
-  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
-  constexpr std::uint32_t kItems = kLocalEpochItemsPerThread;
-  using BlockSort = cub::BlockRadixSort<
-      std::uint32_t, kThreads, kItems, std::uint32_t>;
-  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
-  union ResolutionStorage {
-    typename BlockSort::TempStorage sort;
-    unsigned long long winners[kLocalEpochCapacity];
-  };
-  __shared__ ResolutionStorage resolution_storage;
-  __shared__ typename BlockScan::TempStorage scan_storage;
-  __shared__ std::uint32_t batch_prefix[kBatchesPerEpoch + 1u];
-  __shared__ std::uint16_t sorted_suffixes[kLocalEpochCapacity];
-  __shared__ std::uint32_t cell_counts[kFoundationCells];
-  __shared__ std::uint32_t output_count_shared;
-  const std::uint32_t q = blockIdx.x;
-  if (q >= kQuotients) return;
-
-  if (threadIdx.x == 0u) {
-    std::uint32_t total = 0u;
-    batch_prefix[0] = 0u;
-    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
-      const std::size_t base =
-          std::size_t{batch} * (kQuotients + 1u) + q;
-      total += raw_offsets[base + 1u] - raw_offsets[base];
-      batch_prefix[batch + 1u] = total;
-    }
-    for (std::uint32_t batch = pending_batches;
-         batch < kBatchesPerEpoch; ++batch)
-      batch_prefix[batch + 1u] = total;
-    output_count_shared = 0u;
-  }
-  if (threadIdx.x < kFoundationCells)
-    cell_counts[threadIdx.x] = 0u;
-  __syncthreads();
-  const std::uint32_t raw_count = batch_prefix[pending_batches];
-  if (!raw_count) {
-    if (threadIdx.x == 0u) resolved_counts[q] = 0u;
-    if (threadIdx.x < kFoundationCells)
-      cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] = 0u;
-    return;
-  }
-  if (raw_count > kLocalEpochCapacity) {
-    if (threadIdx.x == 0u) resolved_counts[q] = kInvalid;
-    if (threadIdx.x < kFoundationCells)
-      cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] = 0u;
-    return;
-  }
-
-  std::uint32_t sort_keys[kItems];
-  std::uint32_t sort_sources[kItems];
+    std::uint16_t *cell_ranks,
+    ActiveEpochResolutionStorage &resolution_storage,
+    typename ActiveEpochBlockScan::TempStorage &scan_storage,
+    const std::uint32_t *batch_prefix, std::uint16_t *sorted_suffixes,
+    std::uint32_t *cell_counts, std::uint32_t &output_count_shared) {
+  static_assert(Items >= 1u && Items <= kLocalEpochItemsPerThread);
+  using BlockSort = ActiveEpochBlockSort<Items>;
   constexpr std::uint32_t kInvalidSortKey = 1u << 16u;
-  for (std::uint32_t item = 0u; item < kItems; ++item) {
-    const std::uint32_t local = threadIdx.x * kItems + item;
+  std::uint32_t sort_keys[Items];
+  std::uint32_t sort_sources[Items];
+  for (std::uint32_t item = 0u; item < Items; ++item) {
+    const std::uint32_t local = threadIdx.x * Items + item;
     sort_keys[item] = kInvalidSortKey;
     sort_sources[item] = 0u;
     if (local >= raw_count) continue;
@@ -2592,25 +2577,26 @@ __global__ void resolve_canonical_epoch_local_kernel(
     sort_keys[item] = key_suffix(raw_keys[source]);
     sort_sources[item] = source;
   }
-  BlockSort(resolution_storage.sort).Sort(
-      sort_keys, sort_sources, 0, 17);
-  for (std::uint32_t item = 0u; item < kItems; ++item) {
-    const std::uint32_t local = threadIdx.x * kItems + item;
+  auto &sort_storage = *reinterpret_cast<typename BlockSort::TempStorage *>(
+      &resolution_storage);
+  BlockSort(sort_storage).Sort(sort_keys, sort_sources, 0, 17);
+  for (std::uint32_t item = 0u; item < Items; ++item) {
+    const std::uint32_t local = threadIdx.x * Items + item;
     sorted_suffixes[local] = static_cast<std::uint16_t>(sort_keys[item]);
   }
   __syncthreads();
 
-  bool leaders[kItems];
+  bool leaders[Items];
   std::uint32_t leader_count = 0u;
-  for (std::uint32_t item = 0u; item < kItems; ++item) {
-    const std::uint32_t local = threadIdx.x * kItems + item;
+  for (std::uint32_t item = 0u; item < Items; ++item) {
+    const std::uint32_t local = threadIdx.x * Items + item;
     const bool valid = sort_keys[item] != kInvalidSortKey;
     leaders[item] = valid &&
         (!local || sorted_suffixes[local - 1u] != sorted_suffixes[local]);
     leader_count += leaders[item];
   }
   std::uint32_t output_prefix = 0u, output_count = 0u;
-  BlockScan(scan_storage).ExclusiveSum(
+  ActiveEpochBlockScan(scan_storage).ExclusiveSum(
       leader_count, output_prefix, output_count);
   if (threadIdx.x == 0u) {
     output_count_shared = output_count;
@@ -2622,7 +2608,7 @@ __global__ void resolve_canonical_epoch_local_kernel(
   __syncthreads();
 
   std::uint32_t leaders_seen = 0u;
-  for (std::uint32_t item = 0u; item < kItems; ++item) {
+  for (std::uint32_t item = 0u; item < Items; ++item) {
     if (sort_keys[item] == kInvalidSortKey) continue;
     const std::uint32_t group = leaders[item]
         ? output_prefix + leaders_seen
@@ -2656,7 +2642,7 @@ __global__ void resolve_canonical_epoch_local_kernel(
   const std::uint32_t cell_count = threadIdx.x < kFoundationCells
       ? cell_counts[threadIdx.x] : 0u;
   std::uint32_t cell_prefix = 0u, ignored = 0u;
-  BlockScan(scan_storage).ExclusiveSum(
+  ActiveEpochBlockScan(scan_storage).ExclusiveSum(
       cell_count, cell_prefix, ignored);
   if (threadIdx.x < kFoundationCells)
     cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
@@ -2664,8 +2650,86 @@ __global__ void resolve_canonical_epoch_local_kernel(
 }
 
 template <bool ResidentOutput>
+__global__ __launch_bounds__(kFoundationCompactionThreads, 5)
+void resolve_canonical_epoch_active_jobs_kernel(
+    const std::uint64_t *epoch_jobs,
+    const std::uint32_t *local_job_count, std::uint32_t *next_job,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, const std::uint32_t *raw_section_offsets,
+    Row *output_rows, ResidentRows resident_rows,
+    std::uint64_t resident_begin, std::uint32_t *resolved_counts,
+    std::uint16_t *cell_ranks) {
+  using BlockScan = ActiveEpochBlockScan;
+  using ResolutionStorage = ActiveEpochResolutionStorage;
+  __shared__ ResolutionStorage resolution_storage;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ std::uint32_t batch_prefix[kBatchesPerEpoch + 1u];
+  __shared__ std::uint16_t sorted_suffixes[kLocalEpochCapacity];
+  __shared__ std::uint32_t cell_counts[kFoundationCells];
+  __shared__ std::uint32_t output_count_shared;
+  __shared__ std::uint64_t job_shared;
+
+  std::uint32_t job_count = 0u;
+  if (threadIdx.x == 0u) job_count = *local_job_count;
+  for (;;) {
+    if (threadIdx.x == 0u) {
+      const std::uint32_t ticket = atomicAdd(next_job, 1u);
+      if (ticket < job_count) {
+        job_shared = epoch_jobs[ticket];
+      } else {
+        job_shared = pack_canonical_epoch_job(kInvalid, 0u);
+      }
+    }
+    __syncthreads();
+    const std::uint64_t job = job_shared;
+    const std::uint32_t q = static_cast<std::uint32_t>(job);
+    const std::uint32_t raw_count = static_cast<std::uint32_t>(job >> 32u);
+    if (q == kInvalid) return;
+
+    if (threadIdx.x == 0u) {
+      std::uint32_t total = 0u;
+      batch_prefix[0] = 0u;
+      for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+        const std::size_t base =
+            std::size_t{batch} * (kQuotients + 1u) + q;
+        total += raw_offsets[base + 1u] - raw_offsets[base];
+        batch_prefix[batch + 1u] = total;
+      }
+      for (std::uint32_t batch = pending_batches;
+           batch < kBatchesPerEpoch; ++batch)
+        batch_prefix[batch + 1u] = total;
+      output_count_shared = 0u;
+    }
+    if (threadIdx.x < kFoundationCells)
+      cell_counts[threadIdx.x] = 0u;
+    __syncthreads();
+
+#define GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(Items)                         \
+    resolve_canonical_epoch_active_job<Items, ResidentOutput>(            \
+        q, raw_count, raw_keys, raw_payloads, raw_offsets, batch_stride,  \
+        pending_batches, raw_section_offsets, output_rows, resident_rows, \
+        resident_begin, resolved_counts, cell_ranks, resolution_storage,  \
+        scan_storage, batch_prefix, sorted_suffixes, cell_counts,          \
+        output_count_shared)
+    if (raw_count <= kFoundationCompactionThreads)
+      GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(1u);
+    else if (raw_count <= kFoundationCompactionThreads * 2u)
+      GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(2u);
+    else if (raw_count <= kFoundationCompactionThreads * 3u)
+      GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(3u);
+    else if (raw_count <= kFoundationCompactionThreads * 4u)
+      GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(4u);
+    else
+      GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(5u);
+#undef GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB
+    __syncthreads();
+  }
+}
+
+template <bool ResidentOutput>
 __global__ void resolve_canonical_epoch_oversized_kernel(
-    const std::uint32_t *overflow_quotients,
+    const std::uint64_t *overflow_jobs,
     const std::uint32_t *overflow_count, std::uint32_t *next_overflow,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
@@ -2685,7 +2749,9 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
     if (threadIdx.x == 0u) {
       const std::uint32_t ticket = atomicAdd(next_overflow, 1u);
       q_shared = ticket < *overflow_count
-          ? overflow_quotients[ticket] : kInvalid;
+          ? static_cast<std::uint32_t>(
+                overflow_jobs[kQuotients - 1u - ticket])
+          : kInvalid;
     }
     __syncthreads();
     const std::uint32_t q = q_shared;
@@ -3128,11 +3194,13 @@ __device__ __forceinline__ std::uint32_t canonical_cell_prefix_warp(
   constexpr unsigned mask = 0xffffffffu;
   const std::uint32_t lane = threadIdx.x & 31u;
   std::uint32_t total = 0u;
-  if (lane == 0u)
-    total = cell < kFoundationCells
+  if (lane == 0u) {
+    const std::uint32_t count = epoch_counts[q];
+    total = !count ? 0u : cell < kFoundationCells
         ? epoch_cell_ranks[
               std::size_t{q} * kFoundationCells + cell]
-        : epoch_counts[q];
+        : count;
+  }
   const std::uint32_t source_end = plan->source_count > 1u
       ? min(kMaximumLevels, plan->source_level_limit + 1u) : 0u;
   for (std::uint32_t level = lane;
@@ -3163,14 +3231,17 @@ canonical_combined_cell_prefix_warp(
   const std::uint32_t lane = threadIdx.x & 31u;
   std::uint32_t total = 0u;
   if (lane == 0u) {
-    const std::uint32_t section_begin = epoch_offsets[q];
-    const std::uint16_t *ranks = epoch_cell_ranks +
-        std::size_t{q} * kFoundationCells;
-    const std::uint32_t begin = ranks[cell];
-    const std::uint32_t end = cell + 1u < kFoundationCells
-        ? ranks[cell + 1u] : epoch_counts[q];
-    total = begin + lower_bound_rows(
-        epoch_rows + section_begin + begin, end - begin, suffix);
+    const std::uint32_t count = epoch_counts[q];
+    if (count) {
+      const std::uint32_t section_begin = epoch_offsets[q];
+      const std::uint16_t *ranks = epoch_cell_ranks +
+          std::size_t{q} * kFoundationCells;
+      const std::uint32_t begin = ranks[cell];
+      const std::uint32_t end = cell + 1u < kFoundationCells
+          ? ranks[cell + 1u] : count;
+      total = begin + lower_bound_rows(
+          epoch_rows + section_begin + begin, end - begin, suffix);
+    }
   }
   const std::uint32_t source_end = plan->source_count > 1u
       ? min(kMaximumLevels, plan->source_level_limit + 1u) : 0u;
@@ -3790,6 +3861,7 @@ canonical_tournament_cell_slice(
     std::uint32_t section_count, const Row *epoch_rows,
     const std::uint16_t *epoch_cell_ranks, ResidentRows arena,
     const std::uint16_t *cell_ranks) {
+  if (!section_count) return {};
   const std::uint32_t cell_suffix_begin = cell * kFoundationCellKeys;
   const std::uint32_t cell_suffix_end =
       cell_suffix_begin + kFoundationCellKeys;
@@ -3827,6 +3899,7 @@ canonical_tournament_slice_begin(
     std::uint64_t source_base, std::uint32_t section_count,
     const Row *epoch_rows, const std::uint16_t *epoch_cell_ranks,
     ResidentRows arena, const std::uint16_t *cell_ranks) {
+  if (!section_count) return 0u;
   const std::uint64_t quotient_key = std::uint64_t{q} << 16u;
   const std::uint64_t cell_key_begin =
       quotient_key + std::uint64_t{cell} * kFoundationCellKeys;
@@ -6158,16 +6231,16 @@ private:
         canonical_next_job_.data(), 0, sizeof(std::uint32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(
         canonical_cell_counts_.data(), 0,
-        std::size_t{canonical_epoch_workspace_slots_} *
+        std::size_t{canonical_epoch_workspace_slots_ + 1u} *
             sizeof(std::uint32_t),
         stream));
-    gpulsmopt2_detail::count_canonical_epoch_sections_kernel<<<
+    gpulsmopt2_detail::count_canonical_epoch_jobs_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients + 1u),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
             raw_offsets_.data(), gpulsmopt2_detail::kBatchesPerEpoch,
             foundation_section_output_counts_.data(),
-            reinterpret_cast<std::uint32_t *>(
-                balanced_merge_raw_counts_.data()),
+            balanced_merge_raw_counts_.data(),
+            publication_selected_count_.data(),
             local_epoch_overflow_flag_.data());
     std::size_t scan_bytes = resident_scan_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
@@ -6180,11 +6253,15 @@ private:
         : canonical_cell_ranks_.data() +
               std::size_t{destination_level} *
                   gpulsmopt2_detail::kLocalRankEntries;
+
     if (materialize_resident) {
-      gpulsmopt2_detail::resolve_canonical_epoch_local_kernel<true><<<
-          gpulsmopt2_detail::kQuotients,
+      gpulsmopt2_detail::resolve_canonical_epoch_active_jobs_kernel<true><<<
+          canonical_epoch_resolver_blocks_,
           gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
-              raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+              balanced_merge_raw_counts_.data(),
+              publication_selected_count_.data(),
+              canonical_next_job_.data(), raw_keys_.data(),
+              raw_payloads_.data(), raw_offsets_.data(),
               static_cast<std::uint32_t>(batch_capacity_),
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
@@ -6194,11 +6271,11 @@ private:
       gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<true><<<
           canonical_epoch_resolver_blocks_,
           gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
-              reinterpret_cast<std::uint32_t *>(
-                  balanced_merge_raw_counts_.data()),
+              balanced_merge_raw_counts_.data(),
               local_epoch_overflow_flag_.data(),
-              canonical_next_job_.data(), raw_keys_.data(),
-              raw_payloads_.data(), raw_offsets_.data(),
+              canonical_cell_counts_.data() +
+                  canonical_epoch_workspace_slots_,
+              raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
               static_cast<std::uint32_t>(batch_capacity_),
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
@@ -6206,14 +6283,17 @@ private:
               level_zero_begin(), foundation_section_output_counts_.data(),
               epoch_ranks,
               reinterpret_cast<unsigned long long *>(
-                    canonical_epoch_workspace_.data()),
+                  canonical_epoch_workspace_.data()),
               canonical_cell_counts_.data(),
               canonical_epoch_workspace_slots_);
     } else {
-      gpulsmopt2_detail::resolve_canonical_epoch_local_kernel<false><<<
-          gpulsmopt2_detail::kQuotients,
+      gpulsmopt2_detail::resolve_canonical_epoch_active_jobs_kernel<false><<<
+          canonical_epoch_resolver_blocks_,
           gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
-              raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+              balanced_merge_raw_counts_.data(),
+              publication_selected_count_.data(),
+              canonical_next_job_.data(), raw_keys_.data(),
+              raw_payloads_.data(), raw_offsets_.data(),
               static_cast<std::uint32_t>(batch_capacity_),
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
@@ -6223,11 +6303,11 @@ private:
       gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<false><<<
           canonical_epoch_resolver_blocks_,
           gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
-              reinterpret_cast<std::uint32_t *>(
-                  balanced_merge_raw_counts_.data()),
+              balanced_merge_raw_counts_.data(),
               local_epoch_overflow_flag_.data(),
-              canonical_next_job_.data(), raw_keys_.data(),
-              raw_payloads_.data(), raw_offsets_.data(),
+              canonical_cell_counts_.data() +
+                  canonical_epoch_workspace_slots_,
+              raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
               static_cast<std::uint32_t>(batch_capacity_),
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
@@ -6235,7 +6315,7 @@ private:
               level_zero_begin(), foundation_section_output_counts_.data(),
               epoch_ranks,
               reinterpret_cast<unsigned long long *>(
-                    canonical_epoch_workspace_.data()),
+                  canonical_epoch_workspace_.data()),
               canonical_cell_counts_.data(),
               canonical_epoch_workspace_slots_);
     }
@@ -6243,7 +6323,6 @@ private:
         1, gpulsmopt2_detail::kThreads, 0, stream>>>(
             foundation_section_output_counts_.data(),
             publication_selected_count_.data());
-
   }
 
   void launch_canonical_publication_commands(
