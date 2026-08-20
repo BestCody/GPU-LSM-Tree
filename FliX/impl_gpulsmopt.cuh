@@ -175,6 +175,7 @@ public:
                    gpulsmopt2_detail::kCanonicalTournamentMinimumSources) +
                    "_sources_tournament_at_and_above"
              : "legacy_conditional_paths"},
+        {"tournament_workspace", "elastic_by_job_shape"},
         {"epoch_resolution", gpulsmopt2_detail::kCanonicalLocalEpoch
              ? "quotient_local_direct_with_oversized_fallback"
              : "global_sort_reduce"},

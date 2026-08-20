@@ -194,57 +194,79 @@ __host__ __device__ constexpr std::size_t canonical_align_bytes(
   return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-inline std::size_t canonical_tournament_layout_bytes(
+__host__ __device__ __forceinline__ std::size_t
+canonical_tournament_body_bytes(
     std::uint32_t capacity, std::uint32_t source_count,
-    bool cached_sources) {
+    std::uint32_t quotient_count) {
+  if (!source_count || !quotient_count ||
+      quotient_count > kCanonicalJobQuotients)
+    return ~std::size_t{0};
   const std::uint32_t leaves = canonical_next_power_of_two(source_count);
   std::size_t bytes = 0u;
-  const auto reserve = [&bytes](std::size_t count, std::size_t item_bytes,
-                                std::size_t alignment) {
-    bytes = canonical_align_bytes(bytes, alignment);
-    bytes += count * item_bytes;
-  };
   const std::size_t states =
       std::size_t{kCanonicalTournamentChains} * source_count;
-  if (cached_sources) {
-    // One packed (remaining, position) cursor replaces the two 16-bit
-    // arrays.  Cell-local positions live in unused head bits, so the compact
-    // reference path no longer needs a per-chain slice-base array.
-    reserve(states, sizeof(std::uint32_t), alignof(std::uint32_t));
-  } else {
-    reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
-    reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
-    if (kCanonicalCompactMultiway)
-      reserve(states, sizeof(std::uint16_t), alignof(std::uint16_t));
-  }
-  reserve(states, sizeof(std::uint32_t), alignof(std::uint32_t));
-  if (cached_sources) {
-    const std::size_t source_quotients =
-        std::size_t{kCanonicalJobQuotients} * source_count;
-    reserve(source_quotients, sizeof(std::uint64_t),
-            alignof(std::uint64_t));
-    reserve(source_quotients, sizeof(std::uint32_t),
-            alignof(std::uint32_t));
-  }
-  reserve(std::size_t{kCanonicalTournamentChains} * leaves,
-          sizeof(std::uint8_t), alignof(std::uint8_t));
-  reserve(capacity, sizeof(CanonicalTournamentReference),
-          alignof(CanonicalTournamentReference));
-  reserve(kCanonicalTournamentTasks, sizeof(std::uint16_t),
-          alignof(std::uint16_t));
-  reserve(kCanonicalTournamentTasks + 1u, sizeof(std::uint16_t),
-          alignof(std::uint16_t));
-  return canonical_align_bytes(bytes, 16u);
+  bytes = canonical_align_bytes(bytes, alignof(std::uint32_t));
+  bytes += states * sizeof(std::uint32_t);  // packed cursors
+  bytes = canonical_align_bytes(bytes, alignof(std::uint32_t));
+  bytes += states * sizeof(std::uint32_t);  // source heads
+  const std::size_t source_quotients =
+      std::size_t{quotient_count} * source_count;
+  bytes = canonical_align_bytes(bytes, alignof(std::uint64_t));
+  bytes += source_quotients * sizeof(std::uint64_t);
+  bytes = canonical_align_bytes(bytes, alignof(std::uint32_t));
+  bytes += source_quotients * sizeof(std::uint32_t);
+  bytes += std::size_t{kCanonicalTournamentChains} * leaves;
+  bytes = canonical_align_bytes(
+      bytes, alignof(CanonicalTournamentReference));
+  bytes += std::size_t{capacity} * sizeof(CanonicalTournamentReference);
+  const std::size_t tasks =
+      std::size_t{quotient_count} * kFoundationCells;
+  bytes = canonical_align_bytes(bytes, alignof(std::uint16_t));
+  bytes += tasks * sizeof(std::uint16_t);
+  bytes = canonical_align_bytes(bytes, alignof(std::uint16_t));
+  bytes += (tasks + 1u) * sizeof(std::uint16_t);
+  return bytes;
 }
 
-inline std::size_t canonical_tournament_dynamic_shared_bytes(
+__host__ __device__ __forceinline__ std::size_t
+canonical_tournament_layout_bytes(
+    std::uint32_t capacity, std::uint32_t source_count,
+    std::uint32_t quotient_count) {
+  const std::size_t bytes = canonical_tournament_body_bytes(
+      capacity, source_count, quotient_count);
+  return bytes == ~std::size_t{0}
+      ? bytes : canonical_align_bytes(bytes, 16u);
+}
+
+__host__ __device__ __forceinline__ std::uint32_t
+canonical_tournament_capacity(
+    std::size_t shared_bytes, std::uint32_t source_count,
+    std::uint32_t quotient_count) {
+  // All production tournament allocations are 16-byte aligned.  With the
+  // tape placed before two-byte task arrays, its capacity is linear in the
+  // remaining bytes; no search or workload-derived threshold is needed.
+  const std::size_t usable_bytes = shared_bytes & ~std::size_t{15u};
+  const std::size_t fixed_bytes =
+      canonical_tournament_body_bytes(
+          0u, source_count, quotient_count);
+  if (fixed_bytes == ~std::size_t{0} || fixed_bytes > usable_bytes)
+    return 0u;
+  const std::size_t capacity =
+      (usable_bytes - fixed_bytes) /
+      sizeof(CanonicalTournamentReference);
+  return capacity > kCanonicalTournamentCapacityCeiling
+      ? kCanonicalTournamentCapacityCeiling
+      : static_cast<std::uint32_t>(capacity);
+}
+
+inline std::size_t canonical_tournament_workspace_bytes(
     std::uint32_t capacity, std::uint32_t source_count) {
-  // Keep the old layout as a sizing floor.  The cache overlay therefore does
-  // not silently enlarge jobs just because it repurposes shared memory.  A
-  // larger occupancy-selected grid can still result from lower register use.
-  return std::max(
-      canonical_tournament_layout_bytes(capacity, source_count, false),
-      canonical_tournament_layout_bytes(capacity, source_count, true));
+  // CUDA assigns one shared-memory budget to every block in a launch.  Size
+  // that budget for the widest supported job; each block then lays out its
+  // temporary arrays from the actual job span and gives the remainder to the
+  // survivor tape.
+  return canonical_tournament_layout_bytes(
+      capacity, source_count, kCanonicalJobQuotients);
 }
 #if defined(GPULSMOPT_FORCE_UNIFIED_MERGE)
 constexpr bool kForceUnifiedMergeExperiment = true;
@@ -638,13 +660,23 @@ struct ResidentPublicationPlan {
   std::uint32_t rank_block_count{};
   std::uint32_t status{};
   std::uint32_t job_capacity{};
+  std::uint32_t tournament_workspace_bytes{};
   std::uint64_t output_begin{};
   std::uint64_t output_capacity{};
   std::uint64_t raw_reservation{};
   std::uint64_t survivor_count{};
 };
 
-static_assert(sizeof(ResidentPublicationPlan) == 88u);
+static_assert(sizeof(ResidentPublicationPlan) == 96u);
+
+__device__ __forceinline__ std::uint32_t canonical_job_capacity(
+    const ResidentPublicationPlan *plan, std::uint32_t quotient_count) {
+  if (plan->tournament_workspace_bytes)
+    return canonical_tournament_capacity(
+        plan->tournament_workspace_bytes, plan->source_count,
+        quotient_count);
+  return plan->job_capacity;
+}
 
 struct DeviceManifestSnapshot {
   std::uint64_t occupied_level_mask{};
@@ -4442,7 +4474,8 @@ __global__ void choose_canonical_publication_path_kernel(
     const std::uint32_t *selected_count,
     const DeviceManifest *manifests, const std::uint32_t *active_manifest,
     const LevelStorageSpan *level_spans, std::uint32_t level_count,
-    std::uint32_t job_capacity, bool top_level_rollover,
+    std::uint32_t job_capacity, std::uint32_t tournament_workspace_bytes,
+    bool top_level_rollover,
     ResidentPublicationPlan *plan) {
   if (blockIdx.x || threadIdx.x) return;
   const std::uint32_t active = atomicAdd(
@@ -4482,6 +4515,7 @@ __global__ void choose_canonical_publication_path_kernel(
       ? (manifest->levels[destination].storage_generation ^ 1u) & 1u
       : 0u;
   next.job_capacity = job_capacity;
+  next.tournament_workspace_bytes = tournament_workspace_bytes;
   const bool valid_destination = destination < level_count &&
       destination < kMaximumLevels;
   next.status = valid_destination
@@ -4527,15 +4561,18 @@ __global__ void count_canonical_merge_work_kernel(
 }
 
 __device__ __forceinline__ std::uint32_t canonical_tile_job_count(
-    const std::uint64_t *counts, std::uint32_t capacity,
-    std::uint32_t safe_capacity) {
+    const std::uint64_t *counts, const std::uint32_t *capacities,
+    std::uint32_t source_count) {
+  const std::uint32_t single_capacity = capacities[1u];
+  const std::uint32_t safe_capacity = single_capacity > source_count
+      ? single_capacity - (source_count - 1u) : 1u;
   std::uint32_t jobs = 0u;
   std::uint64_t run_rows = 0u;
   std::uint32_t run_begin = 0u;
   for (std::uint32_t local_q = 0u;
        local_q < kPlanningTileQuotients; ++local_q) {
     const std::uint64_t count = counts[local_q];
-    if (count > capacity) {
+    if (count > single_capacity) {
       if (run_rows) {
         ++jobs;
         run_rows = 0u;
@@ -4546,9 +4583,10 @@ __device__ __forceinline__ std::uint32_t canonical_tile_job_count(
     }
     if (!count) continue;
     if (!run_rows) run_begin = local_q;
+    const std::uint32_t proposed_span = local_q - run_begin + 1u;
     if (run_rows &&
-        (run_rows + count > capacity ||
-         local_q - run_begin >= kCanonicalJobQuotients)) {
+        (proposed_span > kCanonicalJobQuotients ||
+         run_rows + count > capacities[proposed_span])) {
       ++jobs;
       run_rows = 0u;
       run_begin = local_q;
@@ -4562,18 +4600,21 @@ __global__ void count_canonical_planning_jobs_kernel(
     const std::uint64_t *counts, const ResidentPublicationPlan *plan,
     std::uint32_t *tile_job_counts) {
   __shared__ std::uint64_t tile_counts[kPlanningTileQuotients];
+  __shared__ std::uint32_t capacities[kCanonicalJobQuotients + 1u];
   const std::uint32_t tile = blockIdx.x;
   if (tile >= kPlanningTiles) return;
   const std::uint32_t first = tile * kPlanningTileQuotients;
   tile_counts[threadIdx.x] = counts[first + threadIdx.x];
   tile_counts[threadIdx.x + blockDim.x] =
       counts[first + threadIdx.x + blockDim.x];
+  if (threadIdx.x <= kCanonicalJobQuotients)
+    capacities[threadIdx.x] = threadIdx.x
+        ? canonical_job_capacity(plan, threadIdx.x) : 0u;
   __syncthreads();
   if (threadIdx.x == 0u) {
-    const std::uint32_t safe = plan->job_capacity > plan->source_count
-        ? plan->job_capacity - (plan->source_count - 1u) : 1u;
     tile_job_counts[tile] = plan->status ? 0u :
-        canonical_tile_job_count(tile_counts, plan->job_capacity, safe);
+        canonical_tile_job_count(tile_counts, capacities,
+                                 plan->source_count);
     if (tile + 1u == kPlanningTiles)
       tile_job_counts[kPlanningTiles] = 0u;
   }
@@ -4584,12 +4625,16 @@ __global__ void emit_canonical_planning_jobs_kernel(
     ResidentPublicationPlan *plan, std::uint32_t maximum_jobs,
     BalancedMergeJob *jobs, std::uint64_t *reservations) {
   __shared__ std::uint64_t tile_counts[kPlanningTileQuotients];
+  __shared__ std::uint32_t capacities[kCanonicalJobQuotients + 1u];
   const std::uint32_t tile = blockIdx.x;
   if (tile >= kPlanningTiles) return;
   const std::uint32_t first = tile * kPlanningTileQuotients;
   tile_counts[threadIdx.x] = counts[first + threadIdx.x];
   tile_counts[threadIdx.x + blockDim.x] =
       counts[first + threadIdx.x + blockDim.x];
+  if (threadIdx.x <= kCanonicalJobQuotients)
+    capacities[threadIdx.x] = threadIdx.x
+        ? canonical_job_capacity(plan, threadIdx.x) : 0u;
   __syncthreads();
   if (threadIdx.x != 0u || plan->status) return;
   const std::uint32_t total_jobs = tile_job_offsets[kPlanningTiles];
@@ -4599,8 +4644,9 @@ __global__ void emit_canonical_planning_jobs_kernel(
       atomicOr(&plan->status, kPublicationJobOverflow);
   }
   if (total_jobs > maximum_jobs) return;
-  const std::uint32_t safe = plan->job_capacity > plan->source_count
-      ? plan->job_capacity - (plan->source_count - 1u) : 1u;
+  const std::uint32_t single_capacity = capacities[1u];
+  const std::uint32_t safe = single_capacity > plan->source_count
+      ? single_capacity - (plan->source_count - 1u) : 1u;
   std::uint32_t global = tile_job_offsets[tile];
   std::uint64_t run_rows = 0u;
   std::uint32_t run_begin = first;
@@ -4622,7 +4668,7 @@ __global__ void emit_canonical_planning_jobs_kernel(
     const std::uint32_t q = first + local_q;
     const std::uint64_t count = tile_counts[local_q];
     counts[q] = 0u;
-    if (count > plan->job_capacity) {
+    if (count > single_capacity) {
       flush();
       const std::uint32_t pieces = static_cast<std::uint32_t>(
           (count + safe - 1u) / safe);
@@ -4642,9 +4688,10 @@ __global__ void emit_canonical_planning_jobs_kernel(
       run_begin = q;
       run_end = q + 1u;
     }
+    const std::uint32_t proposed_span = q - run_begin + 1u;
     if (run_rows &&
-        (run_rows + count > plan->job_capacity ||
-         q - run_begin >= kCanonicalJobQuotients)) {
+        (proposed_span > kCanonicalJobQuotients ||
+         run_rows + count > capacities[proposed_span])) {
       flush();
       run_begin = q;
     }
@@ -4860,7 +4907,7 @@ __global__ void resolve_canonical_job_boundaries_kernel(
         jobs[index] = job;
         if (previous_suffix >= high.suffix ||
             high.prefix < previous_prefix ||
-            exact > plan->job_capacity)
+            exact > canonical_job_capacity(plan, 1u))
           atomicOr(&plan->status, kPublicationJobTooLarge);
       }
       previous_suffix = high.suffix;
@@ -5527,6 +5574,7 @@ void canonical_tournament_carry_jobs_kernel(
   __shared__ std::uint32_t leaves_shared;
   __shared__ std::uint32_t job_index_shared;
   __shared__ std::uint32_t task_count_shared;
+  __shared__ std::uint32_t job_capacity_shared;
   __shared__ std::uint32_t next_task_shared;
   __shared__ std::uint32_t tape_cursor_shared;
   __shared__ std::uint32_t job_valid_shared;
@@ -5559,15 +5607,20 @@ void canonical_tournament_carry_jobs_kernel(
     const std::uint32_t job_index = job_index_shared;
     if (job_index >= plan->job_count) return;
     const BalancedMergeJob job = jobs[job_index];
+    const std::uint32_t quotient_count =
+        job.quotient_end - job.quotient_begin;
 
     if (threadIdx.x == 0u) {
-      task_count_shared =
-          (job.quotient_end - job.quotient_begin) * kFoundationCells;
+      task_count_shared = quotient_count * kFoundationCells;
+      job_capacity_shared = canonical_job_capacity(plan, quotient_count);
       next_task_shared = 0u;
       tape_cursor_shared = 0u;
       job_valid_shared = source_count_shared == plan->source_count &&
-          source_count_shared <= kMaximumMergeSources && task_count_shared &&
-          task_count_shared <= kCanonicalTournamentTasks;
+          source_count_shared <= kMaximumMergeSources && quotient_count &&
+          quotient_count <= kCanonicalJobQuotients && task_count_shared &&
+          task_count_shared <= kCanonicalTournamentTasks &&
+          job_capacity_shared &&
+          reservations[job_index] <= job_capacity_shared;
     }
     __syncthreads();
 
@@ -5585,7 +5638,7 @@ void canonical_tournament_carry_jobs_kernel(
         reinterpret_cast<std::uint32_t *>(workspace + offset);
     offset += states * sizeof(std::uint32_t);
     const std::size_t source_quotients =
-        std::size_t{kCanonicalJobQuotients} * source_count;
+        std::size_t{quotient_count} * source_count;
     offset = canonical_align_bytes(offset, alignof(std::uint64_t));
     std::uint64_t *source_bases =
         reinterpret_cast<std::uint64_t *>(workspace + offset);
@@ -5600,15 +5653,23 @@ void canonical_tournament_carry_jobs_kernel(
         offset, alignof(CanonicalTournamentReference));
     CanonicalTournamentReference *survivor_tape =
         reinterpret_cast<CanonicalTournamentReference *>(workspace + offset);
-    offset += std::size_t{plan->job_capacity} *
+    offset += std::size_t{job_capacity_shared} *
         sizeof(CanonicalTournamentReference);
     offset = canonical_align_bytes(offset, alignof(std::uint16_t));
     std::uint16_t *task_tape_bases =
         reinterpret_cast<std::uint16_t *>(workspace + offset);
-    offset += std::size_t{kCanonicalTournamentTasks} *
+    offset += std::size_t{task_count_shared} *
         sizeof(std::uint16_t);
+    offset = canonical_align_bytes(offset, alignof(std::uint16_t));
     std::uint16_t *task_output_offsets =
         reinterpret_cast<std::uint16_t *>(workspace + offset);
+    offset += std::size_t{task_count_shared + 1u} *
+        sizeof(std::uint16_t);
+    const std::size_t workspace_bytes = canonical_align_bytes(offset, 16u);
+    if (threadIdx.x == 0u)
+      job_valid_shared &= workspace_bytes <=
+          plan->tournament_workspace_bytes;
+    __syncthreads();
 
     if (!job_valid_shared) {
       if (threadIdx.x == 0u) {
@@ -5619,8 +5680,6 @@ void canonical_tournament_carry_jobs_kernel(
       continue;
     }
 
-    const std::uint32_t quotient_count =
-        job.quotient_end - job.quotient_begin;
     const std::uint32_t active_source_quotients =
         quotient_count * source_count;
     for (std::uint32_t entry = threadIdx.x;
@@ -5689,7 +5748,7 @@ void canonical_tournament_carry_jobs_kernel(
         const std::uint32_t tape_begin =
             atomicAdd(&tape_cursor_shared, raw_count);
         task_tape_bases[task] = static_cast<std::uint16_t>(tape_begin);
-        if (tape_begin + raw_count > plan->job_capacity) {
+        if (tape_begin + raw_count > job_capacity_shared) {
           atomicExch(&job_valid_shared, 0u);
           task_output_offsets[task] = 0u;
           continue;
@@ -10699,7 +10758,7 @@ private:
            source_count <= maximum_sources; ++source_count) {
         const auto active_blocks = [&](std::uint32_t capacity) {
           const std::size_t shared_bytes =
-              gpulsmopt2_detail::canonical_tournament_dynamic_shared_bytes(
+              gpulsmopt2_detail::canonical_tournament_workspace_bytes(
                   capacity, source_count);
           if (shared_bytes > maximum_dynamic_shared_bytes) return 0;
           int blocks = 0;
@@ -10712,8 +10771,8 @@ private:
         };
         const int baseline_blocks = active_blocks(resident_merge_capacity_);
         if (!baseline_blocks) break;
-        // Grow jobs only while preserving the occupancy supported by the
-        // original capacity on this device.
+        // Grow the widest job shape only while preserving the occupancy
+        // supported by the general merge capacity on this device.
         const int desired_blocks = baseline_blocks;
         std::uint32_t low = resident_merge_capacity_;
         std::uint32_t high = gpulsmopt2_detail::kCanonicalCompactMultiway
@@ -10728,10 +10787,16 @@ private:
           else
             high = middle - 1u;
         }
-        const std::uint32_t capacity = low;
+        const std::uint32_t widest_job_capacity = low;
         const std::size_t shared_bytes =
-            gpulsmopt2_detail::canonical_tournament_dynamic_shared_bytes(
-                capacity, source_count);
+            gpulsmopt2_detail::canonical_tournament_workspace_bytes(
+                widest_job_capacity, source_count);
+        const std::uint32_t capacity =
+            gpulsmopt2_detail::canonical_tournament_capacity(
+                shared_bytes, source_count, 1u);
+        if (!capacity)
+          throw std::logic_error(
+              "GPULSMOpt tournament workspace has no job capacity");
         canonical_job_capacities_[source_count] = capacity;
         canonical_tournament_shared_bytes_[source_count] = shared_bytes;
         tournament_attribute_bytes =
@@ -10755,7 +10820,11 @@ private:
           gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
           gpulsmopt2_detail::kFoundationCompactionThreads,
           shared_bytes));
-      if (!blocks_per_sm) continue;
+      if (!blocks_per_sm) {
+        canonical_job_capacities_[source_count] = resident_merge_capacity_;
+        canonical_tournament_shared_bytes_[source_count] = 0u;
+        continue;
+      }
       canonical_tournament_blocks_[source_count] =
           static_cast<std::uint32_t>(
               blocks_per_sm * properties.multiProcessorCount);
@@ -12199,11 +12268,17 @@ private:
                 canonical_job_capacities_[source_count]
             ? canonical_job_capacities_[source_count]
             : resident_merge_capacity_;
+    const std::uint32_t tournament_workspace_bytes =
+        source_count < canonical_tournament_shared_bytes_.size()
+            ? static_cast<std::uint32_t>(
+                  canonical_tournament_shared_bytes_[source_count])
+            : 0u;
     gpulsmopt2_detail::choose_canonical_publication_path_kernel<<<
         1, 1, 0, stream>>>(
             publication_selected_count_.data(), device_manifests_.data(),
             active_device_manifest_.data(), level_storage_spans_.data(),
-            canonical_level_count_, job_capacity, top_level_rollover,
+            canonical_level_count_, job_capacity,
+            tournament_workspace_bytes, top_level_rollover,
             resident_plan_.data());
 
     if (direct_epoch) {

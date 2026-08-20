@@ -518,6 +518,8 @@ void write_metadata(const options &configuration)
            << gpulsmopt2_detail::kCanonicalCompactMultiway << '\n';
     output << "gpulsmopt_canonical_tournament_capacity_ceiling="
            << gpulsmopt2_detail::kCanonicalTournamentCapacityCeiling << '\n';
+    output << "gpulsmopt_canonical_tournament_workspace="
+           << "elastic_by_job_shape\n";
     output << "gpulsmopt_canonical_publication_graph="
            << gpulsmopt2_detail::kCanonicalPublicationGraph << '\n';
 #if defined(GPULSMOPT_FORCE_UNIFIED_MERGE)
