@@ -94,8 +94,8 @@ constexpr std::uint32_t kMaximumMergeSources = kMaximumLevels + 1u;
 constexpr std::uint32_t kBalancedMergeCapacityCeiling =
     kFoundationCompactionThreads * 32u;
 constexpr std::uint32_t kCanonicalTournamentMinimumSources =
-    3u;
-static_assert(kCanonicalTournamentMinimumSources >= 3u &&
+    2u;
+static_assert(kCanonicalTournamentMinimumSources >= 2u &&
               kCanonicalTournamentMinimumSources <= kMaximumMergeSources);
 constexpr std::uint32_t kCanonicalJobQuotients = 16u;
 constexpr std::uint32_t kCanonicalCandidateBits = 12u;
@@ -263,31 +263,65 @@ inline std::size_t maximum_resident_merge_jobs(
       (maximum_raw_rows + safe - 1u) / safe + 1u;
 }
 
+struct CanonicalLevelLayout {
+  std::size_t initial_pool_capacity{};
+  std::size_t highest_regular_capacity{};
+  std::uint32_t regular_level_count{};
+  std::uint32_t level_count{};
+};
+
+// A radix-4 tier owns up to three immutable, equal-capacity slots.  The
+// fourth run is carried into the next tier.  A partially configured final
+// tier may have fewer slots; when none of those slots can hold the complete
+// dictionary, append one lazily mapped full-capacity consolidation slot.
+// That final slot preserves indefinite update/rollover support without
+// charging normal construction for an otherwise unused full-size bank.
+inline CanonicalLevelLayout canonical_level_layout(
+    std::size_t maximum_raw_rows, std::size_t epoch_capacity) {
+  CanonicalLevelLayout layout{};
+  std::size_t remaining = maximum_raw_rows;
+  std::size_t capacity = std::min(maximum_raw_rows, epoch_capacity);
+  while (remaining) {
+    const std::size_t slots = std::min<std::size_t>(
+        3u, (remaining + capacity - 1u) / capacity);
+    if (slots > (std::numeric_limits<std::size_t>::max() -
+                 layout.initial_pool_capacity) / capacity)
+      throw std::bad_alloc();
+    layout.initial_pool_capacity += slots * capacity;
+    if (layout.regular_level_count > kMaximumLevels - slots)
+      throw std::invalid_argument("GPULSMOpt radix-4 slot count overflow");
+    layout.regular_level_count += static_cast<std::uint32_t>(slots);
+    layout.highest_regular_capacity = capacity;
+    const std::size_t covered = std::min(remaining, slots * capacity);
+    remaining -= covered;
+    if (!remaining) break;
+    capacity = capacity > maximum_raw_rows / 4u
+        ? maximum_raw_rows : capacity * 4u;
+  }
+  layout.level_count = layout.regular_level_count;
+  if (layout.highest_regular_capacity < maximum_raw_rows) {
+    if (layout.level_count == kMaximumLevels)
+      throw std::invalid_argument("GPULSMOpt radix-4 slot count overflow");
+    ++layout.level_count;
+  }
+  return layout;
+}
+
 inline std::size_t preassigned_level_pool_capacity(
     std::size_t maximum_raw_rows, std::size_t epoch_capacity) {
-  std::size_t result = 0u;
-  std::size_t capacity = std::min(maximum_raw_rows, epoch_capacity);
-  for (std::uint32_t level = 0u; level < kMaximumLevels; ++level) {
-    if (result > std::numeric_limits<std::size_t>::max() - capacity)
-      throw std::bad_alloc();
-    result += capacity;
-    if (capacity == maximum_raw_rows) break;
-    capacity = capacity > maximum_raw_rows / 2u
-        ? maximum_raw_rows : capacity * 2u;
-  }
-  return result;
+  return canonical_level_layout(
+      maximum_raw_rows, epoch_capacity).initial_pool_capacity;
+}
+
+inline std::uint32_t canonical_regular_level_count(
+    std::size_t maximum_raw_rows, std::size_t epoch_capacity) {
+  return canonical_level_layout(
+      maximum_raw_rows, epoch_capacity).regular_level_count;
 }
 
 inline std::uint32_t canonical_level_count(
     std::size_t maximum_raw_rows, std::size_t epoch_capacity) {
-  std::uint32_t levels = 1u;
-  std::size_t capacity = std::min(maximum_raw_rows, epoch_capacity);
-  while (capacity < maximum_raw_rows && levels < kMaximumLevels) {
-    capacity = capacity > maximum_raw_rows / 2u
-        ? maximum_raw_rows : capacity * 2u;
-    ++levels;
-  }
-  return levels;
+  return canonical_level_layout(maximum_raw_rows, epoch_capacity).level_count;
 }
 
 
@@ -2920,15 +2954,17 @@ __global__ void initialize_device_manifest_kernel(
   *query_occupied_level_mask = manifest.occupied_level_mask;
 }
 
-// Canonical quotient-run carry.  Every occupied level is one immutable,
-// quotient-major run.  The persistent directory is a quotient prefix plus
-// 128 exact cell starts per quotient; routes and guides are not consulted by
-// the canonical point path.
+// Canonical radix-4 quotient-run carry.  Three immutable quotient-major runs
+// may coexist in each regular tier.  Slots fill from high id to low id so the
+// existing low-to-high query traversal still observes newest data first.
+// The fourth run carries into the next tier.  The persistent directory is a
+// quotient prefix plus 128 exact cell starts per physical run.
 
 __global__ void choose_canonical_publication_path_kernel(
     const std::uint32_t *selected_count,
     const DeviceManifest *manifests, const std::uint32_t *active_manifest,
-    const LevelStorageSpan *level_spans, std::uint32_t level_count,
+    const LevelStorageSpan *level_spans, std::uint32_t regular_level_count,
+    std::uint32_t level_count,
     std::uint32_t job_capacity, std::uint32_t tournament_workspace_bytes,
     bool top_level_rollover,
     ResidentPublicationPlan *plan) {
@@ -2937,10 +2973,31 @@ __global__ void choose_canonical_publication_path_kernel(
       const_cast<std::uint32_t *>(active_manifest), 0u) & 1u;
   const DeviceManifest *manifest = manifests + active;
   const std::uint64_t occupied = manifest->occupied_level_mask;
-  const std::uint64_t empty = ~occupied;
-  const std::uint32_t natural_destination = empty
-      ? static_cast<std::uint32_t>(__ffsll(empty) - 1)
-      : kMaximumLevels;
+  std::uint32_t natural_destination = kMaximumLevels;
+  std::uint32_t destination_tier_begin = 0u;
+  for (std::uint32_t tier_begin = 0u;
+       tier_begin < regular_level_count; tier_begin += 3u) {
+    const std::uint32_t slots = min(3u, regular_level_count - tier_begin);
+    const std::uint64_t tier_mask =
+        ((std::uint64_t{1} << slots) - 1u) << tier_begin;
+    const std::uint32_t filled = static_cast<std::uint32_t>(
+        __popcll(occupied & tier_mask));
+    if (filled < slots) {
+      // The next lower id is newer than every occupied sibling.
+      natural_destination = tier_begin + slots - 1u - filled;
+      destination_tier_begin = tier_begin;
+      break;
+    }
+  }
+  // A partial final tier cannot necessarily hold every live row in one run.
+  // Its optional full-capacity terminal slot is used only after all regular
+  // slots fill, and is mapped lazily by the host before this graph launches.
+  if (natural_destination == kMaximumLevels &&
+      regular_level_count < level_count &&
+      !(occupied & (std::uint64_t{1} << regular_level_count))) {
+    natural_destination = regular_level_count;
+    destination_tier_begin = regular_level_count;
+  }
   const bool valid_rollover = top_level_rollover && level_count &&
       level_count <= kMaximumLevels && natural_destination >= level_count;
   const std::uint32_t destination = valid_rollover
@@ -2951,16 +3008,16 @@ __global__ void choose_canonical_publication_path_kernel(
   next.inactive_manifest = active ^ 1u;
   next.destination_level = destination;
   next.source_level_limit = valid_rollover
-      ? destination : destination ? destination - 1u : 0u;
-  const std::uint64_t consumed = valid_rollover
+      ? destination
+      : destination_tier_begin ? destination_tier_begin - 1u : 0u;
+  const std::uint64_t source_mask = valid_rollover
       ? destination == kMaximumLevels - 1u
           ? ~std::uint64_t{0}
           : (std::uint64_t{1} << (destination + 1u)) - 1u
-      : destination == kMaximumLevels
-          ? ~std::uint64_t{0}
-          : destination ? (std::uint64_t{1} << destination) - 1u : 0u;
+      : destination_tier_begin
+          ? (std::uint64_t{1} << destination_tier_begin) - 1u : 0u;
   next.source_count = 1u + static_cast<std::uint32_t>(
-      __popcll(occupied & consumed));
+      __popcll(occupied & source_mask));
   const bool destination_is_foundation = valid_rollover ||
       (destination < kMaximumLevels &&
       (manifest->foundation_level == kMaximumLevels ||
@@ -3481,8 +3538,7 @@ __device__ __forceinline__ unsigned long long canonical_job_prefix(
   return prefix;
 }
 
-template <std::uint32_t StaticSources>
-__global__ void canonical_carry_jobs_kernel(
+__global__ void canonical_fallback_carry_jobs_kernel(
     BalancedMergeJob *jobs, ResidentPublicationPlan *plan,
     const Row *epoch_rows, const std::uint32_t *epoch_offsets,
     const std::uint32_t *epoch_counts,
@@ -3494,8 +3550,7 @@ __global__ void canonical_carry_jobs_kernel(
     CanonicalJobPrefix *prefixes, std::uint32_t *next_job,
     std::uint32_t *cell_counts) {
   constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
-  constexpr std::uint32_t kSourceSlots =
-      StaticSources ? StaticSources : kMaximumMergeSources;
+  constexpr std::uint32_t kSourceSlots = kMaximumMergeSources;
   constexpr std::uint32_t kMaximumItemsPerThread =
       (kCanonicalCandidateLimit + kThreads - 1u) / kThreads;
   using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
@@ -3542,8 +3597,7 @@ __global__ void canonical_carry_jobs_kernel(
       tombstone_words[word] = 0u;
 
     if (threadIdx.x == 0u) {
-      const std::uint32_t expected_sources = StaticSources
-          ? StaticSources : plan->source_count;
+      const std::uint32_t expected_sources = plan->source_count;
       std::uint32_t source_count = 0u;
       source_levels[source_count++] = kMaximumLevels;
       std::uint64_t levels = manifest.occupied_level_mask &
@@ -3690,10 +3744,8 @@ __global__ void canonical_carry_jobs_kernel(
         if (row.flags & kTombstone)
           atomicOr(tombstone_words + (candidate >> 5u),
                    1u << (candidate & 31u));
-        if constexpr (StaticSources != 2u) {
-          if (physical + 1u == physical_run_count_shared)
-            plane_b[destination + position] = record;
-        }
+        if (physical + 1u == physical_run_count_shared)
+          plane_b[destination + position] = record;
       }
     }
     __syncthreads();
@@ -4602,15 +4654,15 @@ __global__ void canonical_lookup_with_pending_kernel(
 inline std::uint32_t select_canonical_merge_capacity() {
   int maximum_blocks = 0;
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &maximum_blocks, canonical_carry_jobs_kernel<0u>,
+      &maximum_blocks, canonical_fallback_carry_jobs_kernel,
       kFoundationCompactionThreads, 0u));
   // Three larger jobs per SM outperform a greater number of smaller jobs:
   // they reduce planning and boundary work while retaining enough warps to
-  // hide the pairwise merge's latency.
+  // hide the fallback merge's latency.
   const int desired_blocks = std::max(1, std::min(3, maximum_blocks));
   std::size_t shared_budget = 0u;
   CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(
-      &shared_budget, canonical_carry_jobs_kernel<0u>, desired_blocks,
+      &shared_budget, canonical_fallback_carry_jobs_kernel, desired_blocks,
       kFoundationCompactionThreads));
 
   // Retain the established job-capacity calculation, deriving its shared
@@ -5022,6 +5074,9 @@ public:
         level_pool_capacity_(
             gpulsmopt2_detail::preassigned_level_pool_capacity(
                 publication_capacity_, level_zero_capacity_)),
+        canonical_regular_level_count_(
+            gpulsmopt2_detail::canonical_regular_level_count(
+                publication_capacity_, level_zero_capacity_)),
         canonical_level_count_(gpulsmopt2_detail::canonical_level_count(
             publication_capacity_, level_zero_capacity_)),
         resident_merge_capacity_(
@@ -5132,8 +5187,6 @@ public:
       cudaEventSynchronize(operation_done_);
       cudaEventDestroy(operation_done_);
     }
-    if (canonical_direct_publication_graph_exec_)
-      cudaGraphExecDestroy(canonical_direct_publication_graph_exec_);
     for (cudaGraphExec_t graph_exec : canonical_publication_graph_execs_)
       if (graph_exec) cudaGraphExecDestroy(graph_exec);
   }
@@ -5188,7 +5241,8 @@ public:
                                stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const std::uint32_t level = initial_level_for_records(count);
+    const std::uint32_t level = initial_level_for_records(base_count);
+    ensure_level_storage_mapped(level, stream);
     ensure_publication_capacity(base_count, stream);
     gpulsmopt2_detail::gather_initial_level_kernel<<<
         blocks(base_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
@@ -5672,33 +5726,41 @@ private:
 
 
   std::uint32_t initial_level_for_records(std::size_t count) const {
-    std::size_t capacity = level_zero_capacity_;
-    std::uint32_t level = 0u;
-    while (level + 1u < gpulsmopt2_detail::kMaximumLevels &&
-           capacity <= count / 2u) {
-      capacity *= 2u;
-      ++level;
+    for (std::uint32_t tier_begin = 0u;
+         tier_begin < canonical_regular_level_count_; tier_begin += 3u) {
+      const std::uint32_t slots = std::min(
+          3u, canonical_regular_level_count_ - tier_begin);
+      if (count <= level_storage_spans_host_[tier_begin].capacity)
+        return tier_begin + slots - 1u;
     }
-    return level;
+    if (canonical_regular_level_count_ < canonical_level_count_ &&
+        count <= level_storage_spans_host_[canonical_regular_level_count_]
+                     .capacity)
+      return canonical_regular_level_count_;
+    throw std::bad_alloc();
   }
 
   std::uint64_t level_begin(std::uint32_t target) const {
-    std::uint64_t begin = 0u;
-    std::size_t capacity = level_zero_capacity_;
-    for (std::uint32_t level = 0u; level < target; ++level) {
-      begin += capacity;
-      capacity = capacity > publication_capacity_ / 2u
-          ? publication_capacity_ : capacity * 2u;
-    }
-    return begin;
+    if (target >= canonical_level_count_) throw std::out_of_range(
+        "GPULSMOpt physical run slot is out of range");
+    return level_storage_spans_host_[target].begin;
   }
 
   std::uint64_t level_capacity(std::uint32_t target) const {
-    std::size_t capacity = level_zero_capacity_;
-    for (std::uint32_t level = 0u; level < target; ++level)
-      capacity = capacity > publication_capacity_ / 2u
-          ? publication_capacity_ : capacity * 2u;
-    return capacity;
+    if (target >= canonical_level_count_) throw std::out_of_range(
+        "GPULSMOpt physical run slot is out of range");
+    return level_storage_spans_host_[target].capacity;
+  }
+
+  void ensure_level_storage_mapped(
+      std::uint32_t level, cudaStream_t stream) {
+    const std::uint64_t required = level_begin(level) + level_capacity(level);
+    if (required <= arena_key_flags_.size() &&
+        required <= arena_values_.size())
+      return;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    arena_key_flags_.grow(required);
+    arena_values_.grow(required);
   }
 
   void ensure_canonical_top_rollover_bank(cudaStream_t stream) {
@@ -5743,15 +5805,19 @@ private:
     std::uint64_t cursor = 0u;
     std::size_t capacity = level_zero_capacity_;
     for (std::uint32_t level = 0u;
-         level < gpulsmopt2_detail::kMaximumLevels; ++level) {
+         level < canonical_regular_level_count_; ++level) {
       spans[level] = {cursor, capacity};
       cursor += capacity;
-      if (capacity == publication_capacity_) break;
-      capacity = capacity > publication_capacity_ / 2u
-          ? publication_capacity_ : capacity * 2u;
+      if ((level + 1u) % 3u == 0u)
+        capacity = capacity > publication_capacity_ / 4u
+            ? publication_capacity_ : capacity * 4u;
     }
-    if (cursor > level_pool_capacity_)
+    if (cursor != level_pool_capacity_)
       throw std::logic_error("GPULSMOpt preassigned level spans overflow");
+    if (canonical_regular_level_count_ < canonical_level_count_)
+      spans[canonical_regular_level_count_] = {
+          cursor, publication_capacity_};
+    level_storage_spans_host_ = spans;
     CUDA_CHECK(cudaMemcpy(
         level_storage_spans_.data(), spans.data(), sizeof(spans),
         cudaMemcpyHostToDevice));
@@ -5803,11 +5869,7 @@ private:
       throw std::logic_error(
           "GPULSMOpt canonical job capacity does not fit 12 bits");
     CUDA_CHECK(cudaFuncSetAttribute(
-        gpulsmopt2_detail::canonical_carry_jobs_kernel<2u>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(canonical_merge_workspace_bytes_)));
-    CUDA_CHECK(cudaFuncSetAttribute(
-        gpulsmopt2_detail::canonical_carry_jobs_kernel<0u>,
+        gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(canonical_merge_workspace_bytes_)));
     int device = 0;
@@ -5829,7 +5891,7 @@ private:
 
     const std::uint32_t maximum_sources = std::min(
         gpulsmopt2_detail::kMaximumMergeSources,
-        std::max(1u, canonical_level_count_));
+        std::max(1u, canonical_level_count_ + 1u));
     cudaFuncAttributes tournament_attributes{};
     CUDA_CHECK(cudaFuncGetAttributes(
         &tournament_attributes,
@@ -5920,19 +5982,10 @@ private:
     blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
-        gpulsmopt2_detail::canonical_carry_jobs_kernel<2u>,
+        gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel,
         gpulsmopt2_detail::kFoundationCompactionThreads,
         canonical_merge_workspace_bytes_));
-    canonical_two_way_blocks_ = static_cast<std::uint32_t>(
-        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
-
-    blocks_per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm,
-        gpulsmopt2_detail::canonical_carry_jobs_kernel<0u>,
-        gpulsmopt2_detail::kFoundationCompactionThreads,
-        canonical_merge_workspace_bytes_));
-    canonical_merge_blocks_ = static_cast<std::uint32_t>(
+    canonical_fallback_blocks_ = static_cast<std::uint32_t>(
         std::max(1, blocks_per_sm) * properties.multiProcessorCount);
     CUDA_CHECK(cudaMemset(
         canonical_cell_counts_.data(), 0,
@@ -5965,18 +6018,17 @@ private:
     cudaStream_t capture_stream{};
     CUDA_CHECK(cudaStreamCreateWithFlags(
         &capture_stream, cudaStreamNonBlocking));
-    canonical_direct_publication_graph_exec_ =
-        capture_canonical_publication_graph(
-            capture_stream, 0u, 1u, true);
-    const std::uint32_t maximum_sources = std::min<std::uint32_t>(
-        canonical_level_count_,
-        static_cast<std::uint32_t>(
-            canonical_publication_graph_execs_.size() - 1u));
-    for (std::uint32_t source_count = 1u;
-         source_count <= maximum_sources; ++source_count)
-      canonical_publication_graph_execs_[source_count] =
+    for (std::uint32_t destination = 0u;
+         destination < canonical_level_count_; ++destination) {
+      const std::uint32_t tier_begin = destination <
+              canonical_regular_level_count_
+          ? (destination / 3u) * 3u : canonical_regular_level_count_;
+      const bool direct_epoch = tier_begin == 0u;
+      const std::uint32_t source_count = 1u + tier_begin;
+      canonical_publication_graph_execs_[destination] =
           capture_canonical_publication_graph(
-              capture_stream, source_count - 1u, source_count, false);
+              capture_stream, destination, source_count, direct_epoch);
+    }
     CUDA_CHECK(cudaStreamDestroy(capture_stream));
   }
 
@@ -6253,6 +6305,8 @@ private:
         : canonical_cell_ranks_.data() +
               std::size_t{destination_level} *
                   gpulsmopt2_detail::kLocalRankEntries;
+    const std::uint64_t resident_destination =
+        level_begin(destination_level);
 
     if (materialize_resident) {
       gpulsmopt2_detail::resolve_canonical_epoch_active_jobs_kernel<true><<<
@@ -6266,7 +6320,7 @@ private:
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
               publication_rows_a_.data(), resident_rows(),
-              level_zero_begin(), foundation_section_output_counts_.data(),
+              resident_destination, foundation_section_output_counts_.data(),
               epoch_ranks);
       gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<true><<<
           canonical_epoch_resolver_blocks_,
@@ -6280,7 +6334,7 @@ private:
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
               publication_rows_a_.data(), resident_rows(),
-              level_zero_begin(), foundation_section_output_counts_.data(),
+              resident_destination, foundation_section_output_counts_.data(),
               epoch_ranks,
               reinterpret_cast<unsigned long long *>(
                   canonical_epoch_workspace_.data()),
@@ -6298,7 +6352,7 @@ private:
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
               publication_rows_a_.data(), resident_rows(),
-              level_zero_begin(), foundation_section_output_counts_.data(),
+              resident_destination, foundation_section_output_counts_.data(),
               epoch_ranks);
       gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<false><<<
           canonical_epoch_resolver_blocks_,
@@ -6312,7 +6366,7 @@ private:
               gpulsmopt2_detail::kBatchesPerEpoch,
               foundation_source_offsets_.data(),
               publication_rows_a_.data(), resident_rows(),
-              level_zero_begin(), foundation_section_output_counts_.data(),
+              resident_destination, foundation_section_output_counts_.data(),
               epoch_ranks,
               reinterpret_cast<unsigned long long *>(
                   canonical_epoch_workspace_.data()),
@@ -6375,7 +6429,8 @@ private:
         1, 1, 0, stream>>>(
             publication_selected_count_.data(), device_manifests_.data(),
             active_device_manifest_.data(), level_storage_spans_.data(),
-            canonical_level_count_, job_capacity,
+            canonical_regular_level_count_, canonical_level_count_,
+            job_capacity,
             tournament_workspace_bytes, top_level_rollover,
             resident_plan_.data());
 
@@ -6459,23 +6514,9 @@ private:
                 device_manifests_.data(), active_device_manifest_.data(),
                 canonical_job_prefixes_.data(), canonical_next_job_.data(),
                 canonical_cell_counts_.data());
-      } else if (source_count == 2u) {
-        gpulsmopt2_detail::canonical_carry_jobs_kernel<2u><<<
-            canonical_two_way_blocks_,
-            gpulsmopt2_detail::kFoundationCompactionThreads,
-            canonical_merge_workspace_bytes_, stream>>>(
-                balanced_merge_jobs_.data(), resident_plan_.data(),
-                publication_rows_a_.data(),
-                foundation_source_offsets_.data(),
-                foundation_section_output_counts_.data(), resident_rows(),
-                descriptors_.data(), level_storage_spans_.data(),
-                level_q_logical_offsets_.data(), device_manifests_.data(),
-                active_device_manifest_.data(),
-                canonical_job_prefixes_.data(), canonical_next_job_.data(),
-                canonical_cell_counts_.data());
       } else {
-        gpulsmopt2_detail::canonical_carry_jobs_kernel<0u><<<
-            canonical_merge_blocks_,
+        gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel<<<
+            canonical_fallback_blocks_,
             gpulsmopt2_detail::kFoundationCompactionThreads,
             canonical_merge_workspace_bytes_, stream>>>(
                 balanced_merge_jobs_.data(), resident_plan_.data(),
@@ -6531,17 +6572,34 @@ private:
   void canonical_publication_parameters(
       std::uint32_t &destination, std::uint32_t &source_count,
       bool &direct_epoch) const {
-    const std::uint64_t empty = ~host_occupied_level_mask_;
-    destination = empty
-        ? static_cast<std::uint32_t>(__builtin_ctzll(empty))
-        : gpulsmopt2_detail::kMaximumLevels;
-    const std::uint64_t carried = destination >=
-            gpulsmopt2_detail::kMaximumLevels
-        ? ~std::uint64_t{0}
-        : destination ? (std::uint64_t{1} << destination) - 1u : 0u;
+    destination = gpulsmopt2_detail::kMaximumLevels;
+    std::uint32_t tier_begin = 0u;
+    for (std::uint32_t begin = 0u;
+         begin < canonical_regular_level_count_; begin += 3u) {
+      const std::uint32_t slots = std::min(
+          3u, canonical_regular_level_count_ - begin);
+      const std::uint64_t tier_mask =
+          ((std::uint64_t{1} << slots) - 1u) << begin;
+      const std::uint32_t filled = static_cast<std::uint32_t>(
+          __builtin_popcountll(host_occupied_level_mask_ & tier_mask));
+      if (filled < slots) {
+        destination = begin + slots - 1u - filled;
+        tier_begin = begin;
+        break;
+      }
+    }
+    if (destination == gpulsmopt2_detail::kMaximumLevels &&
+        canonical_regular_level_count_ < canonical_level_count_ &&
+        !(host_occupied_level_mask_ &
+          (std::uint64_t{1} << canonical_regular_level_count_))) {
+      destination = canonical_regular_level_count_;
+      tier_begin = canonical_regular_level_count_;
+    }
+    const std::uint64_t carried = tier_begin
+        ? (std::uint64_t{1} << tier_begin) - 1u : 0u;
     source_count = 1u + static_cast<std::uint32_t>(
         __builtin_popcountll(host_occupied_level_mask_ & carried));
-    direct_epoch = destination == 0u &&
+    direct_epoch = tier_begin == 0u &&
         (host_occupied_level_mask_ != 0u || !pending_has_tombstones_) &&
         pending_records_ <= level_zero_capacity_;
   }
@@ -6566,12 +6624,16 @@ private:
       source_count = 1u + static_cast<std::uint32_t>(
           __builtin_popcountll(host_occupied_level_mask_ & source_mask));
       direct_epoch = false;
+    } else {
+      ensure_level_storage_mapped(destination, stream);
     }
-    cudaGraphExec_t graph_exec = direct_epoch
-        ? canonical_direct_publication_graph_exec_
-        : !top_level_rollover &&
-              source_count < canonical_publication_graph_execs_.size()
-            ? canonical_publication_graph_execs_[source_count] : nullptr;
+    const std::uint32_t tier_begin = destination <
+            canonical_regular_level_count_
+        ? (destination / 3u) * 3u : canonical_regular_level_count_;
+    const bool graph_compatible = tier_begin != 0u || direct_epoch;
+    cudaGraphExec_t graph_exec = !top_level_rollover && graph_compatible &&
+            destination < canonical_publication_graph_execs_.size()
+        ? canonical_publication_graph_execs_[destination] : nullptr;
     if (graph_exec) {
       CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
       return true;
@@ -6580,10 +6642,6 @@ private:
         stream, destination, source_count, direct_epoch, false,
         top_level_rollover);
     return false;
-  }
-
-  std::uint64_t level_zero_begin() const {
-    return 0u;
   }
 
   void publish_epoch(cudaStream_t stream) {
@@ -6912,7 +6970,11 @@ private:
   std::size_t publication_capacity_{};
   std::size_t level_zero_capacity_{};
   std::size_t level_pool_capacity_{};
+  std::uint32_t canonical_regular_level_count_{};
   std::uint32_t canonical_level_count_{};
+  std::array<gpulsmopt2_detail::LevelStorageSpan,
+             gpulsmopt2_detail::kMaximumLevels>
+      level_storage_spans_host_{};
   std::uint32_t resident_merge_capacity_{};
   std::size_t canonical_merge_workspace_bytes_{};
   std::size_t maximum_resident_jobs_{};
@@ -6936,12 +6998,10 @@ private:
   std::uint8_t *range_section_temp_{};
   std::size_t range_section_temp_bytes_{};
   cudaEvent_t operation_done_{};
-  cudaGraphExec_t canonical_direct_publication_graph_exec_{};
   std::array<cudaGraphExec_t,
-             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+             gpulsmopt2_detail::kMaximumLevels>
       canonical_publication_graph_execs_{};
-  std::uint32_t canonical_merge_blocks_{};
-  std::uint32_t canonical_two_way_blocks_{};
+  std::uint32_t canonical_fallback_blocks_{};
   std::array<std::uint32_t,
              gpulsmopt2_detail::kMaximumMergeSources + 1u>
       canonical_tournament_blocks_{};

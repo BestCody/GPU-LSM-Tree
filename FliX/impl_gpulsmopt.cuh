@@ -167,10 +167,9 @@ public:
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
         {"level_zero_capacity",
          std::to_string(gpulsmopt_adapter_detail::level_zero_capacity())},
-        {"structure", "canonical_quotient_run_binary_carry"},
-        {"carry_crossover", "pairwise_below_" + std::to_string(
-             gpulsmopt2_detail::kCanonicalTournamentMinimumSources) +
-             "_sources_tournament_at_and_above"},
+        {"structure", "canonical_quotient_run_radix4_carry"},
+        {"carry_fanout", "4"},
+        {"carry_merge", "general_tournament_with_shared_memory_fallback"},
         {"tournament_workspace", "elastic_by_job_shape"},
         {"epoch_resolution", "quotient_local_direct_with_oversized_fallback"},
         {"publication_graph", "enabled"},
