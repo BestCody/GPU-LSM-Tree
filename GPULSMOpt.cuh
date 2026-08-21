@@ -2595,19 +2595,19 @@ __device__ __forceinline__ void resolve_canonical_epoch_active_job(
   std::uint32_t sort_keys[Items];
   std::uint32_t sort_sources[Items];
   for (std::uint32_t item = 0u; item < Items; ++item) {
-    const std::uint32_t local = threadIdx.x * Items + item;
+    const std::uint32_t input_local = item * blockDim.x + threadIdx.x;
     sort_keys[item] = kInvalidSortKey;
     sort_sources[item] = 0u;
-    if (local >= raw_count) continue;
+    if (input_local >= raw_count) continue;
     std::uint32_t batch = 0u;
     while (batch + 1u < pending_batches &&
-           local >= batch_prefix[batch + 1u])
+           input_local >= batch_prefix[batch + 1u])
       ++batch;
     const std::size_t base =
         std::size_t{batch} * (kQuotients + 1u) + q;
     const std::uint32_t source = static_cast<std::uint32_t>(
         std::size_t{batch} * batch_stride + raw_offsets[base] +
-        local - batch_prefix[batch]);
+        input_local - batch_prefix[batch]);
     sort_keys[item] = key_suffix(raw_keys[source]);
     sort_sources[item] = source;
   }
