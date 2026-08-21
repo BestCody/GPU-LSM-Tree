@@ -68,12 +68,14 @@ constexpr std::uint32_t kAdmissionCtaHashSlots = 128u;
 static_assert((kAdmissionCtaHashSlots &
                (kAdmissionCtaHashSlots - 1u)) == 0u);
 constexpr std::uint32_t kLookupRouterSlots = 2048u;
+constexpr std::uint32_t kLookupRouterBits = 11u;
 constexpr std::uint32_t kLookupRouterMask = kLookupRouterSlots - 1u;
 constexpr std::uint32_t kLookupRouterAttempts = 4u;
 constexpr std::uint32_t kLookupRouterProbeTarget = 8u;
 constexpr std::uint32_t kLookupRouterDenseRowsPerSection = 8u;
 constexpr std::uint32_t kLookupRouterMinimumBatches = 5u;
 static_assert((kLookupRouterSlots & (kLookupRouterSlots - 1u)) == 0u);
+static_assert(kLookupRouterSlots == (1u << kLookupRouterBits));
 constexpr std::uint32_t kFoundationCompactionThreads = 256u;
 constexpr std::uint32_t kLocalEpochItemsPerThread = 5u;
 constexpr std::uint32_t kLocalEpochCapacity =
@@ -4725,6 +4727,33 @@ __device__ __forceinline__ std::uint32_t lookup_router_find(
 }
 
 
+#if defined(GPULSMOPT_EXPERIMENT_FAST_STRIDED_ROUTER)
+__device__ __forceinline__ void lookup_single_router_location(
+    std::uint32_t key, std::uint32_t &slot, std::uint32_t &step) {
+  const std::uint32_t mixed = key * 0x9e3779b1u;
+  // The high bits choose the home; the odd low-bit stride visits every slot.
+  slot = mixed >> (32u - kLookupRouterBits);
+  step = (mixed | 1u) & kLookupRouterMask;
+}
+
+
+__device__ __forceinline__ std::uint32_t lookup_single_router_find(
+    std::uint32_t key,
+    const std::uint32_t *owners, const std::uint32_t *query_keys) {
+  std::uint32_t slot{}, step{};
+  lookup_single_router_location(key, slot, step);
+#pragma unroll 1
+  for (std::uint32_t probe = 0u; probe < kLookupRouterSlots; ++probe) {
+    const std::uint32_t owner = owners[slot];
+    if (owner == kInvalid) return kInvalid;
+    if (query_keys[owner] == key) return owner;
+    slot = (slot + step) & kLookupRouterMask;
+  }
+  return kInvalid;
+}
+#endif
+
+
 __global__ void lookup_with_dense_router_kernel(
     const std::uint32_t *queries, std::uint32_t *out_values,
     std::uint8_t *out_found, std::uint32_t count,
@@ -4741,8 +4770,10 @@ __global__ void lookup_with_dense_router_kernel(
   __shared__ unsigned long long router_winners[kThreads];
   __shared__ std::uint16_t router_sections[kThreads];
   __shared__ std::uint32_t router_section_count;
+#if !defined(GPULSMOPT_EXPERIMENT_FAST_STRIDED_ROUTER)
   __shared__ std::uint32_t router_max_probe;
   __shared__ std::uint32_t router_seed;
+#endif
 
   const std::uint32_t local = threadIdx.x;
   const std::uint32_t i = blockIdx.x * blockDim.x + local;
@@ -4778,6 +4809,29 @@ __global__ void lookup_with_dense_router_kernel(
   }
   __syncthreads();
 
+#if defined(GPULSMOPT_EXPERIMENT_FAST_STRIDED_ROUTER)
+  for (std::uint32_t slot = local; slot < kLookupRouterSlots;
+       slot += kThreads)
+    router_owners[slot] = kInvalid;
+  __syncthreads();
+
+  std::uint32_t query_owner = kInvalid;
+  if (valid) {
+    std::uint32_t slot{}, step{};
+    lookup_single_router_location(key, slot, step);
+#pragma unroll 1
+    for (std::uint32_t probe = 0u; probe < kLookupRouterSlots; ++probe) {
+      const std::uint32_t owner = atomicCAS(
+          router_owners + slot, kInvalid, local);
+      if (owner == kInvalid || router_query_keys[owner] == key) {
+        query_owner = owner == kInvalid ? local : owner;
+        break;
+      }
+      slot = (slot + step) & kLookupRouterMask;
+    }
+  }
+  __syncthreads();
+#else
   for (std::uint32_t attempt = 0u;
        attempt < kLookupRouterAttempts; ++attempt) {
     for (std::uint32_t slot = local; slot < kLookupRouterSlots;
@@ -4810,6 +4864,7 @@ __global__ void lookup_with_dense_router_kernel(
     }
   }
   __syncthreads();
+#endif
 
   const std::uint32_t section_count = router_section_count;
   const std::uint32_t task_count = section_count * pending_batches;
@@ -4826,8 +4881,8 @@ __global__ void lookup_with_dense_router_kernel(
   for (std::uint32_t task = worker_group;
        task < task_count; task += worker_groups) {
     const std::uint32_t batch = task / section_count;
-    const std::uint32_t section =
-        router_sections[task - batch * section_count];
+    const std::uint32_t section_id = task - batch * section_count;
+    const std::uint32_t section = router_sections[section_id];
     const std::size_t oi =
         std::size_t{batch} * (kQuotients + 1u) + section;
     const std::uint32_t begin = raw_offsets[oi];
@@ -4836,21 +4891,48 @@ __global__ void lookup_with_dense_router_kernel(
          position < end; position += worker_width) {
       const std::uint32_t record = batch * batch_stride + position;
       const std::uint32_t pending_key = raw_keys[record];
+#if defined(GPULSMOPT_EXPERIMENT_FAST_STRIDED_ROUTER)
+      const std::uint32_t owner = lookup_single_router_find(
+          pending_key, router_owners, router_query_keys);
+#else
       const std::uint32_t owner = lookup_router_find(
           pending_key, router_seed, router_owners, router_query_keys);
+#endif
       const bool matched = owner != kInvalid;
       if (!matched) continue;
       const RawPayload payload = raw_payloads[record];
       const std::uint64_t order =
           static_cast<std::uint64_t>(raw_position(payload)) + 1u;
+#if defined(GPULSMOPT_EXPERIMENT_FAST_STRIDED_ROUTER)
+      const std::uint64_t live =
+          (payload.metadata & kRawTombstone) == 0u ? 1u : 0u;
+      // [57:33] age-plus-one, [32] live, [31:0] value.
+      const unsigned long long token =
+          static_cast<unsigned long long>(
+              (order << 33u) | (live << 32u) | payload.value);
+#else
       const unsigned long long token =
           static_cast<unsigned long long>((order << 24u) | record);
+#endif
       atomicMax(router_winners + owner, token);
     }
   }
   __syncthreads();
 
   if (!valid) return;
+#if defined(GPULSMOPT_EXPERIMENT_FAST_STRIDED_ROUTER)
+  const unsigned long long winner = query_owner == kInvalid
+      ? 0ull : router_winners[query_owner];
+  if (winner) {
+    const bool live = ((winner >> 32u) & 1u) != 0u;
+    const std::uint32_t destination = query_ids ? query_ids[i] : i;
+    out_values[destination] = live
+        ? static_cast<std::uint32_t>(winner)
+        : out_found ? 0u : kInvalid;
+    if (out_found) out_found[destination] = live;
+    return;
+  }
+#else
   const std::uint32_t owner = lookup_router_find(
       key, router_seed, router_owners, router_query_keys);
   const unsigned long long winner = owner == kInvalid
@@ -4865,6 +4947,7 @@ __global__ void lookup_with_dense_router_kernel(
     if (out_found) out_found[destination] = live;
     return;
   }
+#endif
   canonical_lookup_resident_only(
       key, i, out_values, out_found, arena, descriptors,
       canonical_cell_ranks, occupied_levels, query_ids);
