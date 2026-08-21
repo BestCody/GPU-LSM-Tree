@@ -4839,25 +4839,13 @@ __global__ void lookup_with_dense_router_kernel(
       const std::uint32_t owner = lookup_router_find(
           pending_key, router_seed, router_owners, router_query_keys);
       const bool matched = owner != kInvalid;
-      unsigned matched_mask = __ballot_sync(__activemask(), matched);
       if (!matched) continue;
       const RawPayload payload = raw_payloads[record];
       const std::uint64_t order =
           static_cast<std::uint64_t>(raw_position(payload)) + 1u;
       const unsigned long long token =
           static_cast<unsigned long long>((order << 24u) | record);
-      const unsigned peers = __match_any_sync(matched_mask, owner);
-      unsigned long long newest = token;
-      unsigned remaining = peers;
-      while (remaining) {
-        const std::uint32_t source =
-            static_cast<std::uint32_t>(__ffs(remaining) - 1);
-        newest = max(newest, __shfl_sync(peers, token, source));
-        remaining &= remaining - 1u;
-      }
-      const std::uint32_t lane = threadIdx.x & 31u;
-      if (lane == static_cast<std::uint32_t>(__ffs(peers) - 1))
-        atomicMax(router_winners + owner, newest);
+      atomicMax(router_winners + owner, token);
     }
   }
   __syncthreads();
