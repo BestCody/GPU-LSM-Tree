@@ -45,6 +45,9 @@ constexpr std::uint32_t kLocalRankBits = 7u;
 constexpr std::uint32_t kLocalRankEntries =
     kQuotients * (1u << kLocalRankBits);
 constexpr std::uint32_t kThreads = 256u;
+constexpr std::uint32_t kTqrjRankThreads = 1024u;
+static_assert(kTqrjRankThreads <= 1024u &&
+              (kTqrjRankThreads & 31u) == 0u);
 constexpr std::uint32_t kRangeSchedulerBlocks = 256u;
 constexpr std::uint32_t kSectionRangeThreads = 128u;
 constexpr std::uint32_t kInvalid = 0xffffffffu;
@@ -84,7 +87,7 @@ constexpr std::uint32_t kTqrjRankTileRows = 2048u;
 static_assert(kTqrjDirectCapacity == 1280u);
 static_assert(kTqrjDirectoryBins == kThreads);
 static_assert(kTqrjDirectPendingRows > kTqrjDirectCapacity);
-static_assert(kTqrjRankTileRows >= kThreads &&
+static_assert(kTqrjRankTileRows >= kTqrjRankThreads &&
               (kTqrjRankTileRows & (kTqrjRankTileRows - 1u)) == 0u);
 constexpr std::uint32_t kFoundationCompactionThreads = 256u;
 constexpr std::uint32_t kLocalEpochItemsPerThread = 5u;
@@ -6058,7 +6061,8 @@ private:
           reinterpret_cast<const void *>(
               gpulsmopt2_detail::tqrj_rank_lookup_kernel),
           dim3(tqrj_rank_worker_blocks_),
-          dim3(gpulsmopt2_detail::kThreads), rank_arguments, 0u, stream));
+          dim3(gpulsmopt2_detail::kTqrjRankThreads), rank_arguments, 0u,
+          stream));
       gpulsmopt2_detail::reset_lookup_quotient_counts_kernel<<<
           blocks(active_capacity), gpulsmopt2_detail::kThreads,
           0, stream>>>(
@@ -6541,7 +6545,7 @@ private:
     int blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm, gpulsmopt2_detail::tqrj_rank_lookup_kernel,
-        gpulsmopt2_detail::kThreads, 0u));
+        gpulsmopt2_detail::kTqrjRankThreads, 0u));
     // The single skew executor derives its worker grid only from kernel
     // resources and hardware parallelism.  It is independent of query count,
     // quotient skew, and the former medium/huge boundary.
