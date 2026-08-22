@@ -69,24 +69,23 @@ constexpr std::uint32_t kAdmissionCtaHashSlots = 128u;
 static_assert((kAdmissionCtaHashSlots &
                (kAdmissionCtaHashSlots - 1u)) == 0u);
 // TQRJ's common state builds a compact exact directory in shared memory.
-// Larger or unusually concentrated tasks use transient exact suffix tables;
-// those tables are generation-tagged and touch only observed input rows.
+// Skewed tasks use the same two-level exact radix directory at every size:
+// sparse page/suffix masks give each observed suffix a compact winner rank,
+// and independent query/pending tiles provide load balance without rescans.
 constexpr std::uint32_t kTqrjDenseRowsPerSection = 8u;
 constexpr std::uint32_t kTqrjMinimumBatches = 5u;
 constexpr std::uint32_t kTqrjDirectCapacity = 1280u;
 constexpr std::uint32_t kTqrjDirectoryBins = 256u;
 constexpr std::uint32_t kTqrjDirectIntervalLimit = 64u;
-constexpr std::uint32_t kTqrjHugeTaskRows = 1u << 16u;
-constexpr std::uint32_t kTqrjMaximumSkewBlocks = 64u;
-constexpr std::uint32_t kTqrjSuffixes = 1u << 16u;
-constexpr std::size_t kTqrjTagWordsPerSkewBlock = kTqrjSuffixes;
-constexpr std::size_t kTqrjWinnerWordsPerSkewBlock =
-    std::size_t{kTqrjSuffixes} * 2u;
-constexpr std::size_t kTqrjScratchWordsPerSkewBlock =
-    kTqrjTagWordsPerSkewBlock + kTqrjWinnerWordsPerSkewBlock;
+constexpr std::uint32_t kTqrjDirectPendingRows = 1u << 16u;
+constexpr std::uint32_t kTqrjRankGroups = 64u;
+constexpr std::uint32_t kTqrjRankPages = 2048u;
+constexpr std::uint32_t kTqrjRankTileRows = 2048u;
 static_assert(kTqrjDirectCapacity == 1280u);
 static_assert(kTqrjDirectoryBins == kThreads);
-static_assert(kTqrjHugeTaskRows > kTqrjDirectCapacity);
+static_assert(kTqrjDirectPendingRows > kTqrjDirectCapacity);
+static_assert(kTqrjRankTileRows >= kThreads &&
+              (kTqrjRankTileRows & (kTqrjRankTileRows - 1u)) == 0u);
 constexpr std::uint32_t kFoundationCompactionThreads = 256u;
 constexpr std::uint32_t kLocalEpochItemsPerThread = 5u;
 constexpr std::uint32_t kLocalEpochCapacity =
@@ -4881,17 +4880,41 @@ __device__ __forceinline__ void tqrj_warp_atomic_max(
     atomicMax(winners + owner, aggregate);
 }
 
-// Exact-state initialization is also warp-coalesced.  Atomic stores make
-// duplicate queries race-free without clearing the complete suffix domain.
-__device__ __forceinline__ void tqrj_mark_suffix(
-    std::uint32_t suffix, std::uint32_t task_tag,
-    std::uint32_t *tags, unsigned long long *winners) {
-  const unsigned active = __activemask();
-  const unsigned peers = __match_any_sync(active, suffix);
-  const std::uint32_t lane = threadIdx.x & 31u;
-  if (lane != static_cast<std::uint32_t>(__ffs(peers) - 1)) return;
-  atomicExch(tags + suffix, task_tag);
-  atomicExch(winners + suffix, 0ull);
+struct TqrjRankTask {
+  std::uint32_t quotient;
+  std::uint32_t pending_rows;
+  std::uint32_t page_base;
+  std::uint32_t winner_base;
+  std::uint32_t page_count;
+  std::uint32_t winner_count;
+};
+
+struct TqrjRankTile {
+  std::uint32_t task;
+  std::uint32_t begin;
+};
+
+constexpr std::size_t kTqrjRankGroupEntries =
+    std::size_t{kQuotients} * kTqrjRankGroups;
+constexpr std::size_t kTqrjRankGroupMaskBytes =
+    kTqrjRankGroupEntries * sizeof(std::uint32_t);
+constexpr std::size_t kTqrjRankGroupPrefixBytes =
+    kTqrjRankGroupEntries * sizeof(std::uint16_t);
+constexpr std::size_t kTqrjRankTaskBytes =
+    std::size_t{kQuotients} * sizeof(TqrjRankTask);
+constexpr std::size_t kTqrjRankCounterBytes =
+    4u * sizeof(std::uint32_t);
+constexpr std::size_t kTqrjRankFixedWorkspaceBytes =
+    kTqrjRankGroupMaskBytes + kTqrjRankGroupPrefixBytes +
+    kTqrjRankTaskBytes + kTqrjRankCounterBytes;
+static_assert(kTqrjRankFixedWorkspaceBytes <=
+              std::size_t{kLocalRankEntries} * sizeof(std::uint32_t));
+
+__device__ __forceinline__ void tqrj_enqueue_rank_task(
+    std::uint32_t quotient, std::uint32_t pending_rows,
+    TqrjRankTask *tasks, std::uint32_t *task_count) {
+  const std::uint32_t ticket = atomicAdd(task_count, 1u);
+  tasks[ticket] = {quotient, pending_rows, 0u, 0u, 0u, 0u};
 }
 
 __device__ __forceinline__ std::uint32_t tqrj_pending_rows(
@@ -4929,7 +4952,8 @@ __device__ __forceinline__ void tqrj_write_result(
 }
 
 // One block owns one ordinary quotient.  Oversized, high-pending, or locally
-// concentrated tasks are enqueued for the two exact skew executors below.
+// concentrated tasks are enqueued for the one size-independent skew executor
+// below.
 __global__ void tqrj_direct_lookup_kernel(
     const std::uint32_t *queries, std::uint32_t *out_values,
     std::uint8_t *out_found, const std::uint32_t *active_quotients,
@@ -4942,8 +4966,7 @@ __global__ void tqrj_direct_lookup_kernel(
     const Descriptor *descriptors, const std::uint32_t *query_ids,
     const std::uint16_t *canonical_cell_ranks,
     const std::uint64_t *query_occupied_level_mask,
-    std::uint32_t *medium_quotients, std::uint32_t *medium_count,
-    std::uint32_t *huge_quotients, std::uint32_t *huge_count) {
+    TqrjRankTask *rank_tasks, std::uint32_t *rank_task_count) {
   using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
   __shared__ typename BlockScan::TempStorage scan_storage;
   __shared__ std::uint32_t directory_counts[kTqrjDirectoryBins];
@@ -4966,17 +4989,10 @@ __global__ void tqrj_direct_lookup_kernel(
   __syncthreads();
 
   if (query_count > kTqrjDirectCapacity ||
-      pending_rows > kTqrjHugeTaskRows) {
-    if (threadIdx.x == 0u) {
-      if (query_count > kTqrjHugeTaskRows ||
-          pending_rows > kTqrjHugeTaskRows) {
-        const std::uint32_t ticket = atomicAdd(huge_count, 1u);
-        huge_quotients[ticket] = q;
-      } else {
-        const std::uint32_t ticket = atomicAdd(medium_count, 1u);
-        medium_quotients[ticket] = q;
-      }
-    }
+      pending_rows > kTqrjDirectPendingRows) {
+    if (threadIdx.x == 0u)
+      tqrj_enqueue_rank_task(
+          q, pending_rows, rank_tasks, rank_task_count);
     return;
   }
   directory_counts[threadIdx.x] = 0u;
@@ -5003,10 +5019,9 @@ __global__ void tqrj_direct_lookup_kernel(
   const bool crowded = __syncthreads_or(
       interval_count > kTqrjDirectIntervalLimit);
   if (crowded) {
-    if (threadIdx.x == 0u) {
-      const std::uint32_t ticket = atomicAdd(medium_count, 1u);
-      medium_quotients[ticket] = q;
-    }
+    if (threadIdx.x == 0u)
+      tqrj_enqueue_rank_task(
+          q, pending_rows, rank_tasks, rank_task_count);
     return;
   }
 
@@ -5057,8 +5072,9 @@ __global__ void tqrj_direct_lookup_kernel(
        local += blockDim.x) {
     const std::uint32_t query_index = query_begin + local;
     const std::uint32_t key = queries[query_index];
+    const std::uint32_t suffix = key_suffix(key);
     const std::uint32_t owner = tqrj_directory_find(
-        directory_offsets, directory_suffixes, key_suffix(key));
+        directory_offsets, directory_suffixes, suffix);
     const unsigned long long winner = owner == kInvalid
         ? 0ull : winners[owner];
     tqrj_write_result(
@@ -5067,168 +5083,343 @@ __global__ void tqrj_direct_lookup_kernel(
   }
 }
 
-// Medium skew remains quotient-owned, but replaces the compact directory
-// with a generation-tagged exact suffix table.  Each persistent block owns
-// one reusable scratch slot and pulls tasks from the device queue.
-__global__ void tqrj_medium_lookup_kernel(
-    const std::uint32_t *queries, std::uint32_t *out_values,
-    std::uint8_t *out_found, const std::uint32_t *query_bases,
+__host__ __device__ constexpr std::uint32_t tqrj_rank_tile_count(
+    std::uint32_t rows) {
+  return (rows + kTqrjRankTileRows - 1u) / kTqrjRankTileRows;
+}
+
+__device__ __forceinline__ std::uint32_t tqrj_rank_page_index(
+    std::uint32_t suffix, const std::uint32_t *group_masks,
+    const std::uint16_t *group_prefixes, std::uint32_t task) {
+  const std::uint32_t group = suffix >> 10u;
+  const std::uint32_t page = (suffix >> 5u) & 31u;
+  const std::size_t group_index =
+      std::size_t{task} * kTqrjRankGroups + group;
+  const std::uint32_t mask = group_masks[group_index];
+  const std::uint32_t bit = 1u << page;
+  if (!(mask & bit)) return kInvalid;
+  return static_cast<std::uint32_t>(group_prefixes[group_index]) +
+      __popc(mask & (bit - 1u));
+}
+
+__device__ __forceinline__ void tqrj_rank_stage_directory(
+    std::uint32_t task, const std::uint32_t *global_group_masks,
+    const std::uint16_t *global_group_prefixes,
+    const std::uint32_t *global_page_masks,
+    const std::uint32_t *global_page_prefix_words,
+    const TqrjRankTask *global_tasks,
+    std::uint32_t *shared_group_masks,
+    std::uint16_t *shared_group_prefixes,
+    std::uint32_t *shared_page_masks,
+    std::uint16_t *shared_page_prefixes,
+    TqrjRankTask *shared_task) {
+  if (threadIdx.x == 0u) *shared_task = global_tasks[task];
+  for (std::uint32_t group = threadIdx.x; group < kTqrjRankGroups;
+       group += blockDim.x) {
+    const std::size_t source =
+        std::size_t{task} * kTqrjRankGroups + group;
+    shared_group_masks[group] = global_group_masks[source];
+    shared_group_prefixes[group] = global_group_prefixes[source];
+  }
+  __syncthreads();
+  for (std::uint32_t page = threadIdx.x;
+       page < shared_task->page_count; page += blockDim.x) {
+    const std::uint32_t source = shared_task->page_base + page;
+    shared_page_masks[page] = global_page_masks[source];
+    shared_page_prefixes[page] = static_cast<std::uint16_t>(
+        global_page_prefix_words[source] >> 16u);
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ std::uint32_t tqrj_rank_find_shared(
+    std::uint32_t suffix, const std::uint32_t *group_masks,
+    const std::uint16_t *group_prefixes,
+    const std::uint32_t *page_masks,
+    const std::uint16_t *page_prefixes,
+    const TqrjRankTask &task) {
+  const std::uint32_t group = suffix >> 10u;
+  const std::uint32_t page = (suffix >> 5u) & 31u;
+  const std::uint32_t group_mask = group_masks[group];
+  const std::uint32_t page_bit = 1u << page;
+  if (!(group_mask & page_bit)) return kInvalid;
+  const std::uint32_t relative_page = group_prefixes[group] +
+      __popc(group_mask & (page_bit - 1u));
+  const std::uint32_t suffix_mask = page_masks[relative_page];
+  const std::uint32_t suffix_bit = 1u << (suffix & 31u);
+  if (!(suffix_mask & suffix_bit)) return kInvalid;
+  return task.winner_base + page_prefixes[relative_page] +
+      __popc(suffix_mask & (suffix_bit - 1u));
+}
+
+// Production skew executor.  The grid barriers separate representation
+// construction, matching, and emission inside one launch.  All task sizes use
+// this same tiled state machine; barriers are phases, not execution paths.
+__global__ void tqrj_rank_lookup_kernel(
+    TqrjRankTask *tasks, const std::uint32_t *task_count,
+    const std::uint32_t *query_bases,
     const std::uint32_t *query_counts,
+    const std::uint32_t *queries,
+    TqrjRankTile *query_tiles, TqrjRankTile *pending_tiles,
+    std::uint32_t *counters, std::uint32_t *global_group_masks,
+    std::uint16_t *global_group_prefixes,
+    std::uint32_t *global_page_masks,
+    std::uint32_t *global_page_prefix_words,
+    unsigned long long *winners,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, ResidentRows arena,
-    const Descriptor *descriptors, const std::uint32_t *query_ids,
+    std::uint32_t pending_batches,
+    std::uint32_t *out_values, std::uint8_t *out_found,
+    ResidentRows arena, const Descriptor *descriptors,
+    const std::uint32_t *query_ids,
     const std::uint16_t *canonical_cell_ranks,
-    const std::uint64_t *query_occupied_level_mask,
-    const std::uint32_t *task_quotients,
-    const std::uint32_t *task_count, std::uint32_t *next_task,
-    std::uint32_t generation, std::uint32_t *scratch_tags,
-    unsigned long long *scratch_winners) {
-  __shared__ std::uint32_t task_index;
-  __shared__ std::uint32_t q;
+    const std::uint64_t *query_occupied_level_mask) {
+  const cooperative_groups::grid_group grid =
+      cooperative_groups::this_grid();
+  __shared__ std::uint32_t group_masks[kTqrjRankGroups];
+  __shared__ std::uint16_t group_prefixes[kTqrjRankGroups];
+  __shared__ std::uint32_t page_masks[kTqrjRankPages];
+  __shared__ std::uint16_t page_prefixes[kTqrjRankPages];
+  __shared__ std::uint32_t section_prefixes[kBatchesPerEpoch + 1u];
+  __shared__ TqrjRankTask shared_task;
+  __shared__ std::uint32_t shared_a, shared_b, shared_c, shared_d;
   __shared__ std::uint64_t occupied_levels;
-  const std::uint32_t slot = blockIdx.x;
-  std::uint32_t *tags = scratch_tags +
-      std::size_t{slot} * kTqrjSuffixes;
-  unsigned long long *winners = scratch_winners +
-      std::size_t{slot} * kTqrjSuffixes;
+
+  const std::uint32_t tasks_in_queue = *task_count;
+  // Direct lookup is the common uniform case.  A uniform zero-work return
+  // avoids entering any grid barrier when it routed no skew task.
+  if (!tasks_in_queue) return;
+
+  // Plan disjoint query and pending tiles and clear one sparse group-mask
+  // header per task.
+  for (std::uint32_t task_index = blockIdx.x;
+       task_index < tasks_in_queue; task_index += gridDim.x) {
+    for (std::uint32_t group = threadIdx.x; group < kTqrjRankGroups;
+         group += blockDim.x)
+      global_group_masks[
+          std::size_t{task_index} * kTqrjRankGroups + group] = 0u;
+    if (threadIdx.x == 0u) {
+      const TqrjRankTask task = tasks[task_index];
+      shared_c = tqrj_rank_tile_count(query_counts[task.quotient]);
+      shared_d = tqrj_rank_tile_count(task.pending_rows);
+      shared_a = atomicAdd(counters, shared_c);
+      shared_b = atomicAdd(counters + 1u, shared_d);
+    }
+    __syncthreads();
+    for (std::uint32_t tile = threadIdx.x; tile < shared_c;
+         tile += blockDim.x)
+      query_tiles[shared_a + tile] =
+          {task_index, tile * kTqrjRankTileRows};
+    for (std::uint32_t tile = threadIdx.x; tile < shared_d;
+         tile += blockDim.x)
+      pending_tiles[shared_b + tile] =
+          {task_index, tile * kTqrjRankTileRows};
+    __syncthreads();
+  }
+  grid.sync();
+
+  // Mark only the 32-suffix pages touched by actual queries.
+  const std::uint32_t query_tile_count = counters[0];
+  for (std::uint32_t tile_index = blockIdx.x;
+       tile_index < query_tile_count; tile_index += gridDim.x) {
+    const TqrjRankTile tile = query_tiles[tile_index];
+    const TqrjRankTask task = tasks[tile.task];
+    const std::uint32_t query_begin = query_bases[task.quotient];
+    const std::uint32_t query_count = query_counts[task.quotient];
+    for (std::uint32_t local = threadIdx.x; local < kTqrjRankTileRows;
+         local += blockDim.x) {
+      const std::uint32_t row = tile.begin + local;
+      const bool valid = row < query_count;
+      const std::uint32_t suffix = valid
+          ? key_suffix(queries[query_begin + row]) : 0u;
+      const std::uint32_t group = suffix >> 10u;
+      const std::uint32_t page = (suffix >> 5u) & 31u;
+      const unsigned active = __ballot_sync(0xffffffffu, valid);
+      if (!valid) continue;
+      const unsigned peers = __match_any_sync(active, group);
+      const std::uint32_t aggregate =
+          __reduce_or_sync(peers, 1u << page);
+      const std::uint32_t lane = threadIdx.x & 31u;
+      if (lane == static_cast<std::uint32_t>(__ffs(peers) - 1))
+        atomicOr(
+            global_group_masks +
+                std::size_t{tile.task} * kTqrjRankGroups + group,
+            aggregate);
+    }
+  }
+  grid.sync();
+
+  // Rank active pages and allocate their compact mask slices.
+  for (std::uint32_t task_index = blockIdx.x;
+       task_index < tasks_in_queue; task_index += gridDim.x) {
+    if (threadIdx.x == 0u) {
+      std::uint32_t prefix = 0u;
+      const std::size_t group_base =
+          std::size_t{task_index} * kTqrjRankGroups;
+      for (std::uint32_t group = 0u; group < kTqrjRankGroups; ++group) {
+        global_group_prefixes[group_base + group] =
+            static_cast<std::uint16_t>(prefix);
+        prefix += __popc(global_group_masks[group_base + group]);
+      }
+      shared_b = prefix;
+      shared_a = atomicAdd(counters + 2u, prefix);
+      tasks[task_index].page_base = shared_a;
+      tasks[task_index].page_count = prefix;
+    }
+    __syncthreads();
+    for (std::uint32_t page = threadIdx.x; page < shared_b;
+         page += blockDim.x)
+      global_page_masks[shared_a + page] = 0u;
+    __syncthreads();
+  }
+  grid.sync();
+
+  // Mark exact low-five-bit suffixes inside the compact active pages.
+  for (std::uint32_t tile_index = blockIdx.x;
+       tile_index < query_tile_count; tile_index += gridDim.x) {
+    const TqrjRankTile tile = query_tiles[tile_index];
+    const TqrjRankTask task = tasks[tile.task];
+    const std::uint32_t query_begin = query_bases[task.quotient];
+    const std::uint32_t query_count = query_counts[task.quotient];
+    for (std::uint32_t local = threadIdx.x; local < kTqrjRankTileRows;
+         local += blockDim.x) {
+      const std::uint32_t row = tile.begin + local;
+      const bool valid = row < query_count;
+      const std::uint32_t suffix = valid
+          ? key_suffix(queries[query_begin + row]) : 0u;
+      const std::uint32_t relative_page = valid
+          ? tqrj_rank_page_index(
+                suffix, global_group_masks, global_group_prefixes,
+                tile.task)
+          : 0u;
+      const std::uint32_t page = task.page_base + relative_page;
+      const unsigned active = __ballot_sync(0xffffffffu, valid);
+      if (!valid) continue;
+      const unsigned peers = __match_any_sync(active, page);
+      const std::uint32_t aggregate =
+          __reduce_or_sync(peers, 1u << (suffix & 31u));
+      const std::uint32_t lane = threadIdx.x & 31u;
+      if (lane == static_cast<std::uint32_t>(__ffs(peers) - 1))
+        atomicOr(global_page_masks + page, aggregate);
+    }
+  }
+  grid.sync();
+
+  // Rank distinct suffixes and clear exactly one winner per observed suffix.
+  for (std::uint32_t task_index = blockIdx.x;
+       task_index < tasks_in_queue; task_index += gridDim.x) {
+    const std::uint32_t page_base = tasks[task_index].page_base;
+    const std::uint32_t page_count = tasks[task_index].page_count;
+    if (threadIdx.x == 0u) {
+      std::uint32_t prefix = 0u;
+      for (std::uint32_t page = 0u; page < page_count; ++page) {
+        const std::uint32_t position = page_base + page;
+        global_page_prefix_words[position] =
+            (global_page_prefix_words[position] & 0xffffu) |
+            (prefix << 16u);
+        prefix += __popc(global_page_masks[page_base + page]);
+      }
+      shared_b = prefix;
+      shared_a = atomicAdd(counters + 3u, prefix);
+      tasks[task_index].winner_base = shared_a;
+      tasks[task_index].winner_count = prefix;
+    }
+    __syncthreads();
+    for (std::uint32_t winner = threadIdx.x; winner < shared_b;
+         winner += blockDim.x)
+      winners[shared_a + winner] = 0ull;
+    __syncthreads();
+  }
+  grid.sync();
+
+  // Match every pending row exactly once.  Tiles map their logical row to one
+  // of the at most sixteen already-grouped raw sections.
+  const std::uint32_t pending_tile_count = counters[1];
+  for (std::uint32_t tile_index = blockIdx.x;
+       tile_index < pending_tile_count; tile_index += gridDim.x) {
+    const TqrjRankTile tile = pending_tiles[tile_index];
+    tqrj_rank_stage_directory(
+        tile.task, global_group_masks, global_group_prefixes,
+        global_page_masks, global_page_prefix_words, tasks,
+        group_masks, group_prefixes, page_masks, page_prefixes,
+        &shared_task);
+    if (threadIdx.x == 0u) {
+      std::uint32_t prefix = 0u;
+      section_prefixes[0] = 0u;
+      for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+        const std::size_t oi = std::size_t{batch} *
+            (kQuotients + 1u) + shared_task.quotient;
+        prefix += raw_offsets[oi + 1u] - raw_offsets[oi];
+        section_prefixes[batch + 1u] = prefix;
+      }
+    }
+    __syncthreads();
+    for (std::uint32_t local = threadIdx.x; local < kTqrjRankTileRows;
+         local += blockDim.x) {
+      const std::uint32_t row = tile.begin + local;
+      bool matched = false;
+      std::uint32_t owner = kInvalid;
+      unsigned long long token = 0ull;
+      if (row < shared_task.pending_rows) {
+        std::uint32_t low = 0u, high = pending_batches;
+        while (low + 1u < high) {
+          const std::uint32_t middle = (low + high) >> 1u;
+          if (section_prefixes[middle] <= row)
+            low = middle;
+          else
+            high = middle;
+        }
+        const std::uint32_t batch = low;
+        const std::size_t oi = std::size_t{batch} *
+            (kQuotients + 1u) + shared_task.quotient;
+        const std::uint32_t position =
+            raw_offsets[oi] + row - section_prefixes[batch];
+        const std::uint32_t record = batch * batch_stride + position;
+        const std::uint32_t suffix = key_suffix(raw_keys[record]);
+        owner = tqrj_rank_find_shared(
+            suffix, group_masks, group_prefixes, page_masks,
+            page_prefixes, shared_task);
+        matched = owner != kInvalid;
+        if (matched) token = tqrj_pending_token(raw_payloads[record]);
+      }
+      tqrj_warp_atomic_max(matched, owner, token, winners);
+    }
+    __syncthreads();
+  }
+  grid.sync();
+
+  // Emit every original query after all pending tiles have contributed.
   if (threadIdx.x == 0u)
     occupied_levels =
         load_query_manifest(query_occupied_level_mask).occupied_level_mask;
   __syncthreads();
-
-  while (true) {
-    if (threadIdx.x == 0u) {
-      task_index = atomicAdd(next_task, 1u);
-      if (task_index < *task_count) q = task_quotients[task_index];
-    }
-    __syncthreads();
-    if (task_index >= *task_count) return;
-
-    const std::uint32_t query_begin = query_bases[q];
-    const std::uint32_t query_count = query_counts[q];
-    const std::uint32_t task_tag =
-        generation * 65537u + task_index + 1u;
-    for (std::uint32_t local = threadIdx.x; local < query_count;
+  for (std::uint32_t tile_index = blockIdx.x;
+       tile_index < query_tile_count; tile_index += gridDim.x) {
+    const TqrjRankTile tile = query_tiles[tile_index];
+    tqrj_rank_stage_directory(
+        tile.task, global_group_masks, global_group_prefixes,
+        global_page_masks, global_page_prefix_words, tasks,
+        group_masks, group_prefixes, page_masks, page_prefixes,
+        &shared_task);
+    const std::uint32_t query_begin = query_bases[shared_task.quotient];
+    const std::uint32_t query_count = query_counts[shared_task.quotient];
+    for (std::uint32_t local = threadIdx.x; local < kTqrjRankTileRows;
          local += blockDim.x) {
-      const std::uint32_t suffix =
-          key_suffix(queries[query_begin + local]);
-      tqrj_mark_suffix(suffix, task_tag, tags, winners);
-    }
-    __syncthreads();
-
-    const std::uint32_t lane = threadIdx.x & 31u;
-    const std::uint32_t warp = threadIdx.x >> 5u;
-    constexpr std::uint32_t kWarps = kThreads / 32u;
-    for (std::uint32_t batch = warp; batch < pending_batches;
-         batch += kWarps) {
-      const std::size_t oi =
-          std::size_t{batch} * (kQuotients + 1u) + q;
-      const std::uint32_t begin = raw_offsets[oi];
-      const std::uint32_t end = raw_offsets[oi + 1u];
-      for (std::uint32_t base = begin; base < end; base += 32u) {
-        const std::uint32_t position = base + lane;
-        bool matched = false;
-        std::uint32_t suffix = 0u;
-        unsigned long long token = 0ull;
-        if (position < end) {
-          const std::uint32_t record = batch * batch_stride + position;
-          suffix = key_suffix(raw_keys[record]);
-          matched = tags[suffix] == task_tag;
-          if (matched) token = tqrj_pending_token(raw_payloads[record]);
-        }
-        tqrj_warp_atomic_max(matched, suffix, token, winners);
-      }
-    }
-    __syncthreads();
-
-    for (std::uint32_t local = threadIdx.x; local < query_count;
-         local += blockDim.x) {
-      const std::uint32_t query_index = query_begin + local;
-      const std::uint32_t key = queries[query_index];
+      const std::uint32_t row = tile.begin + local;
+      if (row >= query_count) continue;
+      const std::uint32_t query_index = query_begin + row;
+      const std::uint32_t suffix = key_suffix(queries[query_index]);
+      const std::uint32_t owner = tqrj_rank_find_shared(
+          suffix, group_masks, group_prefixes, page_masks,
+          page_prefixes, shared_task);
+      const unsigned long long winner =
+          owner == kInvalid ? 0ull : winners[owner];
+      const std::uint32_t key = (shared_task.quotient << 16u) | suffix;
       tqrj_write_result(
-          key, query_index, winners[key_suffix(key)], out_values, out_found,
-          arena, descriptors, canonical_cell_ranks, occupied_levels,
-          query_ids);
+          key, query_index, winner, out_values, out_found, arena,
+          descriptors, canonical_cell_ranks, occupied_levels, query_ids);
     }
     __syncthreads();
-  }
-}
-
-// Very large query or pending sections are processed one quotient at a time
-// by a cooperatively synchronized resident grid.  This gives a single hot
-// quotient grid-wide parallelism while retaining one pending scan.
-__global__ void tqrj_huge_lookup_kernel(
-    const std::uint32_t *queries, std::uint32_t *out_values,
-    std::uint8_t *out_found, const std::uint32_t *query_bases,
-    const std::uint32_t *query_counts,
-    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
-    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, ResidentRows arena,
-    const Descriptor *descriptors, const std::uint32_t *query_ids,
-    const std::uint16_t *canonical_cell_ranks,
-    const std::uint64_t *query_occupied_level_mask,
-    const std::uint32_t *task_quotients,
-    const std::uint32_t *task_count, std::uint32_t generation,
-    std::uint32_t *tags, unsigned long long *winners) {
-  const cooperative_groups::grid_group grid =
-      cooperative_groups::this_grid();
-  const std::uint64_t rank = grid.thread_rank();
-  const std::uint64_t stride = grid.size();
-  const std::uint64_t occupied_levels =
-      load_query_manifest(query_occupied_level_mask).occupied_level_mask;
-
-  for (std::uint32_t task = 0u; task < *task_count; ++task) {
-    const std::uint32_t q = task_quotients[task];
-    const std::uint32_t query_begin = query_bases[q];
-    const std::uint32_t query_count = query_counts[q];
-    const std::uint32_t task_tag =
-        generation * 65537u + task + 0x80000001u;
-    for (std::uint64_t local = rank; local < query_count;
-         local += stride) {
-      const std::uint32_t suffix = key_suffix(
-          queries[query_begin + static_cast<std::uint32_t>(local)]);
-      tqrj_mark_suffix(suffix, task_tag, tags, winners);
-    }
-    grid.sync();
-
-    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
-      const std::size_t oi =
-          std::size_t{batch} * (kQuotients + 1u) + q;
-      const std::uint32_t begin = raw_offsets[oi];
-      const std::uint32_t end = raw_offsets[oi + 1u];
-      for (std::uint64_t block_base =
-               std::uint64_t{blockIdx.x} * blockDim.x;
-           begin + block_base < end; block_base += stride) {
-        const std::uint64_t position64 = begin + block_base + threadIdx.x;
-        const bool valid = position64 < end;
-        bool matched = false;
-        std::uint32_t suffix = 0u;
-        unsigned long long token = 0ull;
-        if (valid) {
-          const std::uint32_t position =
-              static_cast<std::uint32_t>(position64);
-          const std::uint32_t record = batch * batch_stride + position;
-          suffix = key_suffix(raw_keys[record]);
-          matched = tags[suffix] == task_tag;
-          if (matched) token = tqrj_pending_token(raw_payloads[record]);
-        }
-        tqrj_warp_atomic_max(matched, suffix, token, winners);
-      }
-    }
-    grid.sync();
-
-    for (std::uint64_t local = rank; local < query_count;
-         local += stride) {
-      const std::uint32_t query_index =
-          query_begin + static_cast<std::uint32_t>(local);
-      const std::uint32_t key = queries[query_index];
-      tqrj_write_result(
-          key, query_index, winners[key_suffix(key)], out_values, out_found,
-          arena, descriptors, canonical_cell_ranks, occupied_levels,
-          query_ids);
-    }
-    grid.sync();
   }
 }
 
@@ -5702,16 +5893,18 @@ private:
         pending_batches_ >= gpulsmopt2_detail::kTqrjMinimumBatches &&
         std::uint64_t{pending_records_} >= tqrj_dense_threshold;
     if (use_tqrj) {
-      if (publication_keys_a_.size() < batch.count) {
+      if (publication_keys_a_.size() < batch.count ||
+          publication_rows_a_.size() < batch.count) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         publication_keys_a_.grow(batch.count);
+        publication_rows_a_.grow(batch.count);
       }
       const std::size_t reference_capacity =
           canonical_epoch_workspace_.size() *
           sizeof(gpulsmopt2_detail::RawPayload) / sizeof(std::uint32_t);
       if (reference_capacity < 2u * batch.count ||
-          reference_capacity < batch.count + 1u +
-              gpulsmopt2_detail::kTqrjScratchWordsPerSkewBlock) {
+          publication_keys_a_.size() < batch.count ||
+          publication_rows_a_.size() < batch.count) {
         throw std::length_error(
             "insufficient idle publication workspace for GPULSMOpt TQRJ");
       }
@@ -5736,31 +5929,67 @@ private:
       const std::uint32_t active_capacity = std::min(
           count, gpulsmopt2_detail::kQuotients);
       std::uint32_t *grouped_queries = publication_keys_a_.data();
+      // Once direct routing is complete, quotient bits are redundant.  The
+      // skew directory stores one 16-bit page prefix in the upper half of
+      // each leading grouped-query word while preserving every low suffix.
+      std::uint32_t *rank_page_prefix_words = grouped_queries;
       std::uint32_t *grouped_ids = reinterpret_cast<std::uint32_t *>(
           canonical_epoch_workspace_.data());
       std::uint32_t *reservation_ranks = grouped_ids + count;
+      std::uint32_t *rank_page_masks = reservation_ranks;
+      unsigned long long *rank_winners =
+          reinterpret_cast<unsigned long long *>(publication_rows_a_.data());
       std::uint32_t *active_quotients = range_hot_window_offsets_.data();
       std::uint32_t *active_counts =
           foundation_section_output_counts_.data();
       std::uint32_t *active_offsets = foundation_source_offsets_.data();
       std::uint32_t *active_count = range_hot_selected_count_.data();
       std::uint32_t *query_bases = query_quotient_offsets();
-      std::uint32_t *medium_quotients = reinterpret_cast<std::uint32_t *>(
-          range_hot_counts_.data());
-      std::uint32_t *huge_quotients = reinterpret_cast<std::uint32_t *>(
-          range_hot_offsets_.data());
-      std::uint32_t *medium_count = publication_selected_count_.data();
-      std::uint32_t *medium_next = canonical_next_job_.data();
-      std::uint32_t *huge_count = local_epoch_overflow_flag_.data();
+
+      std::uint8_t *rank_fixed = reinterpret_cast<std::uint8_t *>(
+          canonical_cell_counts_.data());
+      std::uint32_t *rank_group_masks =
+          reinterpret_cast<std::uint32_t *>(rank_fixed);
+      std::uint16_t *rank_group_prefixes =
+          reinterpret_cast<std::uint16_t *>(
+              rank_fixed + gpulsmopt2_detail::kTqrjRankGroupMaskBytes);
+      gpulsmopt2_detail::TqrjRankTask *rank_tasks =
+          reinterpret_cast<gpulsmopt2_detail::TqrjRankTask *>(
+              rank_fixed + gpulsmopt2_detail::kTqrjRankGroupMaskBytes +
+              gpulsmopt2_detail::kTqrjRankGroupPrefixBytes);
+      std::uint32_t *rank_counters = reinterpret_cast<std::uint32_t *>(
+          rank_fixed + gpulsmopt2_detail::kTqrjRankGroupMaskBytes +
+          gpulsmopt2_detail::kTqrjRankGroupPrefixBytes +
+          gpulsmopt2_detail::kTqrjRankTaskBytes);
+      std::uint32_t *rank_task_count = publication_selected_count_.data();
+
+      const std::uint32_t maximum_query_tiles =
+          gpulsmopt2_detail::tqrj_rank_tile_count(count) + active_capacity;
+      const std::uint32_t maximum_pending_tiles =
+          gpulsmopt2_detail::tqrj_rank_tile_count(pending_records_) +
+          active_capacity;
+      const std::size_t tile_workspace_bytes =
+          static_cast<std::uint8_t *>(radix_workspace_) -
+          radix_storage_.data();
+      const std::size_t required_tile_bytes =
+          std::size_t{maximum_query_tiles + maximum_pending_tiles} *
+          sizeof(gpulsmopt2_detail::TqrjRankTile);
+      if (required_tile_bytes > tile_workspace_bytes)
+        throw std::length_error(
+            "insufficient idle radix workspace for GPULSMOpt TQRJ");
+      gpulsmopt2_detail::TqrjRankTile *rank_query_tiles =
+          reinterpret_cast<gpulsmopt2_detail::TqrjRankTile *>(
+              radix_storage_.data());
+      gpulsmopt2_detail::TqrjRankTile *rank_pending_tiles =
+          rank_query_tiles + maximum_query_tiles;
 
       CUDA_CHECK(cudaMemsetAsync(
           active_count, 0, sizeof(std::uint32_t), stream));
       CUDA_CHECK(cudaMemsetAsync(
-          medium_count, 0, sizeof(std::uint32_t), stream));
+          rank_task_count, 0, sizeof(std::uint32_t), stream));
       CUDA_CHECK(cudaMemsetAsync(
-          medium_next, 0, sizeof(std::uint32_t), stream));
-      CUDA_CHECK(cudaMemsetAsync(
-          huge_count, 0, sizeof(std::uint32_t), stream));
+          rank_counters, 0,
+          gpulsmopt2_detail::kTqrjRankCounterBytes, stream));
       gpulsmopt2_detail::count_lookup_quotients_kernel<<<
           blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
               batch.queries, count, admission_counts_.data(),
@@ -5784,27 +6013,6 @@ private:
               batch.queries, count, query_bases, reservation_ranks,
               grouped_queries, grouped_ids);
 
-      const std::size_t reference_capacity =
-          canonical_epoch_workspace_.size() *
-          sizeof(gpulsmopt2_detail::RawPayload) / sizeof(std::uint32_t);
-      const std::size_t scratch_begin =
-          std::size_t{count} + (count & 1u);
-      const std::size_t available_scratch_words =
-          reference_capacity - scratch_begin;
-      const std::uint32_t scratch_blocks = static_cast<std::uint32_t>(
-          std::min<std::size_t>(
-              tqrj_max_skew_blocks_, available_scratch_words /
-                  gpulsmopt2_detail::kTqrjScratchWordsPerSkewBlock));
-      if (!scratch_blocks)
-        throw std::length_error("insufficient GPULSMOpt TQRJ skew scratch");
-      std::uint32_t *scratch_tags = grouped_ids + scratch_begin;
-      unsigned long long *scratch_winners =
-          reinterpret_cast<unsigned long long *>(
-              scratch_tags + std::size_t{scratch_blocks} *
-                  gpulsmopt2_detail::kTqrjTagWordsPerSkewBlock);
-      ++tqrj_lookup_generation_;
-      if (!tqrj_lookup_generation_) ++tqrj_lookup_generation_;
-
       gpulsmopt2_detail::tqrj_direct_lookup_kernel<<<
           active_capacity, gpulsmopt2_detail::kThreads, 0, stream>>>(
               grouped_queries, batch.out_values, batch.out_found,
@@ -5813,55 +6021,44 @@ private:
               static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
               resident_rows(), descriptors_.data(), grouped_ids,
               canonical_cell_ranks_.data(),
-              query_occupied_level_mask_.data(), medium_quotients,
-              medium_count, huge_quotients, huge_count);
-      gpulsmopt2_detail::tqrj_medium_lookup_kernel<<<
-          scratch_blocks, gpulsmopt2_detail::kThreads, 0, stream>>>(
-              grouped_queries, batch.out_values, batch.out_found,
-              query_bases, admission_counts_.data(), raw_keys_.data(),
-              raw_payloads_.data(), raw_offsets_.data(),
-              static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
-              resident_rows(), descriptors_.data(), grouped_ids,
-              canonical_cell_ranks_.data(),
-              query_occupied_level_mask_.data(), medium_quotients,
-              medium_count, medium_next, tqrj_lookup_generation_,
-              scratch_tags, scratch_winners);
+              query_occupied_level_mask_.data(), rank_tasks,
+              rank_task_count);
 
-      const std::uint32_t *huge_task_quotients = huge_quotients;
-      const std::uint32_t *huge_task_count = huge_count;
-      const std::uint32_t *query_counts = admission_counts_.data();
-      const std::uint32_t *raw_keys = raw_keys_.data();
-      const gpulsmopt2_detail::RawPayload *raw_payloads =
+      const std::uint32_t *rank_query_counts = admission_counts_.data();
+      const std::uint32_t *rank_raw_keys = raw_keys_.data();
+      const gpulsmopt2_detail::RawPayload *rank_raw_payloads =
           raw_payloads_.data();
-      const std::uint32_t *raw_offsets = raw_offsets_.data();
-      std::uint32_t batch_stride =
+      const std::uint32_t *rank_raw_offsets = raw_offsets_.data();
+      const std::uint32_t rank_batch_stride =
           static_cast<std::uint32_t>(batch_capacity_);
-      std::uint32_t pending_batches = pending_batches_;
-      gpulsmopt2_detail::ResidentRows arena = resident_rows();
-      const gpulsmopt2_detail::Descriptor *descriptors =
+      const std::uint32_t rank_pending_batches = pending_batches_;
+      std::uint32_t *rank_out_values = batch.out_values;
+      std::uint8_t *rank_out_found = batch.out_found;
+      gpulsmopt2_detail::ResidentRows rank_arena = resident_rows();
+      const gpulsmopt2_detail::Descriptor *rank_descriptors =
           descriptors_.data();
-      const std::uint16_t *canonical_cell_ranks =
+      const std::uint32_t *rank_query_ids = grouped_ids;
+      const std::uint16_t *rank_cell_ranks =
           canonical_cell_ranks_.data();
-      const std::uint64_t *query_manifest =
+      const std::uint64_t *rank_query_manifest =
           query_occupied_level_mask_.data();
-      std::uint32_t *out_values = batch.out_values;
-      std::uint8_t *out_found = batch.out_found;
-      const std::uint32_t *tqrj_queries = grouped_queries;
-      const std::uint32_t *tqrj_query_bases = query_bases;
-      const std::uint32_t *tqrj_query_ids = grouped_ids;
-      std::uint32_t generation = tqrj_lookup_generation_;
-      void *huge_arguments[] = {
-          &tqrj_queries, &out_values, &out_found, &tqrj_query_bases,
-          &query_counts, &raw_keys, &raw_payloads, &raw_offsets,
-          &batch_stride, &pending_batches, &arena, &descriptors,
-          &tqrj_query_ids, &canonical_cell_ranks, &query_manifest,
-          &huge_task_quotients, &huge_task_count, &generation,
-          &scratch_tags, &scratch_winners};
+      void *rank_arguments[] = {
+          &rank_tasks, &rank_task_count, &query_bases,
+          &rank_query_counts, &grouped_queries, &rank_query_tiles,
+          &rank_pending_tiles, &rank_counters, &rank_group_masks,
+          &rank_group_prefixes, &rank_page_masks,
+          &rank_page_prefix_words,
+          &rank_winners, &rank_raw_keys, &rank_raw_payloads,
+          &rank_raw_offsets, const_cast<std::uint32_t *>(&rank_batch_stride),
+          const_cast<std::uint32_t *>(&rank_pending_batches),
+          &rank_out_values, &rank_out_found, &rank_arena,
+          &rank_descriptors, &rank_query_ids, &rank_cell_ranks,
+          &rank_query_manifest};
       CUDA_CHECK(cudaLaunchCooperativeKernel(
           reinterpret_cast<const void *>(
-              gpulsmopt2_detail::tqrj_huge_lookup_kernel),
-          dim3(scratch_blocks), dim3(gpulsmopt2_detail::kThreads),
-          huge_arguments, 0u, stream));
+              gpulsmopt2_detail::tqrj_rank_lookup_kernel),
+          dim3(tqrj_rank_worker_blocks_),
+          dim3(gpulsmopt2_detail::kThreads), rank_arguments, 0u, stream));
       gpulsmopt2_detail::reset_lookup_quotient_counts_kernel<<<
           blocks(active_capacity), gpulsmopt2_detail::kThreads,
           0, stream>>>(
@@ -6341,13 +6538,17 @@ private:
     if (!properties.cooperativeLaunch)
       throw std::runtime_error(
           "GPULSMOpt TQRJ requires cooperative kernel launch support");
-    // One block per SM is a portable cooperative-grid bound.  Capping it
-    // also bounds the transient skew scratch borrowed during lookup.
-    tqrj_max_skew_blocks_ = std::min(
-        gpulsmopt2_detail::kTqrjMaximumSkewBlocks,
-        static_cast<std::uint32_t>(
-            std::max(1, properties.multiProcessorCount)));
     int blocks_per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, gpulsmopt2_detail::tqrj_rank_lookup_kernel,
+        gpulsmopt2_detail::kThreads, 0u));
+    // The single skew executor derives its worker grid only from kernel
+    // resources and hardware parallelism.  It is independent of query count,
+    // quotient skew, and the former medium/huge boundary.
+    tqrj_rank_worker_blocks_ = static_cast<std::uint32_t>(
+        std::max(1, std::min(4, blocks_per_sm)) *
+        properties.multiProcessorCount);
+    blocks_per_sm = 0;
     resident_planner_blocks_ = static_cast<std::uint32_t>(std::max<std::size_t>(
         1u, std::min<std::size_t>(maximum_resident_jobs_,
             static_cast<std::size_t>(properties.multiProcessorCount) * 4u)));
@@ -7508,8 +7709,7 @@ private:
       canonical_job_capacities_{};
   std::uint32_t canonical_epoch_resolver_blocks_{};
   std::uint32_t canonical_epoch_workspace_slots_{};
-  std::uint32_t tqrj_max_skew_blocks_{};
-  std::uint32_t tqrj_lookup_generation_{};
+  std::uint32_t tqrj_rank_worker_blocks_{};
   std::array<std::size_t,
              gpulsmopt2_detail::kMaximumMergeSources + 1u>
       canonical_tournament_shared_bytes_{};
