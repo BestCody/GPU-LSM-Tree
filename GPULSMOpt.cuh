@@ -8,6 +8,7 @@
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_reduce.cuh>
+#include <cub/device/device_run_length_encode.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_scan.cuh>
@@ -5632,11 +5633,36 @@ __global__ void successor_with_pending_kernel(
 
 }
 
+#include "gpulsm_sparse/pending.cuh"
+#include "gpulsm_sparse/refine.cuh"
+#include "gpulsm_sparse/bulk.cuh"
+#include "gpulsm_sparse/sealed.cuh"
+#include "gpulsm_sparse/read.cuh"
+#include "gpulsm_sparse/ordered_read.cuh"
+#include "gpulsm_sparse/range.cuh"
+
 class GPULSMOpt {
 public:
   struct DeviceKeyBatch {
     const std::uint32_t *keys = nullptr;
     std::size_t count = 0u;
+  };
+
+  struct SparseMemoryAccounting {
+    std::uint64_t manifest_bytes{};
+    std::uint64_t overlay_metadata_bytes{};
+    std::uint64_t workspace_bytes{};
+    std::uint64_t workspace_high_water_bytes{};
+    std::uint64_t capsule_reserved_bytes{};
+    std::uint64_t capsule_mapped_bytes{};
+    std::uint64_t capsule_live_bytes{};
+    std::uint64_t capsule_garbage_bytes{};
+    std::uint32_t capsule_segments{};
+
+    std::uint64_t physical_bytes() const {
+      return manifest_bytes + overlay_metadata_bytes + workspace_bytes +
+          capsule_mapped_bytes;
+    }
   };
 
   explicit GPULSMOpt(const DictionaryConfig &config)
@@ -5689,6 +5715,11 @@ public:
         device_manifests_(2u),
         active_device_manifest_(1u),
         query_occupied_level_mask_(1u),
+        device_sparse_manifests_(2u),
+        device_pending_sparse_states_(
+            gpulsmopt2_detail::kBatchesPerEpoch),
+        sealed_device_command_(1u),
+        sealed_device_receipt_(1u),
         resident_plan_(1u),
         publication_receipt_(1u),
         level_storage_spans_(gpulsmopt2_detail::kMaximumLevels),
@@ -5698,6 +5729,8 @@ public:
         operation_workspace_(
             operation_workspace_maximum_bytes(batch_capacity_),
             operation_workspace_initial_bytes(batch_capacity_)),
+        sealed_workspace_(make_sealed_workspace(
+            publication_capacity_, level_zero_capacity_)),
         canonical_job_prefixes_(maximum_resident_jobs_),
         canonical_next_job_(1u),
         raw_keys_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
@@ -5868,11 +5901,172 @@ public:
     end_operation(stream);
   }
 
+  void bulk_build(const DeviceRecordBatchView &batch,
+                  cudaStream_t stream) {
+    validate_record_batch(batch);
+    // This is the protected representation-capability dispatch: call the
+    // restored bulk_build entry itself, with no universal or sparse setup.
+    if (ordinary_compatible(batch) &&
+        batch.uniform_operation == DeviceMutation::put) {
+      bulk_build(
+          reinterpret_cast<const std::uint32_t *>(batch.keys.bytes),
+          reinterpret_cast<const std::uint32_t *>(batch.values.bytes),
+          static_cast<std::size_t>(batch.count), stream);
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    if (batch.count >= gpulsm_sparse::kCompletionIncoming)
+      throw std::length_error(
+          "GPULSMOpt direct mixed root exceeds locator capacity");
+    begin_operation(stream);
+    reset_updates(stream);
+    if (!batch.count) {
+      end_operation(stream);
+      return;
+    }
+
+    const std::uint32_t rows = static_cast<std::uint32_t>(batch.count);
+    const gpulsm_sparse::RecordBatchView source =
+        gpulsm_sparse::record_batch_view(batch);
+    gpulsm_sparse::DirectRootWorkspace workspace(rows);
+    const gpulsm_sparse::DirectRootPreparation prepared =
+        workspace.prepare(source, rows, stream);
+    const std::uint32_t level = initial_level_for_records(
+        prepared.logical_rows);
+    ensure_level_storage_mapped(level, stream);
+    ensure_publication_capacity(prepared.projection_rows, stream);
+    workspace.materialize_projection(
+        source, prepared.projection_rows, publication_keys_a_.data(),
+        publication_rows_a_.data(), stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        publication_selected_count_.data(), &prepared.projection_rows,
+        sizeof(prepared.projection_rows), cudaMemcpyHostToDevice, stream));
+    gpulsmopt2_detail::build_query_quotient_offsets_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            publication_keys_a_.data(), prepared.projection_rows,
+            foundation_source_offsets_.data());
+
+    const std::uint64_t destination = level_begin(level);
+    const std::uint64_t capacity = level_capacity(level);
+    if (prepared.projection_rows > capacity)
+      throw std::bad_alloc();
+    gpulsmopt2_detail::copy_canonical_epoch_kernel<<<
+        blocks(prepared.projection_rows), gpulsmopt2_detail::kThreads, 0,
+        stream>>>(publication_rows_a_.data(),
+                  publication_selected_count_.data(), resident_rows(),
+                  destination);
+    gpulsmopt2_detail::ResidentPublicationPlan build_plan{};
+    build_plan.destination_level = level;
+    build_plan.output_begin = destination;
+    build_plan.output_capacity = capacity;
+    build_plan.survivor_count = prepared.projection_rows;
+    build_plan.status = gpulsmopt2_detail::kPublicationSuccess;
+    CUDA_CHECK(cudaMemcpyAsync(
+        resident_plan_.data(), &build_plan, sizeof(build_plan),
+        cudaMemcpyHostToDevice, stream));
+    gpulsmopt2_detail::build_canonical_rank_from_run_kernel<<<
+        gpulsmopt2_detail::kQuotients,
+        gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+            resident_rows(), destination,
+            foundation_source_offsets_.data(), level,
+            canonical_cell_ranks_.data());
+    gpulsmopt2_detail::finalize_canonical_level_metadata_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            foundation_source_offsets_.data(), level_storage_spans_.data(),
+            resident_plan_.data(), descriptors_.data(),
+            static_cast<std::uint32_t>(route_stride_),
+            route_headers_.data(), route_slices_.data(),
+            route_logical_begins_.data(), route_quotients_.data(),
+            level_q_logical_offsets_.data());
+
+    std::uint32_t sparse_flags = 0u;
+    std::shared_ptr<gpulsm_sparse::StagedRootOverlay> staged;
+    if (prepared.sparse_heads) {
+      if (!sparse_refinement_workspace_)
+        sparse_refinement_workspace_ = std::make_unique<
+            gpulsm_sparse::SparseRefinementWorkspace>();
+      sparse_refinement_workspace_->prepare_direct_roster(
+          workspace.sparse_heads(), prepared.sparse_heads, stream);
+      gpulsm_sparse::CompletionSourceView completion{};
+      completion.incoming = source;
+      completion.incoming_sorted_heads = workspace.sorted_heads();
+      completion.incoming_sorted_refs = workspace.sorted_refs();
+      completion.incoming_records = rows;
+      staged =
+          std::make_shared<gpulsm_sparse::StagedRootOverlay>();
+      const gpulsm_sparse::SparseRefinementResult refined =
+          sparse_refinement_workspace_->refine(
+              completion, 0u, resident_rows(), descriptors_.data(), level,
+              destination, prepared.projection_rows, true, 0u,
+              next_capsule_segment_ordinal_, *staged, stream);
+      if (staged->state.logical_count != prepared.logical_rows)
+        throw std::logic_error(
+            "direct root logical/projection count mismatch");
+      if (refined.allocated_capsule_bytes) {
+        if (next_capsule_segment_ordinal_ ==
+            std::numeric_limits<std::uint32_t>::max())
+          throw std::overflow_error("GPULSMOpt capsule ordinal overflow");
+        ++next_capsule_segment_ordinal_;
+      }
+      if (refined.exact_heads)
+        sparse_flags |= gpulsm_sparse::kSparseHasExactHeads;
+      if (refined.capsules)
+        sparse_flags |= gpulsm_sparse::kSparseHasCapsules;
+    }
+
+    level_counts_[level] = prepared.projection_rows;
+    host_occupied_level_mask_ = std::uint64_t{1u} << level;
+    gpulsmopt2_detail::initialize_device_manifest_kernel<<<1, 1, 0,
+                                                           stream>>>(
+        device_manifests_.data(), active_device_manifest_.data(),
+        query_occupied_level_mask_.data(), level,
+        prepared.projection_rows, 0u);
+    gpulsm_sparse::initialize_direct_sparse_manifest<<<1, 1, 0, stream>>>(
+        device_sparse_manifests_.data(),
+        sparse_flags ? staged->device_state.data() : nullptr, level,
+        sparse_flags);
+    if (sparse_flags) {
+      sparse_roots_[level] = std::move(staged);
+      const std::uint64_t bit = std::uint64_t{1u} << level;
+      if (sparse_flags & gpulsm_sparse::kSparseHasExactHeads)
+        sparse_exact_level_mask_ |= bit;
+      if (sparse_flags & gpulsm_sparse::kSparseHasCapsules)
+        sparse_capsule_level_mask_ |= bit;
+    }
+    note_sparse_workspace_high_water(workspace.bytes());
+    refresh_active_levels();
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+  }
+
   void insert(const DeviceKeyValueBatch &batch, cudaStream_t stream) {
     std::lock_guard<std::mutex> lock(operation_mutex_);
     resolve_publication_receipt();
     reject_updates_after_publication_failure();
     admit(batch.keys, batch.values, batch.count, false, stream);
+  }
+
+  void insert(const DeviceRecordBatchView &batch, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    reject_updates_after_publication_failure();
+    validate_record_batch(batch);
+    if (!batch.count) return;
+    if (ordinary_compatible(batch)) {
+      const auto *keys = reinterpret_cast<const std::uint32_t *>(
+          batch.keys.bytes);
+      const bool tombstone =
+          batch.uniform_operation == DeviceMutation::erase;
+      const auto *values = tombstone ? nullptr
+          : reinterpret_cast<const std::uint32_t *>(batch.values.bytes);
+      admit(keys, values, static_cast<std::size_t>(batch.count),
+            tombstone, stream);
+      return;
+    }
+    admit_mixed(gpulsm_sparse::record_batch_view(batch), stream);
   }
 
   void erase(const DeviceKeyBatch &batch, cudaStream_t stream) {
@@ -5887,21 +6081,192 @@ public:
     std::lock_guard<std::mutex> lock(operation_mutex_);
     resolve_publication_receipt();
     prepare_failed_epoch_for_reads(stream);
-    lookup_locked(batch, stream, quotients_grouped);
+    if (!has_sparse_read_state()) {
+      lookup_locked(batch, stream, quotients_grouped);
+      return;
+    }
+    if (!batch.count) return;
+    if (!batch.queries || !batch.out_values)
+      throw std::invalid_argument("invalid GPULSMOpt lookup");
+    gpulsm_sparse::RecordBatchView queries{};
+    queries.keys = device_head4_source(batch.queries);
+    queries.count = batch.count;
+    queries.head4_words = true;
+    gpulsm_sparse::SparseLookupOutput output{};
+    output.summaries = batch.out_values;
+    output.found = batch.out_found;
+    lookup_sparse_locked(queries, output, stream, quotients_grouped);
+  }
+
+  void lookup(const DeviceLookupBatchView &batch, cudaStream_t stream,
+              bool quotients_grouped = false) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    prepare_failed_epoch_for_reads(stream);
+    validate_lookup_batch(batch);
+    if (!batch.queries.count) return;
+
+    const bool native_source =
+        batch.queries.key_encoding == DeviceKeyEncoding::head4_words &&
+        batch.queries.keys.bytes && !batch.queries.keys.offsets &&
+        batch.queries.keys.stride == sizeof(std::uint32_t);
+    const bool native_output =
+        batch.output.values.layout == DeviceSinkLayout::fixed_stride &&
+        batch.output.values.bytes && !batch.output.values.offsets &&
+        batch.output.values.stride == sizeof(std::uint32_t) &&
+        batch.queries.count <=
+            batch.output.values.capacity_bytes / sizeof(std::uint32_t) &&
+        !batch.output.required_value_lengths && !batch.output.overflow;
+    if (!has_sparse_read_state() && native_source && native_output) {
+      lookup_locked(
+          DeviceLookupBatch{
+              reinterpret_cast<const std::uint32_t *>(
+                  batch.queries.keys.bytes),
+              static_cast<std::size_t>(batch.queries.count),
+              reinterpret_cast<std::uint32_t *>(batch.output.values.bytes),
+              batch.output.found},
+          stream, quotients_grouped);
+      return;
+    }
+
+    gpulsm_sparse::SparseLookupOutput output{};
+    output.values = batch.output.values;
+    output.value_lengths = batch.output.required_value_lengths;
+    output.found = batch.output.found;
+    output.overflow = batch.output.overflow;
+    lookup_sparse_locked(
+        gpulsm_sparse::key_batch_view(batch.queries), output, stream,
+        quotients_grouped);
   }
 
   void range(const DeviceRangeOutputBatch &batch, cudaStream_t stream) {
     std::lock_guard<std::mutex> lock(operation_mutex_);
     resolve_publication_receipt();
     prepare_failed_epoch_for_reads(stream);
-    range_locked(batch, stream);
+    if (!has_exact_read_state()) {
+      range_locked(batch, stream);
+      return;
+    }
+    if (!batch.query_count) return;
+    if (!batch.lo || !batch.hi || !batch.out_sums)
+      throw std::invalid_argument("invalid GPULSMOpt range input");
+    if (batch.query_count > gpulsmopt2_detail::kMaximumOperationTile) {
+      for (std::size_t begin = 0u; begin < batch.query_count;
+           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+        const std::size_t count = std::min(
+            batch.query_count - begin,
+            gpulsmopt2_detail::kMaximumOperationTile);
+        gpulsm_sparse::range_gate::RangeQueryBatch queries{};
+        queries.lower.keys = device_head4_source(batch.lo + begin);
+        queries.lower.count = count;
+        queries.lower.head4_words = true;
+        queries.upper.keys = device_head4_source(batch.hi + begin);
+        queries.upper.count = count;
+        queries.upper.head4_words = true;
+        queries.count = static_cast<std::uint32_t>(count);
+        range_sparse_locked(
+            queries, batch.out_sums + begin, nullptr, stream);
+      }
+      return;
+    }
+    gpulsm_sparse::range_gate::RangeQueryBatch queries{};
+    queries.lower.keys = device_head4_source(batch.lo);
+    queries.lower.count = batch.query_count;
+    queries.lower.head4_words = true;
+    queries.upper.keys = device_head4_source(batch.hi);
+    queries.upper.count = batch.query_count;
+    queries.upper.head4_words = true;
+    queries.count = static_cast<std::uint32_t>(batch.query_count);
+    range_sparse_locked(queries, batch.out_sums, nullptr, stream);
+  }
+
+  void range(const DeviceRangeSumBatchView &batch, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    prepare_failed_epoch_for_reads(stream);
+    validate_range_batch(batch);
+    const std::uint64_t count = batch.queries.lower.count;
+    if (!count) return;
+    const auto native_source = [](const DeviceKeyBatchView &source) {
+      return source.key_encoding == DeviceKeyEncoding::head4_words &&
+          source.keys.bytes && !source.keys.offsets &&
+          source.keys.stride == sizeof(std::uint32_t);
+    };
+    if (!has_exact_read_state() && native_source(batch.queries.lower) &&
+        native_source(batch.queries.upper) && !batch.valid) {
+      range_locked(
+          DeviceRangeOutputBatch{
+              reinterpret_cast<const std::uint32_t *>(
+                  batch.queries.lower.keys.bytes),
+              reinterpret_cast<const std::uint32_t *>(
+                  batch.queries.upper.keys.bytes),
+              static_cast<std::size_t>(count), batch.out_sums},
+          stream);
+      return;
+    }
+    gpulsm_sparse::range_gate::RangeQueryBatch queries{
+        gpulsm_sparse::key_batch_view(batch.queries.lower),
+        gpulsm_sparse::key_batch_view(batch.queries.upper),
+        static_cast<std::uint32_t>(count)};
+    range_sparse_locked(queries, batch.out_sums, batch.valid, stream);
   }
 
   void successor(const DeviceSuccessorBatch &batch, cudaStream_t stream) {
     std::lock_guard<std::mutex> lock(operation_mutex_);
     resolve_publication_receipt();
     prepare_failed_epoch_for_reads(stream);
-    successor_locked(batch, stream);
+    if (!has_exact_read_state()) {
+      successor_locked(batch, stream);
+      return;
+    }
+    if (!batch.count) return;
+    if (!batch.queries || !batch.out_keys)
+      throw std::invalid_argument("invalid GPULSMOpt successor input");
+    gpulsm_sparse::RecordBatchView queries{};
+    queries.keys = device_head4_source(batch.queries);
+    queries.count = batch.count;
+    queries.head4_words = true;
+    gpulsm_sparse::SparseSuccessorOutput output{};
+    output.head4_words = batch.out_keys;
+    successor_sparse_locked(queries, output, stream);
+  }
+
+  void successor(const DeviceSuccessorBatchView &batch,
+                 cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    resolve_publication_receipt();
+    prepare_failed_epoch_for_reads(stream);
+    validate_successor_batch(batch);
+    if (!batch.queries.count) return;
+    const bool native_source =
+        batch.queries.key_encoding == DeviceKeyEncoding::head4_words &&
+        batch.queries.keys.bytes && !batch.queries.keys.offsets &&
+        batch.queries.keys.stride == sizeof(std::uint32_t);
+    const bool native_output =
+        batch.output.keys.layout == DeviceSinkLayout::fixed_stride &&
+        batch.output.keys.bytes && !batch.output.keys.offsets &&
+        batch.output.keys.stride == sizeof(std::uint32_t) &&
+        batch.queries.count <=
+            batch.output.keys.capacity_bytes / sizeof(std::uint32_t) &&
+        !batch.output.required_key_lengths && !batch.output.found &&
+        !batch.output.overflow;
+    if (!has_exact_read_state() && native_source && native_output) {
+      successor_locked(
+          DeviceSuccessorBatch{
+              reinterpret_cast<const std::uint32_t *>(
+                  batch.queries.keys.bytes),
+              static_cast<std::size_t>(batch.queries.count),
+              reinterpret_cast<std::uint32_t *>(batch.output.keys.bytes)},
+          stream);
+      return;
+    }
+    gpulsm_sparse::SparseSuccessorOutput output{};
+    output.keys = batch.output.keys;
+    output.key_lengths = batch.output.required_key_lengths;
+    output.found = batch.output.found;
+    output.overflow = batch.output.overflow;
+    successor_sparse_locked(
+        gpulsm_sparse::key_batch_view(batch.queries), output, stream);
   }
 
   std::uint32_t canonical_carry_status() const {
@@ -5916,6 +6281,315 @@ public:
   }
 
 private:
+
+  static void validate_record_batch(const DeviceRecordBatchView &batch) {
+    if (batch.count > std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("GPULSMOpt record batch is too large");
+    if (!batch.count) return;
+    if (batch.key_encoding == DeviceKeyEncoding::head4_words) {
+      if (!batch.keys.bytes || batch.keys.offsets ||
+          batch.keys.stride != sizeof(std::uint32_t))
+        throw std::invalid_argument(
+            "invalid GPULSMOpt ordered-head source");
+    } else if (!batch.keys.offsets && batch.keys.stride &&
+               !batch.keys.bytes) {
+      throw std::invalid_argument("invalid GPULSMOpt key source");
+    }
+    if (!batch.operations &&
+        batch.uniform_operation == DeviceMutation::put &&
+        !batch.values.offsets && batch.values.stride &&
+        !batch.values.bytes)
+      throw std::invalid_argument("invalid GPULSMOpt value source");
+  }
+
+  static bool ordinary_compatible(const DeviceRecordBatchView &batch) {
+    if (batch.key_encoding != DeviceKeyEncoding::head4_words ||
+        batch.keys.offsets ||
+        batch.keys.stride != sizeof(std::uint32_t) ||
+        batch.operations || batch.range_contributions)
+      return false;
+    if (batch.uniform_operation == DeviceMutation::erase) return true;
+    return batch.values.bytes && !batch.values.offsets &&
+        batch.values.stride == sizeof(std::uint32_t);
+  }
+
+  static std::uint64_t checked_byte_displacement(
+      std::uint64_t begin, std::uint64_t stride) {
+    if (begin && stride >
+        std::numeric_limits<std::uint64_t>::max() / begin)
+      throw std::overflow_error("GPULSMOpt byte displacement overflow");
+    return begin * stride;
+  }
+
+  static gpulsm_sparse::ByteSource slice_byte_source(
+      gpulsm_sparse::ByteSource source, std::uint64_t begin) {
+    if (source.offsets) {
+      source.offsets += begin;
+    } else if (source.bytes) {
+      source.bytes += checked_byte_displacement(begin, source.stride);
+    }
+    return source;
+  }
+
+  static gpulsm_sparse::RecordBatchView slice_record_batch(
+      gpulsm_sparse::RecordBatchView source, std::uint64_t begin,
+      std::uint64_t count) {
+    source.keys = slice_byte_source(source.keys, begin);
+    source.values = slice_byte_source(source.values, begin);
+    if (source.operations) source.operations += begin;
+    if (source.range_contributions) source.range_contributions += begin;
+    source.count = count;
+    return source;
+  }
+
+  static gpulsm_sparse::SparseLookupOutput slice_lookup_output(
+      gpulsm_sparse::SparseLookupOutput output, std::uint64_t begin) {
+    if (output.summaries) output.summaries += begin;
+    if (output.value_lengths) output.value_lengths += begin;
+    if (output.found) output.found += begin;
+    if (output.overflow) output.overflow += begin;
+    if (output.values.layout == DeviceSinkLayout::packed) {
+      if (output.values.offsets) output.values.offsets += begin;
+    } else if (output.values.bytes) {
+      const std::uint64_t displacement = checked_byte_displacement(
+          begin, output.values.stride);
+      output.values.bytes += displacement;
+      output.values.capacity_bytes =
+          displacement <= output.values.capacity_bytes
+          ? output.values.capacity_bytes - displacement : 0u;
+    }
+    return output;
+  }
+
+  static void validate_lookup_batch(const DeviceLookupBatchView &batch) {
+    if (batch.queries.count > std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("GPULSMOpt lookup batch is too large");
+    if (!batch.queries.count) return;
+    const auto &keys = batch.queries.keys;
+    if (batch.queries.key_encoding == DeviceKeyEncoding::head4_words) {
+      if (!keys.bytes || keys.offsets ||
+          keys.stride != sizeof(std::uint32_t))
+        throw std::invalid_argument("invalid GPULSMOpt lookup heads");
+    } else if (!keys.offsets && !keys.bytes) {
+      throw std::invalid_argument("invalid GPULSMOpt lookup keys");
+    }
+    const auto &output = batch.output;
+    if (!output.values.bytes && !output.required_value_lengths &&
+        !output.found && !output.overflow)
+      throw std::invalid_argument("GPULSMOpt lookup has no output");
+    if (output.values.bytes &&
+        output.values.layout == DeviceSinkLayout::packed &&
+        !output.values.offsets)
+      throw std::invalid_argument("packed GPULSMOpt output needs offsets");
+  }
+
+  bool has_sparse_read_state() const {
+    return pending_sparse_exact_ || pending_sparse_capsules_ ||
+        sparse_exact_level_mask_ || sparse_capsule_level_mask_;
+  }
+
+  bool has_exact_read_state() const {
+    return pending_sparse_exact_ || sparse_exact_level_mask_;
+  }
+
+  static gpulsm_sparse::SparseSuccessorOutput slice_successor_output(
+      gpulsm_sparse::SparseSuccessorOutput output, std::uint64_t begin) {
+    if (output.head4_words) output.head4_words += begin;
+    if (output.key_lengths) output.key_lengths += begin;
+    if (output.found) output.found += begin;
+    if (output.overflow) output.overflow += begin;
+    if (output.keys.layout == DeviceSinkLayout::packed) {
+      if (output.keys.offsets) output.keys.offsets += begin;
+    } else if (output.keys.bytes) {
+      const std::uint64_t displacement = checked_byte_displacement(
+          begin, output.keys.stride);
+      output.keys.bytes += displacement;
+      output.keys.capacity_bytes = displacement <= output.keys.capacity_bytes
+          ? output.keys.capacity_bytes - displacement : 0u;
+    }
+    return output;
+  }
+
+  static void validate_successor_batch(
+      const DeviceSuccessorBatchView &batch) {
+    if (batch.queries.count > std::numeric_limits<std::size_t>::max())
+      throw std::invalid_argument("GPULSMOpt successor batch is too large");
+    if (!batch.queries.count) return;
+    const auto &keys = batch.queries.keys;
+    if (batch.queries.key_encoding == DeviceKeyEncoding::head4_words) {
+      if (!keys.bytes || keys.offsets ||
+          keys.stride != sizeof(std::uint32_t))
+        throw std::invalid_argument("invalid GPULSMOpt successor heads");
+    } else if (!keys.offsets && !keys.bytes) {
+      throw std::invalid_argument("invalid GPULSMOpt successor keys");
+    }
+    const auto &output = batch.output;
+    if (!output.keys.bytes && !output.required_key_lengths &&
+        !output.found && !output.overflow)
+      throw std::invalid_argument("GPULSMOpt successor has no output");
+    if (output.keys.bytes &&
+        output.keys.layout == DeviceSinkLayout::packed &&
+        !output.keys.offsets)
+      throw std::invalid_argument(
+          "packed GPULSMOpt successor output needs offsets");
+  }
+
+  static void validate_range_batch(const DeviceRangeSumBatchView &batch) {
+    const std::uint64_t count = batch.queries.lower.count;
+    if (count != batch.queries.upper.count ||
+        count > std::numeric_limits<std::uint32_t>::max() ||
+        (count && !batch.out_sums))
+      throw std::invalid_argument("invalid GPULSMOpt range batch");
+    if (!count) return;
+    const auto validate = [](const DeviceKeyBatchView &source) {
+      if (source.key_encoding == DeviceKeyEncoding::head4_words) {
+        return source.keys.bytes && !source.keys.offsets &&
+            source.keys.stride == sizeof(std::uint32_t);
+      }
+      return source.keys.offsets || source.keys.bytes;
+    };
+    if (!validate(batch.queries.lower) || !validate(batch.queries.upper))
+      throw std::invalid_argument("invalid GPULSMOpt range endpoints");
+  }
+
+  void admit_mixed(gpulsm_sparse::RecordBatchView source,
+                   cudaStream_t stream) {
+    begin_operation(stream);
+    std::uint64_t consumed = 0u;
+    bool incomplete = false;
+    if (pending_batches_) {
+      const std::uint64_t slots =
+          gpulsmopt2_detail::kBatchesPerEpoch - pending_batches_;
+      const std::uint64_t prefix_rows = slots * batch_capacity_;
+      if (source.count >= prefix_rows) {
+        while (pending_batches_ <
+               gpulsmopt2_detail::kBatchesPerEpoch) {
+          admit_mixed_tile(
+              slice_record_batch(source, consumed, batch_capacity_),
+              static_cast<std::uint32_t>(batch_capacity_), stream);
+          consumed += batch_capacity_;
+        }
+        if (publication_receipt_pending_)
+          resolve_publication_receipt_on_stream(stream);
+        if (publication_failed_) incomplete = true;
+      }
+    }
+    if (!incomplete && consumed < source.count)
+      consumed += try_admit_sealed_mixed(
+          slice_record_batch(
+              source, consumed, source.count - consumed),
+          stream);
+    while (!incomplete && consumed < source.count) {
+      const std::uint32_t tile_count = static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(source.count - consumed,
+                                 batch_capacity_));
+      admit_mixed_tile(
+          slice_record_batch(source, consumed, tile_count),
+          tile_count, stream);
+      consumed += tile_count;
+      if (consumed < source.count && publication_receipt_pending_)
+        resolve_publication_receipt_on_stream(stream);
+      if (consumed < source.count && publication_failed_) {
+        incomplete = true;
+        break;
+      }
+    }
+    end_operation(stream);
+    if (incomplete)
+      throw std::runtime_error(
+          "GPULSMOpt publication failed while tiling a mixed update; "
+          "accepted pending records were preserved");
+  }
+
+  void admit_mixed_tile(gpulsm_sparse::RecordBatchView source,
+                        std::uint32_t count, cudaStream_t stream) {
+    const std::uint32_t slot = pending_batches_;
+    if (slot >= gpulsmopt2_detail::kBatchesPerEpoch)
+      throw std::logic_error("GPULSMOpt pending slot overflow");
+    // Ordinary epochs deliberately do not touch sparse state.  Clear the
+    // tiny sparse slot table lazily when the first exceptional tile of a new
+    // generation arrives, so untouched ordinary slots can never expose
+    // pointers retained from an older epoch.
+    if (pending_sparse_device_generation_ != pending_sparse_generation_) {
+      CUDA_CHECK(cudaMemsetAsync(
+          device_pending_sparse_states_.data(), 0,
+          device_pending_sparse_states_.bytes(), stream));
+      pending_sparse_device_generation_ = pending_sparse_generation_;
+    }
+    pending_records_ += count;
+    pending_has_tombstones_ |= source.operations != nullptr ||
+        source.uniform_operation == DeviceMutation::erase;
+    if (!sparse_pending_workspace_)
+      sparse_pending_workspace_ =
+          std::make_unique<gpulsm_sparse::PendingWorkspace>(
+              static_cast<std::uint32_t>(batch_capacity_));
+
+    auto staged =
+        std::make_shared<gpulsm_sparse::StagedPendingSlotOverlay>();
+    std::uint32_t *batch_offsets = raw_offsets_.data() +
+        std::size_t{slot} * (gpulsmopt2_detail::kQuotients + 1u);
+    std::uint64_t *batch_signatures = raw_signatures_.data() +
+        std::size_t{slot} * gpulsmopt2_detail::kQuotients;
+    std::uint32_t *destination_keys = raw_keys_.data() +
+        std::size_t{slot} * batch_capacity_;
+    gpulsmopt2_detail::RawPayload *destination_payloads =
+        raw_payloads_.data() + std::size_t{slot} * batch_capacity_;
+    const std::uint32_t segment_ordinal = next_capsule_segment_ordinal_;
+    const gpulsm_sparse::PendingBuildResult result =
+        sparse_pending_workspace_->build_batch(
+            source, count, slot, static_cast<std::uint32_t>(batch_capacity_),
+            destination_keys, destination_payloads, batch_offsets,
+            batch_signatures, *staged, segment_ordinal, stream);
+    note_sparse_workspace_high_water();
+    gpulsmopt2_detail::commit_admission_metadata_kernel<<<
+        gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            admission_counts_.data(), batch_signatures,
+            raw_epoch_signatures_.data());
+
+    if (result.capsules) {
+      if (next_capsule_segment_ordinal_ ==
+          std::numeric_limits<std::uint32_t>::max())
+        throw std::overflow_error("GPULSMOpt capsule ordinal overflow");
+      ++next_capsule_segment_ordinal_;
+      gpulsm_sparse::PendingSlotBuildState state{};
+      state.pages = reinterpret_cast<std::uint64_t>(staged->pages.data());
+      state.indexes = reinterpret_cast<std::uint64_t>(
+          staged->indexes.data());
+      state.exact_heads = reinterpret_cast<std::uint64_t>(
+          staged->exact_heads.data());
+      state.exact_refs = reinterpret_cast<std::uint64_t>(
+          staged->exact_refs.data());
+      state.special_heads = reinterpret_cast<std::uint64_t>(
+          staged->special_heads.data());
+      state.exceptions = reinterpret_cast<std::uint64_t>(
+          staged->exceptions.data());
+      state.page_count = result.pages;
+      state.capsule_count = result.capsules;
+      state.exact_head_count = result.exact_heads;
+      state.exact_ref_count = result.exact_refs;
+      state.special_head_count = result.special_heads;
+      state.exception_count = result.capsules;
+      state.record_count = count;
+      state.segment_ordinal = segment_ordinal;
+      state.generation = pending_sparse_generation_;
+      state.live_bytes = result.capsule_bytes;
+      staged->state = state;
+      CUDA_CHECK(cudaMemcpyAsync(
+          device_pending_sparse_states_.data() + slot, &staged->state,
+          sizeof(staged->state), cudaMemcpyHostToDevice, stream));
+      sparse_pending_slots_[slot] = std::move(staged);
+      pending_sparse_exact_ |= result.exact_heads != 0u;
+      pending_sparse_capsules_ = true;
+    } else {
+      sparse_pending_slots_[slot].reset();
+    }
+    CUDA_CHECK(cudaGetLastError());
+    raw_batch_counts_[slot] = count;
+    ++pending_batches_;
+    if (pending_batches_ == gpulsmopt2_detail::kBatchesPerEpoch)
+      publish_epoch(stream);
+  }
 
   gpulsmopt2_detail::TqrjLookupWorkspace borrow_tqrj_lookup_workspace(
       std::uint32_t maximum_query_tiles) {
@@ -6153,6 +6827,357 @@ private:
     end_operation(stream);
   }
 
+  void lookup_sparse_locked(
+      gpulsm_sparse::RecordBatchView queries,
+      gpulsm_sparse::SparseLookupOutput output, cudaStream_t stream,
+      bool quotients_grouped) {
+    if (!queries.count) return;
+    const std::uint64_t tqrj_dense_threshold =
+        std::uint64_t{pending_batches_} * gpulsmopt2_detail::kQuotients *
+        gpulsmopt2_detail::kTqrjDenseRowsPerSection;
+    const bool use_tqrj =
+        queries.count >= gpulsmopt2_detail::kQuotients * 4u &&
+        queries.count <=
+            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch &&
+        pending_batches_ >= gpulsmopt2_detail::kTqrjMinimumBatches &&
+        std::uint64_t{pending_records_} >= tqrj_dense_threshold;
+    if (queries.count > std::numeric_limits<std::uint32_t>::max() ||
+        (queries.count > gpulsmopt2_detail::kMaximumOperationTile &&
+         !use_tqrj)) {
+      for (std::uint64_t begin = 0u; begin < queries.count;
+           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+        const std::uint64_t count = std::min<std::uint64_t>(
+            queries.count - begin,
+            gpulsmopt2_detail::kMaximumOperationTile);
+        lookup_sparse_locked(
+            slice_record_batch(queries, begin, count),
+            slice_lookup_output(output, begin), stream,
+            quotients_grouped);
+      }
+      return;
+    }
+    const std::uint32_t count = static_cast<std::uint32_t>(queries.count);
+    const bool materialize_heads =
+        !queries.head4_words || queries.keys.offsets ||
+        queries.keys.stride != sizeof(std::uint32_t);
+    if (!sparse_read_workspace_)
+      sparse_read_workspace_ =
+          std::make_unique<gpulsm_sparse::SparseReadWorkspace>();
+    if (use_tqrj) {
+      if (publication_keys_a_.size() < count ||
+          publication_rows_a_.size() < count) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        publication_keys_a_.grow(count);
+        publication_rows_a_.grow(count);
+      }
+      if (operation_workspace_.size() <
+              tqrj_hash_workspace_bytes(batch_capacity_) ||
+          count > tqrj_maximum_queries(batch_capacity_))
+        throw std::length_error(
+            "insufficient idle publication workspace for sparse TQRJ");
+    }
+    sparse_read_workspace_->ensure(
+        count, materialize_heads, use_tqrj);
+
+    begin_operation(stream);
+    sparse_read_workspace_->classify(
+        queries, device_pending_sparse_states_.data(), pending_batches_,
+        pending_sparse_generation_, device_sparse_manifests_.data(),
+        active_device_manifest_.data(), materialize_heads, stream);
+    note_sparse_workspace_high_water();
+    const std::uint32_t *heads = materialize_heads
+        ? sparse_read_workspace_->heads()
+        : reinterpret_cast<const std::uint32_t *>(queries.keys.bytes);
+    const gpulsm_sparse::PendingReadView pending{
+        raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+        device_pending_sparse_states_.data(),
+        static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+        pending_sparse_generation_};
+
+    if (use_tqrj) {
+      const std::uint32_t active_capacity = std::min(
+          count, gpulsmopt2_detail::kQuotients);
+      const std::uint32_t maximum_query_tiles =
+          gpulsmopt2_detail::tqrj_hash_tile_count(count) + active_capacity;
+      const std::uint32_t maximum_pending_tiles =
+          gpulsmopt2_detail::tqrj_hash_tile_count(pending_records_) +
+          active_capacity;
+      if (maximum_query_tiles > tqrj_maximum_tiles(batch_capacity_) ||
+          maximum_pending_tiles > tqrj_maximum_tiles(batch_capacity_))
+        throw std::length_error(
+            "insufficient recycled tile workspace for sparse TQRJ");
+      auto workspace = borrow_tqrj_lookup_workspace(maximum_query_tiles);
+      CUDA_CHECK(cudaMemsetAsync(
+          workspace.active_quotient_count, 0, sizeof(std::uint32_t),
+          stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          workspace.hash_task_count, 0, sizeof(std::uint32_t), stream));
+      CUDA_CHECK(cudaMemsetAsync(
+          workspace.hash_counters, 0,
+          gpulsmopt2_detail::kTqrjHashCounterBytes, stream));
+      gpulsmopt2_detail::count_lookup_quotients_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          heads, count, admission_counts_.data(),
+          workspace.reservation_ranks, workspace.active_quotients,
+          workspace.active_quotient_count);
+      gpulsmopt2_detail::materialize_lookup_active_counts_kernel<<<
+          blocks(active_capacity + 1u), gpulsmopt2_detail::kThreads,
+          0, stream>>>(
+          workspace.active_quotients, workspace.active_quotient_count,
+          admission_counts_.data(), active_capacity,
+          workspace.active_query_counts);
+      std::size_t scan_bytes = admission_temp_.size();
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          admission_temp_.data(), scan_bytes,
+          workspace.active_query_counts, workspace.active_query_offsets,
+          active_capacity + 1u, stream));
+      gpulsmopt2_detail::publish_lookup_active_bases_kernel<<<
+          blocks(active_capacity), gpulsmopt2_detail::kThreads,
+          0, stream>>>(
+          workspace.active_quotients, workspace.active_quotient_count,
+          workspace.active_query_offsets, active_capacity,
+          workspace.query_bases);
+      gpulsmopt2_detail::scatter_query_records_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          heads, count, workspace.query_bases, workspace.reservation_ranks,
+          workspace.grouped_queries, workspace.query_ids);
+
+      gpulsm_sparse::sparse_tqrj_direct_lookup_kernel<<<
+          active_capacity, gpulsmopt2_detail::kThreads, 0, stream>>>(
+          queries, output, workspace.grouped_queries,
+          workspace.active_quotients, workspace.active_query_counts,
+          workspace.active_quotient_count, workspace.query_bases,
+          workspace.query_ids, sparse_read_workspace_->exact_flags(),
+          pending, resident_rows(), descriptors_.data(),
+          canonical_cell_ranks_.data(),
+          query_occupied_level_mask_.data(),
+          device_sparse_manifests_.data(), active_device_manifest_.data(),
+          workspace.hash_tasks, workspace.hash_task_count);
+
+      const std::uint32_t *hash_query_counts = admission_counts_.data();
+      const std::uint32_t *hash_grouped_heads = workspace.grouped_queries;
+      const std::uint32_t *hash_query_ids = workspace.query_ids;
+      gpulsm_sparse::RecordBatchView hash_queries = queries;
+      gpulsm_sparse::SparseLookupOutput hash_output = output;
+      const std::uint8_t *hash_exact_flags =
+          sparse_read_workspace_->exact_flags();
+      std::uint32_t *hash_query_owners = sparse_read_workspace_->owners();
+      const std::uint32_t hash_capacity = workspace.hash_table_capacity;
+      gpulsm_sparse::PendingReadView hash_pending = pending;
+      gpulsmopt2_detail::ResidentRows hash_arena = resident_rows();
+      const gpulsmopt2_detail::Descriptor *hash_descriptors =
+          descriptors_.data();
+      const std::uint16_t *hash_cell_ranks =
+          canonical_cell_ranks_.data();
+      const std::uint64_t *hash_occupied_mask =
+          query_occupied_level_mask_.data();
+      const gpulsm_sparse::DeviceSparseManifest *hash_sparse_manifests =
+          device_sparse_manifests_.data();
+      const std::uint32_t *hash_active_manifest =
+          active_device_manifest_.data();
+      void *hash_arguments[] = {
+          &workspace.hash_tasks, &workspace.hash_task_count,
+          &workspace.query_bases, &hash_query_counts,
+          &hash_grouped_heads, &hash_query_ids, &hash_queries,
+          &hash_output, &hash_exact_flags, &hash_query_owners,
+          &workspace.hash_query_tiles, &workspace.hash_pending_tiles,
+          &workspace.hash_counters, &workspace.hash_table,
+          const_cast<std::uint32_t *>(&hash_capacity),
+          &workspace.hash_winners, &hash_pending, &hash_arena,
+          &hash_descriptors, &hash_cell_ranks, &hash_occupied_mask,
+          &hash_sparse_manifests, &hash_active_manifest};
+      CUDA_CHECK(cudaLaunchCooperativeKernel(
+          reinterpret_cast<const void *>(
+              gpulsm_sparse::sparse_tqrj_hash_lookup_kernel),
+          dim3(std::min(tqrj_hash_worker_blocks_,
+                        sparse_read_workspace_->hash_worker_blocks())),
+          dim3(gpulsmopt2_detail::kTqrjHashThreads), hash_arguments, 0u,
+          stream));
+      gpulsmopt2_detail::reset_lookup_quotient_counts_kernel<<<
+          blocks(active_capacity), gpulsmopt2_detail::kThreads,
+          0, stream>>>(
+          workspace.active_quotients, workspace.active_quotient_count,
+          active_capacity, admission_counts_.data());
+      CUDA_CHECK(cudaGetLastError());
+      end_operation(stream);
+      return;
+    }
+
+    const bool grouped =
+        count >= gpulsmopt2_detail::kQuotients * 4u;
+    const std::uint32_t *ordered_heads = heads;
+    const std::uint32_t *query_ids = nullptr;
+    if (grouped && !quotients_grouped) {
+      ensure_radix_workspace(count);
+      gpulsmopt2_detail::count_admission_quotients_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          heads, count, admission_counts_.data(), radix_input_ids());
+      std::size_t scan_bytes = admission_temp_.size();
+      CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+          admission_temp_.data(), scan_bytes, admission_counts_.data(),
+          query_quotient_offsets(),
+          gpulsmopt2_detail::kQuotients + 1u, stream));
+      gpulsmopt2_detail::scatter_query_records_kernel<<<
+          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          heads, count, query_quotient_offsets(), radix_input_ids(),
+          radix_keys_.data(), radix_ids_out_.data());
+      CUDA_CHECK(cudaMemsetAsync(
+          admission_counts_.data(), 0,
+          admission_counts_.size() * sizeof(std::uint32_t), stream));
+      ordered_heads = radix_keys_.data();
+      query_ids = radix_ids_out_.data();
+    }
+
+    gpulsm_sparse::sparse_canonical_ordinary_lookup_kernel<<<
+        blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        queries, ordered_heads, query_ids,
+        sparse_read_workspace_->exact_flags(), count, output, pending,
+        raw_signatures_.data(), raw_epoch_signatures_.data(),
+        resident_rows(), descriptors_.data(), canonical_cell_ranks_.data(),
+        query_occupied_level_mask_.data(), device_sparse_manifests_.data(),
+        active_device_manifest_.data());
+    gpulsm_sparse::sparse_canonical_exact_lookup_kernel<<<
+        blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        queries, sparse_read_workspace_->exact_ids(),
+        sparse_read_workspace_->exact_count(), output, pending,
+        resident_rows(), descriptors_.data(), canonical_cell_ranks_.data(),
+        query_occupied_level_mask_.data(), device_sparse_manifests_.data(),
+        active_device_manifest_.data());
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+  }
+
+  void range_sparse_locked(
+      gpulsm_sparse::range_gate::RangeQueryBatch queries,
+      std::uint32_t *sums, std::uint8_t *valid, cudaStream_t stream) {
+    if (!queries.count) return;
+    if (queries.count > gpulsmopt2_detail::kMaximumOperationTile) {
+      for (std::uint32_t begin = 0u; begin < queries.count;
+           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+        const std::uint32_t count = static_cast<std::uint32_t>(
+            std::min<std::size_t>(
+                queries.count - begin,
+                gpulsmopt2_detail::kMaximumOperationTile));
+        range_sparse_locked(
+            {slice_record_batch(queries.lower, begin, count),
+             slice_record_batch(queries.upper, begin, count), count},
+            sums + begin, valid ? valid + begin : nullptr, stream);
+      }
+      return;
+    }
+
+    begin_operation(stream);
+    try {
+      gpulsm_sparse::rank_range::PreparedReadState state{};
+      std::uint64_t levels = host_occupied_level_mask_;
+      while (levels) {
+        const std::uint32_t level = static_cast<std::uint32_t>(
+            __builtin_ctzll(levels));
+        levels &= levels - 1u;
+        state.levels.push_back(level);
+        gpulsm_sparse::RootBuildState root{};
+        if (sparse_roots_[level]) {
+          root = sparse_roots_[level]->state;
+        } else {
+          root.level = level;
+          root.row_count = level_counts_[level];
+          root.logical_count = level_counts_[level];
+        }
+        state.roots[level] = root;
+        state.candidate_rows += root.logical_count;
+        state.capsule_count += root.capsule_count;
+        state.capsule_bytes += root.capsule_live_bytes;
+      }
+      for (std::uint32_t slot = 0u; slot < pending_batches_; ++slot) {
+        const std::uint32_t count = raw_batch_counts_[slot];
+        state.batch_counts[slot] = count;
+        state.pending_rows += count;
+        const auto &overlay = sparse_pending_slots_[slot];
+        if (overlay &&
+            overlay->state.generation == pending_sparse_generation_) {
+          state.capsule_count += overlay->state.capsule_count;
+          state.capsule_bytes += overlay->state.live_bytes;
+        }
+      }
+      state.candidate_rows += state.pending_rows;
+      state.pending = {
+          raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+          device_pending_sparse_states_.data(),
+          static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+          pending_sparse_generation_};
+      if (!state.candidate_rows) {
+        CUDA_CHECK(cudaMemsetAsync(
+            sums, 0, std::size_t{queries.count} * sizeof(*sums), stream));
+        if (valid)
+          CUDA_CHECK(cudaMemsetAsync(valid, 1, queries.count, stream));
+        end_operation(stream);
+        return;
+      }
+      if (state.candidate_rows > std::numeric_limits<std::uint32_t>::max() ||
+          state.capsule_count > std::numeric_limits<std::size_t>::max() ||
+          state.capsule_bytes > std::numeric_limits<std::size_t>::max())
+        throw std::length_error("range read state exceeds host capacity");
+
+      gpulsm_sparse::Buffer<gpulsm_sparse::RootBuildState> roots(
+          gpulsm_sparse::kLevels);
+      gpulsm_sparse::check(cudaMemcpyAsync(
+          roots.data(), state.roots.data(), roots.bytes(),
+          cudaMemcpyHostToDevice, stream), "copy rank sparse roots");
+      gpulsm_sparse::range_gate::ActiveSectionRoster active;
+      active.rebuild(
+          descriptors_.data(), roots.data(), state.levels,
+          state.pending, stream);
+      gpulsm_sparse::rank_range::RosterStorage roster(
+          static_cast<std::uint32_t>(state.levels.size()), active.count(),
+          gpulsm_sparse::rank_range::roster_capacity(
+              state, active.count()));
+      if (!state.levels.empty())
+        roster.build(
+            resident_rows(), descriptors_.data(), active, roots.data(),
+            stream);
+      const std::uint32_t source_count =
+          static_cast<std::uint32_t>(state.levels.size()) +
+          (state.pending_rows ? 1u : 0u);
+      if (!source_count)
+        throw std::logic_error("nonempty range has no rank source");
+      const std::uint64_t leaves =
+          (state.candidate_rows +
+           gpulsm_sparse::rank_range::kTileRows - 1u) /
+          gpulsm_sparse::rank_range::kTileRows;
+      const std::uint64_t task_capacity64 =
+          2u * leaves + queries.count + 64u;
+      if (task_capacity64 > std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error("range task count exceeds 32 bits");
+      const std::uint32_t task_capacity =
+          static_cast<std::uint32_t>(task_capacity64);
+      gpulsm_sparse::rank_range::Workspace workspace(
+          std::max(1u, state.pending_rows), queries.count,
+          task_capacity, source_count);
+      gpulsm_sparse::rank_range::OutputStorage output(
+          state.candidate_rows, state.capsule_count, state.capsule_bytes,
+          task_capacity, queries.count);
+      note_sparse_workspace_high_water(
+          roots.bytes() + active.bytes() + roster.bytes() +
+          workspace.bytes() + output.bytes());
+      const auto result = workspace.enumerate(
+          roster, queries, output, state.pending,
+          state.batch_counts.data(), resident_rows(), roots.data(), stream);
+      if (result.errors || result.receipt.status)
+        throw std::runtime_error("rank-roster range enumeration failed");
+      gpulsm_sparse::rank_range::reduce_range_slices<<<
+          queries.count, gpulsm_sparse::kThreads, 0, stream>>>(
+          output.view(result.tasks), output.slices_.data(), queries.count,
+          sums);
+      if (valid)
+        CUDA_CHECK(cudaMemsetAsync(valid, 1, queries.count, stream));
+      CUDA_CHECK(cudaGetLastError());
+      end_operation(stream);
+    } catch (...) {
+      end_operation(stream);
+      throw;
+    }
+  }
+
   void range_locked(const DeviceRangeOutputBatch &batch,
                     cudaStream_t stream) {
     if (!batch.query_count) return;
@@ -6379,15 +7404,56 @@ private:
     end_operation(stream);
   }
 
+  void successor_sparse_locked(
+      gpulsm_sparse::RecordBatchView queries,
+      gpulsm_sparse::SparseSuccessorOutput output,
+      cudaStream_t stream) {
+    if (!queries.count) return;
+    if (queries.count > gpulsmopt2_detail::kMaximumOperationTile) {
+      for (std::uint64_t begin = 0u; begin < queries.count;
+           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+        const std::uint64_t count = std::min<std::uint64_t>(
+            queries.count - begin,
+            gpulsmopt2_detail::kMaximumOperationTile);
+        successor_sparse_locked(
+            slice_record_batch(queries, begin, count),
+            slice_successor_output(output, begin), stream);
+      }
+      return;
+    }
+    begin_operation(stream);
+    const gpulsm_sparse::PendingReadView pending{
+        raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
+        device_pending_sparse_states_.data(),
+        static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+        pending_sparse_generation_};
+    gpulsm_sparse::sparse_successor_kernel<<<
+        blocks(queries.count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        queries, output, pending, resident_rows(), descriptors_.data(),
+        route_headers_.data(), route_slices_.data(),
+        canonical_cell_ranks_.data(), query_occupied_level_mask_.data(),
+        device_sparse_manifests_.data(), active_device_manifest_.data());
+    CUDA_CHECK(cudaGetLastError());
+    end_operation(stream);
+  }
+
 public:
+
+  SparseMemoryAccounting sparse_memory_accounting() const {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    const_cast<GPULSMOpt *>(this)->resolve_publication_receipt();
+    return sparse_memory_accounting_unlocked();
+  }
 
   std::size_t gpu_resident_bytes() const {
     std::lock_guard<std::mutex> lock(operation_mutex_);
     const_cast<GPULSMOpt *>(this)->resolve_publication_receipt();
+    const SparseMemoryAccounting sparse =
+        sparse_memory_accounting_unlocked();
     const std::size_t rollover_rank_bytes = canonical_rollover_epoch_ranks_
         ? canonical_rollover_epoch_ranks_->size() * sizeof(std::uint16_t)
         : 0u;
-    return rollover_rank_bytes +
+    const std::uint64_t restored = rollover_rank_bytes +
         arena_key_flags_.size() * sizeof(std::uint32_t) +
         arena_values_.size() * sizeof(std::uint32_t) +
         descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
@@ -6400,12 +7466,14 @@ public:
             sizeof(gpulsmopt2_detail::DeviceManifest) +
         active_device_manifest_.size() * sizeof(std::uint32_t) +
         query_occupied_level_mask_.size() * sizeof(std::uint64_t) +
+        sealed_device_command_.bytes() + sealed_device_receipt_.bytes() +
         resident_plan_.size() *
             sizeof(gpulsmopt2_detail::ResidentPublicationPlan) +
         level_storage_spans_.size() *
             sizeof(gpulsmopt2_detail::LevelStorageSpan) +
         canonical_cell_ranks_.size() * sizeof(std::uint16_t) +
         operation_workspace_.size() * sizeof(std::uint8_t) +
+        (sealed_workspace_ ? sealed_workspace_->bytes() : 0u) +
         canonical_job_prefixes_.size() *
             sizeof(gpulsmopt2_detail::CanonicalJobPrefix) +
         canonical_next_job_.size() * sizeof(std::uint32_t) +
@@ -6442,11 +7510,93 @@ public:
         range_hot_temp_.size() * sizeof(std::uint8_t) +
         range_query_storage_.size() + range_fragment_storage_.size() +
         range_section_storage_.size();
+    if (sparse.physical_bytes() >
+        std::numeric_limits<std::size_t>::max() - restored)
+      throw std::overflow_error("GPULSMOpt memory accounting overflow");
+    return static_cast<std::size_t>(restored + sparse.physical_bytes());
   }
 
 private:
   gpulsmopt2_detail::ResidentRows resident_rows() {
     return {arena_key_flags_.data(), arena_values_.data()};
+  }
+
+  std::uint64_t current_sparse_workspace_bytes() const {
+    return (sparse_pending_workspace_
+                ? sparse_pending_workspace_->bytes() : 0u) +
+        (sparse_refinement_workspace_
+             ? sparse_refinement_workspace_->bytes() : 0u) +
+        (sparse_read_workspace_ ? sparse_read_workspace_->bytes() : 0u);
+  }
+
+  void note_sparse_workspace_high_water(
+      std::uint64_t operation_temporary_bytes = 0u) {
+    const std::uint64_t retained = current_sparse_workspace_bytes();
+    if (operation_temporary_bytes >
+        std::numeric_limits<std::uint64_t>::max() - retained)
+      throw std::overflow_error("sparse workspace accounting overflow");
+    sparse_workspace_high_water_bytes_ = std::max(
+        sparse_workspace_high_water_bytes_,
+        retained + operation_temporary_bytes);
+  }
+
+  SparseMemoryAccounting sparse_memory_accounting_unlocked() const {
+    SparseMemoryAccounting result{};
+    result.manifest_bytes = device_sparse_manifests_.bytes() +
+        device_pending_sparse_states_.bytes();
+    result.workspace_bytes = current_sparse_workspace_bytes();
+    result.workspace_high_water_bytes = std::max(
+        sparse_workspace_high_water_bytes_, result.workspace_bytes);
+
+    std::vector<const gpulsm_sparse::StagedRootOverlay *> root_seen;
+    std::vector<const gpulsm_sparse::StagedPendingSlotOverlay *>
+        pending_seen;
+    std::vector<const gpulsm_sparse::CapsuleSegment *> segment_seen;
+    const auto account_segment =
+        [&](const gpulsm_sparse::CapsuleSegmentOwnership &owned) {
+          if (!owned.segment) return;
+          const auto *segment = owned.segment.get();
+          if (std::find(segment_seen.begin(), segment_seen.end(), segment) !=
+              segment_seen.end())
+            return;
+          segment_seen.push_back(segment);
+          ++result.capsule_segments;
+          result.capsule_reserved_bytes += segment->reserved_bytes();
+          result.capsule_mapped_bytes += segment->mapped_bytes();
+          result.capsule_live_bytes += owned.live_bytes;
+          result.capsule_garbage_bytes += owned.garbage_bytes;
+        };
+    const auto account_root =
+        [&](const std::shared_ptr<gpulsm_sparse::StagedRootOverlay> &root) {
+          if (!root ||
+              std::find(root_seen.begin(), root_seen.end(), root.get()) !=
+                  root_seen.end())
+            return;
+          root_seen.push_back(root.get());
+          result.overlay_metadata_bytes += root->device_state.bytes() +
+              root->exact_heads.bytes() + root->exact_rows.bytes() +
+              root->special_heads.bytes() + root->pages.bytes() +
+              root->indexes.bytes();
+          for (const auto &owned : root->segments) account_segment(owned);
+        };
+    const auto account_pending =
+        [&](const std::shared_ptr<
+                gpulsm_sparse::StagedPendingSlotOverlay> &slot) {
+          if (!slot ||
+              std::find(pending_seen.begin(), pending_seen.end(),
+                        slot.get()) != pending_seen.end())
+            return;
+          pending_seen.push_back(slot.get());
+          result.overlay_metadata_bytes += slot->pages.bytes() +
+              slot->indexes.bytes() + slot->exact_heads.bytes() +
+              slot->exact_refs.bytes() + slot->special_heads.bytes() +
+              slot->exceptions.bytes();
+          for (const auto &owned : slot->segments) account_segment(owned);
+        };
+    for (const auto &root : sparse_roots_) account_root(root);
+    account_root(pending_sparse_publication_root_);
+    for (const auto &slot : sparse_pending_slots_) account_pending(slot);
+    return result;
   }
 
   static int blocks(std::size_t count) {
@@ -6787,6 +7937,61 @@ private:
     publication_rows_a_.grow(count);
   }
 
+  void finalize_sparse_publication_ownership() {
+    if (!pending_sparse_publication_) return;
+    auto destination = pending_sparse_publication_root_;
+    if (!destination)
+      throw std::logic_error("missing staged sparse publication root");
+    destination->segments.reserve(
+        destination->segments.size() + destination->transfers.size());
+    for (gpulsm_sparse::CapsuleTransferIntent &intent :
+         destination->transfers) {
+      auto *source = intent.source;
+      if (!source || !source->segment)
+        throw std::logic_error("capsule transfer source disappeared");
+      source->segment->commit_usage(
+          intent.live_bytes, intent.garbage_bytes);
+      gpulsm_sparse::CapsuleSegmentOwnership moved{
+          std::move(source->segment), intent.ordinal, 0u,
+          intent.live_bytes, intent.garbage_bytes};
+      source->ordinal = 0u;
+      source->live_bytes = 0u;
+      source->garbage_bytes = 0u;
+      destination->segments.push_back(std::move(moved));
+    }
+    destination->transfers.clear();
+
+    const std::uint32_t destination_level =
+        pending_sparse_publication_destination_;
+    const std::uint64_t destination_bit =
+        std::uint64_t{1u} << destination_level;
+    const std::uint64_t replaced =
+        pending_sparse_publication_consumed_mask_ | destination_bit;
+    std::uint64_t levels = replaced;
+    while (levels) {
+      const std::uint32_t level = static_cast<std::uint32_t>(
+          __builtin_ctzll(levels));
+      levels &= levels - 1u;
+      sparse_roots_[level].reset();
+    }
+    sparse_exact_level_mask_ &= ~replaced;
+    sparse_capsule_level_mask_ &= ~replaced;
+    if (pending_sparse_publication_flags_) {
+      sparse_roots_[destination_level] = std::move(destination);
+      if (pending_sparse_publication_flags_ &
+          gpulsm_sparse::kSparseHasExactHeads)
+        sparse_exact_level_mask_ |= destination_bit;
+      if (pending_sparse_publication_flags_ &
+          gpulsm_sparse::kSparseHasCapsules)
+        sparse_capsule_level_mask_ |= destination_bit;
+    }
+    pending_sparse_publication_root_.reset();
+    pending_sparse_publication_consumed_mask_ = 0u;
+    pending_sparse_publication_destination_ = 0u;
+    pending_sparse_publication_flags_ = 0u;
+    pending_sparse_publication_ = false;
+  }
+
   void apply_publication_receipt() {
     if (!publication_receipt_pending_) return;
     const gpulsmopt2_detail::ResidentPublicationPlan &receipt =
@@ -6827,6 +8032,13 @@ private:
         ? 64u - static_cast<std::uint32_t>(
                       __builtin_clzll(host_occupied_level_mask_))
         : 0u;
+
+    finalize_sparse_publication_ownership();
+    for (auto &slot : sparse_pending_slots_) slot.reset();
+    ++pending_sparse_generation_;
+    if (!pending_sparse_generation_) pending_sparse_generation_ = 1u;
+    pending_sparse_exact_ = false;
+    pending_sparse_capsules_ = false;
 
     pending_batches_ = 0u;
     pending_records_ = 0u;
@@ -6898,6 +8110,9 @@ private:
   }
 
   void reset_updates(cudaStream_t stream) {
+    if (sparse_exact_level_mask_ || sparse_capsule_level_mask_ ||
+        pending_sparse_exact_ || pending_sparse_capsules_)
+      CUDA_CHECK(cudaEventSynchronize(operation_done_));
     CUDA_CHECK(cudaMemsetAsync(descriptors_.data(), 0,
                                descriptors_.size() *
                                    sizeof(gpulsmopt2_detail::Descriptor),
@@ -6915,6 +8130,27 @@ private:
     CUDA_CHECK(cudaMemsetAsync(
         admission_counts_.data(), 0,
         admission_counts_.size() * sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        device_sparse_manifests_.data(), 0,
+        device_sparse_manifests_.bytes(), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        device_pending_sparse_states_.data(), 0,
+        device_pending_sparse_states_.bytes(), stream));
+    for (auto &root : sparse_roots_) root.reset();
+    for (auto &slot : sparse_pending_slots_) slot.reset();
+    pending_sparse_publication_root_.reset();
+    pending_sparse_publication_consumed_mask_ = 0u;
+    pending_sparse_publication_destination_ = 0u;
+    pending_sparse_publication_flags_ = 0u;
+    pending_sparse_publication_ = false;
+    ++pending_sparse_generation_;
+    if (!pending_sparse_generation_) pending_sparse_generation_ = 1u;
+    pending_sparse_device_generation_ = pending_sparse_generation_;
+    next_capsule_segment_ordinal_ = 1u;
+    sparse_exact_level_mask_ = 0u;
+    sparse_capsule_level_mask_ = 0u;
+    pending_sparse_exact_ = false;
+    pending_sparse_capsules_ = false;
     pending_batches_ = 0u;
     pending_records_ = 0u;
     pending_has_tombstones_ = false;
@@ -6932,6 +8168,691 @@ private:
     std::fill_n(raw_batch_counts_, gpulsmopt2_detail::kBatchesPerEpoch, 0u);
   }
 
+  std::vector<std::uint32_t> sealed_tier_slots() const {
+    std::vector<std::uint32_t> result;
+    std::uint32_t remaining = canonical_regular_level_count_;
+    while (remaining) {
+      const std::uint32_t slots = std::min(3u, remaining);
+      result.push_back(slots);
+      remaining -= slots;
+    }
+    if (canonical_regular_level_count_ < canonical_level_count_)
+      result.push_back(1u);
+    return result;
+  }
+
+  static std::unique_ptr<gpulsm_sparse::SealedWorkspace>
+  make_sealed_workspace(std::size_t publication_capacity,
+                        std::size_t level_zero_capacity) {
+    const std::size_t capacity =
+        gpulsmopt2_detail::canonical_level_layout(
+            publication_capacity, level_zero_capacity)
+            .highest_regular_capacity;
+    // A single epoch remains on the restored publication path.  Provision
+    // reusable sealed storage only when the configured forest can fuse
+    // multiple epochs, exactly as LSMu sizes insertion storage from max_size
+    // before its insertion timer starts.
+    if (capacity <= level_zero_capacity) return {};
+    if (capacity > std::numeric_limits<std::uint32_t>::max())
+      throw std::length_error("sealed workspace exceeds 32-bit capacity");
+    return std::make_unique<gpulsm_sparse::SealedWorkspace>(
+        static_cast<std::uint32_t>(capacity));
+  }
+
+  std::uint32_t build_sealed_inline_root(
+      gpulsm_sparse::SealedWorkspace &workspace,
+      const std::uint32_t *keys, const std::uint32_t *values,
+      std::uint32_t count, std::uint32_t level,
+      std::uint32_t generation, cudaStream_t stream) {
+    const std::uint32_t selected = workspace.prepare(
+        keys, values, count, false, stream);
+    ensure_level_storage_mapped(level, stream);
+    const std::uint64_t capacity = level_capacity(level);
+    if (count > capacity || selected > capacity)
+      throw std::length_error("sealed inline root capacity");
+    const std::uint64_t destination =
+        level_begin(level) + std::uint64_t{generation} * capacity;
+    gpulsm_sparse::gather_sealed_to_arena<<<4096,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        workspace.sorted_keys(), workspace.sorted_values(),
+        workspace.selected(), workspace.selected_count(), resident_rows(),
+        destination);
+    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    plan.selected_count = selected;
+    plan.survivor_count = selected;
+    plan.destination_level = level;
+    plan.output_generation = generation;
+    plan.output_begin = destination;
+    plan.output_capacity = capacity;
+    plan.status = gpulsmopt2_detail::kPublicationSuccess;
+    CUDA_CHECK(cudaMemcpyAsync(
+        resident_plan_.data(), &plan, sizeof(plan),
+        cudaMemcpyHostToDevice, stream));
+    gpulsmopt2_detail::build_canonical_rank_from_run_kernel<<<
+        gpulsmopt2_detail::kQuotients,
+        gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+        resident_rows(), destination, workspace.section_offsets(), level,
+        canonical_cell_ranks_.data());
+    gpulsmopt2_detail::finalize_canonical_level_metadata_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        workspace.section_offsets(), level_storage_spans_.data(),
+        resident_plan_.data(), descriptors_.data(),
+        static_cast<std::uint32_t>(route_stride_), route_headers_.data(),
+        route_slices_.data(), route_logical_begins_.data(),
+        route_quotients_.data(), level_q_logical_offsets_.data());
+    CUDA_CHECK(cudaGetLastError());
+    return selected;
+  }
+
+  std::uint32_t build_sealed_projection_carry_root(
+      const gpulsmopt2_detail::Row *epoch_rows,
+      const std::uint32_t *section_offsets,
+      const std::uint32_t *section_counts,
+      const std::uint16_t *epoch_ranks, std::uint32_t selected,
+      std::uint64_t resident_sources,
+      std::uint32_t level, std::uint32_t generation,
+      cudaStream_t stream) {
+    const std::uint32_t source_count = 1u + static_cast<std::uint32_t>(
+        __builtin_popcountll(resident_sources));
+    if (!resident_sources ||
+        source_count > gpulsmopt2_detail::kMaximumMergeSources)
+      throw std::invalid_argument("invalid sealed carry sources");
+    const std::uint32_t source_limit = 63u -
+        static_cast<std::uint32_t>(__builtin_clzll(resident_sources));
+    const std::uint64_t source_prefix = source_limit == 63u
+        ? ~std::uint64_t{0}
+        : (std::uint64_t{1u} << (source_limit + 1u)) - 1u;
+    if ((host_occupied_level_mask_ & source_prefix) != resident_sources)
+      throw std::invalid_argument("non-prefix sealed carry sources");
+
+    ensure_level_storage_mapped(level, stream);
+    const std::uint64_t capacity = level_capacity(level);
+    const std::uint64_t destination =
+        level_begin(level) + std::uint64_t{generation} * capacity;
+    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    plan.selected_count = selected;
+    plan.destination_level = level;
+    plan.source_level_limit = source_limit;
+    plan.source_count = source_count;
+    plan.keep_tombstones = 1u;
+    plan.output_generation = generation;
+    plan.output_begin = destination;
+    plan.output_capacity = capacity;
+    plan.job_capacity =
+        source_count < canonical_job_capacities_.size() &&
+                canonical_job_capacities_[source_count]
+            ? canonical_job_capacities_[source_count]
+            : resident_merge_capacity_;
+    plan.tournament_workspace_bytes =
+        source_count < canonical_tournament_shared_bytes_.size()
+            ? static_cast<std::uint32_t>(
+                  canonical_tournament_shared_bytes_[source_count])
+            : 0u;
+    plan.status = selected > capacity
+        ? gpulsmopt2_detail::kPublicationOutputOverflow
+        : gpulsmopt2_detail::kPublicationSuccess;
+    CUDA_CHECK(cudaMemcpyAsync(
+        resident_plan_.data(), &plan, sizeof(plan),
+        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        canonical_cell_counts_.data(), 0,
+        canonical_cell_counts_.size() * sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        canonical_job_prefixes_.data(), 0,
+        canonical_job_prefixes_.size() *
+            sizeof(gpulsmopt2_detail::CanonicalJobPrefix),
+        stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        canonical_next_job_.data(), 0, sizeof(std::uint32_t), stream));
+    gpulsmopt2_detail::count_canonical_merge_work_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        section_counts, descriptors_.data(),
+        device_manifests_.data(), active_device_manifest_.data(),
+        resident_plan_.data(), balanced_merge_raw_counts_.data());
+    gpulsmopt2_detail::count_canonical_planning_jobs_kernel<<<
+        gpulsmopt2_detail::kPlanningTiles,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        balanced_merge_raw_counts_.data(), resident_plan_.data(),
+        resident_tile_job_counts_.data());
+    std::size_t scan_bytes = resident_scan_temp_.size();
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        resident_scan_temp_.data(), scan_bytes,
+        resident_tile_job_counts_.data(),
+        resident_tile_job_offsets_.data(),
+        gpulsmopt2_detail::kPlanningTiles + 1u, stream));
+    gpulsmopt2_detail::emit_canonical_planning_jobs_kernel<<<
+        gpulsmopt2_detail::kPlanningTiles,
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        balanced_merge_raw_counts_.data(),
+        resident_tile_job_offsets_.data(), resident_plan_.data(),
+        static_cast<std::uint32_t>(maximum_resident_jobs_),
+        balanced_merge_jobs_.data(), resident_job_raw_reservations_.data());
+    gpulsmopt2_detail::validate_canonical_plan_kernel<<<1, 1, 0, stream>>>(
+        resident_plan_.data(), resident_tile_job_offsets_.data(),
+        static_cast<std::uint32_t>(maximum_resident_jobs_));
+    gpulsmopt2_detail::resolve_canonical_job_boundaries_kernel<<<
+        resident_planner_blocks_, 32u, 0, stream>>>(
+        balanced_merge_raw_counts_.data(), balanced_merge_jobs_.data(),
+        resident_job_raw_reservations_.data(), resident_plan_.data(),
+        epoch_rows, section_offsets, section_counts, epoch_ranks,
+        resident_rows(), descriptors_.data(), canonical_cell_ranks_.data(),
+        device_manifests_.data(), active_device_manifest_.data());
+    if (source_count < canonical_tournament_blocks_.size() &&
+        canonical_tournament_blocks_[source_count]) {
+      gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel<<<
+          canonical_tournament_blocks_[source_count],
+          gpulsmopt2_detail::kFoundationCompactionThreads,
+          canonical_tournament_shared_bytes_[source_count], stream>>>(
+          balanced_merge_jobs_.data(),
+          resident_job_raw_reservations_.data(), resident_plan_.data(),
+          epoch_rows, section_offsets, section_counts, epoch_ranks,
+          resident_rows(), descriptors_.data(), level_storage_spans_.data(),
+          canonical_cell_ranks_.data(), device_manifests_.data(),
+          active_device_manifest_.data(), canonical_job_prefixes_.data(),
+          canonical_next_job_.data(), canonical_cell_counts_.data());
+    } else {
+      gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel<<<
+          canonical_fallback_blocks_,
+          gpulsmopt2_detail::kFoundationCompactionThreads,
+          canonical_merge_workspace_bytes_, stream>>>(
+          balanced_merge_jobs_.data(), resident_plan_.data(),
+          epoch_rows, section_offsets, section_counts, resident_rows(),
+          descriptors_.data(),
+          level_storage_spans_.data(), level_q_logical_offsets_.data(),
+          device_manifests_.data(), active_device_manifest_.data(),
+          canonical_job_prefixes_.data(), canonical_next_job_.data(),
+          canonical_cell_counts_.data());
+    }
+    gpulsmopt2_detail::build_canonical_rank_from_counts_kernel<<<
+        gpulsmopt2_detail::kQuotients,
+        gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+        canonical_cell_counts_.data(), resident_plan_.data(),
+        canonical_level_count_, canonical_cell_ranks_.data(),
+        foundation_section_output_counts_.data());
+    scan_bytes = resident_scan_temp_.size();
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        resident_scan_temp_.data(), scan_bytes,
+        foundation_section_output_counts_.data(),
+        foundation_source_offsets_.data(),
+        gpulsmopt2_detail::kQuotients + 1u, stream));
+    gpulsmopt2_detail::finalize_canonical_level_metadata_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        foundation_source_offsets_.data(), level_storage_spans_.data(),
+        resident_plan_.data(), descriptors_.data(),
+        static_cast<std::uint32_t>(route_stride_), route_headers_.data(),
+        route_slices_.data(), route_logical_begins_.data(),
+        route_quotients_.data(), level_q_logical_offsets_.data());
+    std::uint32_t survivors = 0u;
+    CUDA_CHECK(cudaMemcpyAsync(
+        &survivors,
+        foundation_source_offsets_.data() + gpulsmopt2_detail::kQuotients,
+        sizeof(survivors), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        &plan, resident_plan_.data(), sizeof(plan),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (plan.status)
+      throw std::runtime_error("sealed canonical carry failed");
+    return survivors;
+  }
+
+  std::uint32_t build_sealed_inline_carry_root(
+      gpulsm_sparse::SealedWorkspace &workspace,
+      const std::uint32_t *keys, const std::uint32_t *values,
+      std::uint32_t count, std::uint64_t resident_sources,
+      std::uint32_t level, std::uint32_t generation,
+      cudaStream_t stream) {
+    const std::uint32_t selected = workspace.prepare(
+        keys, values, count, true, stream);
+    return build_sealed_projection_carry_root(
+        workspace.epoch_rows(), workspace.section_offsets(),
+        workspace.section_counts(), workspace.epoch_ranks(), selected,
+        resident_sources, level, generation, stream);
+  }
+
+  std::uint32_t build_sealed_direct_root(
+      const gpulsm_sparse::DirectRootWorkspace &workspace,
+      const gpulsm_sparse::DirectRootPreparation &prepared,
+      std::uint32_t level, std::uint32_t generation,
+      cudaStream_t stream) {
+    ensure_level_storage_mapped(level, stream);
+    const std::uint64_t capacity = level_capacity(level);
+    if (prepared.projection_rows > capacity)
+      throw std::length_error("sealed direct root capacity");
+    const std::uint64_t destination =
+        level_begin(level) + std::uint64_t{generation} * capacity;
+    gpulsmopt2_detail::copy_canonical_epoch_kernel<<<
+        blocks(prepared.projection_rows), gpulsmopt2_detail::kThreads, 0,
+        stream>>>(workspace.projection_rows(),
+                  workspace.projection_count_device(), resident_rows(),
+                  destination);
+    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    plan.selected_count = prepared.projection_rows;
+    plan.survivor_count = prepared.projection_rows;
+    plan.destination_level = level;
+    plan.output_generation = generation;
+    plan.output_begin = destination;
+    plan.output_capacity = capacity;
+    plan.status = gpulsmopt2_detail::kPublicationSuccess;
+    CUDA_CHECK(cudaMemcpyAsync(
+        resident_plan_.data(), &plan, sizeof(plan),
+        cudaMemcpyHostToDevice, stream));
+    gpulsmopt2_detail::build_canonical_rank_from_run_kernel<<<
+        gpulsmopt2_detail::kQuotients,
+        gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+        resident_rows(), destination, workspace.section_offsets(), level,
+        canonical_cell_ranks_.data());
+    gpulsmopt2_detail::finalize_canonical_level_metadata_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        workspace.section_offsets(), level_storage_spans_.data(),
+        resident_plan_.data(), descriptors_.data(),
+        static_cast<std::uint32_t>(route_stride_), route_headers_.data(),
+        route_slices_.data(), route_logical_begins_.data(),
+        route_quotients_.data(), level_q_logical_offsets_.data());
+    CUDA_CHECK(cudaGetLastError());
+    return prepared.projection_rows;
+  }
+
+  static std::uint32_t next_sealed_output(
+      const gpulsm_sparse::ForestPlan &plan,
+      const std::array<bool, gpulsmopt2_detail::kMaximumLevels> &built) {
+    for (std::uint32_t candidate = 0u;
+         candidate < plan.output_count; ++candidate) {
+      if (built[candidate]) continue;
+      const std::uint64_t destination_bit =
+          std::uint64_t{1u} << plan.outputs[candidate].destination;
+      bool has_unbuilt_reader = false;
+      for (std::uint32_t reader = 0u; reader < plan.output_count;
+           ++reader) {
+        if (reader == candidate || built[reader]) continue;
+        has_unbuilt_reader |=
+            (plan.outputs[reader].resident_sources & destination_bit) != 0u;
+      }
+      if (!has_unbuilt_reader) return candidate;
+    }
+    throw std::logic_error("sealed slot-lifetime dependency cycle");
+  }
+
+  std::uint32_t sealed_output_generation(
+      const gpulsm_sparse::ForestPlan &plan,
+      const gpulsm_sparse::PlannedRoot &root,
+      const gpulsmopt2_detail::DeviceManifest &manifest,
+      gpulsm_sparse::SealedForestCommand &command,
+      cudaStream_t stream) {
+    if (root.destination >= canonical_level_count_)
+      throw std::overflow_error("sealed destination exceeds forest");
+    const std::uint64_t bit = std::uint64_t{1u} << root.destination;
+    std::uint32_t generation = 0u;
+    if ((plan.old_mask & bit) && (root.resident_sources & bit)) {
+      if (root.destination + 1u != canonical_level_count_)
+        throw std::logic_error(
+            "sealed root overwrites its own nonterminal source");
+      ensure_canonical_top_rollover_bank(stream);
+      generation =
+          (manifest.levels[root.destination].storage_generation ^ 1u) & 1u;
+    }
+    // A consumed nonterminal destination is reused only after
+    // next_sealed_output has scheduled every old reader of that slot.
+    if (generation) command.output_generation_bits |= bit;
+    return generation;
+  }
+
+  void commit_sealed_forest(
+      const gpulsm_sparse::ForestPlan &plan,
+      const gpulsm_sparse::SealedForestCommand &command,
+      const std::array<std::uint32_t,
+                       gpulsmopt2_detail::kMaximumLevels> &output_counts,
+      std::array<std::shared_ptr<gpulsm_sparse::StagedRootOverlay>,
+                 gpulsmopt2_detail::kMaximumLevels> &staged_sparse_outputs,
+      std::uint32_t active, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(
+        sealed_device_command_.data(), &command, sizeof(command),
+        cudaMemcpyHostToDevice, stream));
+    gpulsm_sparse::publish_sealed_forest<<<
+        1, gpulsmopt2_detail::kMaximumLevels, 0, stream>>>(
+        sealed_device_command_.data(), device_manifests_.data(),
+        device_sparse_manifests_.data(), active_device_manifest_.data(),
+        query_occupied_level_mask_.data(), sealed_device_receipt_.data());
+    // Preserve the sparse table's shared-index invariant for the next
+    // untouched ordinary publication graph.
+    CUDA_CHECK(cudaMemcpyAsync(
+        device_sparse_manifests_.data() + active,
+        device_sparse_manifests_.data() + (active ^ 1u),
+        sizeof(gpulsm_sparse::DeviceSparseManifest),
+        cudaMemcpyDeviceToDevice, stream));
+    gpulsm_sparse::SealedForestReceipt receipt{};
+    CUDA_CHECK(cudaMemcpyAsync(
+        &receipt, sealed_device_receipt_.data(), sizeof(receipt),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (receipt.status || receipt.occupied_mask != plan.final_mask)
+      throw std::runtime_error("sealed forest publication rejected");
+
+    for (std::uint32_t level = 0u;
+         level < gpulsmopt2_detail::kMaximumLevels; ++level) {
+      auto &destination = staged_sparse_outputs[level];
+      if (!destination) continue;
+      destination->segments.reserve(
+          destination->segments.size() + destination->transfers.size());
+      for (gpulsm_sparse::CapsuleTransferIntent &intent :
+           destination->transfers) {
+        auto *source = intent.source;
+        if (!source || !source->segment)
+          throw std::logic_error(
+              "sealed capsule transfer source disappeared");
+        source->segment->commit_usage(
+            intent.live_bytes, intent.garbage_bytes);
+        gpulsm_sparse::CapsuleSegmentOwnership moved{
+            std::move(source->segment), intent.ordinal, 0u,
+            intent.live_bytes, intent.garbage_bytes};
+        source->ordinal = 0u;
+        source->live_bytes = 0u;
+        source->garbage_bytes = 0u;
+        destination->segments.push_back(std::move(moved));
+      }
+      destination->transfers.clear();
+    }
+
+    const std::uint64_t replaced = plan.consumed_mask | plan.output_mask;
+    std::uint64_t levels = replaced;
+    while (levels) {
+      const std::uint32_t level = static_cast<std::uint32_t>(
+          __builtin_ctzll(levels));
+      levels &= levels - 1u;
+      sparse_roots_[level].reset();
+    }
+    sparse_exact_level_mask_ &= ~replaced;
+    sparse_capsule_level_mask_ &= ~replaced;
+    for (std::uint32_t level = 0u;
+         level < gpulsmopt2_detail::kMaximumLevels; ++level) {
+      if (!staged_sparse_outputs[level]) continue;
+      const std::uint64_t bit = std::uint64_t{1u} << level;
+      sparse_roots_[level] = std::move(staged_sparse_outputs[level]);
+      if (command.sparse_flags[level] &
+          gpulsm_sparse::kSparseHasExactHeads)
+        sparse_exact_level_mask_ |= bit;
+      if (command.sparse_flags[level] &
+          gpulsm_sparse::kSparseHasCapsules)
+        sparse_capsule_level_mask_ |= bit;
+    }
+    for (std::uint32_t level = 0u;
+         level < gpulsmopt2_detail::kMaximumLevels; ++level) {
+      const std::uint64_t bit = std::uint64_t{1u} << level;
+      if (plan.consumed_mask & bit) level_counts_[level] = 0u;
+      if (plan.output_mask & bit) level_counts_[level] = output_counts[level];
+    }
+    host_occupied_level_mask_ = plan.final_mask;
+    refresh_active_levels();
+  }
+
+  std::size_t try_admit_sealed_inline(
+      const std::uint32_t *keys, const std::uint32_t *values,
+      std::size_t count, cudaStream_t stream) {
+    if (pending_batches_ || !count) return 0u;
+    const std::uint64_t epoch_rows =
+        std::uint64_t{batch_capacity_} *
+        gpulsmopt2_detail::kBatchesPerEpoch;
+    const std::uint64_t complete_epochs = count / epoch_rows;
+    if (!complete_epochs) return 0u;
+    const gpulsm_sparse::ForestPlan plan = gpulsm_sparse::plan_forest(
+        host_occupied_level_mask_, complete_epochs, sealed_tier_slots());
+    bool fusion = false;
+    std::uint64_t maximum_interval = 0u;
+    for (std::uint32_t output = 0u; output < plan.output_count; ++output) {
+      const auto &root = plan.outputs[output];
+      fusion |= root.raw_epochs > 1u || root.resident_sources != 0u;
+      maximum_interval = std::max(
+          maximum_interval, root.raw_epochs * epoch_rows);
+    }
+    if (!fusion) return 0u;
+    if (!maximum_interval ||
+        maximum_interval > std::numeric_limits<std::uint32_t>::max())
+      throw std::length_error("sealed interval exceeds 32 bits");
+    if (!sealed_workspace_ ||
+        maximum_interval > sealed_workspace_->capacity())
+      return 0u;
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    gpulsmopt2_detail::DeviceManifest manifests[2]{};
+    std::uint32_t active = 0u;
+    CUDA_CHECK(cudaMemcpy(&active, active_device_manifest_.data(),
+                          sizeof(active), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(manifests, device_manifests_.data(),
+                          sizeof(manifests), cudaMemcpyDeviceToHost));
+    active &= 1u;
+    gpulsm_sparse::SealedForestCommand command{};
+    command.expected_mask = plan.old_mask;
+    command.consumed_mask = plan.consumed_mask;
+    command.output_mask = plan.output_mask;
+    command.final_mask = plan.final_mask;
+    std::array<std::uint32_t, gpulsmopt2_detail::kMaximumLevels>
+        output_counts{};
+    std::array<std::shared_ptr<gpulsm_sparse::StagedRootOverlay>,
+               gpulsmopt2_detail::kMaximumLevels>
+        staged_sparse_outputs{};
+    gpulsm_sparse::SealedWorkspace &workspace = *sealed_workspace_;
+    std::array<bool, gpulsmopt2_detail::kMaximumLevels> built{};
+    for (std::uint32_t ordinal = 0u; ordinal < plan.output_count;
+         ++ordinal) {
+      const std::uint32_t output = next_sealed_output(plan, built);
+      built[output] = true;
+      const auto &root = plan.outputs[output];
+      if (root.destination >= canonical_level_count_)
+        throw std::overflow_error("sealed destination exceeds forest");
+      const std::uint64_t raw_begin = root.raw_begin * epoch_rows;
+      const std::uint64_t raw_count = root.raw_epochs * epoch_rows;
+      if (raw_begin > count || raw_count > count - raw_begin ||
+          raw_count > level_capacity(root.destination))
+        throw std::length_error("invalid sealed root interval");
+      const std::uint32_t generation = sealed_output_generation(
+          plan, root, manifests[active], command, stream);
+      const auto *root_keys = keys + raw_begin;
+      const auto *root_values = values + raw_begin;
+      output_counts[root.destination] = root.resident_sources
+          ? build_sealed_inline_carry_root(
+                workspace, root_keys, root_values,
+                static_cast<std::uint32_t>(raw_count),
+                root.resident_sources, root.destination, generation,
+                stream)
+          : build_sealed_inline_root(
+                workspace, root_keys, root_values,
+                static_cast<std::uint32_t>(raw_count), root.destination,
+                generation, stream);
+      const std::uint64_t sparse_sources = root.resident_sources &
+          (sparse_exact_level_mask_ | sparse_capsule_level_mask_);
+      if (sparse_sources) {
+        if (!sparse_refinement_workspace_)
+          sparse_refinement_workspace_ = std::make_unique<
+              gpulsm_sparse::SparseRefinementWorkspace>();
+        const auto roster = sparse_refinement_workspace_->prepare_roster(
+            sparse_pending_slots_, 0u, sparse_roots_,
+            root.resident_sources, stream);
+        if (!roster.count)
+          throw std::logic_error(
+              "sealed sparse carry has no exceptional roster");
+        gpulsm_sparse::CompletionSourceView completion{};
+        completion.incoming = gpulsm_sparse::inline_u32_batch(
+            workspace.sorted_keys(), workspace.sorted_values(), raw_count);
+        completion.incoming_sorted_heads = workspace.sorted_keys();
+        completion.incoming_sorted_refs = nullptr;
+        completion.incoming_records = static_cast<std::uint32_t>(raw_count);
+        auto staged =
+            std::make_shared<gpulsm_sparse::StagedRootOverlay>();
+        const std::uint64_t capacity = level_capacity(root.destination);
+        const std::uint64_t destination = level_begin(root.destination) +
+            std::uint64_t{generation} * capacity;
+        const gpulsm_sparse::SparseRefinementResult refined =
+            sparse_refinement_workspace_->refine(
+                completion, 0u, resident_rows(), descriptors_.data(),
+                root.destination, destination,
+                output_counts[root.destination], true, generation,
+                next_capsule_segment_ordinal_, *staged, stream);
+        if (refined.allocated_capsule_bytes) {
+          if (next_capsule_segment_ordinal_ ==
+              std::numeric_limits<std::uint32_t>::max())
+            throw std::overflow_error(
+                "GPULSMOpt capsule ordinal overflow");
+          ++next_capsule_segment_ordinal_;
+        }
+        std::uint32_t flags = 0u;
+        if (refined.exact_heads)
+          flags |= gpulsm_sparse::kSparseHasExactHeads;
+        if (refined.capsules)
+          flags |= gpulsm_sparse::kSparseHasCapsules;
+        if (flags) {
+          command.sparse_states[root.destination] =
+              reinterpret_cast<std::uint64_t>(staged->device_state.data());
+          command.sparse_flags[root.destination] = flags;
+          staged_sparse_outputs[root.destination] = std::move(staged);
+        }
+      }
+    }
+
+    note_sparse_workspace_high_water(workspace.bytes());
+    commit_sealed_forest(
+        plan, command, output_counts, staged_sparse_outputs, active, stream);
+    return static_cast<std::size_t>(complete_epochs * epoch_rows);
+  }
+
+  std::uint64_t try_admit_sealed_mixed(
+      gpulsm_sparse::RecordBatchView source, cudaStream_t stream) {
+    if (pending_batches_ || !source.count) return 0u;
+    const std::uint64_t epoch_rows =
+        std::uint64_t{batch_capacity_} *
+        gpulsmopt2_detail::kBatchesPerEpoch;
+    const std::uint64_t complete_epochs = source.count / epoch_rows;
+    if (!complete_epochs) return 0u;
+    const gpulsm_sparse::ForestPlan plan = gpulsm_sparse::plan_forest(
+        host_occupied_level_mask_, complete_epochs, sealed_tier_slots());
+    bool fusion = false;
+    std::uint64_t maximum_interval = 0u;
+    for (std::uint32_t output = 0u; output < plan.output_count; ++output) {
+      const auto &root = plan.outputs[output];
+      fusion |= root.raw_epochs > 1u || root.resident_sources != 0u;
+      maximum_interval = std::max(
+          maximum_interval, root.raw_epochs * epoch_rows);
+    }
+    if (!fusion) return 0u;
+    if (!maximum_interval ||
+        maximum_interval >= gpulsm_sparse::kCompletionIncoming)
+      throw std::length_error(
+          "sealed mixed interval exceeds exact locator capacity");
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    gpulsmopt2_detail::DeviceManifest manifests[2]{};
+    std::uint32_t active = 0u;
+    CUDA_CHECK(cudaMemcpy(&active, active_device_manifest_.data(),
+                          sizeof(active), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(manifests, device_manifests_.data(),
+                          sizeof(manifests), cudaMemcpyDeviceToHost));
+    active &= 1u;
+    gpulsm_sparse::SealedForestCommand command{};
+    command.expected_mask = plan.old_mask;
+    command.consumed_mask = plan.consumed_mask;
+    command.output_mask = plan.output_mask;
+    command.final_mask = plan.final_mask;
+    std::array<std::uint32_t, gpulsmopt2_detail::kMaximumLevels>
+        output_counts{};
+    std::array<std::shared_ptr<gpulsm_sparse::StagedRootOverlay>,
+               gpulsmopt2_detail::kMaximumLevels>
+        staged_sparse_outputs{};
+    gpulsm_sparse::DirectRootWorkspace workspace(
+        static_cast<std::uint32_t>(maximum_interval));
+    std::array<bool, gpulsmopt2_detail::kMaximumLevels> built{};
+    for (std::uint32_t ordinal = 0u; ordinal < plan.output_count;
+         ++ordinal) {
+      const std::uint32_t output = next_sealed_output(plan, built);
+      built[output] = true;
+      const auto &root = plan.outputs[output];
+      if (root.destination >= canonical_level_count_)
+        throw std::overflow_error("sealed destination exceeds forest");
+      const std::uint64_t raw_begin = root.raw_begin * epoch_rows;
+      const std::uint64_t raw_count = root.raw_epochs * epoch_rows;
+      if (raw_begin > source.count ||
+          raw_count > source.count - raw_begin ||
+          raw_count > level_capacity(root.destination) ||
+          raw_count >= gpulsm_sparse::kCompletionIncoming)
+        throw std::length_error("invalid sealed mixed root interval");
+      const std::uint32_t generation = sealed_output_generation(
+          plan, root, manifests[active], command, stream);
+      const gpulsm_sparse::RecordBatchView root_source =
+          slice_record_batch(source, raw_begin, raw_count);
+      const auto prepared = workspace.prepare(
+          root_source, static_cast<std::uint32_t>(raw_count), stream);
+      note_sparse_workspace_high_water(workspace.bytes());
+      workspace.materialize_epoch(
+          root_source, prepared.projection_rows, stream);
+      output_counts[root.destination] = root.resident_sources
+          ? build_sealed_projection_carry_root(
+                workspace.projection_rows(), workspace.section_offsets(),
+                workspace.section_counts(), workspace.epoch_ranks(),
+                prepared.projection_rows, root.resident_sources,
+                root.destination, generation, stream)
+          : build_sealed_direct_root(
+                workspace, prepared, root.destination, generation, stream);
+
+      const std::uint64_t sparse_sources = root.resident_sources &
+          (sparse_exact_level_mask_ | sparse_capsule_level_mask_);
+      if (!prepared.sparse_heads && !sparse_sources) continue;
+      if (!sparse_refinement_workspace_)
+        sparse_refinement_workspace_ = std::make_unique<
+            gpulsm_sparse::SparseRefinementWorkspace>();
+      const auto roster = sparse_refinement_workspace_->prepare_roster(
+          sparse_pending_slots_, 0u, sparse_roots_,
+          root.resident_sources, stream, workspace.sparse_heads(),
+          prepared.sparse_heads);
+      if (!roster.count)
+        throw std::logic_error(
+            "sealed mixed carry has no exceptional roster");
+      gpulsm_sparse::CompletionSourceView completion{};
+      completion.incoming = root_source;
+      completion.incoming_sorted_heads = workspace.sorted_heads();
+      completion.incoming_sorted_refs = workspace.sorted_refs();
+      completion.incoming_records = static_cast<std::uint32_t>(raw_count);
+      auto staged =
+          std::make_shared<gpulsm_sparse::StagedRootOverlay>();
+      const std::uint64_t capacity = level_capacity(root.destination);
+      const std::uint64_t destination = level_begin(root.destination) +
+          std::uint64_t{generation} * capacity;
+      const gpulsm_sparse::SparseRefinementResult refined =
+          sparse_refinement_workspace_->refine(
+              completion, 0u, resident_rows(), descriptors_.data(),
+              root.destination, destination,
+              output_counts[root.destination], true, generation,
+              next_capsule_segment_ordinal_, *staged, stream);
+      if (!root.resident_sources &&
+          staged->state.logical_count != prepared.logical_rows)
+        throw std::logic_error(
+            "sealed mixed logical/projection count mismatch");
+      if (refined.allocated_capsule_bytes) {
+        if (next_capsule_segment_ordinal_ ==
+            std::numeric_limits<std::uint32_t>::max())
+          throw std::overflow_error("GPULSMOpt capsule ordinal overflow");
+        ++next_capsule_segment_ordinal_;
+      }
+      std::uint32_t flags = 0u;
+      if (refined.exact_heads)
+        flags |= gpulsm_sparse::kSparseHasExactHeads;
+      if (refined.capsules)
+        flags |= gpulsm_sparse::kSparseHasCapsules;
+      if (flags) {
+        command.sparse_states[root.destination] =
+            reinterpret_cast<std::uint64_t>(staged->device_state.data());
+        command.sparse_flags[root.destination] = flags;
+        staged_sparse_outputs[root.destination] = std::move(staged);
+      }
+    }
+
+    note_sparse_workspace_high_water(workspace.bytes());
+    commit_sealed_forest(
+        plan, command, output_counts, staged_sparse_outputs, active, stream);
+    return complete_epochs * epoch_rows;
+  }
+
   void admit(const std::uint32_t *keys, const std::uint32_t *values,
              std::size_t count, bool tombstone, cudaStream_t stream) {
     if (!count) return;
@@ -6940,7 +8861,26 @@ private:
     begin_operation(stream);
     std::size_t consumed = 0u;
     bool incomplete = false;
-    while (consumed < count) {
+    if (!tombstone && pending_batches_) {
+      const std::size_t slots =
+          gpulsmopt2_detail::kBatchesPerEpoch - pending_batches_;
+      const std::size_t prefix_rows = slots * batch_capacity_;
+      if (count >= prefix_rows) {
+        while (pending_batches_ < gpulsmopt2_detail::kBatchesPerEpoch) {
+          admit_tile(keys + consumed, values + consumed,
+                     static_cast<std::uint32_t>(batch_capacity_), false,
+                     stream);
+          consumed += batch_capacity_;
+        }
+        if (publication_receipt_pending_)
+          resolve_publication_receipt_on_stream(stream);
+        if (publication_failed_) incomplete = true;
+      }
+    }
+    if (!incomplete && !tombstone && consumed < count)
+      consumed += try_admit_sealed_inline(
+          keys + consumed, values + consumed, count - consumed, stream);
+    while (!incomplete && consumed < count) {
       const std::size_t remaining = count - consumed;
       const std::uint32_t tile_count = static_cast<std::uint32_t>(
           std::min(remaining, batch_capacity_));
@@ -7125,7 +9065,10 @@ private:
   void launch_canonical_publication_commands(
       cudaStream_t stream, std::uint32_t destination,
       std::uint32_t source_count, bool direct_epoch,
-      bool include_receipt, bool top_level_rollover) {
+      bool include_receipt, bool top_level_rollover,
+      bool publish_manifest = true,
+      const std::uint32_t *sparse_roster = nullptr,
+      std::uint32_t sparse_roster_count = 0u) {
     // This check must precede epoch resolution: that stage indexes the rank
     // directory with destination and therefore cannot safely discover the
     // capacity error itself.
@@ -7158,6 +9101,16 @@ private:
                   gpulsmopt2_detail::kLocalRankEntries;
     launch_canonical_epoch_resolution(
         stream, direct_epoch, destination, epoch_ranks);
+    if (sparse_roster_count) {
+      gpulsm_sparse::patch_epoch_sparse_placeholders<<<
+          blocks(sparse_roster_count), gpulsmopt2_detail::kThreads, 0,
+          stream>>>(
+          sparse_roster, sparse_roster_count,
+          foundation_source_offsets_.data(),
+          foundation_section_output_counts_.data(),
+          publication_rows_a_.data(), resident_rows(),
+          level_begin(destination), direct_epoch);
+    }
     const std::uint32_t job_capacity =
         source_count < canonical_job_capacities_.size() &&
                 canonical_job_capacities_[source_count]
@@ -7295,11 +9248,12 @@ private:
               route_logical_begins_.data(), route_quotients_.data(),
               level_q_logical_offsets_.data());
     }
-    gpulsmopt2_detail::publish_resident_manifest_kernel<<<
-        1, gpulsmopt2_detail::kMaximumLevels, 0, stream>>>(
-            resident_plan_.data(), device_manifests_.data(),
-            active_device_manifest_.data(),
-            query_occupied_level_mask_.data());
+    if (publish_manifest)
+      gpulsmopt2_detail::publish_resident_manifest_kernel<<<
+          1, gpulsmopt2_detail::kMaximumLevels, 0, stream>>>(
+              resident_plan_.data(), device_manifests_.data(),
+              active_device_manifest_.data(),
+              query_occupied_level_mask_.data());
     if (include_receipt) {
       CUDA_CHECK(cudaMemcpyAsync(
           publication_receipt_.data(), resident_plan_.data(),
@@ -7387,6 +9341,137 @@ private:
     return false;
   }
 
+  std::uint64_t canonical_sparse_source_mask(
+      std::uint32_t destination, bool top_level_rollover) const {
+    if (top_level_rollover) {
+      const std::uint64_t mask = destination >=
+              gpulsmopt2_detail::kMaximumLevels - 1u
+          ? ~std::uint64_t{0}
+          : (std::uint64_t{1u} << (destination + 1u)) - 1u;
+      return host_occupied_level_mask_ & mask;
+    }
+    const std::uint32_t tier_begin = destination <
+            canonical_regular_level_count_
+        ? (destination / 3u) * 3u
+        : canonical_regular_level_count_;
+    const std::uint64_t mask = tier_begin
+        ? (std::uint64_t{1u} << tier_begin) - 1u : 0u;
+    return host_occupied_level_mask_ & mask;
+  }
+
+  bool sparse_publication_required() const {
+    if (pending_sparse_capsules_ || pending_sparse_exact_) return true;
+    std::uint32_t destination = 0u, source_count = 0u;
+    bool direct_epoch = false;
+    canonical_publication_parameters(
+        destination, source_count, direct_epoch);
+    (void)source_count;
+    (void)direct_epoch;
+    const bool top_level_rollover =
+        destination >= canonical_level_count_;
+    if (top_level_rollover) destination = canonical_level_count_ - 1u;
+    const std::uint64_t source_mask = canonical_sparse_source_mask(
+        destination, top_level_rollover);
+    return (source_mask &
+            (sparse_exact_level_mask_ | sparse_capsule_level_mask_)) != 0u;
+  }
+
+  bool launch_sparse_publication(cudaStream_t stream) {
+    std::uint32_t destination = 0u, source_count = 0u;
+    bool direct_epoch = false;
+    canonical_publication_parameters(
+        destination, source_count, direct_epoch);
+    const bool top_level_rollover =
+        destination >= canonical_level_count_;
+    if (top_level_rollover) {
+      ensure_canonical_top_rollover_bank(stream);
+      destination = canonical_level_count_ - 1u;
+      const std::uint64_t source_mask = destination ==
+              gpulsmopt2_detail::kMaximumLevels - 1u
+          ? ~std::uint64_t{0}
+          : (std::uint64_t{1u} << (destination + 1u)) - 1u;
+      source_count = 1u + static_cast<std::uint32_t>(
+          __builtin_popcountll(host_occupied_level_mask_ & source_mask));
+      direct_epoch = false;
+    } else {
+      ensure_level_storage_mapped(destination, stream);
+    }
+    const std::uint64_t source_mask = canonical_sparse_source_mask(
+        destination, top_level_rollover);
+    if (!sparse_refinement_workspace_)
+      sparse_refinement_workspace_ =
+          std::make_unique<gpulsm_sparse::SparseRefinementWorkspace>();
+    const auto roster = sparse_refinement_workspace_->prepare_roster(
+        sparse_pending_slots_, pending_batches_, sparse_roots_, source_mask,
+        stream);
+    if (!roster.count)
+      throw std::logic_error(
+          "sparse publication was selected without exceptional heads");
+
+    launch_canonical_publication_commands(
+        stream, destination, source_count, direct_epoch, false,
+        top_level_rollover, false, roster.heads, roster.count);
+    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    CUDA_CHECK(cudaMemcpyAsync(
+        &plan, resident_plan_.data(), sizeof(plan), cudaMemcpyDeviceToHost,
+        stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (plan.status) return false;
+    if (plan.survivor_count > std::numeric_limits<std::uint32_t>::max())
+      throw std::length_error("sparse root projection exceeds 32 bits");
+
+    auto staged = std::make_shared<gpulsm_sparse::StagedRootOverlay>();
+    const std::uint32_t segment_ordinal = next_capsule_segment_ordinal_;
+    gpulsm_sparse::CompletionSourceView source{};
+    source.pending_keys = raw_keys_.data();
+    source.pending_payloads = raw_payloads_.data();
+    source.pending_offsets = raw_offsets_.data();
+    source.pending_slots = device_pending_sparse_states_.data();
+    source.batch_capacity = static_cast<std::uint32_t>(batch_capacity_);
+    source.pending_records = pending_records_;
+    const gpulsm_sparse::SparseRefinementResult refined =
+        sparse_refinement_workspace_->refine(
+            source, pending_batches_, resident_rows(), descriptors_.data(),
+            plan.destination_level, plan.output_begin,
+            static_cast<std::uint32_t>(plan.survivor_count),
+            plan.keep_tombstones != 0u, plan.output_generation,
+            segment_ordinal, *staged, stream);
+    note_sparse_workspace_high_water();
+    if (refined.allocated_capsule_bytes) {
+      if (next_capsule_segment_ordinal_ ==
+          std::numeric_limits<std::uint32_t>::max())
+        throw std::overflow_error("GPULSMOpt capsule ordinal overflow");
+      ++next_capsule_segment_ordinal_;
+    }
+    std::uint32_t sparse_flags = 0u;
+    if (refined.exact_heads)
+      sparse_flags |= gpulsm_sparse::kSparseHasExactHeads;
+    if (refined.capsules)
+      sparse_flags |= gpulsm_sparse::kSparseHasCapsules;
+    gpulsm_sparse::publish_refined_manifest_kernel<<<
+        1, gpulsmopt2_detail::kMaximumLevels, 0, stream>>>(
+        resident_plan_.data(), device_manifests_.data(),
+        device_sparse_manifests_.data(), active_device_manifest_.data(),
+        query_occupied_level_mask_.data(),
+        sparse_flags ? staged->device_state.data() : nullptr,
+        sparse_flags);
+    // The active ordinary index is shared with sparse metadata.  Keep the
+    // tiny sparse table identical in both slots after a mixed commit so a
+    // later all-ordinary graph can flip its original manifest unchanged.
+    CUDA_CHECK(cudaMemcpyAsync(
+        device_sparse_manifests_.data() + plan.active_manifest,
+        device_sparse_manifests_.data() + plan.inactive_manifest,
+        sizeof(gpulsm_sparse::DeviceSparseManifest),
+        cudaMemcpyDeviceToDevice, stream));
+    pending_sparse_publication_root_ = std::move(staged);
+    pending_sparse_publication_consumed_mask_ = source_mask;
+    pending_sparse_publication_destination_ = plan.destination_level;
+    pending_sparse_publication_flags_ = sparse_flags;
+    pending_sparse_publication_ = true;
+    CUDA_CHECK(cudaGetLastError());
+    return false;
+  }
+
   void publish_epoch(cudaStream_t stream) {
     if (pending_records_ > publication_capacity_) {
       // Preserve an epoch that cannot reserve output.
@@ -7401,7 +9486,9 @@ private:
       failed_epoch_signatures_ready_ = true;
       return;
     }
-    const bool receipt_in_graph = launch_canonical_publication(stream);
+    const bool receipt_in_graph = sparse_publication_required()
+        ? launch_sparse_publication(stream)
+        : launch_canonical_publication(stream);
     CUDA_CHECK(cudaGetLastError());
 
     if (!receipt_in_graph) {
@@ -7876,6 +9963,14 @@ private:
       device_manifests_;
   gpulsmopt2_detail::Buffer<std::uint32_t> active_device_manifest_;
   gpulsmopt2_detail::Buffer<std::uint64_t> query_occupied_level_mask_;
+  gpulsm_sparse::Buffer<gpulsm_sparse::DeviceSparseManifest>
+      device_sparse_manifests_;
+  gpulsm_sparse::Buffer<gpulsm_sparse::PendingSlotBuildState>
+      device_pending_sparse_states_;
+  gpulsm_sparse::Buffer<gpulsm_sparse::SealedForestCommand>
+      sealed_device_command_;
+  gpulsm_sparse::Buffer<gpulsm_sparse::SealedForestReceipt>
+      sealed_device_receipt_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::ResidentPublicationPlan>
       resident_plan_;
   gpulsmopt2_detail::PinnedBuffer<
@@ -7886,6 +9981,7 @@ private:
   std::unique_ptr<gpulsmopt2_detail::Buffer<std::uint16_t>>
       canonical_rollover_epoch_ranks_;
   gpulsmopt2_detail::VirtualBuffer<std::uint8_t> operation_workspace_;
+  std::unique_ptr<gpulsm_sparse::SealedWorkspace> sealed_workspace_;
   gpulsmopt2_detail::Buffer<std::uint32_t> canonical_cell_counts_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::CanonicalJobPrefix>
       canonical_job_prefixes_;
@@ -7917,6 +10013,33 @@ private:
   std::uint32_t raw_batch_counts_[gpulsmopt2_detail::kBatchesPerEpoch]{};
   gpulsmopt2_detail::Buffer<std::uint8_t> radix_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
+
+  std::array<std::shared_ptr<gpulsm_sparse::StagedRootOverlay>,
+             gpulsmopt2_detail::kMaximumLevels>
+      sparse_roots_{};
+  std::array<std::shared_ptr<gpulsm_sparse::StagedPendingSlotOverlay>,
+             gpulsmopt2_detail::kBatchesPerEpoch>
+      sparse_pending_slots_{};
+  std::unique_ptr<gpulsm_sparse::PendingWorkspace>
+      sparse_pending_workspace_;
+  std::unique_ptr<gpulsm_sparse::SparseRefinementWorkspace>
+      sparse_refinement_workspace_;
+  std::unique_ptr<gpulsm_sparse::SparseReadWorkspace>
+      sparse_read_workspace_;
+  std::shared_ptr<gpulsm_sparse::StagedRootOverlay>
+      pending_sparse_publication_root_;
+  std::uint64_t pending_sparse_publication_consumed_mask_{};
+  std::uint32_t pending_sparse_publication_destination_{};
+  std::uint32_t pending_sparse_publication_flags_{};
+  std::uint32_t pending_sparse_generation_{1u};
+  std::uint32_t pending_sparse_device_generation_{};
+  std::uint32_t next_capsule_segment_ordinal_{1u};
+  std::uint64_t sparse_exact_level_mask_{};
+  std::uint64_t sparse_capsule_level_mask_{};
+  std::uint64_t sparse_workspace_high_water_bytes_{};
+  bool pending_sparse_exact_{};
+  bool pending_sparse_capsules_{};
+  bool pending_sparse_publication_{};
 
   gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_reduction_completion_;
