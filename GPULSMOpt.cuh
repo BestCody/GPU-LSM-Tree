@@ -5633,13 +5633,8354 @@ __global__ void successor_with_pending_kernel(
 
 }
 
-#include "gpulsm_sparse/pending.cuh"
-#include "gpulsm_sparse/refine.cuh"
-#include "gpulsm_sparse/bulk.cuh"
-#include "gpulsm_sparse/sealed.cuh"
-#include "gpulsm_sparse/read.cuh"
-#include "gpulsm_sparse/ordered_read.cuh"
-#include "gpulsm_sparse/range.cuh"
+// BEGIN INLINED COMPONENT: gpulsm_sparse/pending.cuh
+
+// BEGIN INLINED COMPONENT: gpulsm_sparse/capsule_lifecycle.cuh
+
+// BEGIN INLINED COMPONENT: gpulsm_sparse/exact.cuh
+
+// BEGIN INLINED COMPONENT: gpulsm_sparse/capsule.cuh
+
+// BEGIN INLINED COMPONENT: gpulsm_sparse/common.cuh
+
+#include <utility>
+
+namespace gpulsm_sparse {
+
+constexpr std::uint32_t kThreads = 256u;
+constexpr std::uint32_t kSections = gpulsmopt2_detail::kQuotients;
+constexpr std::uint32_t kLevels = gpulsmopt2_detail::kMaximumLevels;
+
+inline void check(cudaError_t error, const char *where) {
+  if (error != cudaSuccess)
+    throw std::runtime_error(
+        std::string(where) + ": " + cudaGetErrorString(error));
+}
+
+inline std::uint32_t blocks(std::uint64_t count) {
+  return static_cast<std::uint32_t>(
+      std::max<std::uint64_t>(1u, (count + kThreads - 1u) / kThreads));
+}
+
+template <class T>
+class Buffer {
+ public:
+  Buffer() = default;
+  explicit Buffer(std::size_t count) { reset(count); }
+  Buffer(const Buffer &) = delete;
+  Buffer &operator=(const Buffer &) = delete;
+  Buffer(Buffer &&other) noexcept { swap(other); }
+  Buffer &operator=(Buffer &&other) noexcept {
+    if (this != &other) {
+      clear();
+      swap(other);
+    }
+    return *this;
+  }
+  ~Buffer() { clear(); }
+
+  void reset(std::size_t count) {
+    clear();
+    count_ = count;
+    if (count) check(cudaMalloc(&pointer_, count * sizeof(T)), "cudaMalloc");
+  }
+
+  void clear() noexcept {
+    if (pointer_) cudaFree(pointer_);
+    pointer_ = nullptr;
+    count_ = 0u;
+  }
+
+  T *data() const { return pointer_; }
+  std::size_t size() const { return count_; }
+  std::size_t bytes() const { return count_ * sizeof(T); }
+
+  void swap(Buffer &other) noexcept {
+    std::swap(pointer_, other.pointer_);
+    std::swap(count_, other.count_);
+  }
+
+ private:
+  T *pointer_{};
+  std::size_t count_{};
+};
+
+// This is the validated structural radix-4 forest planner.  It describes
+// final roots symbolically so a sealed call materializes only those roots.
+struct PlannedRoot {
+  std::uint64_t resident_sources{};
+  std::uint64_t raw_begin{};
+  std::uint64_t raw_epochs{};
+  std::uint32_t destination{};
+};
+
+struct ForestPlan {
+  std::uint64_t old_mask{};
+  std::uint64_t consumed_mask{};
+  std::uint64_t output_mask{};
+  std::uint64_t final_mask{};
+  std::uint32_t output_count{};
+  std::array<PlannedRoot, kLevels> outputs{};
+};
+
+struct PlannerNode {
+  bool occupied{};
+  bool created{};
+  std::uint64_t resident_sources{};
+  std::uint64_t raw_begin{};
+  std::uint64_t raw_epochs{};
+};
+
+inline ForestPlan plan_forest(
+    std::uint64_t old_mask, std::uint64_t complete_epochs,
+    const std::vector<std::uint32_t> &tier_slots) {
+  std::array<PlannerNode, kLevels> levels{};
+  std::uint32_t level_base = 0u;
+  for (std::uint32_t tier = 0u; tier < tier_slots.size(); ++tier) {
+    const std::uint32_t slots = tier_slots[tier];
+    const std::uint64_t mask = ((std::uint64_t{1u} << slots) - 1u)
+        << level_base;
+    const std::uint32_t count = static_cast<std::uint32_t>(
+        __builtin_popcountll(old_mask & mask));
+    const std::uint64_t expected = count
+        ? ((std::uint64_t{1u} << count) - 1u)
+              << (level_base + slots - count)
+        : 0u;
+    if ((old_mask & mask) != expected)
+      throw std::invalid_argument("noncanonical forest mask");
+    for (std::uint32_t local = 0u; local < slots; ++local) {
+      const std::uint32_t level = level_base + local;
+      if (old_mask & (std::uint64_t{1u} << level)) {
+        levels[level].occupied = true;
+        levels[level].resident_sources = std::uint64_t{1u} << level;
+      }
+    }
+    level_base += slots;
+  }
+
+  for (std::uint64_t epoch = 0u; epoch < complete_epochs; ++epoch) {
+    PlannerNode incoming{};
+    incoming.occupied = true;
+    incoming.created = true;
+    incoming.raw_begin = epoch;
+    incoming.raw_epochs = 1u;
+    level_base = 0u;
+    bool placed = false;
+    for (std::uint32_t tier = 0u; tier < tier_slots.size(); ++tier) {
+      const std::uint32_t slots = tier_slots[tier];
+      std::uint32_t count = 0u;
+      for (std::uint32_t local = 0u; local < slots; ++local)
+        count += levels[level_base + local].occupied;
+      if (count < slots) {
+        const std::uint32_t destination = level_base + slots - 1u - count;
+        levels[destination] = incoming;
+        placed = true;
+        break;
+      }
+      PlannerNode parent = incoming;
+      std::uint64_t minimum = incoming.raw_epochs
+          ? incoming.raw_begin : ~std::uint64_t{0};
+      std::uint64_t maximum = incoming.raw_begin + incoming.raw_epochs;
+      std::uint64_t total_raw = incoming.raw_epochs;
+      for (std::uint32_t local = 0u; local < slots; ++local) {
+        const PlannerNode &source = levels[level_base + local];
+        parent.resident_sources |= source.resident_sources;
+        if (source.raw_epochs) {
+          minimum = std::min(minimum, source.raw_begin);
+          maximum = std::max(
+              maximum, source.raw_begin + source.raw_epochs);
+          total_raw += source.raw_epochs;
+        }
+        levels[level_base + local] = {};
+      }
+      if (total_raw) {
+        if (maximum - minimum != total_raw)
+          throw std::logic_error("noncontiguous raw carry interval");
+        parent.raw_begin = minimum;
+        parent.raw_epochs = total_raw;
+      }
+      if (tier + 1u == tier_slots.size()) {
+        if (slots != 1u)
+          throw std::logic_error("terminal rollover requires one slot");
+        levels[level_base] = parent;
+        placed = true;
+        break;
+      }
+      incoming = parent;
+      level_base += slots;
+    }
+    if (!placed) throw std::overflow_error("forest planner overflow");
+  }
+
+  ForestPlan plan{};
+  plan.old_mask = old_mask;
+  level_base = 0u;
+  for (std::uint32_t tier = 0u; tier < tier_slots.size(); ++tier) {
+    for (std::uint32_t local = 0u; local < tier_slots[tier]; ++local) {
+      const std::uint32_t level = level_base + local;
+      const PlannerNode &node = levels[level];
+      if (!node.occupied) continue;
+      plan.final_mask |= std::uint64_t{1u} << level;
+      if (!node.created) continue;
+      plan.output_mask |= std::uint64_t{1u} << level;
+      plan.consumed_mask |= node.resident_sources;
+      plan.outputs[plan.output_count++] = {
+          node.resident_sources, node.raw_begin, node.raw_epochs, level};
+    }
+    level_base += tier_slots[tier];
+  }
+  if (plan.final_mask !=
+      ((old_mask & ~plan.consumed_mask) | plan.output_mask))
+    throw std::logic_error("forest plan decomposition mismatch");
+  return plan;
+}
+
+// Sparse descriptors hang off the authoritative GPULSMOpt level/pending
+// state.  They describe only exceptional storage; ordinary masks, rows,
+// offsets, and counts remain owned by GPULSMOpt.
+struct RootBuildState {
+  std::uint32_t level{};
+  std::uint32_t generation{};
+  std::uint32_t row_count{};
+  std::uint32_t logical_count{};
+  std::uint32_t exact_head_count{};
+  std::uint32_t special_head_count{};
+  std::uint64_t first_epoch{};
+  std::uint64_t last_epoch{};
+  std::uint64_t physical_begin{};
+  std::uint64_t exact_heads{};
+  std::uint64_t exact_rows{};
+  std::uint64_t special_heads{};
+  std::uint64_t capsule_pages{};
+  std::uint64_t capsule_indexes{};
+  std::uint32_t exact_row_count{};
+  std::uint32_t capsule_page_count{};
+  std::uint32_t capsule_count{};
+  std::uint32_t reserved{};
+  std::uint64_t capsule_live_bytes{};
+  std::uint64_t capsule_garbage_bytes{};
+};
+
+struct PendingSlotBuildState {
+  std::uint64_t pages{};
+  std::uint64_t indexes{};
+  std::uint64_t exact_heads{};
+  std::uint64_t exact_refs{};
+  std::uint64_t special_heads{};
+  std::uint64_t exceptions{};
+  std::uint32_t page_count{};
+  std::uint32_t capsule_count{};
+  std::uint32_t exact_head_count{};
+  std::uint32_t exact_ref_count{};
+  std::uint32_t special_head_count{};
+  std::uint32_t exception_count{};
+  std::uint32_t record_count{};
+  std::uint32_t segment_ordinal{};
+  std::uint32_t generation{};
+  std::uint32_t reserved{};
+  std::uint64_t live_bytes{};
+  std::uint64_t garbage_bytes{};
+};
+
+struct DeviceSparseLevelState {
+  std::uint64_t state{};
+  std::uint32_t generation{};
+  std::uint32_t flags{};
+};
+
+enum : std::uint32_t {
+  kSparseHasExactHeads = 1u << 0u,
+  kSparseHasCapsules = 1u << 1u,
+};
+
+// This table is indexed by the restored manifest generation.  It contains no
+// ordinary mask, row, count, offset, or routing metadata.
+struct DeviceSparseManifest {
+  DeviceSparseLevelState levels[gpulsmopt2_detail::kMaximumLevels]{};
+  std::uint64_t exact_level_mask{};
+  std::uint64_t capsule_level_mask{};
+  std::uint32_t generation{};
+  std::uint32_t reserved{};
+};
+
+using Mutation = DeviceMutation;
+using ByteSource = DeviceByteSource;
+
+struct RecordBatchView {
+  ByteSource keys{};
+  ByteSource values{};
+  const std::uint8_t *operations{};
+  const std::uint32_t *range_contributions{};
+  std::uint64_t count{};
+  bool head4_words{};
+  bool inline_u32_values{};
+  Mutation uniform_operation{Mutation::put};
+};
+
+inline RecordBatchView record_batch_view(const DeviceRecordBatchView &source) {
+  return {source.keys, source.values, source.operations,
+          source.range_contributions, source.count,
+          source.key_encoding == DeviceKeyEncoding::head4_words,
+          !source.values.offsets &&
+              source.values.stride == sizeof(std::uint32_t),
+          source.uniform_operation};
+}
+
+inline RecordBatchView key_batch_view(const DeviceKeyBatchView &source) {
+  return {source.keys, {}, nullptr, nullptr, source.count,
+          source.key_encoding == DeviceKeyEncoding::head4_words,
+          false, Mutation::put};
+}
+
+struct DeviceKeyCursor {
+  ByteSource source{};
+  std::uint64_t row{};
+  bool head4_words{};
+
+  __host__ __device__ std::uint64_t begin() const {
+    return source.offsets ? source.offsets[row] : row * source.stride;
+  }
+
+  __host__ __device__ std::uint64_t length() const {
+    return source.offsets ? source.offsets[row + 1u] - source.offsets[row]
+                          : source.stride;
+  }
+
+  __host__ __device__ std::uint8_t byte(std::uint64_t position) const {
+    if (head4_words) {
+      const std::uint32_t key =
+          reinterpret_cast<const std::uint32_t *>(source.bytes)[row];
+      return static_cast<std::uint8_t>(
+          key >> (24u - static_cast<std::uint32_t>(position) * 8u));
+    }
+    return source.bytes[begin() + position];
+  }
+
+  __host__ __device__ std::uint32_t head4() const {
+    if (head4_words)
+      return reinterpret_cast<const std::uint32_t *>(source.bytes)[row];
+    const std::uint64_t size = length();
+    std::uint32_t head = 0u;
+#pragma unroll
+    for (std::uint32_t position = 0u; position < 4u; ++position) {
+      head <<= 8u;
+      if (position < size) head |= byte(position);
+    }
+    return head;
+  }
+};
+
+struct DeviceValueCursor {
+  ByteSource source{};
+  std::uint64_t row{};
+
+  __host__ __device__ std::uint64_t begin() const {
+    return source.offsets ? source.offsets[row] : row * source.stride;
+  }
+
+  __host__ __device__ std::uint64_t length() const {
+    return source.offsets ? source.offsets[row + 1u] - source.offsets[row]
+                          : source.stride;
+  }
+
+  __host__ __device__ std::uint8_t byte(std::uint64_t position) const {
+    return source.bytes[begin() + position];
+  }
+
+  __host__ __device__ std::uint32_t inline_word() const {
+    std::uint32_t value = 0u;
+    const std::uint64_t size = length();
+#pragma unroll
+    for (std::uint32_t position = 0u; position < 4u; ++position)
+      if (position < size)
+        value |= std::uint32_t{byte(position)} << (8u * position);
+    return value;
+  }
+};
+
+__host__ __device__ inline bool record_is_tombstone(
+    const RecordBatchView &source, std::uint64_t row) {
+  if (source.operations)
+    return source.operations[row] ==
+        static_cast<std::uint8_t>(Mutation::erase);
+  return source.uniform_operation == Mutation::erase;
+}
+
+template <class LeftCursor, class RightCursor>
+__host__ __device__ inline int compare_keys(
+    const LeftCursor &left, const RightCursor &right,
+    std::uint64_t depth = 0u) {
+  const std::uint64_t left_length = left.length();
+  const std::uint64_t right_length = right.length();
+  const std::uint64_t common =
+      left_length < right_length ? left_length : right_length;
+  for (std::uint64_t position = depth; position < common; ++position) {
+    const std::uint8_t a = left.byte(position);
+    const std::uint8_t b = right.byte(position);
+    if (a != b) return a < b ? -1 : 1;
+  }
+  return left_length == right_length ? 0
+      : left_length < right_length ? -1 : 1;
+}
+
+template <class KeyCursor>
+__host__ __device__ inline std::uint32_t rejection_hash(
+    const KeyCursor &key) {
+  std::uint32_t hash = 2166136261u;
+  for (std::uint64_t position = 0u; position < key.length(); ++position)
+    hash = (hash ^ key.byte(position)) * 16777619u;
+  return (hash ^ static_cast<std::uint32_t>(key.length())) * 16777619u;
+}
+
+inline RecordBatchView inline_u32_batch(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    std::uint64_t count, Mutation operation = Mutation::put) {
+  return {
+      {reinterpret_cast<const std::uint8_t *>(keys), nullptr,
+       sizeof(std::uint32_t)},
+      {reinterpret_cast<const std::uint8_t *>(values), nullptr,
+       sizeof(std::uint32_t)},
+      nullptr, values, count, true, true, operation};
+}
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/common.cuh
+
+namespace gpulsm_sparse {
+
+constexpr std::uint16_t kAnchorCapsule = 1u << 1u;
+constexpr std::uint16_t kAnchorLengthMask = 7u;
+constexpr std::uint16_t kAnchorKeyLengthShift = 2u;
+constexpr std::uint16_t kAnchorValueLengthShift = 5u;
+constexpr std::uint16_t kAnchorCapsuleRankShift = 2u;
+constexpr std::uint16_t kAnchorCapsuleRankMask = 0x0fffu;
+constexpr std::uint16_t kAnchorSummaryValid = 1u << 14u;
+constexpr std::uint16_t kExactGroupSentinel = 1u << 15u;
+constexpr std::uint32_t kCapsulePageRows = 4096u;
+constexpr std::uint32_t kPendingAgeMask = (1u << 24u) - 1u;
+constexpr std::uint64_t kExactPhysicalBit = std::uint64_t{1u} << 63u;
+
+__host__ __device__ constexpr bool is_exact_physical(
+    std::uint64_t physical) {
+  return (physical & kExactPhysicalBit) != 0u;
+}
+
+__host__ __device__ constexpr std::uint64_t exact_physical_offset(
+    std::uint64_t physical) {
+  return physical & ~kExactPhysicalBit;
+}
+
+__host__ __device__ constexpr bool anchor_is_exact_group(
+    const gpulsmopt2_detail::Row &row) {
+  return (row.flags & kExactGroupSentinel) != 0u;
+}
+
+__host__ __device__ constexpr gpulsmopt2_detail::Row exact_group_row(
+    std::uint32_t head, std::uint32_t descriptor) {
+  return {descriptor, static_cast<std::uint16_t>(head),
+          kExactGroupSentinel};
+}
+
+struct CapsuleHeader {
+  std::uint64_t key_length{};
+  std::uint64_t value_length{};
+  std::uint32_t flags{};
+  std::uint32_t reserved{};
+};
+
+struct CapsuleIndex {
+  std::uint64_t address{};
+  std::uint32_t rejection{};
+  std::uint32_t segment{};
+};
+
+struct CapsulePage {
+  std::uint64_t physical_page{};
+  std::uint32_t index_begin{};
+  std::uint32_t index_count{};
+};
+
+struct ExactHeadDescriptor {
+  std::uint32_t head{};
+  std::uint32_t count{};
+  std::uint64_t physical_begin{};
+};
+
+struct PendingExactHeadDescriptor {
+  std::uint32_t head{};
+  std::uint32_t count{};
+  std::uint32_t ref_begin{};
+  std::uint32_t batch_slot{};
+};
+
+struct PendingExceptionRef {
+  std::uint32_t age{};
+  std::uint32_t physical{};
+};
+
+struct PendingCapsulePage {
+  std::uint32_t batch_slot{};
+  std::uint32_t local_page{};
+  std::uint32_t index_begin{};
+  std::uint32_t index_count{};
+  std::uint32_t bitmap[kCapsulePageRows / 32u]{};
+  std::uint16_t prefixes[kCapsulePageRows / 32u + 1u]{};
+};
+
+static_assert(sizeof(CapsuleHeader) == 24u);
+static_assert(sizeof(CapsuleIndex) == 16u);
+static_assert(sizeof(CapsulePage) == 16u);
+static_assert(sizeof(ExactHeadDescriptor) == 16u);
+static_assert(sizeof(PendingExactHeadDescriptor) == 16u);
+static_assert(sizeof(PendingExceptionRef) == 8u);
+
+__host__ __device__ constexpr std::uint64_t align_capsule_bytes(
+    std::uint64_t bytes) {
+  return (bytes + 7u) & ~std::uint64_t{7u};
+}
+
+__host__ __device__ constexpr bool capsule_object_bytes(
+    std::uint64_t key_bytes, std::uint64_t value_bytes,
+    std::uint64_t &result) {
+  if (key_bytes > std::numeric_limits<std::uint64_t>::max() -
+                      sizeof(CapsuleHeader))
+    return false;
+  const std::uint64_t prefix = sizeof(CapsuleHeader) + key_bytes;
+  if (value_bytes > std::numeric_limits<std::uint64_t>::max() - prefix)
+    return false;
+  const std::uint64_t raw = prefix + value_bytes;
+  if (raw > std::numeric_limits<std::uint64_t>::max() - 7u) return false;
+  result = align_capsule_bytes(raw);
+  return true;
+}
+
+__host__ __device__ constexpr std::uint16_t anchor_length_code(
+    std::uint64_t length) {
+  return length == 4u ? 0u : static_cast<std::uint16_t>(length + 1u);
+}
+
+__host__ __device__ constexpr std::uint64_t anchor_length_from_code(
+    std::uint16_t code) {
+  return code ? static_cast<std::uint64_t>(code - 1u) : 4u;
+}
+
+__host__ __device__ constexpr bool anchor_has_capsule(
+    const gpulsmopt2_detail::Row &row) {
+  return (row.flags & kAnchorCapsule) != 0u;
+}
+
+__host__ __device__ constexpr std::uint32_t anchor_capsule_rank(
+    const gpulsmopt2_detail::Row &row) {
+  return (row.flags >> kAnchorCapsuleRankShift) & kAnchorCapsuleRankMask;
+}
+
+__host__ __device__ constexpr std::uint64_t anchor_key_length(
+    const gpulsmopt2_detail::Row &row) {
+  return anchor_has_capsule(row) ? 0u : anchor_length_from_code(
+      static_cast<std::uint16_t>(
+          (row.flags >> kAnchorKeyLengthShift) & kAnchorLengthMask));
+}
+
+__host__ __device__ constexpr std::uint64_t anchor_value_length(
+    const gpulsmopt2_detail::Row &row) {
+  return anchor_has_capsule(row) ? 0u : anchor_length_from_code(
+      static_cast<std::uint16_t>(
+          (row.flags >> kAnchorValueLengthShift) & kAnchorLengthMask));
+}
+
+__host__ __device__ constexpr std::uint16_t inline_anchor_flags(
+    std::uint64_t key_length, std::uint64_t value_length,
+    bool tombstone, bool summary) {
+  return static_cast<std::uint16_t>(
+      (tombstone ? gpulsmopt2_detail::kTombstone : 0u) |
+      (anchor_length_code(key_length) << kAnchorKeyLengthShift) |
+      (anchor_length_code(value_length) << kAnchorValueLengthShift) |
+      (summary ? kAnchorSummaryValid : 0u));
+}
+
+__host__ __device__ constexpr std::uint16_t capsule_anchor_flags(
+    std::uint32_t rank, bool tombstone, bool summary) {
+  return static_cast<std::uint16_t>(
+      (tombstone ? gpulsmopt2_detail::kTombstone : 0u) |
+      kAnchorCapsule |
+      ((rank & kAnchorCapsuleRankMask) << kAnchorCapsuleRankShift) |
+      (summary ? kAnchorSummaryValid : 0u));
+}
+
+class CapsuleSegment {
+ public:
+  CapsuleSegment() = default;
+  explicit CapsuleSegment(std::uint64_t bytes) { allocate(bytes); }
+  CapsuleSegment(const CapsuleSegment &) = delete;
+  CapsuleSegment &operator=(const CapsuleSegment &) = delete;
+  CapsuleSegment(CapsuleSegment &&other) noexcept { move_from(other); }
+  CapsuleSegment &operator=(CapsuleSegment &&other) noexcept {
+    if (this != &other) {
+      release();
+      move_from(other);
+    }
+    return *this;
+  }
+  ~CapsuleSegment() { release(); }
+
+  void allocate(std::uint64_t bytes) {
+    if (!bytes) return;
+    if (address_) throw std::logic_error("capsule already allocated");
+    check(cudaFree(nullptr), "initialize CUDA for capsule VMM");
+    int device = 0;
+    check(cudaGetDevice(&device), "get capsule device");
+    property_.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    property_.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    property_.location.id = device;
+    auto &functions = gpulsmopt2_detail::vmm_functions();
+    GPULSMOPT_CU_CHECK(functions.granularity(
+        &granularity_, &property_, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+    reserved_bytes_ = align(bytes, granularity_);
+    GPULSMOPT_CU_CHECK(functions.reserve(
+        &address_, reserved_bytes_, granularity_, 0u, 0u));
+    try {
+      constexpr std::uint64_t chunk_limit = std::uint64_t{1u} << 30u;
+      std::uint64_t offset = 0u;
+      while (offset < reserved_bytes_) {
+        const std::uint64_t chunk = align(
+            std::min(chunk_limit, reserved_bytes_ - offset), granularity_);
+        CUmemGenericAllocationHandle handle{};
+        GPULSMOPT_CU_CHECK(functions.create(
+            &handle, chunk, &property_, 0u));
+        bool mapped = false;
+        try {
+          GPULSMOPT_CU_CHECK(functions.map(
+              address_ + offset, chunk, 0u, handle, 0u));
+          mapped = true;
+          CUmemAccessDesc access{};
+          access.location = property_.location;
+          access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+          GPULSMOPT_CU_CHECK(functions.set_access(
+              address_ + offset, chunk, &access, 1u));
+        } catch (...) {
+          if (mapped) functions.unmap(address_ + offset, chunk);
+          functions.release(handle);
+          throw;
+        }
+        mappings_.push_back({offset, chunk, handle});
+        mapped_bytes_ += chunk;
+        offset += chunk;
+      }
+      live_bytes_ = bytes;
+    } catch (...) {
+      release();
+      throw;
+    }
+  }
+
+  std::uint8_t *data() const {
+    return reinterpret_cast<std::uint8_t *>(
+        static_cast<std::uintptr_t>(address_));
+  }
+  std::uint64_t address() const { return address_; }
+  std::uint64_t reserved_bytes() const { return reserved_bytes_; }
+  std::uint64_t mapped_bytes() const { return mapped_bytes_; }
+  std::uint64_t live_bytes() const { return live_bytes_; }
+  std::uint64_t garbage_bytes() const { return garbage_bytes_; }
+  void set_usage(std::uint64_t live, std::uint64_t garbage) {
+    if (live > mapped_bytes_ || garbage > mapped_bytes_ - live)
+      throw std::overflow_error("invalid capsule usage");
+    live_bytes_ = live;
+    garbage_bytes_ = garbage;
+  }
+  void commit_usage(std::uint64_t live, std::uint64_t garbage) noexcept {
+    live_bytes_ = live;
+    garbage_bytes_ = garbage;
+  }
+
+ private:
+  struct Mapping {
+    std::uint64_t offset{};
+    std::uint64_t bytes{};
+    CUmemGenericAllocationHandle handle{};
+  };
+
+  static std::uint64_t align(std::uint64_t value,
+                             std::uint64_t alignment) {
+    if (value > std::numeric_limits<std::uint64_t>::max() - alignment + 1u)
+      throw std::overflow_error("capsule size overflow");
+    return (value + alignment - 1u) / alignment * alignment;
+  }
+
+  void move_from(CapsuleSegment &other) noexcept {
+    address_ = other.address_;
+    granularity_ = other.granularity_;
+    reserved_bytes_ = other.reserved_bytes_;
+    mapped_bytes_ = other.mapped_bytes_;
+    live_bytes_ = other.live_bytes_;
+    garbage_bytes_ = other.garbage_bytes_;
+    property_ = other.property_;
+    mappings_ = std::move(other.mappings_);
+    other.address_ = 0u;
+    other.granularity_ = 0u;
+    other.reserved_bytes_ = 0u;
+    other.mapped_bytes_ = 0u;
+    other.live_bytes_ = 0u;
+    other.garbage_bytes_ = 0u;
+  }
+
+  void release() noexcept {
+    if (!address_) return;
+    auto &functions = gpulsmopt2_detail::vmm_functions();
+    for (auto it = mappings_.rbegin(); it != mappings_.rend(); ++it) {
+      functions.unmap(address_ + it->offset, it->bytes);
+      functions.release(it->handle);
+    }
+    functions.free_address(address_, reserved_bytes_);
+    address_ = 0u;
+    mappings_.clear();
+    granularity_ = reserved_bytes_ = mapped_bytes_ = 0u;
+    live_bytes_ = garbage_bytes_ = 0u;
+  }
+
+  CUdeviceptr address_{};
+  std::uint64_t granularity_{};
+  std::uint64_t reserved_bytes_{};
+  std::uint64_t mapped_bytes_{};
+  std::uint64_t live_bytes_{};
+  std::uint64_t garbage_bytes_{};
+  CUmemAllocationProp property_{};
+  std::vector<Mapping> mappings_;
+};
+
+struct CapsuleSegmentOwnership {
+  std::shared_ptr<CapsuleSegment> segment;
+  std::uint32_t ordinal{};
+  std::uint32_t reserved{};
+  std::uint64_t live_bytes{};
+  std::uint64_t garbage_bytes{};
+};
+
+struct CapsuleTransferIntent {
+  std::uint32_t ordinal{};
+  std::uint32_t reserved{};
+  std::uint64_t live_bytes{};
+  std::uint64_t garbage_bytes{};
+  CapsuleSegmentOwnership *source{};
+};
+
+struct CapsuleLifecycleSource {
+  std::uint32_t ordinal{};
+  std::uint32_t action{};
+  std::uint64_t live_bytes{};
+  std::uint64_t garbage_bytes{};
+  std::uint64_t survivor_bytes{};
+};
+
+constexpr std::uint32_t kCapsuleCopy = 0u;
+constexpr std::uint32_t kCapsuleTransfer = 1u;
+constexpr std::uint32_t kCapsuleCompact = 2u;
+
+struct DeviceCapsulePlane {
+  const CapsulePage *pages{};
+  const CapsuleIndex *indexes{};
+  std::uint32_t page_count{};
+  std::uint32_t capsule_count{};
+};
+
+struct StagedRootOverlay {
+  RootBuildState state{};
+  Buffer<RootBuildState> device_state;
+  Buffer<ExactHeadDescriptor> exact_heads;
+  Buffer<gpulsmopt2_detail::Row> exact_rows;
+  Buffer<std::uint32_t> special_heads;
+  Buffer<CapsulePage> pages;
+  Buffer<CapsuleIndex> indexes;
+  std::vector<CapsuleSegmentOwnership> segments;
+  std::vector<CapsuleTransferIntent> transfers;
+  std::uint64_t live_bytes{};
+  std::uint64_t garbage_bytes{};
+};
+
+struct StagedPendingSlotOverlay {
+  PendingSlotBuildState state{};
+  Buffer<PendingCapsulePage> pages;
+  Buffer<CapsuleIndex> indexes;
+  Buffer<PendingExactHeadDescriptor> exact_heads;
+  Buffer<std::uint32_t> exact_refs;
+  Buffer<std::uint32_t> special_heads;
+  Buffer<PendingExceptionRef> exceptions;
+  std::vector<CapsuleSegmentOwnership> segments;
+  std::uint64_t live_bytes{};
+  std::uint64_t garbage_bytes{};
+};
+
+__device__ __forceinline__ const CapsuleIndex *find_pending_capsule(
+    const PendingCapsulePage *pages, std::uint32_t page_count,
+    const CapsuleIndex *indexes, std::uint32_t batch_slot,
+    std::uint32_t local_record) {
+  const std::uint32_t local_page = local_record / kCapsulePageRows;
+  const std::uint64_t target =
+      std::uint64_t{batch_slot} * (1u << 20u) + local_page;
+  std::uint32_t low = 0u;
+  std::uint32_t high = page_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    const std::uint64_t found =
+        std::uint64_t{pages[middle].batch_slot} * (1u << 20u) +
+        pages[middle].local_page;
+    if (found < target) low = middle + 1u;
+    else high = middle;
+  }
+  if (low == page_count || pages[low].batch_slot != batch_slot ||
+      pages[low].local_page != local_page)
+    return nullptr;
+  const std::uint32_t local = local_record % kCapsulePageRows;
+  const std::uint32_t word = local >> 5u;
+  const std::uint32_t bit = local & 31u;
+  if (!(pages[low].bitmap[word] & (1u << bit))) return nullptr;
+  const std::uint32_t before = bit ? ((1u << bit) - 1u) : 0u;
+  const std::uint32_t rank = pages[low].prefixes[word] +
+      __popc(pages[low].bitmap[word] & before);
+  return indexes + pages[low].index_begin + rank;
+}
+
+__device__ __forceinline__ const PendingExceptionRef *
+find_pending_exception(
+    const PendingExceptionRef *exceptions, std::uint32_t count,
+    std::uint32_t age) {
+  std::uint32_t low = 0u;
+  std::uint32_t high = count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (exceptions[middle].age < age) low = middle + 1u;
+    else high = middle;
+  }
+  return low < count && exceptions[low].age == age
+      ? exceptions + low : nullptr;
+}
+
+__device__ __forceinline__ const CapsuleIndex *find_pending_capsule(
+    const PendingSlotBuildState &slot, std::uint32_t batch_slot,
+    std::uint32_t local_record) {
+  return find_pending_capsule(
+      reinterpret_cast<const PendingCapsulePage *>(slot.pages),
+      slot.page_count, reinterpret_cast<const CapsuleIndex *>(slot.indexes),
+      batch_slot, local_record);
+}
+
+constexpr std::uint32_t kCompletionIncoming = 1u << 31u;
+constexpr std::uint32_t kCompletionSlotShift =
+    gpulsmopt2_detail::kBatchPositionBits;
+constexpr std::uint32_t kCompletionLocalMask =
+    (1u << gpulsmopt2_detail::kBatchPositionBits) - 1u;
+
+__device__ __forceinline__ const CapsuleHeader *capsule_header(
+    const CapsuleIndex *index);
+
+struct CompletionSourceView {
+  RecordBatchView incoming{};
+  // Direct root construction supplies the prototype's stable head-sorted
+  // input order.  Sparse refinement can then gather only roster heads; it
+  // never creates a second full incoming record bank.
+  const std::uint32_t *incoming_sorted_heads{};
+  const std::uint32_t *incoming_sorted_refs{};
+  std::uint32_t incoming_records{};
+  const std::uint32_t *pending_keys{};
+  const gpulsmopt2_detail::RawPayload *pending_payloads{};
+  const std::uint32_t *pending_offsets{};
+  const PendingSlotBuildState *pending_slots{};
+  std::uint32_t batch_capacity{};
+  std::uint32_t pending_records{};
+};
+
+__host__ __device__ constexpr bool completion_is_incoming(
+    std::uint32_t ref) {
+  return (ref & kCompletionIncoming) != 0u;
+}
+
+__host__ __device__ constexpr std::uint32_t completion_slot(
+    std::uint32_t ref) {
+  return (ref >> kCompletionSlotShift) & 15u;
+}
+
+__host__ __device__ constexpr std::uint32_t completion_local(
+    std::uint32_t ref) {
+  return ref & kCompletionLocalMask;
+}
+
+struct CompletionKeyCursor {
+  CompletionSourceView source{};
+  std::uint32_t ref{};
+
+  __device__ std::uint64_t pending_physical() const {
+    return std::uint64_t{completion_slot(ref)} * source.batch_capacity +
+        completion_local(ref);
+  }
+
+  __device__ gpulsmopt2_detail::RawPayload pending_payload() const {
+    return source.pending_payloads[pending_physical()];
+  }
+
+  __device__ const CapsuleIndex *pending_capsule() const {
+    if (completion_is_incoming(ref)) return nullptr;
+    const std::uint32_t slot = completion_slot(ref);
+    return find_pending_capsule(
+        source.pending_slots[slot], slot, completion_local(ref));
+  }
+
+  __device__ const CapsuleHeader *pending_header() const {
+    return capsule_header(pending_capsule());
+  }
+
+  __device__ std::uint64_t length() const {
+    if (completion_is_incoming(ref))
+      return DeviceKeyCursor{
+          source.incoming.keys, ref & ~kCompletionIncoming,
+          source.incoming.head4_words}.length();
+    const CapsuleHeader *object = pending_header();
+    return object ? object->key_length : 4u;
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    if (completion_is_incoming(ref))
+      return DeviceKeyCursor{
+          source.incoming.keys, ref & ~kCompletionIncoming,
+          source.incoming.head4_words}.byte(position);
+    const CapsuleHeader *object = pending_header();
+    if (object)
+      return reinterpret_cast<const std::uint8_t *>(object + 1u)[position];
+    const std::uint32_t head = source.pending_keys[pending_physical()];
+    return static_cast<std::uint8_t>(
+        head >> (24u - static_cast<std::uint32_t>(position) * 8u));
+  }
+
+  __device__ std::uint32_t head4() const {
+    if (completion_is_incoming(ref))
+      return DeviceKeyCursor{
+          source.incoming.keys, ref & ~kCompletionIncoming,
+          source.incoming.head4_words}.head4();
+    return source.pending_keys[pending_physical()];
+  }
+};
+
+struct CompletionValueCursor {
+  CompletionSourceView source{};
+  std::uint32_t ref{};
+
+  __device__ std::uint64_t pending_physical() const {
+    return std::uint64_t{completion_slot(ref)} * source.batch_capacity +
+        completion_local(ref);
+  }
+
+  __device__ const CapsuleHeader *pending_header() const {
+    const std::uint32_t slot = completion_slot(ref);
+    return capsule_header(find_pending_capsule(
+        source.pending_slots[slot], slot, completion_local(ref)));
+  }
+
+  __device__ std::uint64_t length() const {
+    if (completion_is_incoming(ref))
+      return DeviceValueCursor{
+          source.incoming.values, ref & ~kCompletionIncoming}.length();
+    const auto payload = source.pending_payloads[pending_physical()];
+    if (payload.metadata & gpulsmopt2_detail::kRawTombstone) return 0u;
+    const CapsuleHeader *object = pending_header();
+    return object ? object->value_length : 4u;
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    if (completion_is_incoming(ref))
+      return DeviceValueCursor{
+          source.incoming.values, ref & ~kCompletionIncoming}.byte(position);
+    const CapsuleHeader *object = pending_header();
+    if (object) {
+      const auto *bytes = reinterpret_cast<const std::uint8_t *>(object + 1u);
+      return bytes[object->key_length + position];
+    }
+    const std::uint32_t value =
+        source.pending_payloads[pending_physical()].value;
+    return static_cast<std::uint8_t>(value >> (8u * position));
+  }
+
+  __device__ std::uint32_t inline_word() const {
+    if (!completion_is_incoming(ref)) {
+      const CapsuleHeader *object = pending_header();
+      if (!object)
+        return source.pending_payloads[pending_physical()].value;
+      std::uint32_t value = 0u;
+      const std::uint64_t size = object->value_length < 4u
+          ? object->value_length : 4u;
+      for (std::uint32_t position = 0u; position < size; ++position)
+        value |= std::uint32_t{byte(position)} << (8u * position);
+      return value;
+    }
+    return DeviceValueCursor{
+        source.incoming.values, ref & ~kCompletionIncoming}.inline_word();
+  }
+};
+
+__host__ __device__ inline DeviceKeyCursor source_key(
+    RecordBatchView source, std::uint32_t ref) {
+  return {source.keys, ref, source.head4_words};
+}
+
+__device__ inline CompletionKeyCursor source_key(
+    CompletionSourceView source, std::uint32_t ref) {
+  return {source, ref};
+}
+
+__host__ __device__ inline DeviceValueCursor source_value(
+    RecordBatchView source, std::uint32_t ref) {
+  return {source.values, ref};
+}
+
+__device__ inline CompletionValueCursor source_value(
+    CompletionSourceView source, std::uint32_t ref) {
+  return {source, ref};
+}
+
+__host__ __device__ inline bool source_tombstone(
+    RecordBatchView source, std::uint32_t ref) {
+  return record_is_tombstone(source, ref);
+}
+
+__device__ inline bool source_tombstone(
+    CompletionSourceView source, std::uint32_t ref) {
+  if (completion_is_incoming(ref))
+    return record_is_tombstone(source.incoming, ref & ~kCompletionIncoming);
+  const std::uint64_t physical =
+      std::uint64_t{completion_slot(ref)} * source.batch_capacity +
+      completion_local(ref);
+  return (source.pending_payloads[physical].metadata &
+          gpulsmopt2_detail::kRawTombstone) != 0u;
+}
+
+__host__ __device__ inline std::uint32_t source_summary(
+    RecordBatchView source, std::uint32_t ref) {
+  return source.range_contributions ? source.range_contributions[ref]
+      : source_value(source, ref).inline_word();
+}
+
+__device__ inline std::uint32_t source_summary(
+    CompletionSourceView source, std::uint32_t ref) {
+  if (completion_is_incoming(ref)) {
+    const std::uint32_t row = ref & ~kCompletionIncoming;
+    return source.incoming.range_contributions
+        ? source.incoming.range_contributions[row]
+        : source_value(source, ref).inline_word();
+  }
+  const std::uint64_t physical =
+      std::uint64_t{completion_slot(ref)} * source.batch_capacity +
+      completion_local(ref);
+  return source.pending_payloads[physical].value;
+}
+
+__host__ __device__ inline const CapsuleIndex *source_owned_capsule(
+    RecordBatchView, std::uint32_t) {
+  return nullptr;
+}
+
+__device__ inline const CapsuleIndex *source_owned_capsule(
+    CompletionSourceView source, std::uint32_t ref) {
+  return CompletionKeyCursor{source, ref}.pending_capsule();
+}
+
+__device__ __forceinline__ const CapsuleIndex *find_capsule(
+    DeviceCapsulePlane plane, std::uint64_t physical_row,
+    std::uint32_t rank) {
+  const std::uint64_t page = physical_row / kCapsulePageRows;
+  std::uint32_t low = 0u;
+  std::uint32_t high = plane.page_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (plane.pages[middle].physical_page < page) low = middle + 1u;
+    else high = middle;
+  }
+  if (low == plane.page_count || plane.pages[low].physical_page != page ||
+      rank >= plane.pages[low].index_count)
+    return nullptr;
+  return plane.indexes + plane.pages[low].index_begin + rank;
+}
+
+__device__ __forceinline__ const CapsuleHeader *capsule_header(
+    const CapsuleIndex *index) {
+  return index ? reinterpret_cast<const CapsuleHeader *>(index->address)
+               : nullptr;
+}
+
+struct ResidentKeyCursor {
+  std::uint32_t head{};
+  std::uint64_t physical_row{};
+  gpulsmopt2_detail::Row row{};
+  DeviceCapsulePlane plane{};
+
+  __device__ const CapsuleIndex *capsule() const {
+    return anchor_has_capsule(row)
+        ? find_capsule(plane, physical_row, anchor_capsule_rank(row))
+        : nullptr;
+  }
+  __device__ const CapsuleHeader *header() const {
+    return capsule_header(capsule());
+  }
+  __device__ std::uint32_t head4() const { return head; }
+  __device__ std::uint64_t length() const {
+    const CapsuleHeader *object = header();
+    return object ? object->key_length : anchor_key_length(row);
+  }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const CapsuleHeader *object = header();
+    if (object)
+      return reinterpret_cast<const std::uint8_t *>(object + 1u)[position];
+    return static_cast<std::uint8_t>(
+        head >> (24u - static_cast<std::uint32_t>(position) * 8u));
+  }
+};
+
+constexpr std::uint32_t kTerminalIncomingSource = 0xffffffffu;
+
+struct TerminalCandidate {
+  std::uint64_t locator{};
+  std::uint32_t head{};
+  std::uint32_t source{kTerminalIncomingSource};
+};
+
+static_assert(sizeof(TerminalCandidate) == 16u);
+
+template <class IncomingSource>
+struct TerminalSourceView {
+  IncomingSource incoming{};
+  gpulsmopt2_detail::ResidentRows arena{};
+  const RootBuildState *roots{};
+  const TerminalCandidate *candidates{};
+};
+
+template <class IncomingSource>
+struct TerminalKeyCursor {
+  TerminalSourceView<IncomingSource> source{};
+  std::uint32_t ref{};
+
+  __device__ const TerminalCandidate &candidate() const {
+    return source.candidates[ref];
+  }
+  __device__ bool incoming() const {
+    return candidate().source == kTerminalIncomingSource;
+  }
+  __device__ DeviceCapsulePlane plane() const {
+    if (incoming()) return {};
+    const RootBuildState &root = source.roots[candidate().source];
+    return {reinterpret_cast<const CapsulePage *>(root.capsule_pages),
+            reinterpret_cast<const CapsuleIndex *>(root.capsule_indexes),
+            root.capsule_page_count, root.capsule_count};
+  }
+  __device__ gpulsmopt2_detail::Row row() const {
+    if (!is_exact_physical(candidate().locator))
+      return source.arena[candidate().locator];
+    const RootBuildState &root = source.roots[candidate().source];
+    const auto *rows = reinterpret_cast<const gpulsmopt2_detail::Row *>(
+        root.exact_rows);
+    return rows[exact_physical_offset(candidate().locator)];
+  }
+  __device__ ResidentKeyCursor resident() const {
+    return {candidate().head, candidate().locator, row(), plane()};
+  }
+  __device__ std::uint32_t head4() const {
+    return candidate().head;
+  }
+  __device__ std::uint64_t length() const {
+    return incoming()
+        ? source_key(source.incoming,
+                     static_cast<std::uint32_t>(candidate().locator)).length()
+        : resident().length();
+  }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    return incoming()
+        ? source_key(source.incoming,
+                     static_cast<std::uint32_t>(candidate().locator))
+              .byte(position)
+        : resident().byte(position);
+  }
+  __device__ const CapsuleIndex *capsule() const {
+    return incoming()
+        ? source_owned_capsule(
+              source.incoming,
+              static_cast<std::uint32_t>(candidate().locator))
+        : resident().capsule();
+  }
+};
+
+template <class IncomingSource>
+struct TerminalValueCursor {
+  TerminalSourceView<IncomingSource> source{};
+  std::uint32_t ref{};
+
+  __device__ const TerminalCandidate &candidate() const {
+    return source.candidates[ref];
+  }
+  __device__ bool incoming() const {
+    return candidate().source == kTerminalIncomingSource;
+  }
+  __device__ const CapsuleHeader *resident_header() const {
+    const RootBuildState &root = source.roots[candidate().source];
+    const auto row = TerminalKeyCursor<IncomingSource>{source, ref}.row();
+    const DeviceCapsulePlane plane{
+        reinterpret_cast<const CapsulePage *>(root.capsule_pages),
+        reinterpret_cast<const CapsuleIndex *>(root.capsule_indexes),
+        root.capsule_page_count, root.capsule_count};
+    return capsule_header(anchor_has_capsule(row)
+        ? find_capsule(plane, candidate().locator, anchor_capsule_rank(row))
+        : nullptr);
+  }
+  __device__ std::uint64_t length() const {
+    if (incoming())
+      return source_value(
+          source.incoming,
+          static_cast<std::uint32_t>(candidate().locator)).length();
+    const auto row = TerminalKeyCursor<IncomingSource>{source, ref}.row();
+    if (row.flags & gpulsmopt2_detail::kTombstone) return 0u;
+    const CapsuleHeader *object = resident_header();
+    return object ? object->value_length : anchor_value_length(row);
+  }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    if (incoming())
+      return source_value(
+          source.incoming,
+          static_cast<std::uint32_t>(candidate().locator)).byte(position);
+    const CapsuleHeader *object = resident_header();
+    if (object) {
+      const auto *bytes = reinterpret_cast<const std::uint8_t *>(object + 1u);
+      return bytes[object->key_length + position];
+    }
+    return static_cast<std::uint8_t>(
+        TerminalKeyCursor<IncomingSource>{source, ref}.row().value >>
+        (8u * position));
+  }
+  __device__ std::uint32_t inline_word() const {
+    if (incoming())
+      return source_value(
+          source.incoming,
+          static_cast<std::uint32_t>(candidate().locator)).inline_word();
+    const CapsuleHeader *object = resident_header();
+    if (!object)
+      return TerminalKeyCursor<IncomingSource>{source, ref}.row().value;
+    std::uint32_t result = 0u;
+    const std::uint64_t count = object->value_length < 4u
+        ? object->value_length : 4u;
+    for (std::uint32_t position = 0u; position < count; ++position)
+      result |= std::uint32_t{byte(position)} << (8u * position);
+    return result;
+  }
+};
+
+template <class IncomingSource>
+__device__ inline TerminalKeyCursor<IncomingSource> source_key(
+    TerminalSourceView<IncomingSource> source, std::uint32_t ref) {
+  return {source, ref};
+}
+
+template <class IncomingSource>
+__device__ inline TerminalValueCursor<IncomingSource> source_value(
+    TerminalSourceView<IncomingSource> source, std::uint32_t ref) {
+  return {source, ref};
+}
+
+template <class IncomingSource>
+__device__ inline bool source_tombstone(
+    TerminalSourceView<IncomingSource> source, std::uint32_t ref) {
+  const TerminalCandidate &candidate = source.candidates[ref];
+  return candidate.source == kTerminalIncomingSource
+      ? source_tombstone(source.incoming,
+                         static_cast<std::uint32_t>(candidate.locator))
+      : (TerminalKeyCursor<IncomingSource>{source, ref}.row().flags &
+         gpulsmopt2_detail::kTombstone) != 0u;
+}
+
+template <class IncomingSource>
+__device__ inline std::uint32_t source_summary(
+    TerminalSourceView<IncomingSource> source, std::uint32_t ref) {
+  const TerminalCandidate &candidate = source.candidates[ref];
+  return candidate.source == kTerminalIncomingSource
+      ? source_summary(source.incoming,
+                       static_cast<std::uint32_t>(candidate.locator))
+      : TerminalKeyCursor<IncomingSource>{source, ref}.row().value;
+}
+
+template <class IncomingSource>
+__device__ inline const CapsuleIndex *source_owned_capsule(
+    TerminalSourceView<IncomingSource> source, std::uint32_t ref) {
+  return TerminalKeyCursor<IncomingSource>{source, ref}.capsule();
+}
+
+__device__ __forceinline__ bool exact_key_equal(
+    const DeviceKeyCursor &query, const ResidentKeyCursor &stored) {
+  if (query.length() != stored.length()) return false;
+  if (query.length() && rejection_hash(query) !=
+      (stored.capsule() ? stored.capsule()->rejection
+                        : rejection_hash(query)))
+    return false;
+  for (std::uint64_t position = 0u; position < query.length(); ++position)
+    if (query.byte(position) != stored.byte(position)) return false;
+  return true;
+}
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/capsule.cuh
+
+namespace gpulsm_sparse {
+
+constexpr std::uint32_t kContinuationTokenBits = 36u;
+constexpr std::uint64_t kContinuationTokenMask =
+    (std::uint64_t{1u} << kContinuationTokenBits) - 1u;
+
+template <class Source>
+__global__ void initialize_universal_records(
+    Source source, const std::uint32_t *prepared_heads,
+    const std::uint32_t *prepared_refs, std::uint32_t *heads,
+    std::uint32_t *sort_heads, std::uint32_t *refs,
+    std::uint32_t rows) {
+  const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  const std::uint32_t ref = prepared_refs ? prepared_refs[row] : row;
+  const std::uint32_t head = prepared_heads
+      ? prepared_heads[row] : source_key(source, ref).head4();
+  heads[row] = head;
+  sort_heads[row] = head;
+  refs[row] = ref;
+}
+
+template <class Source>
+__global__ void classify_primary_groups(
+    Source source, const std::uint32_t *sorted_refs,
+    const std::uint32_t *group_counts,
+    const std::uint32_t *group_starts,
+    const std::uint32_t *group_count,
+    std::uint32_t *active_rows, std::uint32_t *active_groups,
+    std::uint32_t *group_depths) {
+  const std::uint32_t group = blockIdx.x;
+  if (group >= *group_count) return;
+  const std::uint32_t begin = group_starts[group];
+  const std::uint32_t count = group_counts[group];
+  __shared__ std::uint32_t ambiguous;
+  __shared__ std::uint32_t short_key;
+  if (threadIdx.x == 0u) {
+    ambiguous = 0u;
+    short_key = 0u;
+  }
+  __syncthreads();
+  for (std::uint32_t local = threadIdx.x; local < count;
+       local += blockDim.x) {
+    const std::uint32_t ref = sorted_refs[begin + local];
+    const std::uint64_t length = source_key(source, ref).length();
+    if (length != 4u || source_tombstone(source, ref))
+      atomicExch(&ambiguous, 1u);
+    if (length < 4u) atomicExch(&short_key, 1u);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    active_rows[group] = ambiguous ? count : 0u;
+    active_groups[group] = ambiguous;
+    group_depths[group] = short_key ? 0u : 4u;
+  }
+}
+
+__global__ void finish_scan_total(
+    const std::uint32_t *values, const std::uint32_t *offsets,
+    const std::uint32_t *count, std::uint32_t *total) {
+  if (blockIdx.x || threadIdx.x) return;
+  const std::uint32_t size = *count;
+  *total = size ? offsets[size - 1u] + values[size - 1u] : 0u;
+}
+
+__global__ void initialize_exact_tasks(
+    const std::uint32_t *sorted_refs,
+    const std::uint32_t *group_counts,
+    const std::uint32_t *group_starts,
+    const std::uint32_t *group_count,
+    const std::uint32_t *active_offsets,
+    const std::uint32_t *active_group_ids,
+    const std::uint32_t *active_groups,
+    const std::uint32_t *group_depths,
+    std::uint32_t *active_refs, std::uint32_t *active_task_ids,
+    std::uint32_t *ordered_refs, std::uint32_t *task_begins,
+    std::uint32_t *task_bases, std::uint32_t *task_depths) {
+  const std::uint32_t group = blockIdx.x;
+  if (group >= *group_count) return;
+  const std::uint32_t begin = group_starts[group];
+  const std::uint32_t count = group_counts[group];
+  if (!active_groups[group]) {
+    for (std::uint32_t local = threadIdx.x; local < count;
+         local += blockDim.x)
+      ordered_refs[begin + local] = sorted_refs[begin + local];
+    return;
+  }
+  const std::uint32_t output = active_offsets[group];
+  const std::uint32_t task = active_group_ids[group];
+  for (std::uint32_t local = threadIdx.x; local < count;
+       local += blockDim.x) {
+    active_refs[output + local] = sorted_refs[begin + local];
+    active_task_ids[output + local] = task;
+  }
+  if (threadIdx.x == 0u) {
+    task_begins[task] = output;
+    task_bases[task] = begin;
+    task_depths[task] = group_depths[group];
+  }
+}
+
+template <class Source>
+__global__ void make_continuation_composites(
+    Source source, const std::uint32_t *refs,
+    const std::uint32_t *task_ids,
+    const std::uint32_t *task_depths,
+    std::uint64_t *composites, std::uint32_t active_rows) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= active_rows) return;
+  const std::uint32_t ref = refs[position];
+  const std::uint32_t task = task_ids[position];
+  const std::uint32_t depth = task_depths[task];
+  const auto key = source_key(source, ref);
+  std::uint64_t token = 0u;
+  for (std::uint32_t symbol = 0u; symbol < 4u; ++symbol) {
+    token <<= 9u;
+    const std::uint64_t byte = std::uint64_t{depth} + symbol;
+    if (byte < key.length()) token |= std::uint32_t{key.byte(byte)} + 1u;
+  }
+  composites[position] =
+      (std::uint64_t{task} << kContinuationTokenBits) | token;
+}
+
+__device__ __forceinline__ bool continuation_token_has_end(
+    std::uint64_t token) {
+  for (std::uint32_t symbol = 0u; symbol < 4u; ++symbol) {
+    if (!(token & 0x1ffu)) return true;
+    token >>= 9u;
+  }
+  return false;
+}
+
+__global__ void classify_continuation_groups(
+    const std::uint64_t *unique_composites,
+    const std::uint32_t *group_counts,
+    const std::uint32_t *group_count,
+    std::uint32_t *continuation_rows,
+    std::uint32_t *continuation_groups) {
+  const std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+  if (group >= *group_count) return;
+  const std::uint64_t token =
+      unique_composites[group] & kContinuationTokenMask;
+  const bool continuation =
+      group_counts[group] > 1u && !continuation_token_has_end(token);
+  continuation_rows[group] = continuation ? group_counts[group] : 0u;
+  continuation_groups[group] = continuation;
+}
+
+__global__ void scatter_continuation_groups(
+    const std::uint64_t *unique_composites,
+    const std::uint32_t *sorted_refs,
+    const std::uint32_t *group_counts,
+    const std::uint32_t *group_starts,
+    const std::uint32_t *group_count,
+    const std::uint32_t *continuation_offsets,
+    const std::uint32_t *continuation_group_ids,
+    const std::uint32_t *continuation_groups,
+    const std::uint32_t *task_begins,
+    const std::uint32_t *task_bases,
+    const std::uint32_t *task_depths,
+    std::uint32_t *next_refs, std::uint32_t *next_task_ids,
+    std::uint32_t *ordered_refs,
+    std::uint32_t *next_task_begins,
+    std::uint32_t *next_task_bases,
+    std::uint32_t *next_task_depths) {
+  const std::uint32_t group = blockIdx.x;
+  if (group >= *group_count) return;
+  const std::uint32_t count = group_counts[group];
+  const std::uint32_t begin = group_starts[group];
+  const std::uint32_t parent = static_cast<std::uint32_t>(
+      unique_composites[group] >> kContinuationTokenBits);
+  const std::uint32_t base =
+      task_bases[parent] + begin - task_begins[parent];
+  if (!continuation_groups[group]) {
+    for (std::uint32_t local = threadIdx.x; local < count;
+         local += blockDim.x)
+      ordered_refs[base + local] = sorted_refs[begin + local];
+    return;
+  }
+  const std::uint32_t output = continuation_offsets[group];
+  const std::uint32_t child = continuation_group_ids[group];
+  for (std::uint32_t local = threadIdx.x; local < count;
+       local += blockDim.x) {
+    next_refs[output + local] = sorted_refs[begin + local];
+    next_task_ids[output + local] = child;
+  }
+  if (threadIdx.x == 0u) {
+    next_task_begins[child] = output;
+    next_task_bases[child] = base;
+    next_task_depths[child] = task_depths[parent] + 4u;
+  }
+}
+
+template <class Source>
+__global__ void mark_last_universal_key(
+    Source source, const std::uint32_t *ordered,
+    std::uint8_t *last, std::uint32_t rows) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= rows) return;
+  bool keep = position + 1u == rows;
+  if (!keep) {
+    const auto left = source_key(source, ordered[position]);
+    const auto right = source_key(source, ordered[position + 1u]);
+    keep = compare_keys(left, right) != 0;
+  }
+  last[position] = static_cast<std::uint8_t>(keep);
+}
+
+template <class Source>
+__global__ void classify_winners(
+    Source source, const std::uint32_t *winners,
+    const std::uint32_t *winner_count,
+    const std::uint32_t *unique_heads,
+    const std::uint32_t *primary_group_flags,
+    const std::uint32_t *primary_group_count,
+    std::uint8_t *exact_flags, std::uint8_t *capsule_flags) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t count = *winner_count;
+  if (position >= count) return;
+  const std::uint32_t ref = winners[position];
+  const auto key = source_key(source, ref);
+  const auto value = source_value(source, ref);
+  const std::uint32_t head = key.head4();
+  std::uint32_t low = 0u;
+  std::uint32_t high = *primary_group_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (unique_heads[middle] < head) low = middle + 1u;
+    else high = middle;
+  }
+  exact_flags[position] =
+      low < *primary_group_count && unique_heads[low] == head
+          ? static_cast<std::uint8_t>(primary_group_flags[low] != 0u)
+          : 0u;
+  const bool tombstone = source_tombstone(source, ref);
+  const std::uint32_t inline_value = value.inline_word();
+  const std::uint32_t summary = source_summary(source, ref);
+  capsule_flags[position] = static_cast<std::uint8_t>(
+      key.length() != 4u || (!tombstone && value.length() != 4u) ||
+      (!tombstone && summary != inline_value));
+}
+
+struct ExactOrderResult {
+  std::uint32_t winner_count{};
+  std::uint32_t primary_groups{};
+  std::uint32_t active_rows{};
+  std::uint32_t rounds{};
+};
+
+class ExactOrderWorkspace {
+ public:
+  explicit ExactOrderWorkspace(std::uint32_t capacity)
+      : capacity_(capacity), heads_(capacity), sort_heads_a_(capacity),
+        sort_heads_b_(capacity), refs_a_(capacity), refs_b_(capacity),
+        task_ids_a_(capacity),
+        unique_heads_(capacity), primary_counts_(capacity),
+        primary_starts_(capacity), primary_count_(1u),
+        primary_rows_(capacity), primary_flags_(capacity),
+        primary_depths_(capacity), primary_offsets_(capacity),
+        primary_ids_(capacity), composites_a_(capacity),
+        composites_b_(capacity), unique_composites_(capacity),
+        round_counts_(capacity), round_starts_(capacity), round_count_(1u),
+        continuation_rows_(capacity), continuation_flags_(capacity),
+        continuation_offsets_(capacity), continuation_ids_(capacity),
+        task_begins_a_(capacity), task_begins_b_(capacity),
+        task_bases_a_(capacity), task_bases_b_(capacity),
+        task_depths_a_(capacity), task_depths_b_(capacity),
+        ordered_(capacity), last_(capacity), winners_(capacity),
+        winner_count_(1u), totals_(2u), exact_flags_(capacity),
+        capsule_flags_(capacity) {
+    size_temporary();
+  }
+
+  template <class Source>
+  ExactOrderResult order(
+      Source source, std::uint32_t rows, cudaStream_t stream,
+      const std::uint32_t *prepared_heads = nullptr,
+      const std::uint32_t *prepared_refs = nullptr) {
+    if (rows > capacity_) throw std::length_error("exact order capacity");
+    check(cudaMemsetAsync(
+              ordered_.data(), 0xff, rows * sizeof(std::uint32_t), stream),
+          "clear exact order");
+    initialize_universal_records<<<blocks(rows), kThreads, 0, stream>>>(
+        source, prepared_heads, prepared_refs, heads_.data(),
+        sort_heads_a_.data(), refs_a_.data(), rows);
+    std::size_t bytes = sort32_bytes_;
+    check(cub::DeviceRadixSort::SortPairs(
+              temporary_.data(), bytes, sort_heads_a_.data(),
+              sort_heads_b_.data(), refs_a_.data(), refs_b_.data(), rows,
+              0, 32, stream),
+          "sort universal heads");
+    bytes = rle32_bytes_;
+    check(cub::DeviceRunLengthEncode::Encode(
+              temporary_.data(), bytes, sort_heads_b_.data(),
+              unique_heads_.data(), primary_counts_.data(),
+              primary_count_.data(), rows, stream),
+          "encode universal heads");
+    std::uint32_t groups = 0u;
+    check(cudaMemcpyAsync(&groups, primary_count_.data(), sizeof(groups),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy head group count");
+    check(cudaStreamSynchronize(stream), "wait head group count");
+    bytes = scan32_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, primary_counts_.data(),
+              primary_starts_.data(), groups, stream),
+          "scan head groups");
+    classify_primary_groups<<<groups, kThreads, 0, stream>>>(
+        source, refs_b_.data(), primary_counts_.data(),
+        primary_starts_.data(), primary_count_.data(), primary_rows_.data(),
+        primary_flags_.data(), primary_depths_.data());
+    bytes = scan32_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, primary_rows_.data(),
+              primary_offsets_.data(), groups, stream),
+          "scan active rows");
+    bytes = scan32_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, primary_flags_.data(),
+              primary_ids_.data(), groups, stream),
+          "scan active groups");
+    finish_scan_total<<<1, 1, 0, stream>>>(
+        primary_rows_.data(), primary_offsets_.data(),
+        primary_count_.data(), totals_.data());
+    finish_scan_total<<<1, 1, 0, stream>>>(
+        primary_flags_.data(), primary_ids_.data(),
+        primary_count_.data(), totals_.data() + 1u);
+    std::uint32_t initial[2]{};
+    check(cudaMemcpyAsync(initial, totals_.data(), sizeof(initial),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy initial exact totals");
+    check(cudaStreamSynchronize(stream), "wait exact totals");
+    initialize_exact_tasks<<<groups, kThreads, 0, stream>>>(
+        refs_b_.data(), primary_counts_.data(), primary_starts_.data(),
+        primary_count_.data(), primary_offsets_.data(), primary_ids_.data(),
+        primary_flags_.data(), primary_depths_.data(), refs_a_.data(),
+        task_ids_a_.data(), ordered_.data(), task_begins_a_.data(),
+        task_bases_a_.data(), task_depths_a_.data());
+
+    std::uint32_t active_rows = initial[0];
+    std::uint32_t rounds = 0u;
+    bool task_ping = false;
+    while (active_rows) {
+      if (++rounds > 64u)
+        throw std::runtime_error("exact continuation did not converge");
+      std::uint32_t *task_begins = task_ping
+          ? task_begins_b_.data() : task_begins_a_.data();
+      std::uint32_t *task_bases = task_ping
+          ? task_bases_b_.data() : task_bases_a_.data();
+      std::uint32_t *task_depths = task_ping
+          ? task_depths_b_.data() : task_depths_a_.data();
+      std::uint32_t *next_begins = task_ping
+          ? task_begins_a_.data() : task_begins_b_.data();
+      std::uint32_t *next_bases = task_ping
+          ? task_bases_a_.data() : task_bases_b_.data();
+      std::uint32_t *next_depths = task_ping
+          ? task_depths_a_.data() : task_depths_b_.data();
+      make_continuation_composites<<<
+          blocks(active_rows), kThreads, 0, stream>>>(
+          source, refs_a_.data(), task_ids_a_.data(), task_depths,
+          composites_a_.data(), active_rows);
+      bytes = sort64_bytes_;
+      check(cub::DeviceRadixSort::SortPairs(
+                temporary_.data(), bytes, composites_a_.data(),
+                composites_b_.data(), refs_a_.data(), refs_b_.data(),
+                active_rows, 0, 64, stream),
+            "sort exact continuation");
+      bytes = rle64_bytes_;
+      check(cub::DeviceRunLengthEncode::Encode(
+                temporary_.data(), bytes, composites_b_.data(),
+                unique_composites_.data(), round_counts_.data(),
+                round_count_.data(), active_rows, stream),
+            "encode exact continuation");
+      std::uint32_t round_groups = 0u;
+      check(cudaMemcpyAsync(&round_groups, round_count_.data(),
+                            sizeof(round_groups), cudaMemcpyDeviceToHost,
+                            stream),
+            "copy exact round groups");
+      check(cudaStreamSynchronize(stream), "wait exact round groups");
+      bytes = scan32_bytes_;
+      check(cub::DeviceScan::ExclusiveSum(
+                temporary_.data(), bytes, round_counts_.data(),
+                round_starts_.data(), round_groups, stream),
+            "scan exact round groups");
+      classify_continuation_groups<<<
+          blocks(round_groups), kThreads, 0, stream>>>(
+          unique_composites_.data(), round_counts_.data(),
+          round_count_.data(), continuation_rows_.data(),
+          continuation_flags_.data());
+      bytes = scan32_bytes_;
+      check(cub::DeviceScan::ExclusiveSum(
+                temporary_.data(), bytes, continuation_rows_.data(),
+                continuation_offsets_.data(), round_groups, stream),
+            "scan continuation rows");
+      bytes = scan32_bytes_;
+      check(cub::DeviceScan::ExclusiveSum(
+                temporary_.data(), bytes, continuation_flags_.data(),
+                continuation_ids_.data(), round_groups, stream),
+            "scan continuation tasks");
+      finish_scan_total<<<1, 1, 0, stream>>>(
+          continuation_rows_.data(), continuation_offsets_.data(),
+          round_count_.data(), totals_.data());
+      finish_scan_total<<<1, 1, 0, stream>>>(
+          continuation_flags_.data(), continuation_ids_.data(),
+          round_count_.data(), totals_.data() + 1u);
+      scatter_continuation_groups<<<round_groups, kThreads, 0, stream>>>(
+          unique_composites_.data(), refs_b_.data(), round_counts_.data(),
+          round_starts_.data(), round_count_.data(),
+          continuation_offsets_.data(), continuation_ids_.data(),
+          continuation_flags_.data(), task_begins, task_bases, task_depths,
+          refs_a_.data(), task_ids_a_.data(), ordered_.data(), next_begins,
+          next_bases, next_depths);
+      std::uint32_t next[2]{};
+      check(cudaMemcpyAsync(next, totals_.data(), sizeof(next),
+                            cudaMemcpyDeviceToHost, stream),
+            "copy continuation totals");
+      check(cudaStreamSynchronize(stream), "wait continuation totals");
+      active_rows = next[0];
+      task_ping = !task_ping;
+    }
+
+    mark_last_universal_key<<<blocks(rows), kThreads, 0, stream>>>(
+        source, ordered_.data(), last_.data(), rows);
+    bytes = select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              temporary_.data(), bytes, ordered_.data(), last_.data(),
+              winners_.data(), winner_count_.data(), rows, stream),
+          "select exact winners");
+    std::uint32_t winners = 0u;
+    check(cudaMemcpyAsync(&winners, winner_count_.data(), sizeof(winners),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy exact winner count");
+    check(cudaStreamSynchronize(stream), "wait exact winner count");
+    classify_winners<<<blocks(winners), kThreads, 0, stream>>>(
+        source, winners_.data(), winner_count_.data(), unique_heads_.data(),
+        primary_flags_.data(), primary_count_.data(), exact_flags_.data(),
+        capsule_flags_.data());
+    check(cudaGetLastError(), "classify exact winners");
+    return {winners, groups, initial[0], rounds};
+  }
+
+  std::uint32_t *heads() const { return heads_.data(); }
+  std::uint32_t *ordered() const { return ordered_.data(); }
+  std::uint32_t *winners() const { return winners_.data(); }
+  std::uint32_t *winner_count() const { return winner_count_.data(); }
+  std::uint8_t *exact_flags() const { return exact_flags_.data(); }
+  std::uint8_t *capsule_flags() const { return capsule_flags_.data(); }
+  std::size_t bytes() const {
+    return temporary_.bytes() +
+        25u * std::size_t{capacity_} * sizeof(std::uint32_t) +
+        3u * std::size_t{capacity_} * sizeof(std::uint64_t) +
+        3u * std::size_t{capacity_} * sizeof(std::uint8_t);
+  }
+
+ private:
+  void size_temporary() {
+    std::size_t sizes[7]{};
+    check(cub::DeviceRadixSort::SortPairs(
+              nullptr, sizes[0], sort_heads_a_.data(), sort_heads_b_.data(),
+              refs_a_.data(), refs_b_.data(), capacity_),
+          "size head sort");
+    check(cub::DeviceRadixSort::SortPairs(
+              nullptr, sizes[1], composites_a_.data(), composites_b_.data(),
+              refs_a_.data(), refs_b_.data(), capacity_),
+          "size continuation sort");
+    check(cub::DeviceRunLengthEncode::Encode(
+              nullptr, sizes[2], sort_heads_b_.data(), unique_heads_.data(),
+              primary_counts_.data(), primary_count_.data(), capacity_),
+          "size head encoding");
+    check(cub::DeviceRunLengthEncode::Encode(
+              nullptr, sizes[3], composites_b_.data(),
+              unique_composites_.data(), round_counts_.data(),
+              round_count_.data(), capacity_),
+          "size continuation encoding");
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, sizes[4], primary_counts_.data(),
+              primary_starts_.data(), capacity_),
+          "size exact scan");
+    check(cub::DeviceSelect::Flagged(
+              nullptr, sizes[5], ordered_.data(), last_.data(),
+              winners_.data(), winner_count_.data(), capacity_),
+          "size winner selection");
+    check(cub::DeviceSelect::Flagged(
+              nullptr, sizes[6], winners_.data(), exact_flags_.data(),
+              refs_b_.data(), totals_.data(), capacity_),
+          "size exact selection");
+    sort32_bytes_ = sizes[0];
+    sort64_bytes_ = sizes[1];
+    rle32_bytes_ = sizes[2];
+    rle64_bytes_ = sizes[3];
+    scan32_bytes_ = sizes[4];
+    select_bytes_ = std::max(sizes[5], sizes[6]);
+    temporary_.reset(*std::max_element(std::begin(sizes), std::end(sizes)));
+  }
+
+  std::uint32_t capacity_{};
+  Buffer<std::uint32_t> heads_, sort_heads_a_, sort_heads_b_, refs_a_, refs_b_;
+  Buffer<std::uint32_t> task_ids_a_;
+  Buffer<std::uint32_t> unique_heads_, primary_counts_, primary_starts_;
+  Buffer<std::uint32_t> primary_count_, primary_rows_, primary_flags_;
+  Buffer<std::uint32_t> primary_depths_, primary_offsets_, primary_ids_;
+  Buffer<std::uint64_t> composites_a_, composites_b_, unique_composites_;
+  Buffer<std::uint32_t> round_counts_, round_starts_, round_count_;
+  Buffer<std::uint32_t> continuation_rows_, continuation_flags_;
+  Buffer<std::uint32_t> continuation_offsets_, continuation_ids_;
+  Buffer<std::uint32_t> task_begins_a_, task_begins_b_;
+  Buffer<std::uint32_t> task_bases_a_, task_bases_b_;
+  Buffer<std::uint32_t> task_depths_a_, task_depths_b_;
+  Buffer<std::uint32_t> ordered_, winners_, winner_count_, totals_;
+  Buffer<std::uint8_t> last_, exact_flags_, capsule_flags_;
+  Buffer<std::uint8_t> temporary_;
+  std::size_t sort32_bytes_{}, sort64_bytes_{}, rle32_bytes_{};
+  std::size_t rle64_bytes_{}, scan32_bytes_{}, select_bytes_{};
+};
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/exact.cuh
+
+namespace gpulsm_sparse {
+
+template <class Source>
+__device__ __forceinline__ std::uint32_t find_capsule_lifecycle_source(
+    const CapsuleLifecycleSource *sources, std::uint32_t source_count,
+    std::uint32_t ordinal) {
+  std::uint32_t low = 0u;
+  std::uint32_t high = source_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (sources[middle].ordinal < ordinal) low = middle + 1u;
+    else high = middle;
+  }
+  return low < source_count && sources[low].ordinal == ordinal
+      ? low : source_count;
+}
+
+template <class Source>
+__global__ void count_capsule_survivors(
+    Source source, const std::uint32_t *refs,
+    const std::uint32_t *count, CapsuleLifecycleSource *sources,
+    std::uint32_t source_count, unsigned long long *errors) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= *count) return;
+  const CapsuleIndex *owned = source_owned_capsule(source, refs[ordinal]);
+  if (!owned) return;
+  const std::uint32_t source_index = find_capsule_lifecycle_source<Source>(
+      sources, source_count, owned->segment);
+  if (source_index == source_count) {
+    atomicCAS(errors, 0ull,
+              (1ull << 32u) | static_cast<unsigned long long>(owned->segment));
+    return;
+  }
+  const CapsuleHeader *header = capsule_header(owned);
+  std::uint64_t bytes = 0u;
+  if (!header || !capsule_object_bytes(
+          header->key_length, header->value_length, bytes)) {
+    atomicCAS(errors, 0ull,
+              (2ull << 32u) | static_cast<unsigned long long>(owned->segment));
+    return;
+  }
+  atomicAdd(reinterpret_cast<unsigned long long *>(
+                &sources[source_index].survivor_bytes),
+            static_cast<unsigned long long>(bytes));
+}
+
+template <class Source>
+__global__ void make_capsule_object_sizes(
+    Source source, const std::uint32_t *refs,
+    const std::uint32_t *count, const CapsuleLifecycleSource *sources,
+    std::uint32_t source_count, std::uint64_t *sizes,
+    unsigned long long *errors) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t size = *count;
+  if (ordinal > size) return;
+  if (ordinal == size) {
+    sizes[ordinal] = 0u;
+    return;
+  }
+  const std::uint32_t ref = refs[ordinal];
+  const CapsuleIndex *owned = source_owned_capsule(source, ref);
+  if (owned) {
+    const std::uint32_t source_index = find_capsule_lifecycle_source<Source>(
+        sources, source_count, owned->segment);
+    if (source_index == source_count) {
+      sizes[ordinal] = 0u;
+      if (errors)
+        atomicCAS(errors, 0ull,
+                  (3ull << 32u) |
+                      static_cast<unsigned long long>(owned->segment));
+      return;
+    }
+    if (sources[source_index].action == kCapsuleTransfer) {
+      sizes[ordinal] = 0u;
+      return;
+    }
+  }
+  const auto key = source_key(source, ref);
+  const auto value = source_value(source, ref);
+  std::uint64_t object = 0u;
+  const std::uint64_t value_length =
+      source_tombstone(source, ref) ? 0u : value.length();
+  sizes[ordinal] = capsule_object_bytes(
+      key.length(), value_length, object) ? object : 0u;
+}
+
+__global__ void build_capsule_pages(
+    const std::uint64_t *unique_pages,
+    const std::uint32_t *page_counts,
+    const std::uint32_t *page_starts,
+    const std::uint32_t *page_count,
+    CapsulePage *pages) {
+  const std::uint32_t page = blockIdx.x * blockDim.x + threadIdx.x;
+  if (page < *page_count)
+    pages[page] = {
+        unique_pages[page], page_starts[page], page_counts[page]};
+}
+
+__global__ void assign_capsule_ranks(
+    const std::uint64_t *physical_pages,
+    const std::uint32_t *page_starts,
+    const std::uint32_t *page_count,
+    const std::uint32_t *capsule_positions,
+    const std::uint32_t *capsule_count,
+    std::uint16_t *combined_ranks,
+    unsigned long long *errors) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= *capsule_count) return;
+  std::uint32_t low = 0u;
+  std::uint32_t high = *page_count;
+  const std::uint64_t target = physical_pages[ordinal];
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (physical_pages[page_starts[middle]] < target) low = middle + 1u;
+    else high = middle;
+  }
+  if (low >= *page_count || physical_pages[page_starts[low]] != target) {
+    atomicAdd(errors, 1ull);
+    return;
+  }
+  const std::uint32_t rank = ordinal - page_starts[low];
+  if (rank > kAnchorCapsuleRankMask) {
+    atomicAdd(errors, 1ull);
+    return;
+  }
+  combined_ranks[capsule_positions[ordinal]] =
+      static_cast<std::uint16_t>(rank);
+}
+
+template <class Source>
+__global__ void emit_capsule_objects(
+    Source source, const std::uint32_t *refs,
+    const std::uint32_t *count, const std::uint64_t *offsets,
+    std::uint8_t *segment, std::uint32_t segment_ordinal,
+    const CapsuleLifecycleSource *sources, std::uint32_t source_count,
+    CapsuleIndex *indexes, unsigned long long *errors) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= *count) return;
+  const std::uint32_t ref = refs[ordinal];
+  const CapsuleIndex *owned = source_owned_capsule(source, ref);
+  if (owned) {
+    const std::uint32_t source_index = find_capsule_lifecycle_source<Source>(
+        sources, source_count, owned->segment);
+    if (source_index == source_count) {
+      if (errors)
+        atomicCAS(errors, 0ull,
+                  (4ull << 32u) |
+                      static_cast<unsigned long long>(owned->segment));
+      return;
+    }
+    if (sources[source_index].action == kCapsuleTransfer) {
+      indexes[ordinal] = *owned;
+      return;
+    }
+  }
+  const auto key = source_key(source, ref);
+  const auto value = source_value(source, ref);
+  const bool tombstone = source_tombstone(source, ref);
+  const std::uint64_t value_length = tombstone ? 0u : value.length();
+  std::uint8_t *object = segment + offsets[ordinal];
+  reinterpret_cast<CapsuleHeader *>(object)[0] = {
+      key.length(), value_length, tombstone ? 1u : 0u, 0u};
+  std::uint8_t *bytes = object + sizeof(CapsuleHeader);
+  for (std::uint64_t position = 0u; position < key.length(); ++position)
+    bytes[position] = key.byte(position);
+  for (std::uint64_t position = 0u; position < value_length; ++position)
+    bytes[key.length() + position] = value.byte(position);
+  indexes[ordinal] = {
+      reinterpret_cast<std::uint64_t>(object), rejection_hash(key),
+      segment_ordinal};
+}
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/capsule_lifecycle.cuh
+
+namespace gpulsm_sparse {
+
+__global__ void normalize_pending_input(
+    RecordBatchView source, std::uint32_t count, std::uint32_t batch_slot,
+    std::uint32_t *heads, gpulsmopt2_detail::RawPayload *payloads,
+    std::uint8_t *capsule_flags, std::uint8_t *extended_key_flags) {
+  const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= count) return;
+  const DeviceKeyCursor key{source.keys, row, source.head4_words};
+  const DeviceValueCursor value{source.values, row};
+  const bool tombstone = record_is_tombstone(source, row);
+  const std::uint32_t inline_value = value.inline_word();
+  const std::uint32_t summary = source.range_contributions
+      ? source.range_contributions[row] : inline_value;
+  const bool capsule = key.length() != 4u ||
+      (!tombstone && value.length() != 4u) ||
+      (!tombstone && summary != inline_value);
+  std::uint32_t metadata =
+      ((batch_slot << gpulsmopt2_detail::kBatchPositionBits) | row) &
+      kPendingAgeMask;
+  if (tombstone) metadata |= gpulsmopt2_detail::kRawTombstone;
+  heads[row] = key.head4();
+  payloads[row] = {summary, metadata};
+  capsule_flags[row] = capsule;
+  extended_key_flags[row] = key.length() != 4u;
+}
+
+__global__ void make_pending_exact_entries(
+    RecordBatchView source, const std::uint32_t *winners,
+    std::uint32_t count, const std::uint32_t *destinations,
+    std::uint32_t batch_slot, std::uint32_t *heads,
+    std::uint32_t *physical_refs) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= count) return;
+  const std::uint32_t input = winners[ordinal];
+  heads[ordinal] = DeviceKeyCursor{
+      source.keys, input, source.head4_words}.head4();
+  physical_refs[ordinal] =
+      (batch_slot << gpulsmopt2_detail::kBatchPositionBits) |
+      destinations[input];
+}
+
+__global__ void make_pending_special_entries(
+    RecordBatchView source, const std::uint32_t *selected,
+    std::uint32_t count, std::uint32_t *heads, std::uint32_t *refs) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= count) return;
+  const std::uint32_t ref = selected[ordinal];
+  heads[ordinal] = DeviceKeyCursor{
+      source.keys, ref, source.head4_words}.head4();
+  refs[ordinal] = ref;
+}
+
+__global__ void build_pending_exact_descriptors(
+    const std::uint32_t *heads, const std::uint32_t *counts,
+    const std::uint32_t *starts, std::uint32_t descriptor_count,
+    std::uint32_t ref_base, std::uint32_t batch_slot,
+    PendingExactHeadDescriptor *descriptors) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < descriptor_count)
+    descriptors[index] = {
+        heads[index], counts[index], ref_base + starts[index], batch_slot};
+}
+
+__global__ void scatter_pending_input(
+    const std::uint32_t *heads,
+    const gpulsmopt2_detail::RawPayload *payloads,
+    std::uint32_t count, const std::uint32_t *offsets,
+    const std::uint32_t *reservation_ranks,
+    std::uint32_t *destination_keys,
+    gpulsmopt2_detail::RawPayload *destination_payloads,
+    std::uint32_t *destinations) {
+  const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= count) return;
+  const std::uint32_t head = heads[row];
+  const std::uint32_t output =
+      offsets[head >> 16u] + reservation_ranks[row];
+  destination_keys[output] = head;
+  destination_payloads[output] = payloads[row];
+  destinations[row] = output;
+}
+
+__global__ void gather_pending_capsules(
+    const std::uint32_t *selected_input,
+    const std::uint32_t *selected_count,
+    const std::uint32_t *destinations,
+    std::uint32_t *physical_positions,
+    std::uint32_t *input_refs) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= *selected_count) return;
+  const std::uint32_t ref = selected_input[ordinal];
+  physical_positions[ordinal] = destinations[ref];
+  input_refs[ordinal] = ref;
+}
+
+__global__ void make_pending_exception_refs(
+    const std::uint32_t *selected_input, std::uint32_t count,
+    const std::uint32_t *destinations, std::uint32_t batch_slot,
+    PendingExceptionRef *exceptions) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= count) return;
+  const std::uint32_t input = selected_input[ordinal];
+  exceptions[ordinal] = {
+      (batch_slot << gpulsmopt2_detail::kBatchPositionBits) | input,
+      destinations[input]};
+}
+
+__global__ void make_pending_page_keys(
+    const std::uint32_t *positions, std::uint32_t count,
+    std::uint32_t batch_slot, std::uint64_t *keys) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal < count)
+    keys[ordinal] = (std::uint64_t{batch_slot} << 32u) |
+        (positions[ordinal] / kCapsulePageRows);
+}
+
+__global__ void initialize_pending_pages(
+    const std::uint64_t *keys, const std::uint32_t *counts,
+    const std::uint32_t *starts, const std::uint32_t *page_count,
+    std::uint32_t index_base, PendingCapsulePage *pages) {
+  const std::uint32_t page = blockIdx.x;
+  if (page >= *page_count) return;
+  PendingCapsulePage &output = pages[page];
+  if (threadIdx.x == 0u) {
+    output.batch_slot = static_cast<std::uint32_t>(keys[page] >> 32u);
+    output.local_page = static_cast<std::uint32_t>(keys[page]);
+    output.index_begin = index_base + starts[page];
+    output.index_count = counts[page];
+  }
+  for (std::uint32_t word = threadIdx.x;
+       word < kCapsulePageRows / 32u; word += blockDim.x)
+    output.bitmap[word] = 0u;
+  if (threadIdx.x <= kCapsulePageRows / 32u)
+    output.prefixes[threadIdx.x] = 0u;
+}
+
+__global__ void populate_pending_pages(
+    const std::uint32_t *positions, std::uint32_t count,
+    const std::uint32_t *page_starts,
+    const std::uint32_t *page_count,
+    PendingCapsulePage *pages) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= count) return;
+  std::uint32_t low = 0u;
+  std::uint32_t high = *page_count;
+  const std::uint32_t target = positions[ordinal] / kCapsulePageRows;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    const std::uint32_t found =
+        positions[page_starts[middle]] / kCapsulePageRows;
+    if (found < target) low = middle + 1u;
+    else high = middle;
+  }
+  if (low >= *page_count) return;
+  const std::uint32_t local = positions[ordinal] % kCapsulePageRows;
+  atomicOr(pages[low].bitmap + (local >> 5u), 1u << (local & 31u));
+}
+
+__global__ void prefix_pending_pages(
+    PendingCapsulePage *pages, const std::uint32_t *page_count) {
+  const std::uint32_t page = blockIdx.x;
+  if (page >= *page_count || threadIdx.x) return;
+  std::uint16_t prefix = 0u;
+  pages[page].prefixes[0] = 0u;
+  for (std::uint32_t word = 0u; word < kCapsulePageRows / 32u; ++word) {
+    prefix = static_cast<std::uint16_t>(
+        prefix + __popc(pages[page].bitmap[word]));
+    pages[page].prefixes[word + 1u] = prefix;
+  }
+}
+
+struct PendingBuildResult {
+  std::uint32_t rows{};
+  std::uint32_t capsules{};
+  std::uint32_t pages{};
+  std::uint32_t special_heads{};
+  std::uint32_t exact_heads{};
+  std::uint32_t exact_refs{};
+  std::uint64_t capsule_bytes{};
+};
+
+class PendingWorkspace {
+ public:
+  explicit PendingWorkspace(std::uint32_t capacity)
+      : capacity_(capacity), heads_(capacity), payloads_(capacity),
+        reservation_ranks_(capacity), counts_(kSections + 1u),
+        capsule_flags_(capacity), extended_key_flags_(capacity),
+        capsule_inputs_(capacity), capsule_count_(1u),
+        extended_inputs_(capacity), extended_count_(1u),
+        destinations_(capacity), exact_order_(capacity),
+        exact_heads_(capacity), unique_exact_heads_(capacity),
+        exact_counts_(capacity), exact_starts_(capacity),
+        exact_head_count_(1u), exact_physical_refs_(capacity),
+        capsule_positions_a_(capacity), capsule_positions_b_(capacity),
+        capsule_refs_a_(capacity), capsule_refs_b_(capacity),
+        page_keys_(capacity), unique_page_keys_(capacity),
+        page_counts_(capacity), page_starts_(capacity), page_count_(1u),
+        object_sizes_(std::size_t{capacity} + 1u),
+        object_offsets_(std::size_t{capacity} + 1u) {
+    size_temporary();
+  }
+
+  PendingBuildResult build_batch(
+      RecordBatchView source, std::uint32_t count,
+      std::uint32_t batch_slot, std::uint32_t batch_capacity,
+      std::uint32_t *staging_keys,
+      gpulsmopt2_detail::RawPayload *staging_payloads,
+      std::uint32_t *staging_offsets, std::uint64_t *staging_signatures,
+      StagedPendingSlotOverlay &overlay, std::uint32_t segment_ordinal,
+      cudaStream_t stream) {
+    if (count > capacity_ || count > batch_capacity)
+      throw std::length_error("pending batch capacity");
+    check(cudaMemsetAsync(counts_.data(), 0, counts_.bytes(), stream),
+          "clear pending counts");
+    check(cudaMemsetAsync(staging_signatures, 0,
+                          kSections * sizeof(std::uint64_t), stream),
+          "clear pending signatures");
+    normalize_pending_input<<<blocks(count), kThreads, 0, stream>>>(
+        source, count, batch_slot, heads_.data(), payloads_.data(),
+        capsule_flags_.data(), extended_key_flags_.data());
+    gpulsmopt2_detail::count_admission_quotients_kernel<<<
+        blocks(count), kThreads, 0, stream>>>(
+        heads_.data(), count, counts_.data(), reservation_ranks_.data());
+    std::size_t bytes = scan32_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, counts_.data(), staging_offsets,
+              kSections + 1u, stream),
+          "scan pending sections");
+    scatter_pending_input<<<blocks(count), kThreads, 0, stream>>>(
+        heads_.data(), payloads_.data(), count, staging_offsets,
+        reservation_ranks_.data(), staging_keys, staging_payloads,
+        destinations_.data());
+    gpulsmopt2_detail::build_admission_signatures_kernel<<<
+        blocks(count), kThreads, 0, stream>>>(
+        staging_keys, count, staging_signatures);
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    bytes = select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              temporary_.data(), bytes, ids, capsule_flags_.data(),
+              capsule_inputs_.data(), capsule_count_.data(), count, stream),
+          "select pending capsules");
+    bytes = select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              temporary_.data(), bytes, ids, extended_key_flags_.data(),
+              extended_inputs_.data(), extended_count_.data(), count,
+              stream),
+          "select pending extended keys");
+    std::uint32_t capsules = 0u;
+    std::uint32_t extended = 0u;
+    check(cudaMemcpyAsync(&capsules, capsule_count_.data(), sizeof(capsules),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy pending capsule count");
+    check(cudaMemcpyAsync(&extended, extended_count_.data(),
+                          sizeof(extended), cudaMemcpyDeviceToHost, stream),
+          "copy pending extended count");
+    check(cudaStreamSynchronize(stream), "wait pending capsule count");
+    if (!capsules) return {count, 0u, 0u, 0u, 0u, 0u, 0u};
+
+    gather_pending_capsules<<<blocks(capsules), kThreads, 0, stream>>>(
+        capsule_inputs_.data(), capsule_count_.data(), destinations_.data(),
+        capsule_positions_a_.data(), capsule_refs_a_.data());
+    bytes = sort32_bytes_;
+    check(cub::DeviceRadixSort::SortPairs(
+              temporary_.data(), bytes, capsule_positions_a_.data(),
+              capsule_positions_b_.data(), capsule_refs_a_.data(),
+              capsule_refs_b_.data(), capsules, 0, 32, stream),
+          "sort pending capsules");
+    make_pending_page_keys<<<blocks(capsules), kThreads, 0, stream>>>(
+        capsule_positions_b_.data(), capsules, batch_slot, page_keys_.data());
+    bytes = rle64_bytes_;
+    check(cub::DeviceRunLengthEncode::Encode(
+              temporary_.data(), bytes, page_keys_.data(),
+              unique_page_keys_.data(), page_counts_.data(),
+              page_count_.data(), capsules, stream),
+          "encode pending capsule pages");
+    std::uint32_t pages = 0u;
+    check(cudaMemcpyAsync(&pages, page_count_.data(), sizeof(pages),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy pending page count");
+    check(cudaStreamSynchronize(stream), "wait pending page count");
+    bytes = scan32_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, page_counts_.data(),
+              page_starts_.data(), pages, stream),
+          "scan pending pages");
+    make_capsule_object_sizes<<<blocks(std::uint64_t{capsules} + 1u),
+                                kThreads, 0, stream>>>(
+        source, capsule_refs_b_.data(), capsule_count_.data(),
+        nullptr, 0u, object_sizes_.data(), nullptr);
+    bytes = scan64_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, object_sizes_.data(),
+              object_offsets_.data(), std::size_t{capsules} + 1u, stream),
+          "scan pending capsule bytes");
+    std::uint64_t capsule_bytes = 0u;
+    check(cudaMemcpyAsync(&capsule_bytes, object_offsets_.data() + capsules,
+                          sizeof(capsule_bytes), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy pending capsule bytes");
+    check(cudaStreamSynchronize(stream), "wait pending capsule bytes");
+
+    overlay.pages.reset(pages);
+    overlay.indexes.reset(capsules);
+    overlay.exceptions.reset(capsules);
+    auto segment = std::make_shared<CapsuleSegment>(capsule_bytes);
+    make_pending_exception_refs<<<blocks(capsules), kThreads, 0, stream>>>(
+        capsule_inputs_.data(), capsules, destinations_.data(), batch_slot,
+        overlay.exceptions.data());
+    initialize_pending_pages<<<pages, 256u, 0, stream>>>(
+        unique_page_keys_.data(), page_counts_.data(), page_starts_.data(),
+        page_count_.data(), 0u, overlay.pages.data());
+    populate_pending_pages<<<blocks(capsules), kThreads, 0, stream>>>(
+        capsule_positions_b_.data(), capsules, page_starts_.data(),
+        page_count_.data(), overlay.pages.data());
+    prefix_pending_pages<<<pages, 1u, 0, stream>>>(
+        overlay.pages.data(), page_count_.data());
+    emit_capsule_objects<<<blocks(capsules), kThreads, 0, stream>>>(
+        source, capsule_refs_b_.data(), capsule_count_.data(),
+        object_offsets_.data(), segment->data(), segment_ordinal,
+        nullptr, 0u, overlay.indexes.data(), nullptr);
+    overlay.segments.push_back(
+        {std::move(segment), segment_ordinal, 0u, capsule_bytes, 0u});
+    overlay.live_bytes = capsule_bytes;
+    overlay.garbage_bytes = 0u;
+
+    // Every capsule-valued head participates in sparse lifecycle work, even
+    // when its key is an ordinary four-byte key and only its value is long.
+    // This reuses the pending prototype's existing sort/RLE scratch after
+    // capsule emission, so no capacity-sized permanent head plane is added.
+    make_pending_special_entries<<<blocks(capsules), kThreads, 0, stream>>>(
+        source, capsule_inputs_.data(), capsules, exact_heads_.data(),
+        capsule_refs_a_.data());
+    bytes = sort32_bytes_;
+    check(cub::DeviceRadixSort::SortPairs(
+              temporary_.data(), bytes, exact_heads_.data(),
+              capsule_positions_a_.data(), capsule_refs_a_.data(),
+              capsule_refs_b_.data(), capsules, 0, 32, stream),
+          "sort pending special heads");
+    bytes = rle32_bytes_;
+    check(cub::DeviceRunLengthEncode::Encode(
+              temporary_.data(), bytes, capsule_positions_a_.data(),
+              unique_exact_heads_.data(), exact_counts_.data(),
+              exact_head_count_.data(), capsules, stream),
+          "encode pending special heads");
+    std::uint32_t special_heads = 0u;
+    check(cudaMemcpyAsync(&special_heads, exact_head_count_.data(),
+                          sizeof(special_heads), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy pending special head count");
+    check(cudaStreamSynchronize(stream),
+          "wait pending special head count");
+    overlay.special_heads.reset(special_heads);
+    check(cudaMemcpyAsync(
+              overlay.special_heads.data(), unique_exact_heads_.data(),
+              special_heads * sizeof(std::uint32_t),
+              cudaMemcpyDeviceToDevice, stream),
+          "store pending special heads");
+
+    std::uint32_t exact_heads = 0u;
+    std::uint32_t exact_refs = 0u;
+    if (extended) {
+      const ExactOrderResult order = exact_order_.order(
+          source, extended, stream, nullptr, extended_inputs_.data());
+      exact_refs = order.winner_count;
+      make_pending_exact_entries<<<blocks(exact_refs), kThreads, 0, stream>>>(
+          source, exact_order_.winners(), exact_refs, destinations_.data(),
+          batch_slot, exact_heads_.data(), exact_physical_refs_.data());
+      bytes = rle32_bytes_;
+      check(cub::DeviceRunLengthEncode::Encode(
+                temporary_.data(), bytes, exact_heads_.data(),
+                unique_exact_heads_.data(), exact_counts_.data(),
+                exact_head_count_.data(), exact_refs, stream),
+            "encode pending exact heads");
+      check(cudaMemcpyAsync(&exact_heads, exact_head_count_.data(),
+                            sizeof(exact_heads), cudaMemcpyDeviceToHost,
+                            stream),
+            "copy pending exact head count");
+      check(cudaStreamSynchronize(stream),
+            "wait pending exact head count");
+      bytes = scan32_bytes_;
+      check(cub::DeviceScan::ExclusiveSum(
+                temporary_.data(), bytes, exact_counts_.data(),
+                exact_starts_.data(), exact_heads, stream),
+            "scan pending exact heads");
+      overlay.exact_heads.reset(exact_heads);
+      overlay.exact_refs.reset(exact_refs);
+      check(cudaMemcpyAsync(
+                overlay.exact_refs.data(), exact_physical_refs_.data(),
+                exact_refs * sizeof(std::uint32_t),
+                cudaMemcpyDeviceToDevice, stream),
+            "store pending exact refs");
+      build_pending_exact_descriptors<<<
+          blocks(exact_heads), kThreads, 0, stream>>>(
+          unique_exact_heads_.data(), exact_counts_.data(),
+          exact_starts_.data(), exact_heads, 0u, batch_slot,
+          overlay.exact_heads.data());
+    }
+    check(cudaGetLastError(), "build pending capsules");
+    return {count, capsules, pages, special_heads, exact_heads, exact_refs,
+            capsule_bytes};
+  }
+
+  std::size_t bytes() const {
+    return temporary_.bytes() +
+        10u * std::size_t{capacity_} * sizeof(std::uint32_t) +
+        5u * std::size_t{capacity_} * sizeof(std::uint64_t) +
+        std::size_t{capacity_} * sizeof(gpulsmopt2_detail::RawPayload) +
+        3u * std::size_t{capacity_} + exact_order_.bytes();
+  }
+
+ private:
+  void size_temporary() {
+    std::size_t sizes[7]{};
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, sizes[0], counts_.data(), counts_.data(),
+              kSections + 1u),
+          "size pending scan");
+    check(cub::DeviceSelect::Flagged(
+              nullptr, sizes[1], ids, capsule_flags_.data(),
+              capsule_inputs_.data(), capsule_count_.data(), capacity_),
+          "size pending select");
+    check(cub::DeviceRunLengthEncode::Encode(
+              nullptr, sizes[5], exact_heads_.data(),
+              unique_exact_heads_.data(), exact_counts_.data(),
+              exact_head_count_.data(), capacity_),
+          "size pending exact heads");
+    check(cub::DeviceRadixSort::SortPairs(
+              nullptr, sizes[2], capsule_positions_a_.data(),
+              capsule_positions_b_.data(), capsule_refs_a_.data(),
+              capsule_refs_b_.data(), capacity_),
+          "size pending sort");
+    check(cub::DeviceRunLengthEncode::Encode(
+              nullptr, sizes[3], page_keys_.data(), unique_page_keys_.data(),
+              page_counts_.data(), page_count_.data(), capacity_),
+          "size pending pages");
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, sizes[4], object_sizes_.data(), object_offsets_.data(),
+              std::size_t{capacity_} + 1u),
+          "size pending byte scan");
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, sizes[6], exact_counts_.data(),
+              exact_starts_.data(), capacity_),
+          "size pending exact scan");
+    scan32_bytes_ = std::max(sizes[0], sizes[6]);
+    select_bytes_ = sizes[1];
+    sort32_bytes_ = sizes[2];
+    rle64_bytes_ = sizes[3];
+    scan64_bytes_ = sizes[4];
+    rle32_bytes_ = sizes[5];
+    temporary_.reset(*std::max_element(std::begin(sizes), std::end(sizes)));
+  }
+
+  std::uint32_t capacity_{};
+  Buffer<std::uint32_t> heads_;
+  Buffer<gpulsmopt2_detail::RawPayload> payloads_;
+  Buffer<std::uint32_t> reservation_ranks_, counts_;
+  Buffer<std::uint8_t> capsule_flags_, extended_key_flags_;
+  Buffer<std::uint32_t> capsule_inputs_, capsule_count_;
+  Buffer<std::uint32_t> extended_inputs_, extended_count_, destinations_;
+  ExactOrderWorkspace exact_order_;
+  Buffer<std::uint32_t> exact_heads_, unique_exact_heads_;
+  Buffer<std::uint32_t> exact_counts_, exact_starts_, exact_head_count_;
+  Buffer<std::uint32_t> exact_physical_refs_;
+  Buffer<std::uint32_t> capsule_positions_a_, capsule_positions_b_;
+  Buffer<std::uint32_t> capsule_refs_a_, capsule_refs_b_;
+  Buffer<std::uint64_t> page_keys_, unique_page_keys_;
+  Buffer<std::uint32_t> page_counts_, page_starts_, page_count_;
+  Buffer<std::uint64_t> object_sizes_, object_offsets_;
+  Buffer<std::uint8_t> temporary_;
+  std::size_t scan32_bytes_{}, select_bytes_{}, sort32_bytes_{};
+  std::size_t rle64_bytes_{}, rle32_bytes_{}, scan64_bytes_{};
+};
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/pending.cuh
+// BEGIN INLINED COMPONENT: gpulsm_sparse/refine.cuh
+
+// BEGIN INLINED COMPONENT: gpulsm_sparse/fan_in.cuh
+
+
+#include <thrust/execution_policy.h>
+#include <thrust/merge.h>
+
+namespace gpulsm_sparse {
+
+struct ExactRun {
+  std::uint32_t begin{};
+  std::uint32_t count{};
+};
+
+template <class IncomingSource>
+struct TerminalRefLess {
+  TerminalSourceView<IncomingSource> source{};
+
+  __device__ std::uint64_t age(std::uint32_t ref) const {
+    const TerminalCandidate &candidate = source.candidates[ref];
+    // This is the canonical GPULSMOpt source order: pending is source zero
+    // and resident levels are visited in ascending level order, so a smaller
+    // resident level is newer.  Express that order as an increasing age so
+    // the prototype's mark-last rule selects the same winner as the original
+    // carry without mirroring epoch metadata for ordinary roots.
+    return candidate.source == kTerminalIncomingSource
+        ? std::numeric_limits<std::uint64_t>::max()
+        : std::numeric_limits<std::uint64_t>::max() - 1u -
+              candidate.source;
+  }
+
+  __device__ bool operator()(std::uint32_t left,
+                             std::uint32_t right) const {
+    const int comparison = compare_keys(
+        source_key(source, left), source_key(source, right));
+    if (comparison != 0) return comparison < 0;
+    const std::uint64_t left_age = age(left);
+    const std::uint64_t right_age = age(right);
+    if (left_age != right_age) return left_age < right_age;
+    const TerminalCandidate &a = source.candidates[left];
+    const TerminalCandidate &b = source.candidates[right];
+    if (a.source != b.source) return a.source < b.source;
+    if (a.locator != b.locator) return a.locator < b.locator;
+    return left < right;
+  }
+};
+
+__global__ void initialize_terminal_refs(
+    std::uint32_t *refs, std::uint32_t count) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position < count) refs[position] = position;
+}
+
+template <class IncomingSource>
+__global__ void mark_last_terminal_key(
+    TerminalSourceView<IncomingSource> source,
+    const std::uint32_t *merged, std::uint8_t *flags,
+    std::uint32_t count) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= count) return;
+  flags[position] = static_cast<std::uint8_t>(
+      position + 1u == count ||
+      compare_keys(source_key(source, merged[position]),
+                   source_key(source, merged[position + 1u])) != 0);
+}
+
+// Direct production extraction of exact_fanin_gate.cu: sorted exact streams
+// are merged pairwise with thrust::merge, then the last (newest) member of
+// each equal-key group is selected.  The merge tree is allowed to have more
+// than the benchmark's four leaves because a terminal radix carry can expose
+// any number of already-sorted resident roots.
+class ExactFanInWorkspace {
+ public:
+  struct Result {
+    const std::uint32_t *winners{};
+    std::uint32_t winner_count{};
+  };
+
+  template <class IncomingSource>
+  Result merge(TerminalSourceView<IncomingSource> source,
+               const std::vector<ExactRun> &runs,
+               std::uint32_t candidate_count, cudaStream_t stream) {
+    if (!candidate_count || runs.empty()) return {};
+    ensure(candidate_count);
+    std::uint64_t covered = 0u;
+    for (const ExactRun &run : runs) {
+      if (!run.count || run.begin != covered)
+        throw std::invalid_argument("noncontiguous exact fan-in runs");
+      covered += run.count;
+    }
+    if (covered != candidate_count)
+      throw std::invalid_argument("exact fan-in coverage mismatch");
+
+    initialize_terminal_refs<<<blocks(candidate_count), kThreads, 0,
+                               stream>>>(refs_a_.data(), candidate_count);
+    check(cudaGetLastError(), "initialize exact fan-in refs");
+    std::vector<ExactRun> current = runs;
+    bool input_a = true;
+    TerminalRefLess<IncomingSource> less{source};
+    auto policy = thrust::cuda::par_nosync.on(stream);
+    while (current.size() > 1u) {
+      const std::uint32_t *input = input_a
+          ? refs_a_.data() : refs_b_.data();
+      std::uint32_t *output = input_a
+          ? refs_b_.data() : refs_a_.data();
+      std::vector<ExactRun> next;
+      next.reserve((current.size() + 1u) / 2u);
+      for (std::size_t index = 0u; index < current.size(); index += 2u) {
+        const ExactRun left = current[index];
+        if (index + 1u == current.size()) {
+          check(cudaMemcpyAsync(
+                    output + left.begin, input + left.begin,
+                    std::size_t{left.count} * sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToDevice, stream),
+                "copy odd exact fan-in run");
+          next.push_back(left);
+          continue;
+        }
+        const ExactRun right = current[index + 1u];
+        if (left.begin + left.count != right.begin)
+          throw std::invalid_argument("disjoint exact fan-in pair");
+        thrust::merge(policy,
+                      input + left.begin,
+                      input + left.begin + left.count,
+                      input + right.begin,
+                      input + right.begin + right.count,
+                      output + left.begin, less);
+        next.push_back({left.begin, left.count + right.count});
+      }
+      current = std::move(next);
+      input_a = !input_a;
+    }
+
+    const std::uint32_t *merged = input_a
+        ? refs_a_.data() : refs_b_.data();
+    mark_last_terminal_key<<<blocks(candidate_count), kThreads, 0, stream>>>(
+        source, merged, last_.data(), candidate_count);
+    std::size_t bytes = select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              temporary_.data(), bytes, merged, last_.data(),
+              winners_.data(), winner_count_.data(), candidate_count,
+              stream),
+          "select exact fan-in winners");
+    std::uint32_t winners = 0u;
+    check(cudaMemcpyAsync(&winners, winner_count_.data(), sizeof(winners),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy exact fan-in winner count");
+    check(cudaStreamSynchronize(stream), "wait exact fan-in winners");
+    return {winners_.data(), winners};
+  }
+
+  std::size_t bytes() const {
+    return refs_a_.bytes() + refs_b_.bytes() + last_.bytes() +
+        winners_.bytes() + winner_count_.bytes() + temporary_.bytes();
+  }
+
+ private:
+  void ensure(std::uint32_t capacity) {
+    if (capacity <= capacity_) return;
+    capacity_ = capacity;
+    refs_a_.reset(capacity);
+    refs_b_.reset(capacity);
+    last_.reset(capacity);
+    winners_.reset(capacity);
+    winner_count_.reset(1u);
+    std::size_t bytes = 0u;
+    check(cub::DeviceSelect::Flagged(
+              nullptr, bytes, refs_a_.data(), last_.data(),
+              winners_.data(), winner_count_.data(), capacity),
+          "size exact fan-in select");
+    select_bytes_ = bytes;
+    temporary_.reset(bytes);
+  }
+
+  std::uint32_t capacity_{};
+  Buffer<std::uint32_t> refs_a_, refs_b_, winners_, winner_count_;
+  Buffer<std::uint8_t> last_, temporary_;
+  std::size_t select_bytes_{};
+};
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/fan_in.cuh
+
+namespace gpulsm_sparse {
+
+__device__ __forceinline__ const ExactHeadDescriptor *
+find_root_exact_head(const RootBuildState &root, std::uint32_t head) {
+  const auto *descriptors = reinterpret_cast<const ExactHeadDescriptor *>(
+      root.exact_heads);
+  std::uint32_t low = 0u;
+  std::uint32_t high = root.exact_head_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (descriptors[middle].head < head) low = middle + 1u;
+    else high = middle;
+  }
+  return low < root.exact_head_count && descriptors[low].head == head
+      ? descriptors + low : nullptr;
+}
+
+__device__ __forceinline__ std::uint64_t find_projection_row(
+    std::uint32_t head, std::uint32_t level,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors) {
+  const std::uint32_t section = head >> 16u;
+  const std::uint32_t suffix = head & 0xffffu;
+  const auto rows = descriptors[
+      gpulsmopt2_detail::descriptor_index(section, level)];
+  const std::uint32_t local = gpulsmopt2_detail::lower_bound_rows(
+      arena + rows.offset(), rows.count(), suffix);
+  return local < rows.count() && arena[rows.offset() + local].key == suffix
+      ? rows.offset() + local : ~std::uint64_t{0};
+}
+
+// Mixed epochs retain one non-tombstone placeholder for every observed
+// exceptional head until exact refinement has resolved all complete keys.
+// This is the required pre-winner deferral: a newer different long key may
+// not erase the projection needed by an older surviving key.
+__global__ void patch_epoch_sparse_placeholders(
+    const std::uint32_t *roster, std::uint32_t roster_count,
+    const std::uint32_t *section_offsets,
+    const std::uint32_t *section_counts,
+    gpulsmopt2_detail::Row *epoch_rows,
+    gpulsmopt2_detail::ResidentRows resident_rows,
+    std::uint64_t resident_begin, bool materialized) {
+  const std::uint32_t task = blockIdx.x * blockDim.x + threadIdx.x;
+  if (task >= roster_count) return;
+  const std::uint32_t head = roster[task];
+  const std::uint32_t section = head >> 16u;
+  const std::uint32_t suffix = head & 0xffffu;
+  const std::uint32_t begin = section_offsets[section];
+  const std::uint32_t count = section_counts[section];
+  const std::uint32_t local = materialized
+      ? gpulsmopt2_detail::lower_bound_rows(
+            resident_rows + resident_begin + begin, count, suffix)
+      : gpulsmopt2_detail::lower_bound_rows(
+            epoch_rows + begin, count, suffix);
+  if (local >= count) return;
+  const std::uint16_t found = materialized
+      ? resident_rows.key_at(resident_begin + begin + local)
+      : epoch_rows[begin + local].key;
+  if (found != suffix) return;
+  const gpulsmopt2_detail::Row sentinel = exact_group_row(head, 0u);
+  if (materialized)
+    resident_rows.store(resident_begin + begin + local, sentinel);
+  else
+    epoch_rows[begin + local] = sentinel;
+}
+
+__global__ void count_pending_roster_candidates(
+    const std::uint32_t *roster, std::uint32_t roster_count,
+    const std::uint32_t *incoming_sorted_heads,
+    std::uint32_t incoming_records,
+    const std::uint32_t *pending_keys,
+    const std::uint32_t *pending_offsets,
+    std::uint32_t batch_capacity, std::uint32_t batch_count,
+    std::uint32_t *counts) {
+  const std::uint32_t task = blockIdx.x * blockDim.x + threadIdx.x;
+  if (task >= roster_count) return;
+  const std::uint32_t head = roster[task];
+  const std::uint32_t section = head >> 16u;
+  std::uint32_t low = 0u;
+  std::uint32_t high = incoming_records;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (incoming_sorted_heads[middle] < head) low = middle + 1u;
+    else high = middle;
+  }
+  const std::uint32_t incoming_begin = low;
+  high = incoming_records;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (incoming_sorted_heads[middle] <= head) low = middle + 1u;
+    else high = middle;
+  }
+  std::uint32_t count = low - incoming_begin;
+  for (std::uint32_t batch = 0u; batch < batch_count; ++batch) {
+    const std::uint32_t *offsets = pending_offsets +
+        std::size_t{batch} * (kSections + 1u);
+    const std::uint32_t *keys = pending_keys +
+        std::size_t{batch} * batch_capacity;
+    for (std::uint32_t row = offsets[section];
+         row < offsets[section + 1u]; ++row)
+      count += keys[row] == head;
+  }
+  counts[task] = count;
+}
+
+__global__ void emit_pending_roster_candidates(
+    const std::uint32_t *roster, std::uint32_t roster_count,
+    const std::uint32_t *candidate_offsets,
+    const std::uint32_t *incoming_sorted_heads,
+    const std::uint32_t *incoming_sorted_refs,
+    std::uint32_t incoming_records,
+    const std::uint32_t *pending_keys,
+    const gpulsmopt2_detail::RawPayload *pending_payloads,
+    const std::uint32_t *pending_offsets,
+    std::uint32_t batch_capacity, std::uint32_t batch_count,
+    std::uint32_t *ages, std::uint32_t *refs) {
+  const std::uint32_t task = blockIdx.x;
+  if (task >= roster_count) return;
+  const std::uint32_t head = roster[task];
+  const std::uint32_t section = head >> 16u;
+  __shared__ std::uint32_t cursor;
+  if (!threadIdx.x) cursor = 0u;
+  __syncthreads();
+  std::uint32_t low = 0u;
+  std::uint32_t high = incoming_records;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (incoming_sorted_heads[middle] < head) low = middle + 1u;
+    else high = middle;
+  }
+  const std::uint32_t incoming_begin = low;
+  high = incoming_records;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (incoming_sorted_heads[middle] <= head) low = middle + 1u;
+    else high = middle;
+  }
+  const std::uint32_t incoming_end = low;
+  for (std::uint32_t sorted = incoming_begin + threadIdx.x;
+       sorted < incoming_end; sorted += blockDim.x) {
+    const std::uint32_t ref = incoming_sorted_refs
+        ? incoming_sorted_refs[sorted] : sorted;
+    const std::uint32_t output = candidate_offsets[task] +
+        atomicAdd(&cursor, 1u);
+    ages[output] = ref;
+    refs[output] = kCompletionIncoming | ref;
+  }
+  __syncthreads();
+  for (std::uint32_t batch = 0u; batch < batch_count; ++batch) {
+    const std::uint32_t *offsets = pending_offsets +
+        std::size_t{batch} * (kSections + 1u);
+    const std::uint32_t *keys = pending_keys +
+        std::size_t{batch} * batch_capacity;
+    const auto *payloads = pending_payloads +
+        std::size_t{batch} * batch_capacity;
+    for (std::uint32_t row = offsets[section] + threadIdx.x;
+         row < offsets[section + 1u]; row += blockDim.x) {
+      if (keys[row] != head) continue;
+      const std::uint32_t output = candidate_offsets[task] +
+          atomicAdd(&cursor, 1u);
+      ages[output] = gpulsmopt2_detail::raw_position(payloads[row]);
+      refs[output] =
+          (batch << gpulsmopt2_detail::kBatchPositionBits) | row;
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void count_resident_candidate_streams(
+    const std::uint32_t *roster, std::uint32_t roster_count,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const RootBuildState *roots, const std::uint32_t *levels,
+    std::uint32_t source_count, unsigned long long *counts) {
+  const std::uint32_t source = blockIdx.x;
+  if (source >= source_count) return;
+  const std::uint32_t level = levels[source];
+  unsigned long long local = 0u;
+  for (std::uint32_t task = threadIdx.x; task < roster_count;
+       task += blockDim.x) {
+    const std::uint32_t head = roster[task];
+    const ExactHeadDescriptor *exact = find_root_exact_head(
+        roots[level], head);
+    if (exact)
+      local += exact->count;
+    else
+      local += find_projection_row(head, level, arena, descriptors) !=
+          ~std::uint64_t{0};
+  }
+  for (std::uint32_t offset = 16u; offset; offset >>= 1u)
+    local += __shfl_down_sync(0xffffffffu, local, offset);
+  if (!(threadIdx.x & 31u))
+    atomicAdd(counts + source, local);
+}
+
+__global__ void emit_resident_candidate_streams(
+    const std::uint32_t *roster, std::uint32_t roster_count,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const RootBuildState *roots, const std::uint32_t *levels,
+    std::uint32_t source_count, const std::uint32_t *stream_begins,
+    TerminalCandidate *candidates) {
+  const std::uint32_t source = blockIdx.x;
+  if (source >= source_count) return;
+  const std::uint32_t level = levels[source];
+  __shared__ std::uint32_t cursor;
+  if (!threadIdx.x) cursor = stream_begins[source];
+  __syncthreads();
+  for (std::uint32_t task = 0u; task < roster_count; ++task) {
+    const std::uint32_t head = roster[task];
+    const ExactHeadDescriptor *exact = find_root_exact_head(
+        roots[level], head);
+    if (exact) {
+      const std::uint32_t begin = cursor;
+      for (std::uint32_t local = threadIdx.x; local < exact->count;
+           local += blockDim.x)
+        candidates[begin + local] = {
+            exact->physical_begin + local, head, level};
+      __syncthreads();
+      if (!threadIdx.x) cursor += exact->count;
+      __syncthreads();
+      continue;
+    }
+    if (!threadIdx.x) {
+      const std::uint64_t ordinary = find_projection_row(
+          head, level, arena, descriptors);
+      if (ordinary != ~std::uint64_t{0})
+        candidates[cursor++] = {ordinary, head, level};
+    }
+    __syncthreads();
+  }
+}
+
+template <class Source>
+__global__ void emit_incoming_candidate_stream(
+    Source source, const std::uint32_t *refs, std::uint32_t count,
+    TerminalCandidate *candidates) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= count) return;
+  const std::uint32_t ref = refs[position];
+  candidates[position] = {
+      ref, source_key(source, ref).head4(), kTerminalIncomingSource};
+}
+
+template <class Source>
+__global__ void mark_live_terminal_winners(
+    Source source, const std::uint32_t *winners, std::uint32_t count,
+    std::uint8_t *flags) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position < count) flags[position] = 1u;
+}
+
+template <class Source>
+__global__ void make_winner_heads(
+    Source source, const std::uint32_t *winners,
+    std::uint32_t count, std::uint32_t *heads) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position < count)
+    heads[position] = source_key(source, winners[position]).head4();
+}
+
+template <class Source>
+__device__ __forceinline__ bool winner_requires_sparse(
+    Source source, std::uint32_t ref) {
+  const auto key = source_key(source, ref);
+  const auto value = source_value(source, ref);
+  const bool tombstone = source_tombstone(source, ref);
+  return source_owned_capsule(source, ref) || key.length() != 4u ||
+      (!tombstone && value.length() != 4u) ||
+      (!tombstone && source_summary(source, ref) != value.inline_word());
+}
+
+template <class Source>
+__global__ void classify_refined_groups(
+    Source source, const std::uint32_t *winners,
+    const std::uint32_t *counts, const std::uint32_t *starts,
+    std::uint32_t group_count, std::uint32_t *exact_rows,
+    std::uint8_t *exact_flags, std::uint8_t *special_flags) {
+  const std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+  if (group >= group_count) return;
+  const std::uint32_t count = counts[group];
+  const std::uint32_t ref = winners[starts[group]];
+  const bool recovered = count == 1u &&
+      source_key(source, ref).length() == 4u &&
+      !source_tombstone(source, ref);
+  exact_rows[group] = recovered ? 0u : count;
+  exact_flags[group] = static_cast<std::uint8_t>(!recovered);
+  special_flags[group] = static_cast<std::uint8_t>(
+      !recovered || winner_requires_sparse(source, ref));
+}
+
+__global__ void build_refined_exact_descriptors(
+    const std::uint32_t *group_ids, std::uint32_t descriptor_count,
+    const std::uint32_t *heads, const std::uint32_t *counts,
+    const std::uint32_t *exact_offsets,
+    ExactHeadDescriptor *descriptors) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= descriptor_count) return;
+  const std::uint32_t group = group_ids[position];
+  descriptors[position] = {
+      heads[group], counts[group],
+      kExactPhysicalBit | std::uint64_t{exact_offsets[group]}};
+}
+
+__global__ void resolve_refined_destinations(
+    const std::uint32_t *heads, const std::uint32_t *counts,
+    const std::uint32_t *starts, const std::uint32_t *exact_offsets,
+    const std::uint8_t *exact_flags, std::uint32_t group_count,
+    std::uint32_t destination_level,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    std::uint64_t *destinations, unsigned long long *errors) {
+  const std::uint32_t group = blockIdx.x;
+  if (group >= group_count) return;
+  const std::uint32_t count = counts[group];
+  const std::uint32_t begin = starts[group];
+  if (exact_flags[group]) {
+    for (std::uint32_t local = threadIdx.x; local < count;
+         local += blockDim.x)
+      destinations[begin + local] = kExactPhysicalBit |
+          std::uint64_t{exact_offsets[group] + local};
+    return;
+  }
+  if (threadIdx.x) return;
+  const std::uint64_t physical = find_projection_row(
+      heads[group], destination_level, arena, descriptors);
+  if (physical == ~std::uint64_t{0}) {
+    atomicAdd(errors, 1ull);
+    return;
+  }
+  destinations[begin] = physical;
+}
+
+__global__ void patch_exact_projection_rows(
+    const ExactHeadDescriptor *exact_heads, std::uint32_t exact_head_count,
+    std::uint32_t destination_level,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    unsigned long long *errors) {
+  const std::uint32_t descriptor = blockIdx.x * blockDim.x + threadIdx.x;
+  if (descriptor >= exact_head_count) return;
+  const std::uint32_t head = exact_heads[descriptor].head;
+  const std::uint64_t physical = find_projection_row(
+      head, destination_level, arena, descriptors);
+  if (physical == ~std::uint64_t{0}) {
+    atomicAdd(errors, 1ull);
+    return;
+  }
+  arena.store(physical, exact_group_row(head, descriptor));
+}
+
+__global__ void patch_retired_roster_rows(
+    const std::uint32_t *roster, std::uint32_t roster_count,
+    const std::uint32_t *live_heads, std::uint32_t live_head_count,
+    std::uint32_t destination_level,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    unsigned long long *errors) {
+  const std::uint32_t task = blockIdx.x * blockDim.x + threadIdx.x;
+  if (task >= roster_count) return;
+  const std::uint32_t head = roster[task];
+  std::uint32_t low = 0u;
+  std::uint32_t high = live_head_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (live_heads[middle] < head) low = middle + 1u;
+    else high = middle;
+  }
+  if (low < live_head_count && live_heads[low] == head) return;
+  const std::uint64_t physical = find_projection_row(
+      head, destination_level, arena, descriptors);
+  if (physical == ~std::uint64_t{0}) {
+    atomicAdd(errors, 1ull);
+    return;
+  }
+  arena.store(physical,
+              {0u, static_cast<std::uint16_t>(head),
+               gpulsmopt2_detail::kTombstone});
+}
+
+template <class Source>
+__global__ void classify_refined_capsules(
+    Source source, const std::uint32_t *winners,
+    std::uint32_t count, std::uint8_t *flags) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= count) return;
+  const std::uint32_t ref = winners[position];
+  const auto key = source_key(source, ref);
+  const auto value = source_value(source, ref);
+  const bool tombstone = source_tombstone(source, ref);
+  flags[position] = static_cast<std::uint8_t>(
+      source_owned_capsule(source, ref) || key.length() != 4u ||
+      (!tombstone && value.length() != 4u) ||
+      (!tombstone && source_summary(source, ref) != value.inline_word()));
+}
+
+__global__ void gather_refined_capsule_sort_fields(
+    const std::uint32_t *capsule_positions,
+    const std::uint32_t *capsule_count,
+    const std::uint64_t *destinations, std::uint64_t *physical_rows,
+    std::uint32_t *winner_positions) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= *capsule_count) return;
+  const std::uint32_t position = capsule_positions[ordinal];
+  physical_rows[ordinal] = destinations[position];
+  winner_positions[ordinal] = position;
+}
+
+__global__ void gather_sorted_refined_capsules(
+    const std::uint32_t *winners, const std::uint32_t *winner_positions,
+    const std::uint64_t *physical_rows, const std::uint32_t *capsule_count,
+    std::uint32_t *refs, std::uint64_t *physical_pages) {
+  const std::uint32_t ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ordinal >= *capsule_count) return;
+  refs[ordinal] = winners[winner_positions[ordinal]];
+  physical_pages[ordinal] = physical_rows[ordinal] / kCapsulePageRows;
+}
+
+template <class Source>
+__global__ void emit_refined_anchors(
+    Source source, const std::uint32_t *winners,
+    const std::uint64_t *destinations,
+    const std::uint8_t *capsule_flags,
+    const std::uint16_t *capsule_ranks, std::uint32_t count,
+    gpulsmopt2_detail::ResidentRows arena,
+    gpulsmopt2_detail::Row *exact_rows) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= count) return;
+  const std::uint32_t ref = winners[position];
+  const auto key = source_key(source, ref);
+  const auto value = source_value(source, ref);
+  const bool tombstone = source_tombstone(source, ref);
+  const std::uint32_t inline_value = value.inline_word();
+  const std::uint32_t summary = source_summary(source, ref);
+  const bool summary_only = !tombstone && summary != inline_value;
+  const std::uint16_t flags = capsule_flags[position]
+      ? capsule_anchor_flags(
+            capsule_ranks[position], tombstone, summary_only)
+      : inline_anchor_flags(
+            key.length(), tombstone ? 0u : value.length(), tombstone,
+            summary_only);
+  const gpulsmopt2_detail::Row row{
+      summary, static_cast<std::uint16_t>(key.head4()), flags};
+  const std::uint64_t destination = destinations[position];
+  if (is_exact_physical(destination))
+    exact_rows[exact_physical_offset(destination)] = row;
+  else
+    arena.store(destination, row);
+}
+
+struct SparseRefinementResult {
+  std::uint32_t exact_heads{};
+  std::uint32_t exact_rows{};
+  std::uint32_t special_heads{};
+  std::uint32_t capsules{};
+  std::uint32_t pages{};
+  std::uint64_t allocated_capsule_bytes{};
+};
+
+// Mixed publication is one receipt-backed commit.  The original ordinary
+// manifest layout is preserved byte-for-byte; this companion kernel copies
+// its publication rule and updates the sparse-only table before performing
+// the same single active-index flip.
+__global__ void publish_refined_manifest_kernel(
+    gpulsmopt2_detail::ResidentPublicationPlan *plan,
+    gpulsmopt2_detail::DeviceManifest *manifests,
+    DeviceSparseManifest *sparse_manifests,
+    std::uint32_t *active_manifest,
+    std::uint64_t *query_occupied_level_mask,
+    const RootBuildState *root, std::uint32_t sparse_flags) {
+  if (blockIdx.x || plan->status) return;
+  const auto *current = manifests + plan->active_manifest;
+  auto *next = manifests + plan->inactive_manifest;
+  const auto *current_sparse = sparse_manifests + plan->active_manifest;
+  auto *next_sparse = sparse_manifests + plan->inactive_manifest;
+  const std::uint32_t destination = plan->destination_level;
+  const std::uint64_t consumed = destination == 64u
+      ? ~std::uint64_t{0}
+      : ((std::uint64_t{1u} << destination) - 1u);
+  for (std::uint32_t level = threadIdx.x;
+       level < gpulsmopt2_detail::kMaximumLevels; level += blockDim.x) {
+    if (level == destination) continue;
+    next->levels[level] = level < destination
+        ? gpulsmopt2_detail::DeviceLevelState{}
+        : current->levels[level];
+    next_sparse->levels[level] = level < destination
+        ? DeviceSparseLevelState{}
+        : current_sparse->levels[level];
+  }
+  __syncthreads();
+  if (!threadIdx.x) {
+    next->occupied_level_mask = current->occupied_level_mask & ~consumed;
+    gpulsmopt2_detail::DeviceLevelState ordinary{};
+    ordinary.storage_generation = plan->output_generation;
+    next->levels[destination] = ordinary;
+    if (plan->survivor_count)
+      next->occupied_level_mask |= std::uint64_t{1u} << destination;
+    else
+      next->occupied_level_mask &= ~(std::uint64_t{1u} << destination);
+    next->active_levels = next->occupied_level_mask
+        ? 64u - static_cast<std::uint32_t>(
+                    __clzll(next->occupied_level_mask))
+        : 0u;
+    next->foundation_level = next->active_levels
+        ? next->active_levels - 1u
+        : gpulsmopt2_detail::kMaximumLevels;
+    next->generation = current->generation + 1u;
+
+    next_sparse->exact_level_mask =
+        current_sparse->exact_level_mask & ~consumed;
+    next_sparse->capsule_level_mask =
+        current_sparse->capsule_level_mask & ~consumed;
+    next_sparse->levels[destination] = {};
+    next_sparse->exact_level_mask &=
+        ~(std::uint64_t{1u} << destination);
+    next_sparse->capsule_level_mask &=
+        ~(std::uint64_t{1u} << destination);
+    if (root && sparse_flags) {
+      next_sparse->levels[destination] = {
+          reinterpret_cast<std::uint64_t>(root), root->generation,
+          sparse_flags};
+      if (sparse_flags & kSparseHasExactHeads)
+        next_sparse->exact_level_mask |=
+            std::uint64_t{1u} << destination;
+      if (sparse_flags & kSparseHasCapsules)
+        next_sparse->capsule_level_mask |=
+            std::uint64_t{1u} << destination;
+    }
+    next_sparse->generation = next->generation;
+  }
+  __syncthreads();
+  if (!threadIdx.x) {
+    __threadfence();
+    atomicExch(active_manifest, plan->inactive_manifest);
+    atomicExch(reinterpret_cast<unsigned long long *>(
+                   query_occupied_level_mask),
+               static_cast<unsigned long long>(
+                   next->occupied_level_mask));
+  }
+}
+
+class SparseRefinementWorkspace {
+ public:
+  struct PreparedRoster {
+    const std::uint32_t *heads{};
+    std::uint32_t count{};
+    const std::uint32_t *source_levels{};
+    std::uint32_t source_count{};
+    const RootBuildState *device_roots{};
+  };
+
+  PreparedRoster prepare_roster(
+      const std::array<std::shared_ptr<StagedPendingSlotOverlay>,
+                       gpulsmopt2_detail::kBatchesPerEpoch> &pending,
+      std::uint32_t pending_batches,
+      const std::array<std::shared_ptr<StagedRootOverlay>,
+                       gpulsmopt2_detail::kMaximumLevels> &roots,
+      std::uint64_t source_mask, cudaStream_t stream,
+      const std::uint32_t *direct_heads = nullptr,
+      std::uint32_t direct_head_count = 0u) {
+    host_source_levels_.clear();
+    lifecycle_owners_.clear();
+    std::array<RootBuildState, kLevels> host_roots{};
+    std::uint64_t levels = source_mask;
+    std::uint32_t occurrences = direct_head_count;
+    for (std::uint32_t slot = 0u; slot < pending_batches; ++slot) {
+      if (!pending[slot]) continue;
+      occurrences += pending[slot]->state.special_head_count;
+      for (auto &segment : pending[slot]->segments)
+        if (segment.segment) lifecycle_owners_.push_back(&segment);
+    }
+    while (levels) {
+      const std::uint32_t level = static_cast<std::uint32_t>(
+          __builtin_ctzll(levels));
+      levels &= levels - 1u;
+      host_source_levels_.push_back(level);
+      if (!roots[level]) continue;
+      host_roots[level] = roots[level]->state;
+      occurrences += roots[level]->state.special_head_count;
+      for (auto &segment : roots[level]->segments)
+        if (segment.segment) lifecycle_owners_.push_back(&segment);
+    }
+    device_roots_.reset(kLevels);
+    check(cudaMemcpyAsync(
+              device_roots_.data(), host_roots.data(),
+              sizeof(host_roots), cudaMemcpyHostToDevice, stream),
+          "stage sparse source roots");
+    device_source_levels_.reset(host_source_levels_.size());
+    if (!host_source_levels_.empty())
+      check(cudaMemcpyAsync(
+                device_source_levels_.data(), host_source_levels_.data(),
+                host_source_levels_.size() * sizeof(std::uint32_t),
+                cudaMemcpyHostToDevice, stream),
+            "stage sparse source levels");
+    if (!occurrences) {
+      roster_count_host_ = 0u;
+      return {nullptr, 0u, device_source_levels_.data(),
+              static_cast<std::uint32_t>(host_source_levels_.size()),
+              device_roots_.data()};
+    }
+    ensure_roster_capacity(occurrences);
+    std::uint32_t cursor = 0u;
+    if (direct_head_count) {
+      check(cudaMemcpyAsync(
+                roster_input_.data(), direct_heads,
+                std::size_t{direct_head_count} * sizeof(std::uint32_t),
+                cudaMemcpyDeviceToDevice, stream),
+            "append direct sparse roster");
+      cursor = direct_head_count;
+    }
+    for (std::uint32_t slot = 0u; slot < pending_batches; ++slot) {
+      if (!pending[slot] || !pending[slot]->state.special_head_count)
+        continue;
+      const std::uint32_t count = pending[slot]->state.special_head_count;
+      check(cudaMemcpyAsync(
+                roster_input_.data() + cursor,
+                pending[slot]->special_heads.data(),
+                std::size_t{count} * sizeof(std::uint32_t),
+                cudaMemcpyDeviceToDevice, stream),
+            "append pending sparse roster");
+      cursor += count;
+    }
+    for (std::uint32_t level : host_source_levels_) {
+      if (!roots[level] || !roots[level]->state.special_head_count) continue;
+      const std::uint32_t count = roots[level]->state.special_head_count;
+      check(cudaMemcpyAsync(
+                roster_input_.data() + cursor,
+                roots[level]->special_heads.data(),
+                std::size_t{count} * sizeof(std::uint32_t),
+                cudaMemcpyDeviceToDevice, stream),
+            "append resident sparse roster");
+      cursor += count;
+    }
+    std::size_t bytes = roster_sort_bytes_;
+    check(cub::DeviceRadixSort::SortKeys(
+              roster_temporary_.data(), bytes, roster_input_.data(),
+              roster_sorted_.data(), occurrences, 0, 32, stream),
+          "sort sparse roster");
+    bytes = roster_rle_bytes_;
+    check(cub::DeviceRunLengthEncode::Encode(
+              roster_temporary_.data(), bytes, roster_sorted_.data(),
+              roster_.data(), roster_run_counts_.data(),
+              roster_count_.data(), occurrences, stream),
+          "deduplicate sparse roster");
+    check(cudaMemcpyAsync(&roster_count_host_, roster_count_.data(),
+                          sizeof(roster_count_host_),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy sparse roster count");
+    check(cudaStreamSynchronize(stream), "wait sparse roster");
+    return {roster_.data(), roster_count_host_,
+            device_source_levels_.data(),
+            static_cast<std::uint32_t>(host_source_levels_.size()),
+            device_roots_.data()};
+  }
+
+  // Direct bulk/sealed roots already have a sorted, deduplicated sparse-head
+  // roster from the transplanted root builder.  Stage that sparse list only;
+  // ordinary projection metadata remains exclusively in GPULSMOpt.
+  PreparedRoster prepare_direct_roster(
+      const std::uint32_t *heads, std::uint32_t count,
+      cudaStream_t stream) {
+    host_source_levels_.clear();
+    lifecycle_owners_.clear();
+    device_roots_.reset(kLevels);
+    check(cudaMemsetAsync(device_roots_.data(), 0, device_roots_.bytes(),
+                          stream),
+          "clear direct sparse source roots");
+    device_source_levels_.reset(0u);
+    roster_count_host_ = count;
+    if (!count)
+      return {nullptr, 0u, nullptr, 0u, device_roots_.data()};
+    ensure_roster_capacity(count);
+    check(cudaMemcpyAsync(roster_.data(), heads,
+                          std::size_t{count} * sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToDevice, stream),
+          "stage direct sparse roster");
+    check(cudaMemcpyAsync(roster_count_.data(), &count, sizeof(count),
+                          cudaMemcpyHostToDevice, stream),
+          "stage direct sparse roster count");
+    return {roster_.data(), count, nullptr, 0u, device_roots_.data()};
+  }
+
+  const std::vector<CapsuleSegmentOwnership *> &lifecycle_owners() const {
+    return lifecycle_owners_;
+  }
+
+  std::size_t bytes() const;
+
+  SparseRefinementResult refine(
+      CompletionSourceView pending, std::uint32_t pending_batches,
+      gpulsmopt2_detail::ResidentRows arena,
+      const gpulsmopt2_detail::Descriptor *descriptors,
+      std::uint32_t destination_level, std::uint64_t output_begin,
+      std::uint32_t projection_count,
+      bool keep_tombstones, std::uint32_t output_generation,
+      std::uint32_t segment_ordinal, StagedRootOverlay &overlay,
+      cudaStream_t stream);
+
+ private:
+  void ensure_roster_capacity(std::uint32_t count);
+  void ensure_pending_capacity(std::uint32_t count);
+  void ensure_candidate_capacity(std::uint32_t count);
+  void ensure_group_capacity(std::uint32_t count);
+  void ensure_capsule_capacity(std::uint32_t count);
+  template <class Source>
+  const CapsuleLifecycleSource *prepare_capsule_lifecycle(
+      Source source, const std::uint32_t *refs, std::uint32_t count,
+      StagedRootOverlay &overlay, cudaStream_t stream);
+
+  std::uint32_t roster_capacity_{};
+  std::uint32_t roster_count_host_{};
+  Buffer<std::uint32_t> roster_input_, roster_sorted_, roster_;
+  Buffer<std::uint32_t> roster_run_counts_, roster_count_;
+  Buffer<std::uint8_t> roster_temporary_;
+  std::size_t roster_sort_bytes_{}, roster_rle_bytes_{};
+  Buffer<RootBuildState> device_roots_;
+  Buffer<std::uint32_t> device_source_levels_;
+  std::vector<std::uint32_t> host_source_levels_;
+  std::vector<CapsuleSegmentOwnership *> lifecycle_owners_;
+
+  std::uint32_t pending_capacity_{};
+  Buffer<std::uint32_t> pending_counts_, pending_offsets_;
+  Buffer<std::uint32_t> pending_ages_a_, pending_ages_b_;
+  Buffer<std::uint32_t> pending_refs_a_, pending_refs_b_;
+  Buffer<std::uint32_t> pending_total_;
+  Buffer<std::uint8_t> pending_temporary_;
+  std::size_t pending_scan_bytes_{}, pending_sort_bytes_{};
+  std::unique_ptr<ExactOrderWorkspace> pending_order_;
+
+  std::uint32_t candidate_capacity_{};
+  Buffer<TerminalCandidate> candidates_;
+  Buffer<unsigned long long> source_counts_;
+  Buffer<std::uint32_t> source_begins_;
+  ExactFanInWorkspace fan_in_;
+
+  std::uint32_t group_capacity_{};
+  Buffer<std::uint8_t> live_flags_;
+  Buffer<std::uint32_t> live_winners_, live_count_;
+  Buffer<std::uint32_t> winner_heads_, group_heads_, group_counts_;
+  Buffer<std::uint32_t> group_starts_, group_count_;
+  Buffer<std::uint32_t> exact_rows_, exact_offsets_;
+  Buffer<std::uint8_t> exact_flags_, special_flags_;
+  Buffer<std::uint32_t> exact_group_ids_, exact_group_count_;
+  Buffer<std::uint32_t> selected_special_heads_, special_head_count_;
+  Buffer<std::uint64_t> destinations_;
+  Buffer<unsigned long long> errors_;
+  Buffer<std::uint8_t> group_temporary_;
+  std::size_t group_select_bytes_{}, group_rle_bytes_{};
+  std::size_t group_scan_bytes_{};
+
+  std::uint32_t capsule_capacity_{};
+  Buffer<std::uint8_t> capsule_flags_;
+  Buffer<std::uint16_t> capsule_ranks_;
+  Buffer<std::uint32_t> capsule_positions_a_, capsule_positions_b_;
+  Buffer<std::uint32_t> capsule_count_, capsule_refs_;
+  Buffer<std::uint64_t> capsule_rows_a_, capsule_rows_b_;
+  Buffer<std::uint64_t> capsule_pages_, unique_pages_;
+  Buffer<std::uint32_t> page_counts_, page_starts_, page_count_;
+  Buffer<std::uint64_t> capsule_sizes_, capsule_offsets_;
+  Buffer<std::uint8_t> capsule_temporary_;
+  std::size_t capsule_select_bytes_{}, capsule_sort_bytes_{};
+  std::size_t capsule_rle_bytes_{}, capsule_scan32_bytes_{};
+  std::size_t capsule_scan64_bytes_{};
+
+  std::uint32_t lifecycle_capacity_{};
+  std::uint32_t lifecycle_count_{};
+  Buffer<CapsuleLifecycleSource> lifecycle_sources_;
+  std::vector<CapsuleLifecycleSource> host_lifecycle_;
+  Buffer<unsigned long long> lifecycle_errors_;
+};
+
+inline void SparseRefinementWorkspace::ensure_roster_capacity(
+    std::uint32_t count) {
+  if (count <= roster_capacity_) return;
+  roster_capacity_ = count;
+  roster_input_.reset(count);
+  roster_sorted_.reset(count);
+  roster_.reset(count);
+  roster_run_counts_.reset(count);
+  roster_count_.reset(1u);
+  pending_counts_.reset(count);
+  pending_offsets_.reset(count);
+  pending_total_.reset(1u);
+  std::size_t sizes[3]{};
+  check(cub::DeviceRadixSort::SortKeys(
+            nullptr, sizes[0], roster_input_.data(), roster_sorted_.data(),
+            count),
+        "size sparse roster sort");
+  check(cub::DeviceRunLengthEncode::Encode(
+            nullptr, sizes[1], roster_sorted_.data(), roster_.data(),
+            roster_run_counts_.data(), roster_count_.data(), count),
+        "size sparse roster encoding");
+  check(cub::DeviceScan::ExclusiveSum(
+            nullptr, sizes[2], pending_counts_.data(),
+            pending_offsets_.data(), count),
+        "size pending roster scan");
+  roster_sort_bytes_ = sizes[0];
+  roster_rle_bytes_ = sizes[1];
+  pending_scan_bytes_ = sizes[2];
+  roster_temporary_.reset(std::max(sizes[0], sizes[1]));
+  pending_temporary_.reset(
+      std::max(pending_scan_bytes_, pending_sort_bytes_));
+}
+
+inline void SparseRefinementWorkspace::ensure_pending_capacity(
+    std::uint32_t count) {
+  if (count <= pending_capacity_) return;
+  pending_capacity_ = count;
+  pending_ages_a_.reset(count);
+  pending_ages_b_.reset(count);
+  pending_refs_a_.reset(count);
+  pending_refs_b_.reset(count);
+  std::size_t bytes = 0u;
+  check(cub::DeviceRadixSort::SortPairs(
+            nullptr, bytes, pending_ages_a_.data(), pending_ages_b_.data(),
+            pending_refs_a_.data(), pending_refs_b_.data(), count),
+        "size pending age sort");
+  pending_sort_bytes_ = bytes;
+  pending_temporary_.reset(std::max(pending_scan_bytes_, bytes));
+  pending_order_ = std::make_unique<ExactOrderWorkspace>(count);
+}
+
+inline void SparseRefinementWorkspace::ensure_candidate_capacity(
+    std::uint32_t count) {
+  if (count <= candidate_capacity_) return;
+  candidate_capacity_ = count;
+  candidates_.reset(count);
+}
+
+inline void SparseRefinementWorkspace::ensure_group_capacity(
+    std::uint32_t count) {
+  if (count <= group_capacity_) return;
+  group_capacity_ = count;
+  live_flags_.reset(count);
+  live_winners_.reset(count);
+  live_count_.reset(1u);
+  winner_heads_.reset(count);
+  group_heads_.reset(count);
+  group_counts_.reset(count);
+  group_starts_.reset(count);
+  group_count_.reset(1u);
+  exact_rows_.reset(count);
+  exact_offsets_.reset(count);
+  exact_flags_.reset(count);
+  special_flags_.reset(count);
+  exact_group_ids_.reset(count);
+  exact_group_count_.reset(1u);
+  selected_special_heads_.reset(count);
+  special_head_count_.reset(1u);
+  destinations_.reset(count);
+  errors_.reset(1u);
+  std::size_t sizes[4]{};
+  check(cub::DeviceSelect::Flagged(
+            nullptr, sizes[0], winner_heads_.data(), live_flags_.data(),
+            live_winners_.data(), live_count_.data(), count),
+        "size refined winner selection");
+  check(cub::DeviceRunLengthEncode::Encode(
+            nullptr, sizes[1], winner_heads_.data(), group_heads_.data(),
+            group_counts_.data(), group_count_.data(), count),
+        "size refined head encoding");
+  check(cub::DeviceScan::ExclusiveSum(
+            nullptr, sizes[2], group_counts_.data(), group_starts_.data(),
+            count),
+        "size refined group scan");
+  cub::CountingInputIterator<std::uint32_t> ids(0u);
+  check(cub::DeviceSelect::Flagged(
+            nullptr, sizes[3], ids, exact_flags_.data(),
+            exact_group_ids_.data(), exact_group_count_.data(), count),
+        "size refined group selection");
+  group_select_bytes_ = std::max(sizes[0], sizes[3]);
+  group_rle_bytes_ = sizes[1];
+  group_scan_bytes_ = sizes[2];
+  group_temporary_.reset(*std::max_element(
+      std::begin(sizes), std::end(sizes)));
+}
+
+inline void SparseRefinementWorkspace::ensure_capsule_capacity(
+    std::uint32_t count) {
+  if (count <= capsule_capacity_) return;
+  capsule_capacity_ = count;
+  capsule_flags_.reset(count);
+  capsule_ranks_.reset(count);
+  capsule_positions_a_.reset(count);
+  capsule_positions_b_.reset(count);
+  capsule_count_.reset(1u);
+  capsule_refs_.reset(count);
+  capsule_rows_a_.reset(count);
+  capsule_rows_b_.reset(count);
+  capsule_pages_.reset(count);
+  unique_pages_.reset(count);
+  page_counts_.reset(count);
+  page_starts_.reset(count);
+  page_count_.reset(1u);
+  capsule_sizes_.reset(std::size_t{count} + 1u);
+  capsule_offsets_.reset(std::size_t{count} + 1u);
+  std::size_t sizes[5]{};
+  cub::CountingInputIterator<std::uint32_t> ids(0u);
+  check(cub::DeviceSelect::Flagged(
+            nullptr, sizes[0], ids, capsule_flags_.data(),
+            capsule_positions_a_.data(), capsule_count_.data(), count),
+        "size refined capsule selection");
+  check(cub::DeviceRadixSort::SortPairs(
+            nullptr, sizes[1], capsule_rows_a_.data(),
+            capsule_rows_b_.data(), capsule_positions_b_.data(),
+            capsule_positions_a_.data(), count),
+        "size refined capsule sort");
+  check(cub::DeviceRunLengthEncode::Encode(
+            nullptr, sizes[2], capsule_pages_.data(), unique_pages_.data(),
+            page_counts_.data(), page_count_.data(), count),
+        "size refined capsule pages");
+  check(cub::DeviceScan::ExclusiveSum(
+            nullptr, sizes[3], page_counts_.data(), page_starts_.data(),
+            count),
+        "size refined page scan");
+  check(cub::DeviceScan::ExclusiveSum(
+            nullptr, sizes[4], capsule_sizes_.data(),
+            capsule_offsets_.data(), std::size_t{count} + 1u),
+        "size refined capsule byte scan");
+  capsule_select_bytes_ = sizes[0];
+  capsule_sort_bytes_ = sizes[1];
+  capsule_rle_bytes_ = sizes[2];
+  capsule_scan32_bytes_ = sizes[3];
+  capsule_scan64_bytes_ = sizes[4];
+  capsule_temporary_.reset(*std::max_element(
+      std::begin(sizes), std::end(sizes)));
+}
+
+template <class Source>
+const CapsuleLifecycleSource *
+SparseRefinementWorkspace::prepare_capsule_lifecycle(
+    Source source, const std::uint32_t *refs, std::uint32_t count,
+    StagedRootOverlay &overlay, cudaStream_t stream) {
+  host_lifecycle_.clear();
+  host_lifecycle_.reserve(lifecycle_owners_.size());
+  for (CapsuleSegmentOwnership *owned : lifecycle_owners_) {
+    if (!owned || !owned->segment) continue;
+    host_lifecycle_.push_back({
+        owned->ordinal, kCapsuleCopy, owned->live_bytes,
+        owned->garbage_bytes, 0u});
+  }
+  std::sort(host_lifecycle_.begin(), host_lifecycle_.end(),
+            [](const CapsuleLifecycleSource &left,
+               const CapsuleLifecycleSource &right) {
+              return left.ordinal < right.ordinal;
+            });
+  for (std::size_t index = 1u; index < host_lifecycle_.size(); ++index)
+    if (host_lifecycle_[index - 1u].ordinal ==
+        host_lifecycle_[index].ordinal)
+      throw std::logic_error("capsule segment has multiple owners");
+  lifecycle_count_ = static_cast<std::uint32_t>(host_lifecycle_.size());
+  if (lifecycle_count_ > lifecycle_capacity_) {
+    lifecycle_capacity_ = lifecycle_count_;
+    lifecycle_sources_.reset(lifecycle_capacity_);
+  }
+  if (!lifecycle_errors_.size()) lifecycle_errors_.reset(1u);
+  check(cudaMemsetAsync(lifecycle_errors_.data(), 0,
+                        lifecycle_errors_.bytes(), stream),
+        "clear capsule lifecycle errors");
+  if (!lifecycle_count_) return nullptr;
+  check(cudaMemcpyAsync(
+            lifecycle_sources_.data(), host_lifecycle_.data(),
+            std::size_t{lifecycle_count_} * sizeof(CapsuleLifecycleSource),
+            cudaMemcpyHostToDevice, stream),
+        "stage capsule lifecycle sources");
+  count_capsule_survivors<<<blocks(count), kThreads, 0, stream>>>(
+      source, refs, capsule_count_.data(), lifecycle_sources_.data(),
+      lifecycle_count_, lifecycle_errors_.data());
+  check(cudaMemcpyAsync(
+            host_lifecycle_.data(), lifecycle_sources_.data(),
+            std::size_t{lifecycle_count_} * sizeof(CapsuleLifecycleSource),
+            cudaMemcpyDeviceToHost, stream),
+        "copy capsule liveness");
+  unsigned long long lifecycle_error = 0u;
+  check(cudaMemcpyAsync(&lifecycle_error, lifecycle_errors_.data(),
+                        sizeof(lifecycle_error), cudaMemcpyDeviceToHost,
+                        stream),
+        "copy capsule liveness error");
+  check(cudaStreamSynchronize(stream), "wait capsule liveness");
+  if (lifecycle_error)
+    throw std::runtime_error(
+        "capsule lifecycle error kind " +
+        std::to_string(static_cast<std::uint32_t>(lifecycle_error >> 32u)) +
+        " segment " + std::to_string(static_cast<std::uint32_t>(
+            lifecycle_error)));
+
+  const auto find_owner = [&](std::uint32_t ordinal) {
+    CapsuleSegmentOwnership *found = nullptr;
+    for (CapsuleSegmentOwnership *owned : lifecycle_owners_) {
+      if (!owned || !owned->segment || owned->ordinal != ordinal) continue;
+      if (found) throw std::logic_error(
+          "capsule transfer source is duplicated");
+      found = owned;
+    }
+    return found;
+  };
+  overlay.transfers.reserve(
+      overlay.transfers.size() + lifecycle_count_);
+  for (CapsuleLifecycleSource &state : host_lifecycle_) {
+    if (state.survivor_bytes > state.live_bytes)
+      throw std::runtime_error("capsule survivor accounting overflow");
+    if (state.garbage_bytes >
+        std::numeric_limits<std::uint64_t>::max() - state.live_bytes)
+      throw std::overflow_error("capsule usage overflow");
+    const std::uint64_t occupied = state.live_bytes + state.garbage_bytes;
+    const std::uint64_t garbage = occupied - state.survivor_bytes;
+    if (!state.survivor_bytes) {
+      state.action = kCapsuleCompact;
+    } else if (garbage < state.survivor_bytes) {
+      state.action = kCapsuleTransfer;
+      CapsuleSegmentOwnership *owner = find_owner(state.ordinal);
+      if (!owner) throw std::logic_error(
+          "capsule transfer source is absent");
+      const std::uint64_t mapped = owner->segment->mapped_bytes();
+      if (state.survivor_bytes > mapped ||
+          garbage > mapped - state.survivor_bytes)
+        throw std::overflow_error("capsule transfer usage is invalid");
+      overlay.transfers.push_back({
+          state.ordinal, 0u, state.survivor_bytes, garbage, owner});
+      overlay.live_bytes += state.survivor_bytes;
+      overlay.garbage_bytes += garbage;
+    } else {
+      state.action = kCapsuleCompact;
+    }
+  }
+  check(cudaMemcpyAsync(
+            lifecycle_sources_.data(), host_lifecycle_.data(),
+            std::size_t{lifecycle_count_} * sizeof(CapsuleLifecycleSource),
+            cudaMemcpyHostToDevice, stream),
+        "stage capsule lifecycle actions");
+  return lifecycle_sources_.data();
+}
+
+inline SparseRefinementResult SparseRefinementWorkspace::refine(
+    CompletionSourceView pending, std::uint32_t pending_batches,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    std::uint32_t destination_level, std::uint64_t output_begin,
+    std::uint32_t projection_count, bool keep_tombstones,
+    std::uint32_t output_generation, std::uint32_t segment_ordinal,
+    StagedRootOverlay &overlay, cudaStream_t stream) {
+  if (!roster_count_host_)
+    throw std::logic_error("sparse refinement has no roster");
+  overlay.state = {};
+  overlay.live_bytes = 0u;
+  overlay.garbage_bytes = 0u;
+  overlay.transfers.clear();
+
+  count_pending_roster_candidates<<<
+      blocks(roster_count_host_), kThreads, 0, stream>>>(
+      roster_.data(), roster_count_host_, pending.incoming_sorted_heads,
+      pending.incoming_records, pending.pending_keys,
+      pending.pending_offsets, pending.batch_capacity, pending_batches,
+      pending_counts_.data());
+  std::size_t bytes = pending_scan_bytes_;
+  check(cub::DeviceScan::ExclusiveSum(
+            pending_temporary_.data(), bytes, pending_counts_.data(),
+            pending_offsets_.data(), roster_count_host_, stream),
+        "scan pending sparse candidates");
+  finish_scan_total<<<1, 1, 0, stream>>>(
+      pending_counts_.data(), pending_offsets_.data(), roster_count_.data(),
+      pending_total_.data());
+  std::uint32_t pending_rows = 0u;
+  check(cudaMemcpyAsync(&pending_rows, pending_total_.data(),
+                        sizeof(pending_rows), cudaMemcpyDeviceToHost,
+                        stream),
+        "copy pending sparse candidate count");
+  check(cudaStreamSynchronize(stream),
+        "wait pending sparse candidate count");
+
+  std::uint32_t pending_winners = 0u;
+  if (pending_rows) {
+    ensure_pending_capacity(pending_rows);
+    emit_pending_roster_candidates<<<roster_count_host_, kThreads, 0,
+                                     stream>>>(
+        roster_.data(), roster_count_host_, pending_offsets_.data(),
+        pending.incoming_sorted_heads, pending.incoming_sorted_refs,
+        pending.incoming_records, pending.pending_keys,
+        pending.pending_payloads,
+        pending.pending_offsets, pending.batch_capacity, pending_batches,
+        pending_ages_a_.data(), pending_refs_a_.data());
+    bytes = pending_sort_bytes_;
+    check(cub::DeviceRadixSort::SortPairs(
+              pending_temporary_.data(), bytes, pending_ages_a_.data(),
+              pending_ages_b_.data(), pending_refs_a_.data(),
+              pending_refs_b_.data(), pending_rows, 0, 32, stream),
+          "sort pending sparse candidates by age");
+    const ExactOrderResult ordered = pending_order_->order(
+        pending, pending_rows, stream, nullptr, pending_refs_b_.data());
+    pending_winners = ordered.winner_count;
+  }
+
+  const std::uint32_t source_count = static_cast<std::uint32_t>(
+      host_source_levels_.size());
+  source_counts_.reset(source_count);
+  source_begins_.reset(source_count);
+  std::vector<unsigned long long> host_source_counts(source_count);
+  if (source_count) {
+    check(cudaMemsetAsync(source_counts_.data(), 0, source_counts_.bytes(),
+                          stream),
+          "clear resident sparse source counts");
+    count_resident_candidate_streams<<<source_count, kThreads, 0, stream>>>(
+        roster_.data(), roster_count_host_, arena, descriptors,
+        device_roots_.data(), device_source_levels_.data(), source_count,
+        source_counts_.data());
+    check(cudaMemcpyAsync(
+              host_source_counts.data(), source_counts_.data(),
+              source_count * sizeof(unsigned long long),
+              cudaMemcpyDeviceToHost, stream),
+          "copy resident sparse source counts");
+    check(cudaStreamSynchronize(stream),
+          "wait resident sparse source counts");
+  }
+
+  std::uint64_t candidate_total = pending_winners;
+  std::vector<std::uint32_t> host_source_begins(source_count);
+  std::vector<ExactRun> runs;
+  if (pending_winners) runs.push_back({0u, pending_winners});
+  for (std::uint32_t source = 0u; source < source_count; ++source) {
+    if (candidate_total > std::numeric_limits<std::uint32_t>::max() ||
+        host_source_counts[source] >
+            std::numeric_limits<std::uint32_t>::max() - candidate_total)
+      throw std::length_error("sparse candidate set exceeds 32 bits");
+    host_source_begins[source] = static_cast<std::uint32_t>(candidate_total);
+    const std::uint32_t count = static_cast<std::uint32_t>(
+        host_source_counts[source]);
+    if (count) runs.push_back({static_cast<std::uint32_t>(candidate_total),
+                               count});
+    candidate_total += count;
+  }
+  if (!candidate_total)
+    throw std::logic_error("sparse roster has no exact candidates");
+  ensure_candidate_capacity(static_cast<std::uint32_t>(candidate_total));
+  if (pending_winners)
+    emit_incoming_candidate_stream<<<blocks(pending_winners), kThreads, 0,
+                                     stream>>>(
+        pending, pending_order_->winners(), pending_winners,
+        candidates_.data());
+  if (source_count) {
+    check(cudaMemcpyAsync(
+              source_begins_.data(), host_source_begins.data(),
+              source_count * sizeof(std::uint32_t),
+              cudaMemcpyHostToDevice, stream),
+          "stage resident sparse stream begins");
+    emit_resident_candidate_streams<<<source_count, kThreads, 0, stream>>>(
+        roster_.data(), roster_count_host_, arena, descriptors,
+        device_roots_.data(), device_source_levels_.data(), source_count,
+        source_begins_.data(), candidates_.data());
+  }
+
+  const TerminalSourceView<CompletionSourceView> terminal{
+      pending, arena, device_roots_.data(), candidates_.data()};
+  const auto merged = fan_in_.merge(
+      terminal, runs, static_cast<std::uint32_t>(candidate_total), stream);
+  ensure_group_capacity(merged.winner_count);
+  mark_live_terminal_winners<<<blocks(merged.winner_count), kThreads, 0,
+                               stream>>>(
+      terminal, merged.winners, merged.winner_count, live_flags_.data());
+  bytes = group_select_bytes_;
+  check(cub::DeviceSelect::Flagged(
+            group_temporary_.data(), bytes, merged.winners,
+            live_flags_.data(), live_winners_.data(), live_count_.data(),
+            merged.winner_count, stream),
+        "select live exact winners");
+  std::uint32_t live_count = 0u;
+  check(cudaMemcpyAsync(&live_count, live_count_.data(), sizeof(live_count),
+                        cudaMemcpyDeviceToHost, stream),
+        "copy live exact winner count");
+  check(cudaStreamSynchronize(stream), "wait live exact winners");
+  check(cudaMemsetAsync(errors_.data(), 0, errors_.bytes(), stream),
+        "clear sparse refinement errors");
+
+  std::uint32_t group_count = 0u;
+  std::uint32_t exact_row_count = 0u;
+  std::uint32_t exact_head_count = 0u;
+  std::uint32_t special_head_count = 0u;
+  if (live_count) {
+    make_winner_heads<<<blocks(live_count), kThreads, 0, stream>>>(
+        terminal, live_winners_.data(), live_count, winner_heads_.data());
+    bytes = group_rle_bytes_;
+    check(cub::DeviceRunLengthEncode::Encode(
+              group_temporary_.data(), bytes, winner_heads_.data(),
+              group_heads_.data(), group_counts_.data(), group_count_.data(),
+              live_count, stream),
+          "encode refined winner heads");
+    check(cudaMemcpyAsync(&group_count, group_count_.data(),
+                          sizeof(group_count), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy refined head count");
+    check(cudaStreamSynchronize(stream), "wait refined head count");
+    bytes = group_scan_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              group_temporary_.data(), bytes, group_counts_.data(),
+              group_starts_.data(), group_count, stream),
+          "scan refined winner heads");
+    classify_refined_groups<<<blocks(group_count), kThreads, 0, stream>>>(
+        terminal, live_winners_.data(), group_counts_.data(),
+        group_starts_.data(), group_count, exact_rows_.data(),
+        exact_flags_.data(), special_flags_.data());
+    bytes = group_scan_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              group_temporary_.data(), bytes, exact_rows_.data(),
+              exact_offsets_.data(), group_count, stream),
+          "scan refined exact rows");
+    finish_scan_total<<<1, 1, 0, stream>>>(
+        exact_rows_.data(), exact_offsets_.data(), group_count_.data(),
+        pending_total_.data());
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    bytes = group_select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              group_temporary_.data(), bytes, ids, exact_flags_.data(),
+              exact_group_ids_.data(), exact_group_count_.data(),
+              group_count, stream),
+          "select refined exact groups");
+    bytes = group_select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              group_temporary_.data(), bytes, group_heads_.data(),
+              special_flags_.data(), selected_special_heads_.data(),
+              special_head_count_.data(), group_count, stream),
+          "select refined special heads");
+    check(cudaMemcpyAsync(&exact_row_count, pending_total_.data(),
+                          sizeof(exact_row_count), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy refined exact row count");
+    check(cudaMemcpyAsync(&exact_head_count, exact_group_count_.data(),
+                          sizeof(exact_head_count), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy refined exact head count");
+    check(cudaMemcpyAsync(&special_head_count, special_head_count_.data(),
+                          sizeof(special_head_count), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy refined special head count");
+    check(cudaStreamSynchronize(stream),
+          "wait refined sparse metadata counts");
+  }
+
+  overlay.exact_heads.reset(exact_head_count);
+  overlay.exact_rows.reset(exact_row_count);
+  overlay.special_heads.reset(special_head_count);
+  if (exact_head_count)
+    build_refined_exact_descriptors<<<
+        blocks(exact_head_count), kThreads, 0, stream>>>(
+        exact_group_ids_.data(), exact_head_count, group_heads_.data(),
+        group_counts_.data(), exact_offsets_.data(),
+        overlay.exact_heads.data());
+  if (special_head_count)
+    check(cudaMemcpyAsync(
+              overlay.special_heads.data(), selected_special_heads_.data(),
+              std::size_t{special_head_count} * sizeof(std::uint32_t),
+              cudaMemcpyDeviceToDevice, stream),
+          "store refined special heads");
+  if (group_count)
+    resolve_refined_destinations<<<group_count, kThreads, 0, stream>>>(
+        group_heads_.data(), group_counts_.data(), group_starts_.data(),
+        exact_offsets_.data(), exact_flags_.data(), group_count,
+        destination_level, arena, descriptors, destinations_.data(),
+        errors_.data());
+
+  std::uint32_t capsule_count = 0u;
+  std::uint32_t page_count = 0u;
+  std::uint64_t capsule_bytes = 0u;
+  if (live_count) {
+    ensure_capsule_capacity(live_count);
+    check(cudaMemsetAsync(capsule_ranks_.data(), 0,
+                          std::size_t{live_count} * sizeof(std::uint16_t),
+                          stream),
+          "clear refined capsule ranks");
+    classify_refined_capsules<<<blocks(live_count), kThreads, 0, stream>>>(
+        terminal, live_winners_.data(), live_count, capsule_flags_.data());
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    bytes = capsule_select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              capsule_temporary_.data(), bytes, ids, capsule_flags_.data(),
+              capsule_positions_a_.data(), capsule_count_.data(), live_count,
+              stream),
+          "select refined capsules");
+    check(cudaMemcpyAsync(&capsule_count, capsule_count_.data(),
+                          sizeof(capsule_count), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy refined capsule count");
+    check(cudaStreamSynchronize(stream), "wait refined capsule count");
+  }
+  if (capsule_count) {
+    gather_refined_capsule_sort_fields<<<
+        blocks(capsule_count), kThreads, 0, stream>>>(
+        capsule_positions_a_.data(), capsule_count_.data(),
+        destinations_.data(), capsule_rows_a_.data(),
+        capsule_positions_b_.data());
+    bytes = capsule_sort_bytes_;
+    check(cub::DeviceRadixSort::SortPairs(
+              capsule_temporary_.data(), bytes, capsule_rows_a_.data(),
+              capsule_rows_b_.data(), capsule_positions_b_.data(),
+              capsule_positions_a_.data(), capsule_count, 0, 64, stream),
+          "sort refined capsules by destination");
+    gather_sorted_refined_capsules<<<
+        blocks(capsule_count), kThreads, 0, stream>>>(
+        live_winners_.data(), capsule_positions_a_.data(),
+        capsule_rows_b_.data(), capsule_count_.data(), capsule_refs_.data(),
+        capsule_pages_.data());
+    bytes = capsule_rle_bytes_;
+    check(cub::DeviceRunLengthEncode::Encode(
+              capsule_temporary_.data(), bytes, capsule_pages_.data(),
+              unique_pages_.data(), page_counts_.data(), page_count_.data(),
+              capsule_count, stream),
+          "encode refined capsule pages");
+    check(cudaMemcpyAsync(&page_count, page_count_.data(),
+                          sizeof(page_count), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy refined capsule page count");
+    check(cudaStreamSynchronize(stream),
+          "wait refined capsule page count");
+    bytes = capsule_scan32_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              capsule_temporary_.data(), bytes, page_counts_.data(),
+              page_starts_.data(), page_count, stream),
+          "scan refined capsule pages");
+    const CapsuleLifecycleSource *lifecycle = prepare_capsule_lifecycle(
+        terminal, capsule_refs_.data(), capsule_count, overlay, stream);
+    make_capsule_object_sizes<<<
+        blocks(std::uint64_t{capsule_count} + 1u), kThreads, 0, stream>>>(
+        terminal, capsule_refs_.data(), capsule_count_.data(), lifecycle,
+        lifecycle_count_, capsule_sizes_.data(), lifecycle_errors_.data());
+    bytes = capsule_scan64_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              capsule_temporary_.data(), bytes, capsule_sizes_.data(),
+              capsule_offsets_.data(), std::size_t{capsule_count} + 1u,
+              stream),
+          "scan refined capsule bytes");
+    check(cudaMemcpyAsync(&capsule_bytes,
+                          capsule_offsets_.data() + capsule_count,
+                          sizeof(capsule_bytes), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy refined capsule bytes");
+    check(cudaStreamSynchronize(stream), "wait refined capsule bytes");
+    overlay.pages.reset(page_count);
+    overlay.indexes.reset(capsule_count);
+    std::shared_ptr<CapsuleSegment> new_segment;
+    if (capsule_bytes) {
+      new_segment = std::make_shared<CapsuleSegment>(capsule_bytes);
+      overlay.segments.push_back({
+          new_segment, segment_ordinal, 0u, capsule_bytes, 0u});
+      overlay.live_bytes += capsule_bytes;
+    }
+    build_capsule_pages<<<blocks(page_count), kThreads, 0, stream>>>(
+        unique_pages_.data(), page_counts_.data(), page_starts_.data(),
+        page_count_.data(), overlay.pages.data());
+    assign_capsule_ranks<<<blocks(capsule_count), kThreads, 0, stream>>>(
+        capsule_pages_.data(), page_starts_.data(), page_count_.data(),
+        capsule_positions_a_.data(), capsule_count_.data(),
+        capsule_ranks_.data(), errors_.data());
+    emit_capsule_objects<<<blocks(capsule_count), kThreads, 0, stream>>>(
+        terminal, capsule_refs_.data(), capsule_count_.data(),
+        capsule_offsets_.data(), new_segment ? new_segment->data() : nullptr,
+        segment_ordinal, lifecycle_sources_.data(), lifecycle_count_,
+        overlay.indexes.data(), lifecycle_errors_.data());
+  }
+
+  if (live_count)
+    emit_refined_anchors<<<blocks(live_count), kThreads, 0, stream>>>(
+        terminal, live_winners_.data(), destinations_.data(),
+        capsule_flags_.data(), capsule_ranks_.data(), live_count, arena,
+        overlay.exact_rows.data());
+  if (exact_head_count)
+    patch_exact_projection_rows<<<blocks(exact_head_count), kThreads, 0,
+                                  stream>>>(
+        overlay.exact_heads.data(), exact_head_count, destination_level,
+        arena, descriptors, errors_.data());
+  patch_retired_roster_rows<<<blocks(roster_count_host_), kThreads, 0,
+                              stream>>>(
+      roster_.data(), roster_count_host_, group_heads_.data(), group_count,
+      destination_level, arena, descriptors, errors_.data());
+  check(cudaGetLastError(), "refine sparse projection");
+
+  unsigned long long errors = 0u;
+  unsigned long long lifecycle_errors = 0u;
+  check(cudaMemcpyAsync(&errors, errors_.data(), sizeof(errors),
+                        cudaMemcpyDeviceToHost, stream),
+        "copy sparse refinement errors");
+  if (lifecycle_errors_.size())
+    check(cudaMemcpyAsync(&lifecycle_errors, lifecycle_errors_.data(),
+                          sizeof(lifecycle_errors), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy sparse lifecycle errors");
+  check(cudaStreamSynchronize(stream), "wait sparse refinement");
+  if (lifecycle_errors)
+    throw std::runtime_error(
+        "capsule lifecycle error kind " +
+        std::to_string(static_cast<std::uint32_t>(lifecycle_errors >> 32u)) +
+        " segment " + std::to_string(static_cast<std::uint32_t>(
+            lifecycle_errors)));
+  if (errors)
+    throw std::runtime_error("invalid sparse projection refinement");
+
+  RootBuildState state{};
+  state.level = destination_level;
+  state.generation = output_generation;
+  state.row_count = projection_count;
+  state.logical_count = projection_count - exact_head_count + exact_row_count;
+  state.exact_head_count = exact_head_count;
+  state.special_head_count = special_head_count;
+  state.physical_begin = output_begin;
+  state.exact_heads = reinterpret_cast<std::uint64_t>(
+      overlay.exact_heads.data());
+  state.exact_rows = reinterpret_cast<std::uint64_t>(
+      overlay.exact_rows.data());
+  state.special_heads = reinterpret_cast<std::uint64_t>(
+      overlay.special_heads.data());
+  state.capsule_pages = reinterpret_cast<std::uint64_t>(
+      overlay.pages.data());
+  state.capsule_indexes = reinterpret_cast<std::uint64_t>(
+      overlay.indexes.data());
+  state.exact_row_count = exact_row_count;
+  state.capsule_page_count = page_count;
+  state.capsule_count = capsule_count;
+  state.capsule_live_bytes = overlay.live_bytes;
+  state.capsule_garbage_bytes = overlay.garbage_bytes;
+  overlay.state = state;
+  if (special_head_count) {
+    overlay.device_state.reset(1u);
+    check(cudaMemcpyAsync(overlay.device_state.data(), &overlay.state,
+                          sizeof(overlay.state), cudaMemcpyHostToDevice,
+                          stream),
+          "stage refined root state");
+  }
+  return {exact_head_count, exact_row_count, special_head_count,
+          capsule_count, page_count, capsule_bytes};
+}
+
+inline std::size_t SparseRefinementWorkspace::bytes() const {
+  return roster_input_.bytes() + roster_sorted_.bytes() + roster_.bytes() +
+      roster_run_counts_.bytes() + roster_count_.bytes() +
+      roster_temporary_.bytes() + device_roots_.bytes() +
+      device_source_levels_.bytes() + pending_counts_.bytes() +
+      pending_offsets_.bytes() + pending_ages_a_.bytes() +
+      pending_ages_b_.bytes() + pending_refs_a_.bytes() +
+      pending_refs_b_.bytes() + pending_total_.bytes() +
+      pending_temporary_.bytes() +
+      (pending_order_ ? pending_order_->bytes() : 0u) + candidates_.bytes() +
+      source_counts_.bytes() + source_begins_.bytes() + fan_in_.bytes() +
+      live_flags_.bytes() + live_winners_.bytes() + live_count_.bytes() +
+      winner_heads_.bytes() + group_heads_.bytes() + group_counts_.bytes() +
+      group_starts_.bytes() + group_count_.bytes() + exact_rows_.bytes() +
+      exact_offsets_.bytes() + exact_flags_.bytes() +
+      special_flags_.bytes() + exact_group_ids_.bytes() +
+      exact_group_count_.bytes() + selected_special_heads_.bytes() +
+      special_head_count_.bytes() + destinations_.bytes() + errors_.bytes() +
+      group_temporary_.bytes() + capsule_flags_.bytes() +
+      capsule_ranks_.bytes() + capsule_positions_a_.bytes() +
+      capsule_positions_b_.bytes() + capsule_count_.bytes() +
+      capsule_refs_.bytes() + capsule_rows_a_.bytes() +
+      capsule_rows_b_.bytes() + capsule_pages_.bytes() +
+      unique_pages_.bytes() + page_counts_.bytes() + page_starts_.bytes() +
+      page_count_.bytes() + capsule_sizes_.bytes() +
+      capsule_offsets_.bytes() + capsule_temporary_.bytes() +
+      lifecycle_sources_.bytes() + lifecycle_errors_.bytes();
+}
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/refine.cuh
+// BEGIN INLINED COMPONENT: gpulsm_sparse/bulk.cuh
+
+
+namespace gpulsm_sparse {
+
+// Direct extraction of the observed-head front of the closure prototype's
+// UniversalRootWorkspace.  It produces exactly one restored projection row
+// per head and compacts only exceptional head groups for exact refinement.
+template <class Source>
+__device__ __forceinline__ bool direct_source_requires_sparse(
+    Source source, std::uint32_t ref) {
+  const auto key = source_key(source, ref);
+  const auto value = source_value(source, ref);
+  const bool tombstone = source_tombstone(source, ref);
+  const std::uint32_t inline_value = value.inline_word();
+  return source_owned_capsule(source, ref) || key.length() != 4u ||
+      (!tombstone && value.length() != 4u) ||
+      (!tombstone && source_summary(source, ref) != inline_value);
+}
+
+template <class Source>
+__global__ void classify_direct_head_groups(
+    Source source, const std::uint32_t *sorted_refs,
+    const std::uint32_t *group_counts, const std::uint32_t *group_starts,
+    std::uint32_t group_count, std::uint32_t *sparse_rows,
+    std::uint8_t *sparse_flags) {
+  const std::uint32_t group = blockIdx.x;
+  if (group >= group_count) return;
+  const std::uint32_t begin = group_starts[group];
+  const std::uint32_t count = group_counts[group];
+  __shared__ std::uint32_t sparse;
+  if (!threadIdx.x) sparse = 0u;
+  __syncthreads();
+  for (std::uint32_t local = threadIdx.x; local < count;
+       local += blockDim.x)
+    if (direct_source_requires_sparse(source, sorted_refs[begin + local]))
+      atomicExch(&sparse, 1u);
+  __syncthreads();
+  if (!threadIdx.x) {
+    sparse_rows[group] = sparse ? count : 0u;
+    sparse_flags[group] = static_cast<std::uint8_t>(sparse);
+  }
+}
+
+__global__ void scatter_direct_sparse_refs(
+    const std::uint32_t *sorted_refs, const std::uint32_t *group_counts,
+    const std::uint32_t *group_starts,
+    const std::uint32_t *sparse_offsets,
+    const std::uint8_t *sparse_flags, std::uint32_t group_count,
+    std::uint32_t *sparse_refs) {
+  const std::uint32_t group = blockIdx.x;
+  if (group >= group_count || !sparse_flags[group]) return;
+  const std::uint32_t count = group_counts[group];
+  for (std::uint32_t local = threadIdx.x; local < count;
+       local += blockDim.x)
+    sparse_refs[sparse_offsets[group] + local] =
+        sorted_refs[group_starts[group] + local];
+}
+
+template <class Source>
+__global__ void emit_direct_projection(
+    Source source, const std::uint32_t *heads,
+    const std::uint32_t *sorted_refs,
+    const std::uint32_t *group_counts, const std::uint32_t *group_starts,
+    const std::uint8_t *sparse_flags, std::uint32_t group_count,
+    std::uint32_t *projection_keys,
+    gpulsmopt2_detail::Row *projection_rows) {
+  const std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+  if (group >= group_count) return;
+  const std::uint32_t head = heads[group];
+  projection_keys[group] = head;
+  if (sparse_flags[group]) {
+    projection_rows[group] = exact_group_row(head, 0u);
+    return;
+  }
+  // DeviceRadixSort is stable, so the last member of an ordinary head group
+  // is the newest input update, matching restored bulk/admission chronology.
+  const std::uint32_t ref = sorted_refs[
+      group_starts[group] + group_counts[group] - 1u];
+  const bool tombstone = source_tombstone(source, ref);
+  projection_rows[group] = {
+      tombstone ? gpulsmopt2_detail::kInvalid : source_summary(source, ref),
+      static_cast<std::uint16_t>(head),
+      static_cast<std::uint16_t>(
+          tombstone ? gpulsmopt2_detail::kTombstone : 0u)};
+}
+
+__global__ void build_direct_section_offsets(
+    const std::uint32_t *heads, std::uint32_t count,
+    std::uint32_t *offsets) {
+  const std::uint32_t section = blockIdx.x * blockDim.x + threadIdx.x;
+  if (section > kSections) return;
+  if (section == kSections) {
+    offsets[section] = count;
+    return;
+  }
+  const std::uint32_t target = section << 16u;
+  std::uint32_t low = 0u;
+  std::uint32_t high = count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (heads[middle] < target) low = middle + 1u;
+    else high = middle;
+  }
+  offsets[section] = low;
+}
+
+__global__ void build_direct_epoch_counts_and_ranks(
+    const gpulsmopt2_detail::Row *rows,
+    const std::uint32_t *section_offsets, std::uint32_t *section_counts,
+    std::uint16_t *cell_ranks) {
+  const std::uint32_t section = blockIdx.x;
+  const std::uint32_t cell = threadIdx.x;
+  const std::uint32_t begin = section_offsets[section];
+  const std::uint32_t count =
+      section_offsets[section + 1u] - begin;
+  if (!cell) {
+    section_counts[section] = count;
+    if (!section) section_counts[kSections] = 0u;
+  }
+  cell_ranks[std::size_t{section} *
+                 gpulsmopt2_detail::kFoundationCells + cell] =
+      static_cast<std::uint16_t>(gpulsmopt2_detail::lower_bound_rows(
+          rows + begin, count,
+          cell * gpulsmopt2_detail::kFoundationCellKeys));
+}
+
+struct DirectRootPreparation {
+  std::uint32_t projection_rows{};
+  std::uint32_t logical_rows{};
+  std::uint32_t sparse_heads{};
+  std::uint32_t sparse_input_rows{};
+};
+
+class DirectRootWorkspace {
+ public:
+  explicit DirectRootWorkspace(std::uint32_t capacity)
+      : capacity_(capacity), heads_a_(capacity), heads_b_(capacity),
+        refs_a_(capacity), refs_b_(capacity), group_heads_(capacity),
+        group_counts_(capacity), group_starts_(capacity), group_count_(1u),
+        sparse_rows_(capacity), sparse_offsets_(capacity),
+        sparse_flags_(capacity), sparse_heads_(capacity),
+        sparse_head_count_(1u), sparse_refs_(capacity), totals_(1u) {
+    projection_keys_.reset(capacity);
+    projection_rows_.reset(capacity);
+    section_offsets_.reset(kSections + 1u);
+    section_counts_.reset(kSections + 1u);
+    epoch_ranks_.reset(gpulsmopt2_detail::kLocalRankEntries);
+    std::size_t sizes[4]{};
+    check(cub::DeviceRadixSort::SortPairs(
+              nullptr, sizes[0], heads_a_.data(), heads_b_.data(),
+              refs_a_.data(), refs_b_.data(), capacity),
+          "size direct head sort");
+    check(cub::DeviceRunLengthEncode::Encode(
+              nullptr, sizes[1], heads_b_.data(), group_heads_.data(),
+              group_counts_.data(), group_count_.data(), capacity),
+          "size direct head encoding");
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, sizes[2], sparse_rows_.data(),
+              sparse_offsets_.data(), capacity),
+          "size direct sparse scan");
+    check(cub::DeviceSelect::Flagged(
+              nullptr, sizes[3], group_heads_.data(), sparse_flags_.data(),
+              sparse_heads_.data(), sparse_head_count_.data(), capacity),
+          "size direct sparse-head selection");
+    sort_bytes_ = sizes[0];
+    rle_bytes_ = sizes[1];
+    scan_bytes_ = sizes[2];
+    select_bytes_ = sizes[3];
+    temporary_.reset(*std::max_element(
+        std::begin(sizes), std::end(sizes)));
+  }
+
+  DirectRootPreparation prepare(
+      RecordBatchView source, std::uint32_t rows, cudaStream_t stream) {
+    if (!rows || rows > capacity_)
+      throw std::length_error("direct root capacity");
+    initialize_universal_records<<<blocks(rows), kThreads, 0, stream>>>(
+        source, nullptr, nullptr, heads_a_.data(), heads_a_.data(),
+        refs_a_.data(), rows);
+    std::size_t bytes = sort_bytes_;
+    check(cub::DeviceRadixSort::SortPairs(
+              temporary_.data(), bytes, heads_a_.data(), heads_b_.data(),
+              refs_a_.data(), refs_b_.data(), rows, 0, 32, stream),
+          "sort direct root heads");
+    bytes = rle_bytes_;
+    check(cub::DeviceRunLengthEncode::Encode(
+              temporary_.data(), bytes, heads_b_.data(),
+              group_heads_.data(), group_counts_.data(),
+              group_count_.data(), rows, stream),
+          "encode direct root heads");
+    std::uint32_t groups = 0u;
+    check(cudaMemcpyAsync(&groups, group_count_.data(), sizeof(groups),
+                          cudaMemcpyDeviceToHost, stream),
+          "copy direct projection count");
+    check(cudaStreamSynchronize(stream),
+          "wait direct projection count");
+    bytes = scan_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, group_counts_.data(),
+              group_starts_.data(), groups, stream),
+          "scan direct head groups");
+    classify_direct_head_groups<<<groups, kThreads, 0, stream>>>(
+        source, refs_b_.data(), group_counts_.data(), group_starts_.data(),
+        groups, sparse_rows_.data(), sparse_flags_.data());
+    bytes = scan_bytes_;
+    check(cub::DeviceScan::ExclusiveSum(
+              temporary_.data(), bytes, sparse_rows_.data(),
+              sparse_offsets_.data(), groups, stream),
+          "scan direct sparse rows");
+    finish_scan_total<<<1, 1, 0, stream>>>(
+        sparse_rows_.data(), sparse_offsets_.data(), group_count_.data(),
+        totals_.data());
+    bytes = select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              temporary_.data(), bytes, group_heads_.data(),
+              sparse_flags_.data(), sparse_heads_.data(),
+              sparse_head_count_.data(), groups, stream),
+          "select direct sparse heads");
+    std::uint32_t sparse[2]{};
+    check(cudaMemcpyAsync(sparse, sparse_head_count_.data(),
+                          sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy direct sparse head count");
+    check(cudaMemcpyAsync(sparse + 1u, totals_.data(),
+                          sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy direct sparse row count");
+    check(cudaStreamSynchronize(stream), "wait direct sparse counts");
+
+    std::uint32_t sparse_winners = 0u;
+    if (sparse[1]) {
+      scatter_direct_sparse_refs<<<groups, kThreads, 0, stream>>>(
+          refs_b_.data(), group_counts_.data(), group_starts_.data(),
+          sparse_offsets_.data(), sparse_flags_.data(), groups,
+          sparse_refs_.data());
+      exact_order_ = std::make_unique<ExactOrderWorkspace>(sparse[1]);
+      sparse_winners = exact_order_->order(
+          source, sparse[1], stream, nullptr, sparse_refs_.data())
+          .winner_count;
+    }
+    const std::uint64_t logical =
+        std::uint64_t{groups} - sparse[0] + sparse_winners;
+    if (logical > std::numeric_limits<std::uint32_t>::max())
+      throw std::length_error("direct logical root exceeds 32 bits");
+    return {groups, static_cast<std::uint32_t>(logical), sparse[0],
+            sparse[1]};
+  }
+
+  void materialize_projection(
+      RecordBatchView source, std::uint32_t groups,
+      std::uint32_t *projection_keys,
+      gpulsmopt2_detail::Row *projection_rows,
+      cudaStream_t stream) const {
+    emit_direct_projection<<<blocks(groups), kThreads, 0, stream>>>(
+        source, group_heads_.data(), refs_b_.data(), group_counts_.data(),
+        group_starts_.data(), sparse_flags_.data(), groups,
+        projection_keys, projection_rows);
+    check(cudaGetLastError(), "materialize direct root projection");
+  }
+
+  void materialize_epoch(
+      RecordBatchView source, std::uint32_t groups,
+      cudaStream_t stream) {
+    materialize_projection(source, groups, projection_keys_.data(),
+                           projection_rows_.data(), stream);
+    build_direct_section_offsets<<<blocks(kSections + 1u), kThreads, 0,
+                                   stream>>>(
+        projection_keys_.data(), groups, section_offsets_.data());
+    build_direct_epoch_counts_and_ranks<<<
+        kSections, gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+        projection_rows_.data(), section_offsets_.data(),
+        section_counts_.data(), epoch_ranks_.data());
+    check(cudaGetLastError(), "materialize direct projection epoch");
+  }
+
+  const std::uint32_t *sorted_heads() const { return heads_b_.data(); }
+  const std::uint32_t *sorted_refs() const { return refs_b_.data(); }
+  const std::uint32_t *sparse_heads() const {
+    return sparse_heads_.data();
+  }
+  const std::uint32_t *projection_keys() const {
+    return projection_keys_.data();
+  }
+  const gpulsmopt2_detail::Row *projection_rows() const {
+    return projection_rows_.data();
+  }
+  const std::uint32_t *section_offsets() const {
+    return section_offsets_.data();
+  }
+  const std::uint32_t *section_counts() const {
+    return section_counts_.data();
+  }
+  const std::uint16_t *epoch_ranks() const { return epoch_ranks_.data(); }
+  const std::uint32_t *projection_count_device() const {
+    return group_count_.data();
+  }
+
+  std::size_t bytes() const {
+    return heads_a_.bytes() + heads_b_.bytes() + refs_a_.bytes() +
+        refs_b_.bytes() + group_heads_.bytes() + group_counts_.bytes() +
+        group_starts_.bytes() + group_count_.bytes() +
+        sparse_rows_.bytes() + sparse_offsets_.bytes() +
+        sparse_flags_.bytes() + sparse_heads_.bytes() +
+        sparse_head_count_.bytes() + sparse_refs_.bytes() + totals_.bytes() +
+        projection_keys_.bytes() + projection_rows_.bytes() +
+        section_offsets_.bytes() + section_counts_.bytes() +
+        epoch_ranks_.bytes() + temporary_.bytes() +
+        (exact_order_ ? exact_order_->bytes() : 0u);
+  }
+
+ private:
+  std::uint32_t capacity_{};
+  Buffer<std::uint32_t> heads_a_, heads_b_, refs_a_, refs_b_;
+  Buffer<std::uint32_t> group_heads_, group_counts_, group_starts_;
+  Buffer<std::uint32_t> group_count_, sparse_rows_, sparse_offsets_;
+  Buffer<std::uint8_t> sparse_flags_;
+  Buffer<std::uint32_t> sparse_heads_, sparse_head_count_, sparse_refs_;
+  Buffer<std::uint32_t> totals_;
+  Buffer<std::uint32_t> projection_keys_, section_offsets_,
+      section_counts_;
+  Buffer<gpulsmopt2_detail::Row> projection_rows_;
+  Buffer<std::uint16_t> epoch_ranks_;
+  Buffer<std::uint8_t> temporary_;
+  std::unique_ptr<ExactOrderWorkspace> exact_order_;
+  std::size_t sort_bytes_{}, rle_bytes_{}, scan_bytes_{}, select_bytes_{};
+};
+
+__global__ void initialize_direct_sparse_manifest(
+    DeviceSparseManifest *manifests, const RootBuildState *root,
+    std::uint32_t level, std::uint32_t flags) {
+  if (blockIdx.x || threadIdx.x) return;
+  DeviceSparseManifest manifest{};
+  manifest.generation = 1u;
+  if (root && flags) {
+    manifest.levels[level] = {
+        reinterpret_cast<std::uint64_t>(root), root->generation, flags};
+    if (flags & kSparseHasExactHeads)
+      manifest.exact_level_mask = std::uint64_t{1u} << level;
+    if (flags & kSparseHasCapsules)
+      manifest.capsule_level_mask = std::uint64_t{1u} << level;
+  }
+  manifests[0] = manifest;
+  manifests[1] = manifest;
+}
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/bulk.cuh
+// BEGIN INLINED COMPONENT: gpulsm_sparse/sealed.cuh
+
+
+namespace gpulsm_sparse {
+
+// Validated specialized sealed-anchor builder transplanted from
+// closure_spine.cuh.  It remains an all-inline builder: mixed intervals use
+// DirectRootWorkspace plus the same sparse refinement instead.
+__global__ void mark_last_sealed_key(
+    const std::uint32_t *keys, std::uint32_t count, std::uint8_t *keep) {
+  const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < count)
+    keep[row] = static_cast<std::uint8_t>(
+        row + 1u == count || keys[row] != keys[row + 1u]);
+}
+
+__global__ void gather_sealed_to_arena(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    const std::uint32_t *selected, const std::uint32_t *selected_count,
+    gpulsmopt2_detail::ResidentRows arena, std::uint64_t destination) {
+  for (std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+       row < *selected_count; row += blockDim.x * gridDim.x) {
+    const std::uint32_t source = selected[row];
+    arena.store(destination + row,
+                gpulsmopt2_detail::make_row(
+                    keys[source], values[source], 0u));
+  }
+}
+
+__global__ void gather_sealed_epoch_rows(
+    const std::uint32_t *keys, const std::uint32_t *values,
+    const std::uint32_t *selected, const std::uint32_t *selected_count,
+    gpulsmopt2_detail::Row *rows) {
+  for (std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+       row < *selected_count; row += blockDim.x * gridDim.x) {
+    const std::uint32_t source = selected[row];
+    rows[row] = gpulsmopt2_detail::make_row(
+        keys[source], values[source], 0u);
+  }
+}
+
+__global__ void build_sealed_section_offsets(
+    const std::uint32_t *keys, const std::uint32_t *selected,
+    const std::uint32_t *selected_count, std::uint32_t *offsets) {
+  const std::uint32_t section = blockIdx.x * blockDim.x + threadIdx.x;
+  if (section > kSections) return;
+  const std::uint32_t count = *selected_count;
+  if (section == kSections) {
+    offsets[section] = count;
+    return;
+  }
+  const std::uint32_t target = section << 16u;
+  std::uint32_t low = 0u;
+  std::uint32_t high = count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (keys[selected[middle]] < target) low = middle + 1u;
+    else high = middle;
+  }
+  offsets[section] = low;
+}
+
+__global__ void build_sealed_epoch_counts_and_ranks(
+    const gpulsmopt2_detail::Row *rows,
+    const std::uint32_t *section_offsets, std::uint32_t *section_counts,
+    std::uint16_t *cell_ranks) {
+  const std::uint32_t section = blockIdx.x;
+  const std::uint32_t cell = threadIdx.x;
+  const std::uint32_t begin = section_offsets[section];
+  const std::uint32_t count =
+      section_offsets[section + 1u] - begin;
+  if (cell == 0u) {
+    section_counts[section] = count;
+    if (section == 0u) section_counts[kSections] = 0u;
+  }
+  cell_ranks[std::size_t{section} *
+                 gpulsmopt2_detail::kFoundationCells + cell] =
+      static_cast<std::uint16_t>(gpulsmopt2_detail::lower_bound_rows(
+          rows + begin, count,
+          cell * gpulsmopt2_detail::kFoundationCellKeys));
+}
+
+class SealedWorkspace {
+ public:
+  explicit SealedWorkspace(std::uint32_t capacity)
+      : capacity_(capacity), sorted_keys_(capacity),
+        sorted_values_(capacity), keep_(capacity), selected_(capacity),
+        selected_count_(1u), section_offsets_(kSections + 1u),
+        section_counts_(kSections + 1u), epoch_rows_(capacity),
+        epoch_ranks_(gpulsmopt2_detail::kLocalRankEntries) {
+    std::size_t bytes = 0u;
+    check(cub::DeviceRadixSort::SortPairs(
+              nullptr, bytes, sorted_keys_.data(), sorted_keys_.data(),
+              sorted_values_.data(), sorted_values_.data(), capacity_,
+              0, 32),
+          "size sealed sort");
+    sort_bytes_ = bytes;
+    sort_temporary_.reset(bytes);
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    bytes = 0u;
+    check(cub::DeviceSelect::Flagged(
+              nullptr, bytes, ids, keep_.data(), selected_.data(),
+              selected_count_.data(), capacity_),
+          "size sealed selection");
+    select_bytes_ = bytes;
+    select_temporary_.reset(bytes);
+  }
+
+  std::uint32_t capacity() const { return capacity_; }
+
+  std::uint32_t prepare(
+      const std::uint32_t *keys, const std::uint32_t *values,
+      std::uint32_t count, bool materialize_epoch, cudaStream_t stream) {
+    if (!count || count > capacity_)
+      throw std::length_error("sealed workspace capacity");
+    std::size_t bytes = sort_bytes_;
+    check(cub::DeviceRadixSort::SortPairs(
+              sort_temporary_.data(), bytes, keys, sorted_keys_.data(),
+              values, sorted_values_.data(), count, 0, 32, stream),
+          "sort sealed interval");
+    mark_last_sealed_key<<<blocks(count), kThreads, 0, stream>>>(
+        sorted_keys_.data(), count, keep_.data());
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    bytes = select_bytes_;
+    check(cub::DeviceSelect::Flagged(
+              select_temporary_.data(), bytes, ids, keep_.data(),
+              selected_.data(), selected_count_.data(), count, stream),
+          "select sealed winners");
+    build_sealed_section_offsets<<<blocks(kSections + 1u), kThreads, 0,
+                                   stream>>>(
+        sorted_keys_.data(), selected_.data(), selected_count_.data(),
+        section_offsets_.data());
+    if (materialize_epoch) {
+      gather_sealed_epoch_rows<<<4096, kThreads, 0, stream>>>(
+          sorted_keys_.data(), sorted_values_.data(), selected_.data(),
+          selected_count_.data(), epoch_rows_.data());
+      build_sealed_epoch_counts_and_ranks<<<
+          kSections, gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+          epoch_rows_.data(), section_offsets_.data(),
+          section_counts_.data(), epoch_ranks_.data());
+    }
+    std::uint32_t selected = 0u;
+    check(cudaMemcpyAsync(&selected, selected_count_.data(),
+                          sizeof(selected), cudaMemcpyDeviceToHost,
+                          stream),
+          "copy sealed winner count");
+    check(cudaStreamSynchronize(stream), "wait sealed preparation");
+    return selected;
+  }
+
+  const std::uint32_t *sorted_keys() const { return sorted_keys_.data(); }
+  const std::uint32_t *sorted_values() const {
+    return sorted_values_.data();
+  }
+  const std::uint32_t *selected() const { return selected_.data(); }
+  const std::uint32_t *selected_count() const {
+    return selected_count_.data();
+  }
+  const std::uint32_t *section_offsets() const {
+    return section_offsets_.data();
+  }
+  const std::uint32_t *section_counts() const {
+    return section_counts_.data();
+  }
+  const gpulsmopt2_detail::Row *epoch_rows() const {
+    return epoch_rows_.data();
+  }
+  const std::uint16_t *epoch_ranks() const { return epoch_ranks_.data(); }
+
+  std::size_t bytes() const {
+    return sorted_keys_.bytes() + sorted_values_.bytes() + keep_.bytes() +
+        selected_.bytes() + selected_count_.bytes() +
+        section_offsets_.bytes() + section_counts_.bytes() +
+        epoch_rows_.bytes() + epoch_ranks_.bytes() +
+        sort_temporary_.bytes() + select_temporary_.bytes();
+  }
+
+ private:
+  std::uint32_t capacity_{};
+  Buffer<std::uint32_t> sorted_keys_, sorted_values_;
+  Buffer<std::uint8_t> keep_;
+  Buffer<std::uint32_t> selected_, selected_count_;
+  Buffer<std::uint32_t> section_offsets_, section_counts_;
+  Buffer<gpulsmopt2_detail::Row> epoch_rows_;
+  Buffer<std::uint16_t> epoch_ranks_;
+  Buffer<std::uint8_t> sort_temporary_, select_temporary_;
+  std::size_t sort_bytes_{}, select_bytes_{};
+};
+
+struct SealedForestCommand {
+  std::uint64_t expected_mask{};
+  std::uint64_t consumed_mask{};
+  std::uint64_t output_mask{};
+  std::uint64_t final_mask{};
+  std::uint64_t output_generation_bits{};
+  std::uint64_t sparse_states[kLevels]{};
+  std::uint32_t sparse_flags[kLevels]{};
+};
+
+struct SealedForestReceipt {
+  std::uint64_t occupied_mask{};
+  std::uint32_t generation{};
+  std::uint32_t status{};
+};
+
+// One publication for every final materialized root.  This is the prototype
+// multi-root receipt rule grafted onto the original ordinary manifest and
+// the sparse-only companion table; it introduces no wrapper manifest.
+__global__ void publish_sealed_forest(
+    const SealedForestCommand *command,
+    gpulsmopt2_detail::DeviceManifest *manifests,
+    DeviceSparseManifest *sparse_manifests,
+    std::uint32_t *active_manifest, std::uint64_t *query_mask,
+    SealedForestReceipt *receipt) {
+  if (blockIdx.x) return;
+  const std::uint32_t active = atomicAdd(active_manifest, 0u) & 1u;
+  const auto *current = manifests + active;
+  auto *next = manifests + (active ^ 1u);
+  const auto *current_sparse = sparse_manifests + active;
+  auto *next_sparse = sparse_manifests + (active ^ 1u);
+  if (current->occupied_level_mask != command->expected_mask) {
+    if (!threadIdx.x) {
+      receipt->occupied_mask = current->occupied_level_mask;
+      receipt->generation = current->generation;
+      receipt->status = 1u;
+    }
+    return;
+  }
+  for (std::uint32_t level = threadIdx.x; level < kLevels;
+       level += blockDim.x) {
+    const std::uint64_t bit = std::uint64_t{1u} << level;
+    if (command->output_mask & bit) {
+      gpulsmopt2_detail::DeviceLevelState state{};
+      state.storage_generation =
+          (command->output_generation_bits & bit) != 0u;
+      next->levels[level] = state;
+      const std::uint32_t flags = command->sparse_flags[level];
+      next_sparse->levels[level] = flags
+          ? DeviceSparseLevelState{command->sparse_states[level],
+                                   state.storage_generation, flags}
+          : DeviceSparseLevelState{};
+    } else if (command->consumed_mask & bit) {
+      next->levels[level] = {};
+      next_sparse->levels[level] = {};
+    } else {
+      next->levels[level] = current->levels[level];
+      next_sparse->levels[level] = current_sparse->levels[level];
+    }
+  }
+  __syncthreads();
+  if (!threadIdx.x) {
+    next->occupied_level_mask = command->final_mask;
+    next->active_levels = command->final_mask
+        ? 64u - static_cast<std::uint32_t>(__clzll(command->final_mask))
+        : 0u;
+    next->foundation_level = next->active_levels
+        ? next->active_levels - 1u : kLevels;
+    next->generation = current->generation + 1u;
+
+    next_sparse->exact_level_mask = 0u;
+    next_sparse->capsule_level_mask = 0u;
+    for (std::uint32_t level = 0u; level < kLevels; ++level) {
+      const std::uint64_t bit = std::uint64_t{1u} << level;
+      if (!(command->final_mask & bit)) continue;
+      const std::uint32_t flags = next_sparse->levels[level].flags;
+      if (flags & kSparseHasExactHeads)
+        next_sparse->exact_level_mask |= bit;
+      if (flags & kSparseHasCapsules)
+        next_sparse->capsule_level_mask |= bit;
+    }
+    next_sparse->generation = next->generation;
+    receipt->occupied_mask = command->final_mask;
+    receipt->generation = next->generation;
+    receipt->status = 0u;
+    __threadfence();
+    atomicExch(active_manifest, active ^ 1u);
+    atomicExch(reinterpret_cast<unsigned long long *>(query_mask),
+               static_cast<unsigned long long>(command->final_mask));
+  }
+}
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/sealed.cuh
+// BEGIN INLINED COMPONENT: gpulsm_sparse/read.cuh
+
+
+namespace gpulsm_sparse {
+
+// The restored FliX result plane and the optional complete-value sink share
+// one final-store helper.  Sparse reads never allocate an intermediate
+// `found` array.
+struct SparseLookupOutput {
+  std::uint32_t *summaries{};
+  DeviceByteSink values{};
+  std::uint64_t *value_lengths{};
+  std::uint8_t *found{};
+  std::uint8_t *overflow{};
+};
+
+struct InlineWordCursor {
+  std::uint32_t word{};
+  std::uint64_t bytes{4u};
+
+  __device__ std::uint64_t length() const { return bytes; }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    return static_cast<std::uint8_t>(word >> (8u * position));
+  }
+};
+
+struct CapsuleValueCursor {
+  const CapsuleHeader *object{};
+
+  __device__ std::uint64_t length() const {
+    return object ? object->value_length : 0u;
+  }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const auto *bytes = reinterpret_cast<const std::uint8_t *>(object + 1u);
+    return bytes[object->key_length + position];
+  }
+};
+
+__device__ __forceinline__ void write_lookup_missing(
+    std::uint32_t output, SparseLookupOutput destination) {
+  if (destination.summaries)
+    destination.summaries[output] = destination.found
+        ? 0u : gpulsmopt2_detail::kInvalid;
+  if (destination.found) destination.found[output] = 0u;
+  if (destination.value_lengths) destination.value_lengths[output] = 0u;
+  if (destination.overflow) destination.overflow[output] = 0u;
+}
+
+template <class ValueCursor>
+__device__ __forceinline__ void write_lookup_live(
+    std::uint32_t output, std::uint32_t summary,
+    const ValueCursor &value, SparseLookupOutput destination) {
+  if (destination.summaries) destination.summaries[output] = summary;
+  if (destination.found) destination.found[output] = 1u;
+  const std::uint64_t length = value.length();
+  if (destination.value_lengths) destination.value_lengths[output] = length;
+
+  bool overflow = false;
+  if (destination.values.bytes) {
+    std::uint64_t begin = 0u;
+    std::uint64_t capacity = 0u;
+    if (destination.values.layout == DeviceSinkLayout::packed) {
+      if (!destination.values.offsets) {
+        overflow = true;
+      } else {
+        begin = destination.values.offsets[output];
+        const std::uint64_t end = destination.values.offsets[output + 1u];
+        overflow = end < begin || end > destination.values.capacity_bytes;
+        if (!overflow) capacity = end - begin;
+      }
+    } else {
+      begin = std::uint64_t{output} * destination.values.stride;
+      overflow = begin > destination.values.capacity_bytes;
+      if (!overflow) {
+        const std::uint64_t remaining =
+            destination.values.capacity_bytes - begin;
+        capacity = remaining < destination.values.stride
+            ? remaining : destination.values.stride;
+      }
+    }
+    overflow = overflow || length > capacity;
+    if (!overflow)
+      for (std::uint64_t position = 0u; position < length; ++position)
+        destination.values.bytes[begin + position] = value.byte(position);
+  }
+  if (destination.overflow)
+    destination.overflow[output] = static_cast<std::uint8_t>(overflow);
+}
+
+struct PendingReadView {
+  const std::uint32_t *keys{};
+  const gpulsmopt2_detail::RawPayload *payloads{};
+  const std::uint32_t *offsets{};
+  const PendingSlotBuildState *slots{};
+  std::uint32_t batch_capacity{};
+  std::uint32_t batch_count{};
+  std::uint32_t generation{};
+};
+
+struct PendingRecordCursor {
+  PendingReadView source{};
+  std::uint32_t batch{};
+  std::uint32_t local{};
+
+  __device__ std::uint64_t physical() const {
+    return std::uint64_t{batch} * source.batch_capacity + local;
+  }
+  __device__ gpulsmopt2_detail::RawPayload payload() const {
+    return source.payloads[physical()];
+  }
+  __device__ const PendingSlotBuildState *slot() const {
+    const PendingSlotBuildState *state = source.slots + batch;
+    return state->generation == source.generation ? state : nullptr;
+  }
+  __device__ const CapsuleIndex *capsule() const {
+    const PendingSlotBuildState *state = slot();
+    return state ? find_pending_capsule(*state, batch, local) : nullptr;
+  }
+  __device__ const CapsuleHeader *header() const {
+    return capsule_header(capsule());
+  }
+  __device__ std::uint64_t length() const {
+    const CapsuleHeader *object = header();
+    return object ? object->key_length : 4u;
+  }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const CapsuleHeader *object = header();
+    if (object)
+      return reinterpret_cast<const std::uint8_t *>(object + 1u)[position];
+    const std::uint32_t head = source.keys[physical()];
+    return static_cast<std::uint8_t>(
+        head >> (24u - static_cast<std::uint32_t>(position) * 8u));
+  }
+  __device__ std::uint32_t head4() const {
+    return source.keys[physical()];
+  }
+};
+
+template <class Left, class Right>
+__device__ __forceinline__ bool read_key_equal(
+    const Left &left, const Right &right) {
+  if (left.length() != right.length()) return false;
+  if (left.head4() != right.head4()) return false;
+  return left.length() == 4u || compare_keys(left, right, 4u) == 0;
+}
+
+template <class Cursor>
+__device__ __forceinline__ std::uint64_t read_hash_key(
+    const Cursor &key, std::uint64_t seed) {
+  std::uint64_t hash = seed ^ (key.length() * 0x9e3779b97f4a7c15ull);
+  for (std::uint64_t position = 0u; position < key.length(); ++position) {
+    hash ^= std::uint64_t{key.byte(position)} + 0x9e3779b97f4a7c15ull +
+        (hash << 6u) + (hash >> 2u);
+  }
+  return gpulsmopt2_detail::tqrj_hash_mix(hash);
+}
+
+constexpr std::uint64_t kPendingWinnerLive = std::uint64_t{1u} << 32u;
+constexpr std::uint32_t kPendingWinnerOrderShift = 33u;
+
+__device__ __forceinline__ std::uint64_t make_pending_winner(
+    const PendingRecordCursor &candidate) {
+  const auto payload = candidate.payload();
+  const std::uint32_t age = payload.metadata & kPendingAgeMask;
+  const std::uint64_t live =
+      payload.metadata & gpulsmopt2_detail::kRawTombstone
+      ? 0u : kPendingWinnerLive;
+  return (std::uint64_t{age + 1u} << kPendingWinnerOrderShift) |
+      live | payload.value;
+}
+
+__device__ __forceinline__ void write_pending_winner(
+    std::uint32_t output, std::uint64_t winner,
+    PendingReadView pending, SparseLookupOutput destination) {
+  if (!winner || !(winner & kPendingWinnerLive)) {
+    write_lookup_missing(output, destination);
+    return;
+  }
+  const std::uint32_t age = static_cast<std::uint32_t>(
+      (winner >> kPendingWinnerOrderShift) - 1u);
+  const std::uint32_t batch =
+      age >> gpulsmopt2_detail::kBatchPositionBits;
+  const PendingSlotBuildState *slot = pending.slots + batch;
+  if (slot->generation == pending.generation) {
+    const auto *exception = find_pending_exception(
+        reinterpret_cast<const PendingExceptionRef *>(slot->exceptions),
+        slot->exception_count, age);
+    if (exception) {
+      const PendingRecordCursor candidate{
+          pending, batch, exception->physical};
+      const auto payload = candidate.payload();
+      write_lookup_live(output, payload.value,
+                        CapsuleValueCursor{candidate.header()}, destination);
+      return;
+    }
+  }
+  const std::uint32_t value = static_cast<std::uint32_t>(winner);
+  write_lookup_live(
+      output, value, InlineWordCursor{value, 4u}, destination);
+}
+
+struct ResidentMatch {
+  bool found{};
+  gpulsmopt2_detail::Row row{};
+  std::uint64_t physical{};
+  DeviceCapsulePlane capsules{};
+};
+
+__device__ __forceinline__ DeviceCapsulePlane root_capsule_plane(
+    const RootBuildState *root) {
+  return root ? DeviceCapsulePlane{
+      reinterpret_cast<const CapsulePage *>(root->capsule_pages),
+      reinterpret_cast<const CapsuleIndex *>(root->capsule_indexes),
+      root->capsule_page_count, root->capsule_count} : DeviceCapsulePlane{};
+}
+
+__device__ __forceinline__ const RootBuildState *sparse_root(
+    const DeviceSparseManifest &manifest, std::uint32_t level) {
+  return reinterpret_cast<const RootBuildState *>(
+      manifest.levels[level].state);
+}
+
+__device__ __forceinline__ const ExactHeadDescriptor *find_exact_head(
+    const RootBuildState &root, std::uint32_t head) {
+  const auto *descriptors = reinterpret_cast<const ExactHeadDescriptor *>(
+      root.exact_heads);
+  std::uint32_t low = 0u;
+  std::uint32_t high = root.exact_head_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (descriptors[middle].head < head) low = middle + 1u;
+    else high = middle;
+  }
+  return low < root.exact_head_count && descriptors[low].head == head
+      ? descriptors + low : nullptr;
+}
+
+__device__ __forceinline__ const PendingExactHeadDescriptor *
+find_pending_exact_head(
+    const PendingSlotBuildState &slot, std::uint32_t head) {
+  const auto *descriptors =
+      reinterpret_cast<const PendingExactHeadDescriptor *>(slot.exact_heads);
+  std::uint32_t low = 0u;
+  std::uint32_t high = slot.exact_head_count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (descriptors[middle].head < head) low = middle + 1u;
+    else high = middle;
+  }
+  return low < slot.exact_head_count && descriptors[low].head == head
+      ? descriptors + low : nullptr;
+}
+
+__device__ __forceinline__ ResidentMatch find_projection_match(
+    std::uint32_t head, std::uint32_t level,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, DeviceCapsulePlane capsules) {
+  const std::uint32_t section = head >> 16u;
+  const std::uint32_t suffix = head & 0xffffu;
+  const auto rows = descriptors[
+      gpulsmopt2_detail::descriptor_index(section, level)];
+  if (!rows.count()) return {};
+  const std::uint32_t cell =
+      suffix / gpulsmopt2_detail::kFoundationCellKeys;
+  const std::uint16_t *ranks = cell_ranks +
+      std::size_t{level} * gpulsmopt2_detail::kLocalRankEntries +
+      std::size_t{section} * gpulsmopt2_detail::kFoundationCells;
+  const std::uint32_t begin = ranks[cell];
+  const std::uint32_t end =
+      cell + 1u < gpulsmopt2_detail::kFoundationCells
+      ? ranks[cell + 1u] : rows.count();
+  const std::uint32_t local = gpulsmopt2_detail::lower_bound_rows(
+      arena + rows.offset() + begin, end - begin, suffix);
+  if (local >= end - begin) return {};
+  const std::uint64_t physical = rows.offset() + begin + local;
+  const auto row = arena[physical];
+  return row.key == suffix
+      ? ResidentMatch{true, row, physical, capsules} : ResidentMatch{};
+}
+
+__device__ __forceinline__ ResidentMatch find_resident_ordinary(
+    std::uint32_t head, gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, std::uint64_t occupied_levels,
+    const DeviceSparseManifest &sparse) {
+  while (occupied_levels) {
+    const std::uint32_t level = __ffsll(occupied_levels) - 1u;
+    occupied_levels &= occupied_levels - 1u;
+    const RootBuildState *root = sparse_root(sparse, level);
+    const ResidentMatch match = find_projection_match(
+        head, level, arena, descriptors, cell_ranks,
+        root_capsule_plane(root));
+    if (match.found && !anchor_is_exact_group(match.row)) return match;
+  }
+  return {};
+}
+
+template <class QueryCursor>
+__device__ __forceinline__ ResidentMatch find_resident_exact(
+    const QueryCursor &query, gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, std::uint64_t occupied_levels,
+    const DeviceSparseManifest &sparse) {
+  const std::uint32_t head = query.head4();
+  while (occupied_levels) {
+    const std::uint32_t level = __ffsll(occupied_levels) - 1u;
+    occupied_levels &= occupied_levels - 1u;
+    const RootBuildState *root = sparse_root(sparse, level);
+    const DeviceCapsulePlane capsules = root_capsule_plane(root);
+    const ExactHeadDescriptor *chunk =
+        root ? find_exact_head(*root, head) : nullptr;
+    if (chunk) {
+      const auto *exact_rows =
+          reinterpret_cast<const gpulsmopt2_detail::Row *>(root->exact_rows);
+      std::uint32_t low = 0u;
+      std::uint32_t high = chunk->count;
+      while (low < high) {
+        const std::uint32_t middle = low + ((high - low) >> 1u);
+        const std::uint64_t physical = chunk->physical_begin + middle;
+        const auto row = exact_rows[exact_physical_offset(physical)];
+        const ResidentKeyCursor stored{head, physical, row, capsules};
+        if (compare_keys(stored, query) < 0) low = middle + 1u;
+        else high = middle;
+      }
+      if (low < chunk->count) {
+        const std::uint64_t physical = chunk->physical_begin + low;
+        const auto row = exact_rows[exact_physical_offset(physical)];
+        const ResidentKeyCursor stored{head, physical, row, capsules};
+        if (read_key_equal(query, stored))
+          return {true, row, physical, capsules};
+      }
+      continue;
+    }
+    const ResidentMatch ordinary = find_projection_match(
+        head, level, arena, descriptors, cell_ranks, capsules);
+    if (!ordinary.found || anchor_is_exact_group(ordinary.row)) continue;
+    const ResidentKeyCursor stored{
+        head, ordinary.physical, ordinary.row, capsules};
+    if (read_key_equal(query, stored)) return ordinary;
+  }
+  return {};
+}
+
+__device__ __forceinline__ void write_resident_match(
+    std::uint32_t output, const ResidentMatch &match,
+    SparseLookupOutput destination) {
+  if (!match.found ||
+      (match.row.flags & gpulsmopt2_detail::kTombstone)) {
+    write_lookup_missing(output, destination);
+    return;
+  }
+  if (anchor_has_capsule(match.row)) {
+    const CapsuleIndex *index = find_capsule(
+        match.capsules, match.physical, anchor_capsule_rank(match.row));
+    write_lookup_live(
+        output, match.row.value,
+        CapsuleValueCursor{capsule_header(index)}, destination);
+  } else {
+    write_lookup_live(
+        output, match.row.value,
+        InlineWordCursor{match.row.value, anchor_value_length(match.row)},
+        destination);
+  }
+}
+
+__device__ __forceinline__ bool query_head_requires_exact(
+    std::uint32_t head, const PendingSlotBuildState *pending_slots,
+    std::uint32_t pending_batches, std::uint32_t pending_generation,
+    const DeviceSparseManifest &sparse) {
+  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+    const PendingSlotBuildState &slot = pending_slots[batch];
+    if (slot.generation == pending_generation && slot.exact_head_count &&
+        find_pending_exact_head(slot, head))
+      return true;
+  }
+  std::uint64_t levels = sparse.exact_level_mask;
+  while (levels) {
+    const std::uint32_t level = __ffsll(levels) - 1u;
+    levels &= levels - 1u;
+    const RootBuildState *root = sparse_root(sparse, level);
+    if (root && find_exact_head(*root, head)) return true;
+  }
+  return false;
+}
+
+__global__ void classify_lookup_queries(
+    RecordBatchView queries, const PendingSlotBuildState *pending_slots,
+    std::uint32_t pending_batches, std::uint32_t pending_generation,
+    const DeviceSparseManifest *sparse_manifests,
+    const std::uint32_t *active_manifest, std::uint8_t *exact_flags,
+    std::uint32_t *heads) {
+  const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= queries.count) return;
+  const DeviceKeyCursor query{queries.keys, row, queries.head4_words};
+  const std::uint32_t head = query.head4();
+  if (heads) heads[row] = head;
+  const std::uint32_t active = __ldg(active_manifest) & 1u;
+  exact_flags[row] = static_cast<std::uint8_t>(
+      query.length() != 4u || query_head_requires_exact(
+          head, pending_slots, pending_batches, pending_generation,
+          sparse_manifests[active]));
+}
+
+__global__ void sparse_canonical_ordinary_lookup_kernel(
+    RecordBatchView queries, const std::uint32_t *ordered_heads,
+    const std::uint32_t *query_ids, const std::uint8_t *exact_flags,
+    std::uint32_t count, SparseLookupOutput output,
+    PendingReadView pending, const std::uint64_t *batch_signatures,
+    const std::uint64_t *epoch_signatures,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks,
+    const std::uint64_t *occupied_mask,
+    const DeviceSparseManifest *sparse_manifests,
+    const std::uint32_t *active_manifest) {
+  const std::uint32_t grouped = blockIdx.x * blockDim.x + threadIdx.x;
+  if (grouped >= count) return;
+  const std::uint32_t original = query_ids ? query_ids[grouped] : grouped;
+  if (exact_flags[original]) return;
+  const std::uint32_t head = ordered_heads[grouped];
+  const std::uint32_t section = head >> 16u;
+  const std::uint64_t signature_bits =
+      gpulsmopt2_detail::pending_signature_bits(head);
+  if (pending.batch_count &&
+      (epoch_signatures[section] & signature_bits) == signature_bits) {
+    for (int batch = static_cast<int>(pending.batch_count) - 1;
+         batch >= 0; --batch) {
+      const std::uint32_t slot = static_cast<std::uint32_t>(batch);
+      const std::uint64_t signature = batch_signatures[
+          std::size_t{slot} * kSections + section];
+      if ((signature & signature_bits) != signature_bits) continue;
+      const std::size_t offset =
+          std::size_t{slot} * (kSections + 1u) + section;
+      const std::uint32_t begin = pending.offsets[offset];
+      const std::uint32_t end = pending.offsets[offset + 1u];
+      bool found = false;
+      std::uint32_t newest = 0u;
+      std::uint64_t winner = 0u;
+      for (std::uint32_t local = begin; local < end; ++local) {
+        const PendingRecordCursor candidate{pending, slot, local};
+        if (candidate.head4() != head) continue;
+        const std::uint32_t age =
+            candidate.payload().metadata & kPendingAgeMask;
+        if (!found || age > newest) {
+          found = true;
+          newest = age;
+          winner = make_pending_winner(candidate);
+        }
+      }
+      if (found) {
+        write_pending_winner(original, winner, pending, output);
+        return;
+      }
+    }
+  }
+  const std::uint32_t active = __ldg(active_manifest) & 1u;
+  write_resident_match(
+      original, find_resident_ordinary(
+          head, arena, descriptors, cell_ranks, __ldg(occupied_mask),
+          sparse_manifests[active]), output);
+}
+
+__global__ void sparse_canonical_exact_lookup_kernel(
+    RecordBatchView queries, const std::uint32_t *exact_ids,
+    const std::uint32_t *exact_count, SparseLookupOutput output,
+    PendingReadView pending, gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks,
+    const std::uint64_t *occupied_mask,
+    const DeviceSparseManifest *sparse_manifests,
+    const std::uint32_t *active_manifest) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= *exact_count) return;
+  const std::uint32_t original = exact_ids[position];
+  const DeviceKeyCursor query{queries.keys, original, queries.head4_words};
+  const std::uint32_t head = query.head4();
+  const std::uint32_t section = head >> 16u;
+  for (int batch = static_cast<int>(pending.batch_count) - 1;
+       batch >= 0; --batch) {
+    const std::uint32_t slot = static_cast<std::uint32_t>(batch);
+    const std::size_t offset =
+        std::size_t{slot} * (kSections + 1u) + section;
+    const std::uint32_t begin = pending.offsets[offset];
+    const std::uint32_t end = pending.offsets[offset + 1u];
+    bool found = false;
+    std::uint32_t newest = 0u;
+    std::uint64_t winner = 0u;
+    for (std::uint32_t local = begin; local < end; ++local) {
+      const PendingRecordCursor candidate{pending, slot, local};
+      if (candidate.head4() != head || !read_key_equal(query, candidate))
+        continue;
+      const std::uint32_t age =
+          candidate.payload().metadata & kPendingAgeMask;
+      if (!found || age > newest) {
+        found = true;
+        newest = age;
+        winner = make_pending_winner(candidate);
+      }
+    }
+    if (found) {
+      write_pending_winner(original, winner, pending, output);
+      return;
+    }
+  }
+  const std::uint32_t active = __ldg(active_manifest) & 1u;
+  write_resident_match(
+      original, find_resident_exact(
+          query, arena, descriptors, cell_ranks, __ldg(occupied_mask),
+          sparse_manifests[active]), output);
+}
+
+template <class CandidateCursor>
+__device__ __forceinline__ std::uint32_t sparse_direct_query_owner(
+    const CandidateCursor &candidate, RecordBatchView queries,
+    const std::uint8_t *exact_flags,
+    const std::uint16_t *directory_offsets,
+    const std::uint16_t *directory_suffixes,
+    const std::uint16_t *directory_owners,
+    const std::uint32_t *query_ids, std::uint32_t query_begin) {
+  const std::uint32_t suffix = candidate.head4() & 0xffffu;
+  const std::uint32_t interval = suffix >> 8u;
+  const std::uint32_t end = directory_offsets[interval + 1u];
+  for (std::uint32_t position = directory_offsets[interval];
+       position < end; ++position) {
+    if (directory_suffixes[position] != suffix) continue;
+    const std::uint32_t owner = directory_owners[position];
+    const std::uint32_t original = query_ids[query_begin + owner];
+    if (!exact_flags[original]) return owner;
+    const DeviceKeyCursor query{
+        queries.keys, original, queries.head4_words};
+    if (read_key_equal(candidate, query)) return owner;
+  }
+  return gpulsmopt2_detail::kInvalid;
+}
+
+template <class QueryCursor>
+__device__ __forceinline__ void write_sparse_tqrj_result(
+    const QueryCursor &query, std::uint32_t output,
+    std::uint64_t winner, bool exact, PendingReadView pending,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, std::uint64_t occupied_levels,
+    const DeviceSparseManifest &sparse,
+    SparseLookupOutput destination) {
+  if (winner) {
+    write_pending_winner(output, winner, pending, destination);
+    return;
+  }
+  const ResidentMatch match = exact
+      ? find_resident_exact(
+            query, arena, descriptors, cell_ranks, occupied_levels, sparse)
+      : find_resident_ordinary(
+            query.head4(), arena, descriptors, cell_ranks,
+            occupied_levels, sparse);
+  write_resident_match(output, match, destination);
+}
+
+// This is the prototype's direct group owner adapted onto the restored TQRJ
+// routing.  Exact owners are compared as complete keys before a pending
+// winner is accepted; ordinary owners retain head-only matching.
+__global__ void sparse_tqrj_direct_lookup_kernel(
+    RecordBatchView queries, SparseLookupOutput output,
+    const std::uint32_t *grouped_heads,
+    const std::uint32_t *active_sections,
+    const std::uint32_t *active_counts,
+    const std::uint32_t *active_count,
+    const std::uint32_t *query_bases,
+    const std::uint32_t *query_ids,
+    const std::uint8_t *exact_flags, PendingReadView pending,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks,
+    const std::uint64_t *occupied_mask,
+    const DeviceSparseManifest *sparse_manifests,
+    const std::uint32_t *active_manifest,
+    gpulsmopt2_detail::TqrjHashTask *hash_tasks,
+    std::uint32_t *hash_task_count) {
+  using BlockScan = cub::BlockScan<std::uint32_t,
+                                   gpulsmopt2_detail::kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ std::uint32_t directory_counts[
+      gpulsmopt2_detail::kTqrjDirectoryBins];
+  __shared__ std::uint16_t directory_offsets[
+      gpulsmopt2_detail::kTqrjDirectoryBins + 1u];
+  __shared__ __align__(4) std::uint16_t directory_suffixes[
+      gpulsmopt2_detail::kTqrjDirectCapacity];
+  __shared__ std::uint16_t directory_owners[
+      gpulsmopt2_detail::kTqrjDirectCapacity];
+  __shared__ unsigned long long winners[
+      gpulsmopt2_detail::kTqrjDirectCapacity];
+  __shared__ std::uint32_t pending_rows;
+  __shared__ std::uint64_t occupied_levels;
+  __shared__ std::uint32_t manifest_index;
+
+  const std::uint32_t task = blockIdx.x;
+  if (task >= *active_count) return;
+  const std::uint32_t section = active_sections[task];
+  const std::uint32_t query_begin = query_bases[section];
+  const std::uint32_t query_count = active_counts[task];
+  if (threadIdx.x == 0u) {
+    pending_rows = gpulsmopt2_detail::tqrj_pending_rows(
+        section, pending.offsets, pending.batch_count);
+    occupied_levels = __ldg(occupied_mask);
+    manifest_index = __ldg(active_manifest) & 1u;
+  }
+  __syncthreads();
+  if (query_count > gpulsmopt2_detail::kTqrjDirectCapacity ||
+      pending_rows > gpulsmopt2_detail::kTqrjDirectPendingRows) {
+    if (threadIdx.x == 0u)
+      gpulsmopt2_detail::tqrj_enqueue_hash_task(
+          section, pending_rows, hash_tasks, hash_task_count);
+    return;
+  }
+
+  directory_counts[threadIdx.x] = 0u;
+  __syncthreads();
+  for (std::uint32_t local = threadIdx.x; local < query_count;
+       local += blockDim.x) {
+    const std::uint32_t suffix = grouped_heads[query_begin + local] & 0xffffu;
+    atomicAdd(directory_counts + (suffix >> 8u), 1u);
+  }
+  __syncthreads();
+  const std::uint32_t interval_count = directory_counts[threadIdx.x];
+  std::uint32_t interval_begin = 0u;
+  BlockScan(scan_storage).ExclusiveSum(interval_count, interval_begin);
+  directory_offsets[threadIdx.x] =
+      static_cast<std::uint16_t>(interval_begin);
+  if (threadIdx.x + 1u == gpulsmopt2_detail::kTqrjDirectoryBins)
+    directory_offsets[gpulsmopt2_detail::kTqrjDirectoryBins] =
+        static_cast<std::uint16_t>(interval_begin + interval_count);
+  directory_counts[threadIdx.x] = 0u;
+  const bool crowded = __syncthreads_or(
+      interval_count > gpulsmopt2_detail::kTqrjDirectIntervalLimit);
+  if (crowded) {
+    if (threadIdx.x == 0u)
+      gpulsmopt2_detail::tqrj_enqueue_hash_task(
+          section, pending_rows, hash_tasks, hash_task_count);
+    return;
+  }
+
+  for (std::uint32_t local = threadIdx.x; local < query_count;
+       local += blockDim.x) {
+    const std::uint32_t suffix = grouped_heads[query_begin + local] & 0xffffu;
+    const std::uint32_t interval = suffix >> 8u;
+    const std::uint32_t rank = atomicAdd(directory_counts + interval, 1u);
+    const std::uint32_t position = directory_offsets[interval] + rank;
+    directory_suffixes[position] = static_cast<std::uint16_t>(suffix);
+    directory_owners[position] = static_cast<std::uint16_t>(local);
+    winners[local] = 0ull;
+  }
+  __syncthreads();
+
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp = threadIdx.x >> 5u;
+  constexpr std::uint32_t warps = gpulsmopt2_detail::kThreads / 32u;
+  for (std::uint32_t batch = warp; batch < pending.batch_count;
+       batch += warps) {
+    const std::size_t oi =
+        std::size_t{batch} * (kSections + 1u) + section;
+    const std::uint32_t begin = pending.offsets[oi];
+    const std::uint32_t end = pending.offsets[oi + 1u];
+    for (std::uint32_t base = begin; base < end; base += 32u) {
+      const std::uint32_t local = base + lane;
+      bool matched = false;
+      std::uint32_t owner = gpulsmopt2_detail::kInvalid;
+      unsigned long long token = 0ull;
+      if (local < end) {
+        const PendingRecordCursor candidate{pending, batch, local};
+        owner = sparse_direct_query_owner(
+            candidate, queries, exact_flags, directory_offsets,
+            directory_suffixes, directory_owners, query_ids, query_begin);
+        matched = owner != gpulsmopt2_detail::kInvalid;
+        if (matched) token = make_pending_winner(candidate);
+      }
+      gpulsmopt2_detail::tqrj_warp_atomic_max(
+          matched, owner, token, winners);
+    }
+  }
+  __syncthreads();
+
+  for (std::uint32_t local = threadIdx.x; local < query_count;
+       local += blockDim.x) {
+    const std::uint32_t grouped = query_begin + local;
+    const std::uint32_t original = query_ids[grouped];
+    const DeviceKeyCursor query{
+        queries.keys, original, queries.head4_words};
+    const std::uint32_t owner = sparse_direct_query_owner(
+        query, queries, exact_flags, directory_offsets, directory_suffixes,
+        directory_owners, query_ids, query_begin);
+    const std::uint64_t winner = owner == gpulsmopt2_detail::kInvalid
+        ? 0ull : winners[owner];
+    write_sparse_tqrj_result(
+        query, original, winner, exact_flags[original] != 0u, pending,
+        arena, descriptors, cell_ranks, occupied_levels,
+        sparse_manifests[manifest_index], output);
+  }
+}
+
+__device__ __forceinline__ std::uint64_t sparse_query_hash(
+    RecordBatchView queries, const std::uint32_t *query_ids,
+    const std::uint32_t *grouped_heads, const std::uint8_t *exact_flags,
+    std::uint32_t grouped, std::uint64_t seed) {
+  const std::uint32_t original = query_ids[grouped];
+  if (!exact_flags[original])
+    return gpulsmopt2_detail::tqrj_hash_key(grouped_heads[grouped], seed);
+  return read_hash_key(
+      DeviceKeyCursor{queries.keys, original, queries.head4_words}, seed);
+}
+
+__device__ __forceinline__ bool sparse_queries_equal(
+    RecordBatchView queries, const std::uint32_t *query_ids,
+    const std::uint32_t *grouped_heads, const std::uint8_t *exact_flags,
+    std::uint32_t left, std::uint32_t right) {
+  const std::uint32_t left_original = query_ids[left];
+  const std::uint32_t right_original = query_ids[right];
+  const bool exact = exact_flags[left_original] != 0u;
+  if (exact != (exact_flags[right_original] != 0u)) return false;
+  if (!exact) return grouped_heads[left] == grouped_heads[right];
+  return read_key_equal(
+      DeviceKeyCursor{queries.keys, left_original, queries.head4_words},
+      DeviceKeyCursor{queries.keys, right_original, queries.head4_words});
+}
+
+__device__ __forceinline__ std::uint32_t sparse_hash_insert(
+    RecordBatchView queries, const std::uint32_t *query_ids,
+    const std::uint32_t *grouped_heads, const std::uint8_t *exact_flags,
+    std::uint32_t query, std::uint32_t *table, std::uint32_t capacity,
+    std::uint64_t seed, std::uint32_t maximum_probes,
+    std::uint32_t *failure) {
+  const std::uint64_t hash = sparse_query_hash(
+      queries, query_ids, grouped_heads, exact_flags, query, seed);
+  const std::uint32_t desired =
+      gpulsmopt2_detail::tqrj_hash_entry(query, hash);
+  const std::uint32_t fingerprint =
+      gpulsmopt2_detail::tqrj_hash_entry_fingerprint(desired);
+  std::uint32_t slot =
+      gpulsmopt2_detail::tqrj_hash_slot(hash, capacity);
+  for (std::uint32_t probe = 0u; probe < maximum_probes; ++probe) {
+    const std::uint32_t previous = atomicCAS(table + slot, 0u, desired);
+    if (!previous) return query;
+    if (gpulsmopt2_detail::tqrj_hash_entry_fingerprint(previous) ==
+        fingerprint) {
+      const std::uint32_t owner =
+          gpulsmopt2_detail::tqrj_hash_entry_owner(previous);
+      if (sparse_queries_equal(
+              queries, query_ids, grouped_heads, exact_flags,
+              owner, query))
+        return owner;
+    }
+    if (++slot == capacity) slot = 0u;
+  }
+  atomicExch(failure, 1u);
+  return gpulsmopt2_detail::kInvalid;
+}
+
+template <class CandidateCursor>
+__device__ __forceinline__ std::uint32_t sparse_hash_find_category(
+    const CandidateCursor &candidate, bool exact, RecordBatchView queries,
+    const std::uint32_t *query_ids, const std::uint32_t *grouped_heads,
+    const std::uint8_t *exact_flags, const std::uint32_t *table,
+    std::uint32_t capacity, std::uint64_t seed) {
+  const std::uint64_t hash = exact
+      ? read_hash_key(candidate, seed)
+      : gpulsmopt2_detail::tqrj_hash_key(candidate.head4(), seed);
+  const std::uint32_t fingerprint =
+      gpulsmopt2_detail::tqrj_hash_entry_fingerprint(
+          gpulsmopt2_detail::tqrj_hash_entry(0u, hash));
+  std::uint32_t slot =
+      gpulsmopt2_detail::tqrj_hash_slot(hash, capacity);
+  for (std::uint32_t probe = 0u; probe < capacity; ++probe) {
+    const std::uint32_t entry = table[slot];
+    if (!entry) return gpulsmopt2_detail::kInvalid;
+    if (gpulsmopt2_detail::tqrj_hash_entry_fingerprint(entry) ==
+        fingerprint) {
+      const std::uint32_t owner =
+          gpulsmopt2_detail::tqrj_hash_entry_owner(entry);
+      const std::uint32_t original = query_ids[owner];
+      if ((exact_flags[original] != 0u) == exact) {
+        if (!exact && grouped_heads[owner] == candidate.head4()) return owner;
+        if (exact && read_key_equal(
+                DeviceKeyCursor{
+                    queries.keys, original, queries.head4_words},
+                candidate))
+          return owner;
+      }
+    }
+    if (++slot == capacity) slot = 0u;
+  }
+  return gpulsmopt2_detail::kInvalid;
+}
+
+template <class CandidateCursor>
+__device__ __forceinline__ std::uint32_t sparse_hash_find(
+    const CandidateCursor &candidate, RecordBatchView queries,
+    const std::uint32_t *query_ids, const std::uint32_t *grouped_heads,
+    const std::uint8_t *exact_flags, const std::uint32_t *table,
+    std::uint32_t capacity, std::uint64_t seed) {
+  const std::uint32_t exact = sparse_hash_find_category(
+      candidate, true, queries, query_ids, grouped_heads, exact_flags,
+      table, capacity, seed);
+  return exact != gpulsmopt2_detail::kInvalid ? exact
+      : sparse_hash_find_category(
+            candidate, false, queries, query_ids, grouped_heads,
+            exact_flags, table, capacity, seed);
+}
+
+// The prototype's exact hash matcher is grafted into the restored overflow
+// queue.  Ordinary entries remain keyed by four-byte heads; deferred entries
+// are keyed and compared by complete key.
+__global__ __launch_bounds__(gpulsmopt2_detail::kTqrjHashThreads, 1)
+void sparse_tqrj_hash_lookup_kernel(
+    gpulsmopt2_detail::TqrjHashTask *tasks,
+    const std::uint32_t *task_count,
+    const std::uint32_t *query_bases,
+    const std::uint32_t *query_counts,
+    const std::uint32_t *grouped_heads,
+    const std::uint32_t *query_ids, RecordBatchView queries,
+    SparseLookupOutput output, const std::uint8_t *exact_flags,
+    std::uint32_t *query_owners,
+    gpulsmopt2_detail::TqrjHashTile *query_tiles,
+    gpulsmopt2_detail::TqrjHashTile *pending_tiles,
+    std::uint32_t *counters, std::uint32_t *hash_table,
+    std::uint32_t maximum_hash_entries,
+    unsigned long long *winners, PendingReadView pending,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks,
+    const std::uint64_t *occupied_mask,
+    const DeviceSparseManifest *sparse_manifests,
+    const std::uint32_t *active_manifest) {
+  const cooperative_groups::grid_group grid =
+      cooperative_groups::this_grid();
+  __shared__ std::uint32_t section_prefixes[
+      gpulsmopt2_detail::kBatchesPerEpoch + 1u];
+  __shared__ gpulsmopt2_detail::TqrjHashTask shared_task;
+  __shared__ std::uint32_t shared_a, shared_b;
+  __shared__ std::uint64_t occupied_levels;
+  __shared__ std::uint32_t manifest_index;
+  const std::uint32_t tasks_in_queue = *task_count;
+  if (!tasks_in_queue) return;
+  const std::uint32_t global_thread =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t global_stride = blockDim.x * gridDim.x;
+
+  for (std::uint32_t task_index = blockIdx.x;
+       task_index < tasks_in_queue; task_index += gridDim.x) {
+    if (threadIdx.x == 0u) {
+      const auto task = tasks[task_index];
+      const std::uint32_t count = query_counts[task.quotient];
+      shared_a = gpulsmopt2_detail::tqrj_hash_tile_count(count);
+      shared_b = gpulsmopt2_detail::tqrj_hash_tile_count(task.pending_rows);
+      tasks[task_index].query_tile_base = atomicAdd(counters, shared_a);
+      tasks[task_index].pending_tile_base =
+          atomicAdd(counters + 1u, shared_b);
+      atomicAdd(counters + 2u, count);
+    }
+    __syncthreads();
+    const auto task = tasks[task_index];
+    for (std::uint32_t tile = threadIdx.x; tile < shared_a;
+         tile += blockDim.x)
+      query_tiles[task.query_tile_base + tile] = {
+          task_index, tile * gpulsmopt2_detail::kTqrjHashTileRows};
+    for (std::uint32_t tile = threadIdx.x; tile < shared_b;
+         tile += blockDim.x)
+      pending_tiles[task.pending_tile_base + tile] = {
+          task_index, tile * gpulsmopt2_detail::kTqrjHashTileRows};
+    __syncthreads();
+  }
+  grid.sync();
+
+  const std::uint32_t query_tile_count = counters[0];
+  const std::uint32_t pending_tile_count = counters[1];
+  const std::uint32_t hash_capacity =
+      gpulsmopt2_detail::tqrj_hash_capacity(counters[2]);
+  if (global_thread == 0u) {
+    counters[4] = 0u;
+    counters[5] = hash_capacity > maximum_hash_entries ? 1u : 0u;
+  }
+  grid.sync();
+  if (counters[5]) return;
+
+  for (std::uint32_t attempt = 0u;
+       attempt < gpulsmopt2_detail::kTqrjHashAttempts; ++attempt) {
+    if (global_thread == 0u) counters[3] = 0u;
+    for (std::uint32_t slot = global_thread; slot < hash_capacity;
+         slot += global_stride)
+      hash_table[slot] = 0u;
+    grid.sync();
+    const std::uint64_t seed =
+        gpulsmopt2_detail::tqrj_hash_seed(attempt);
+    const std::uint32_t probe_limit =
+        attempt + 1u == gpulsmopt2_detail::kTqrjHashAttempts
+        ? hash_capacity : gpulsmopt2_detail::kTqrjHashProbeLimit;
+    for (std::uint32_t tile_index = blockIdx.x;
+         tile_index < query_tile_count; tile_index += gridDim.x) {
+      const auto tile = query_tiles[tile_index];
+      const auto task = tasks[tile.task];
+      const std::uint32_t query_begin = query_bases[task.quotient];
+      const std::uint32_t query_count = query_counts[task.quotient];
+      for (std::uint32_t local = threadIdx.x;
+           local < gpulsmopt2_detail::kTqrjHashTileRows;
+           local += blockDim.x) {
+        const std::uint32_t row = tile.begin + local;
+        if (row >= query_count) continue;
+        const std::uint32_t query = query_begin + row;
+        const std::uint32_t owner = sparse_hash_insert(
+            queries, query_ids, grouped_heads, exact_flags, query,
+            hash_table, hash_capacity, seed, probe_limit, counters + 3u);
+        query_owners[query_ids[query]] = owner;
+      }
+    }
+    grid.sync();
+    if (!counters[3]) {
+      if (global_thread == 0u) counters[4] = attempt;
+      grid.sync();
+      break;
+    }
+    grid.sync();
+  }
+
+  for (std::uint32_t tile_index = blockIdx.x;
+       tile_index < query_tile_count; tile_index += gridDim.x) {
+    const auto tile = query_tiles[tile_index];
+    const auto task = tasks[tile.task];
+    const std::uint32_t query_begin = query_bases[task.quotient];
+    const std::uint32_t query_count = query_counts[task.quotient];
+    for (std::uint32_t local = threadIdx.x;
+         local < gpulsmopt2_detail::kTqrjHashTileRows;
+         local += blockDim.x) {
+      const std::uint32_t row = tile.begin + local;
+      if (row < query_count) winners[query_begin + row] = 0ull;
+    }
+  }
+  grid.sync();
+
+  const std::uint64_t selected_seed =
+      gpulsmopt2_detail::tqrj_hash_seed(counters[4]);
+  for (std::uint32_t tile_index = blockIdx.x;
+       tile_index < pending_tile_count; tile_index += gridDim.x) {
+    const auto tile = pending_tiles[tile_index];
+    if (threadIdx.x == 0u) {
+      shared_task = tasks[tile.task];
+      std::uint32_t prefix = 0u;
+      section_prefixes[0] = 0u;
+      for (std::uint32_t batch = 0u; batch < pending.batch_count; ++batch) {
+        const std::size_t oi =
+            std::size_t{batch} * (kSections + 1u) + shared_task.quotient;
+        prefix += pending.offsets[oi + 1u] - pending.offsets[oi];
+        section_prefixes[batch + 1u] = prefix;
+      }
+    }
+    __syncthreads();
+    for (std::uint32_t local = threadIdx.x;
+         local < gpulsmopt2_detail::kTqrjHashTileRows;
+         local += blockDim.x) {
+      const std::uint32_t row = tile.begin + local;
+      bool matched = false;
+      std::uint32_t owner = gpulsmopt2_detail::kInvalid;
+      unsigned long long token = 0ull;
+      if (row < shared_task.pending_rows) {
+        std::uint32_t low = 0u;
+        std::uint32_t high = pending.batch_count;
+        while (low + 1u < high) {
+          const std::uint32_t middle = (low + high) >> 1u;
+          if (section_prefixes[middle] <= row) low = middle;
+          else high = middle;
+        }
+        const std::uint32_t batch = low;
+        const std::size_t oi =
+            std::size_t{batch} * (kSections + 1u) + shared_task.quotient;
+        const std::uint32_t position =
+            pending.offsets[oi] + row - section_prefixes[batch];
+        const PendingRecordCursor candidate{pending, batch, position};
+        owner = sparse_hash_find(
+            candidate, queries, query_ids, grouped_heads, exact_flags,
+            hash_table, hash_capacity, selected_seed);
+        matched = owner != gpulsmopt2_detail::kInvalid;
+        if (matched) token = make_pending_winner(candidate);
+      }
+      gpulsmopt2_detail::tqrj_warp_atomic_max(
+          matched, owner, token, winners);
+    }
+    __syncthreads();
+  }
+  grid.sync();
+
+  if (threadIdx.x == 0u) {
+    occupied_levels = __ldg(occupied_mask);
+    manifest_index = __ldg(active_manifest) & 1u;
+  }
+  __syncthreads();
+  for (std::uint32_t tile_index = blockIdx.x;
+       tile_index < query_tile_count; tile_index += gridDim.x) {
+    const auto tile = query_tiles[tile_index];
+    const auto task = tasks[tile.task];
+    const std::uint32_t query_begin = query_bases[task.quotient];
+    const std::uint32_t query_count = query_counts[task.quotient];
+    for (std::uint32_t local = threadIdx.x;
+         local < gpulsmopt2_detail::kTqrjHashTileRows;
+         local += blockDim.x) {
+      const std::uint32_t row = tile.begin + local;
+      if (row >= query_count) continue;
+      const std::uint32_t grouped = query_begin + row;
+      const std::uint32_t original = query_ids[grouped];
+      const std::uint32_t owner = query_owners[original];
+      const DeviceKeyCursor query{
+          queries.keys, original, queries.head4_words};
+      write_sparse_tqrj_result(
+          query, original, winners[owner], exact_flags[original] != 0u,
+          pending, arena, descriptors, cell_ranks, occupied_levels,
+          sparse_manifests[manifest_index], output);
+    }
+    __syncthreads();
+  }
+}
+
+class SparseReadWorkspace {
+ public:
+  SparseReadWorkspace() {
+    int blocks_per_sm = 0;
+    check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &blocks_per_sm, sparse_tqrj_hash_lookup_kernel,
+              gpulsmopt2_detail::kTqrjHashThreads, 0u),
+          "size sparse exact hash grid");
+    int device = 0;
+    check(cudaGetDevice(&device), "get sparse read device");
+    cudaDeviceProp properties{};
+    check(cudaGetDeviceProperties(&properties, device),
+          "get sparse read properties");
+    hash_worker_blocks_ = static_cast<std::uint32_t>(
+        blocks_per_sm * properties.multiProcessorCount);
+    if (!hash_worker_blocks_)
+      throw std::runtime_error("sparse exact hash has zero occupancy");
+  }
+
+  void ensure(std::uint32_t count, bool need_heads, bool need_owners) {
+    if (count > capacity_) {
+      capacity_ = count;
+      exact_flags_.reset(capacity_);
+      exact_ids_.reset(capacity_);
+      exact_count_.reset(1u);
+      std::size_t bytes = 0u;
+      cub::CountingInputIterator<std::uint32_t> ids(0u);
+      check(cub::DeviceSelect::Flagged(
+                nullptr, bytes, ids, exact_flags_.data(),
+                exact_ids_.data(), exact_count_.data(), capacity_),
+            "size sparse exact query roster");
+      select_temporary_.reset(bytes);
+    }
+    if (need_heads && heads_.size() < count) heads_.reset(count);
+    if (need_owners && owners_.size() < count) owners_.reset(count);
+  }
+
+  void classify(
+      RecordBatchView queries, const PendingSlotBuildState *pending_slots,
+      std::uint32_t pending_batches, std::uint32_t pending_generation,
+      const DeviceSparseManifest *sparse_manifests,
+      const std::uint32_t *active_manifest, bool materialize_heads,
+      cudaStream_t stream) {
+    classify_lookup_queries<<<blocks(queries.count), kThreads, 0, stream>>>(
+        queries, pending_slots, pending_batches, pending_generation,
+        sparse_manifests, active_manifest, exact_flags_.data(),
+        materialize_heads ? heads_.data() : nullptr);
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    std::size_t bytes = select_temporary_.bytes();
+    check(cub::DeviceSelect::Flagged(
+              select_temporary_.data(), bytes, ids, exact_flags_.data(),
+              exact_ids_.data(), exact_count_.data(),
+              static_cast<std::uint32_t>(queries.count), stream),
+          "compact sparse exact query roster");
+  }
+
+  std::uint8_t *exact_flags() const { return exact_flags_.data(); }
+  std::uint32_t *exact_ids() const { return exact_ids_.data(); }
+  std::uint32_t *exact_count() const { return exact_count_.data(); }
+  std::uint32_t *heads() const { return heads_.data(); }
+  std::uint32_t *owners() const { return owners_.data(); }
+  std::uint32_t hash_worker_blocks() const { return hash_worker_blocks_; }
+  std::size_t bytes() const {
+    return exact_flags_.bytes() + exact_ids_.bytes() +
+        exact_count_.bytes() + heads_.bytes() + owners_.bytes() +
+        select_temporary_.bytes();
+  }
+
+ private:
+  std::uint32_t capacity_{};
+  std::uint32_t hash_worker_blocks_{};
+  Buffer<std::uint8_t> exact_flags_;
+  Buffer<std::uint32_t> exact_ids_, exact_count_, heads_, owners_;
+  Buffer<std::uint8_t> select_temporary_;
+};
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/read.cuh
+// BEGIN INLINED COMPONENT: gpulsm_sparse/ordered_read.cuh
+
+
+namespace gpulsm_sparse {
+
+struct SparseSuccessorOutput {
+  std::uint32_t *head4_words{};
+  DeviceByteSink keys{};
+  std::uint64_t *key_lengths{};
+  std::uint8_t *found{};
+  std::uint8_t *overflow{};
+};
+
+struct HeadKeyCursor {
+  std::uint32_t head{};
+
+  __device__ std::uint32_t head4() const { return head; }
+  __device__ std::uint64_t length() const { return 4u; }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    return static_cast<std::uint8_t>(
+        head >> (24u - static_cast<std::uint32_t>(position) * 8u));
+  }
+};
+
+struct SuccessorKeyCursor {
+  // 1: ordinary four-byte head, 2: pending complete key,
+  // 3: resident complete key.
+  std::uint32_t kind{};
+  std::uint32_t head{};
+  PendingReadView pending{};
+  std::uint32_t batch{};
+  std::uint32_t local{};
+  gpulsmopt2_detail::Row row{};
+  std::uint64_t physical{};
+  DeviceCapsulePlane capsules{};
+
+  __device__ std::uint32_t head4() const { return head; }
+  __device__ std::uint64_t length() const {
+    if (kind == 1u) return 4u;
+    if (kind == 2u)
+      return PendingRecordCursor{pending, batch, local}.length();
+    return ResidentKeyCursor{head, physical, row, capsules}.length();
+  }
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    if (kind == 1u)
+      return HeadKeyCursor{head}.byte(position);
+    if (kind == 2u)
+      return PendingRecordCursor{pending, batch, local}.byte(position);
+    return ResidentKeyCursor{head, physical, row, capsules}.byte(position);
+  }
+};
+
+__device__ __forceinline__ PendingRecordCursor pending_cursor_from_ref(
+    PendingReadView pending, std::uint32_t ref) {
+  return {
+      pending, ref >> gpulsmopt2_detail::kBatchPositionBits,
+      ref & ((1u << gpulsmopt2_detail::kBatchPositionBits) - 1u)};
+}
+
+__device__ __forceinline__ const std::uint32_t *pending_exact_refs(
+    const PendingSlotBuildState &slot) {
+  return reinterpret_cast<const std::uint32_t *>(slot.exact_refs);
+}
+
+template <class Candidate>
+__device__ __forceinline__ bool successor_candidate_is_eligible(
+    const Candidate &candidate, const DeviceKeyCursor &query,
+    bool have_after, const SuccessorKeyCursor &after) {
+  if (candidate.head4() == query.head4() &&
+      compare_keys(candidate, query) < 0)
+    return false;
+  return !have_after || compare_keys(candidate, after) > 0;
+}
+
+template <class Candidate>
+__device__ __forceinline__ void consider_exact_successor_candidate(
+    const Candidate &candidate, const SuccessorKeyCursor &encoded,
+    const DeviceKeyCursor &query, bool have_after,
+    const SuccessorKeyCursor &after, bool &have_best,
+    SuccessorKeyCursor &best) {
+  if (!successor_candidate_is_eligible(
+          candidate, query, have_after, after))
+    return;
+  if (!have_best || compare_keys(candidate, best) < 0) {
+    best = encoded;
+    have_best = true;
+  }
+}
+
+__device__ __forceinline__ bool next_sparse_exact_head(
+    std::uint32_t lower, PendingReadView pending,
+    const DeviceSparseManifest &sparse, std::uint32_t &result) {
+  bool found = false;
+  std::uint32_t best = 0u;
+  for (std::uint32_t slot = 0u; slot < pending.batch_count; ++slot) {
+    const PendingSlotBuildState &state = pending.slots[slot];
+    if (state.generation != pending.generation ||
+        !state.exact_head_count)
+      continue;
+    const auto *heads =
+        reinterpret_cast<const PendingExactHeadDescriptor *>(
+            state.exact_heads);
+    std::uint32_t low = 0u;
+    std::uint32_t high = state.exact_head_count;
+    while (low < high) {
+      const std::uint32_t middle = low + ((high - low) >> 1u);
+      if (heads[middle].head < lower) low = middle + 1u;
+      else high = middle;
+    }
+    if (low < state.exact_head_count &&
+        (!found || heads[low].head < best)) {
+      best = heads[low].head;
+      found = true;
+    }
+  }
+  std::uint64_t levels = sparse.exact_level_mask;
+  while (levels) {
+    const std::uint32_t level = __ffsll(levels) - 1u;
+    levels &= levels - 1u;
+    const RootBuildState *root = sparse_root(sparse, level);
+    if (!root || !root->exact_head_count) continue;
+    const auto *heads = reinterpret_cast<const ExactHeadDescriptor *>(
+        root->exact_heads);
+    std::uint32_t low = 0u;
+    std::uint32_t high = root->exact_head_count;
+    while (low < high) {
+      const std::uint32_t middle = low + ((high - low) >> 1u);
+      if (heads[middle].head < lower) low = middle + 1u;
+      else high = middle;
+    }
+    if (low < root->exact_head_count &&
+        (!found || heads[low].head < best)) {
+      best = heads[low].head;
+      found = true;
+    }
+  }
+  if (found) result = best;
+  return found;
+}
+
+__device__ __forceinline__ bool first_original_successor_head(
+    std::uint32_t lower, PendingReadView pending,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const gpulsmopt2_detail::RouteHeader *route_headers,
+    const gpulsmopt2_detail::RouteSlice *route_slices,
+    std::uint32_t active_levels, std::uint64_t occupied_levels,
+    std::uint32_t &result) {
+  const std::uint32_t first_section = lower >> 16u;
+  for (std::uint32_t section = first_section;
+       section < kSections; ++section) {
+    const std::uint32_t section_lower = section == first_section
+        ? lower : section << 16u;
+    if (gpulsmopt2_detail::first_visible_in_quotient(
+            section, section_lower, pending.keys, pending.payloads,
+            pending.offsets, pending.batch_capacity, pending.batch_count,
+            arena, descriptors, route_headers, route_slices, active_levels,
+            occupied_levels, result))
+      return true;
+  }
+  return false;
+}
+
+__device__ __forceinline__ std::uint32_t first_eligible_pending_key(
+    PendingReadView pending, const std::uint32_t *refs,
+    std::uint32_t ref_begin, std::uint32_t count,
+    const DeviceKeyCursor &query, bool have_after,
+    const SuccessorKeyCursor &after) {
+  std::uint32_t low = 0u;
+  std::uint32_t high = count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    const auto candidate = pending_cursor_from_ref(
+        pending, refs[ref_begin + middle]);
+    const bool before_query = candidate.head4() == query.head4() &&
+        compare_keys(candidate, query) < 0;
+    const bool before_after =
+        have_after && compare_keys(candidate, after) <= 0;
+    if (before_query || before_after) low = middle + 1u;
+    else high = middle;
+  }
+  return low;
+}
+
+__device__ __forceinline__ std::uint32_t first_eligible_resident_key(
+    std::uint32_t head, const gpulsmopt2_detail::Row *rows,
+    const ExactHeadDescriptor &chunk, DeviceCapsulePlane capsules,
+    const DeviceKeyCursor &query, bool have_after,
+    const SuccessorKeyCursor &after) {
+  std::uint32_t low = 0u;
+  std::uint32_t high = chunk.count;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    const std::uint64_t physical = chunk.physical_begin + middle;
+    const auto row = rows[exact_physical_offset(physical)];
+    const ResidentKeyCursor candidate{head, physical, row, capsules};
+    const bool before_query = candidate.head4() == query.head4() &&
+        compare_keys(candidate, query) < 0;
+    const bool before_after =
+        have_after && compare_keys(candidate, after) <= 0;
+    if (before_query || before_after) low = middle + 1u;
+    else high = middle;
+  }
+  return low;
+}
+
+__device__ __forceinline__ bool next_exact_key_at_head(
+    std::uint32_t head, const DeviceKeyCursor &query,
+    bool have_after, const SuccessorKeyCursor &after,
+    PendingReadView pending, const DeviceSparseManifest &sparse,
+    bool &have_best, SuccessorKeyCursor &best) {
+  have_best = false;
+  const HeadKeyCursor short_key{head};
+  const SuccessorKeyCursor short_encoded{1u, head};
+  consider_exact_successor_candidate(
+      short_key, short_encoded, query, have_after, after,
+      have_best, best);
+
+  for (std::uint32_t slot = 0u; slot < pending.batch_count; ++slot) {
+    const PendingSlotBuildState &state = pending.slots[slot];
+    if (state.generation != pending.generation) continue;
+    const PendingExactHeadDescriptor *chunk =
+        find_pending_exact_head(state, head);
+    if (!chunk) continue;
+    const std::uint32_t *refs = pending_exact_refs(state);
+    const std::uint32_t local = first_eligible_pending_key(
+        pending, refs, chunk->ref_begin, chunk->count, query,
+        have_after, after);
+    if (local >= chunk->count) continue;
+    const PendingRecordCursor candidate = pending_cursor_from_ref(
+        pending, refs[chunk->ref_begin + local]);
+    const SuccessorKeyCursor encoded{
+        2u, head, pending, candidate.batch, candidate.local};
+    consider_exact_successor_candidate(
+        candidate, encoded, query, have_after, after, have_best, best);
+  }
+
+  std::uint64_t levels = sparse.exact_level_mask;
+  while (levels) {
+    const std::uint32_t level = __ffsll(levels) - 1u;
+    levels &= levels - 1u;
+    const RootBuildState *root = sparse_root(sparse, level);
+    if (!root) continue;
+    const ExactHeadDescriptor *chunk = find_exact_head(*root, head);
+    if (!chunk) continue;
+    const auto *rows = reinterpret_cast<const gpulsmopt2_detail::Row *>(
+        root->exact_rows);
+    const DeviceCapsulePlane capsules = root_capsule_plane(root);
+    const std::uint32_t local = first_eligible_resident_key(
+        head, rows, *chunk, capsules, query, have_after, after);
+    if (local >= chunk->count) continue;
+    const std::uint64_t physical = chunk->physical_begin + local;
+    const auto row = rows[exact_physical_offset(physical)];
+    const ResidentKeyCursor candidate{head, physical, row, capsules};
+    const SuccessorKeyCursor encoded{
+        3u, head, {}, 0u, 0u, row, physical, capsules};
+    consider_exact_successor_candidate(
+        candidate, encoded, query, have_after, after, have_best, best);
+  }
+  return have_best;
+}
+
+struct ExactSuccessorAssignment {
+  bool found{};
+  bool tombstone{};
+  SuccessorKeyCursor key{};
+};
+
+template <class KeyCursor>
+__device__ __forceinline__ ExactSuccessorAssignment
+resolve_exact_successor_assignment(
+    const KeyCursor &key, PendingReadView pending,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, std::uint64_t occupied_levels,
+    const DeviceSparseManifest &sparse) {
+  const std::uint32_t section = key.head4() >> 16u;
+  for (int batch = static_cast<int>(pending.batch_count) - 1;
+       batch >= 0; --batch) {
+    const std::uint32_t slot = static_cast<std::uint32_t>(batch);
+    const std::size_t oi =
+        std::size_t{slot} * (kSections + 1u) + section;
+    const std::uint32_t begin = pending.offsets[oi];
+    const std::uint32_t end = pending.offsets[oi + 1u];
+    bool found = false;
+    std::uint32_t newest = 0u;
+    PendingRecordCursor winner{};
+    for (std::uint32_t local = begin; local < end; ++local) {
+      const PendingRecordCursor candidate{pending, slot, local};
+      if (candidate.head4() != key.head4() ||
+          !read_key_equal(candidate, key))
+        continue;
+      const std::uint32_t age =
+          candidate.payload().metadata & kPendingAgeMask;
+      if (!found || age > newest) {
+        found = true;
+        newest = age;
+        winner = candidate;
+      }
+    }
+    if (found) {
+      const auto payload = winner.payload();
+      return {
+          true,
+          (payload.metadata & gpulsmopt2_detail::kRawTombstone) != 0u,
+          {2u, key.head4(), pending, winner.batch, winner.local}};
+    }
+  }
+  const ResidentMatch resident = find_resident_exact(
+      key, arena, descriptors, cell_ranks, occupied_levels, sparse);
+  if (!resident.found) return {};
+  return {
+      true,
+      (resident.row.flags & gpulsmopt2_detail::kTombstone) != 0u,
+      {3u, key.head4(), {}, 0u, 0u, resident.row,
+       resident.physical, resident.capsules}};
+}
+
+__device__ __forceinline__ bool refine_exact_successor_head(
+    std::uint32_t head, const DeviceKeyCursor &query,
+    PendingReadView pending, gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, std::uint64_t occupied_levels,
+    const DeviceSparseManifest &sparse, SuccessorKeyCursor &result) {
+  bool have_after = false;
+  SuccessorKeyCursor after{};
+  for (;;) {
+    bool have_candidate = false;
+    SuccessorKeyCursor candidate{};
+    next_exact_key_at_head(
+        head, query, have_after, after, pending, sparse,
+        have_candidate, candidate);
+    if (!have_candidate) return false;
+    const auto assignment = resolve_exact_successor_assignment(
+        candidate, pending, arena, descriptors, cell_ranks,
+        occupied_levels, sparse);
+    if (assignment.found && !assignment.tombstone) {
+      result = assignment.key;
+      return true;
+    }
+    after = candidate;
+    have_after = true;
+  }
+}
+
+__device__ __forceinline__ void write_successor_missing(
+    std::uint32_t output, SparseSuccessorOutput destination) {
+  if (destination.head4_words)
+    destination.head4_words[output] = gpulsmopt2_detail::kInvalid;
+  if (destination.found) destination.found[output] = 0u;
+  if (destination.key_lengths) destination.key_lengths[output] = 0u;
+  if (destination.overflow) destination.overflow[output] = 0u;
+}
+
+template <class KeyCursor>
+__device__ __forceinline__ void write_successor_key(
+    std::uint32_t output, const KeyCursor &key,
+    SparseSuccessorOutput destination) {
+  if (destination.head4_words)
+    destination.head4_words[output] = key.head4();
+  if (destination.found) destination.found[output] = 1u;
+  const std::uint64_t length = key.length();
+  if (destination.key_lengths) destination.key_lengths[output] = length;
+  bool overflow = false;
+  if (destination.keys.bytes) {
+    std::uint64_t begin = 0u;
+    std::uint64_t capacity = 0u;
+    if (destination.keys.layout == DeviceSinkLayout::packed) {
+      if (!destination.keys.offsets) {
+        overflow = true;
+      } else {
+        begin = destination.keys.offsets[output];
+        const std::uint64_t end = destination.keys.offsets[output + 1u];
+        overflow = end < begin || end > destination.keys.capacity_bytes;
+        if (!overflow) capacity = end - begin;
+      }
+    } else {
+      begin = std::uint64_t{output} * destination.keys.stride;
+      overflow = begin > destination.keys.capacity_bytes;
+      if (!overflow) {
+        const std::uint64_t remaining =
+            destination.keys.capacity_bytes - begin;
+        capacity = remaining < destination.keys.stride
+            ? remaining : destination.keys.stride;
+      }
+    }
+    overflow = overflow || length > capacity;
+    if (!overflow)
+      for (std::uint64_t position = 0u; position < length; ++position)
+        destination.keys.bytes[begin + position] = key.byte(position);
+  }
+  if (destination.overflow)
+    destination.overflow[output] = static_cast<std::uint8_t>(overflow);
+}
+
+__global__ void sparse_successor_kernel(
+    RecordBatchView queries, SparseSuccessorOutput output,
+    PendingReadView pending, gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const gpulsmopt2_detail::RouteHeader *route_headers,
+    const gpulsmopt2_detail::RouteSlice *route_slices,
+    const std::uint16_t *cell_ranks,
+    const std::uint64_t *occupied_mask,
+    const DeviceSparseManifest *sparse_manifests,
+    const std::uint32_t *active_manifest) {
+  const std::uint32_t query_index =
+      blockIdx.x * blockDim.x + threadIdx.x;
+  if (query_index >= queries.count) return;
+  const DeviceKeyCursor query{
+      queries.keys, query_index, queries.head4_words};
+  const std::uint32_t active = __ldg(active_manifest) & 1u;
+  const DeviceSparseManifest &sparse = sparse_manifests[active];
+  const std::uint64_t occupied_levels = __ldg(occupied_mask);
+  const std::uint32_t active_levels = occupied_levels
+      ? 64u - static_cast<std::uint32_t>(__clzll(occupied_levels)) : 0u;
+  std::uint32_t lower = query.head4();
+
+  for (;;) {
+    std::uint32_t ordinary_head = 0u;
+    const bool have_ordinary = first_original_successor_head(
+        lower, pending, arena, descriptors, route_headers, route_slices,
+        active_levels, occupied_levels, ordinary_head);
+    std::uint32_t exact_head = 0u;
+    const bool have_exact =
+        next_sparse_exact_head(lower, pending, sparse, exact_head);
+    if (!have_ordinary && !have_exact) {
+      write_successor_missing(query_index, output);
+      return;
+    }
+    const std::uint32_t candidate_head = !have_ordinary ? exact_head
+        : !have_exact ? ordinary_head
+        : ordinary_head < exact_head ? ordinary_head : exact_head;
+    if (have_exact && exact_head == candidate_head) {
+      SuccessorKeyCursor result{};
+      if (refine_exact_successor_head(
+              candidate_head, query, pending, arena, descriptors,
+              cell_ranks, occupied_levels, sparse, result)) {
+        write_successor_key(query_index, result, output);
+        return;
+      }
+    } else {
+      const HeadKeyCursor ordinary{candidate_head};
+      if (compare_keys(ordinary, query) >= 0) {
+        write_successor_key(query_index, ordinary, output);
+        return;
+      }
+    }
+    if (candidate_head == std::numeric_limits<std::uint32_t>::max()) {
+      write_successor_missing(query_index, output);
+      return;
+    }
+    lower = candidate_head + 1u;
+  }
+}
+
+}  // namespace gpulsm_sparse
+// END INLINED COMPONENT: gpulsm_sparse/ordered_read.cuh
+// BEGIN INLINED COMPONENT: gpulsm_sparse/range.cuh
+
+// BEGIN INLINED COMPONENT: gpulsm_sparse/range_common.cuh
+
+
+namespace gpulsm_sparse::range_gate {
+
+constexpr std::uint32_t kOutputOverflow = 1u;
+
+template <class Function>
+inline std::pair<float, double> time_once(Function &&function) {
+  function();
+  return {};
+}
+
+struct RangeQueryBatch {
+  RecordBatchView lower{};
+  RecordBatchView upper{};
+  std::uint32_t count{};
+};
+
+struct QueryOrderSource {
+  RecordBatchView records{};
+};
+
+__host__ __device__ inline DeviceKeyCursor source_key(
+    QueryOrderSource source, std::uint32_t ref) {
+  return {source.records.keys, ref, source.records.head4_words};
+}
+
+struct QueryOrderValue {
+  __host__ __device__ std::uint64_t length() const { return 0u; }
+  __host__ __device__ std::uint8_t byte(std::uint64_t) const { return 0u; }
+  __host__ __device__ std::uint32_t inline_word() const { return 0u; }
+};
+
+__host__ __device__ inline QueryOrderValue source_value(
+    QueryOrderSource, std::uint32_t) {
+  return {};
+}
+
+__host__ __device__ inline bool source_tombstone(
+    QueryOrderSource, std::uint32_t) {
+  return false;
+}
+
+__host__ __device__ inline std::uint32_t source_summary(
+    QueryOrderSource, std::uint32_t) {
+  return 0u;
+}
+
+struct RangeComponent {
+  std::uint32_t lower_ref{};
+  std::uint32_t upper_ref{};
+  std::uint32_t task_begin{};
+  std::uint32_t task_count{};
+};
+
+struct RangeSlice {
+  std::uint64_t begin{};
+  std::uint64_t end{};
+  std::uint32_t component{};
+  std::uint32_t status{};
+};
+
+struct RangeReceipt {
+  std::uint64_t records{};
+  std::uint64_t capsule_indexes{};
+  std::uint64_t capsule_bytes{};
+  std::uint32_t chunks{};
+  std::uint32_t status{};
+};
+
+struct RangeCounters {
+  unsigned long long records{};
+  unsigned long long capsule_indexes{};
+  unsigned long long capsule_bytes{};
+  unsigned int status{};
+};
+
+struct RangePrefix {
+  std::uint64_t records{};
+  std::uint64_t capsules{};
+  std::uint64_t bytes{};
+};
+
+struct AddRangePrefix {
+  __host__ __device__ RangePrefix operator()(
+      const RangePrefix &left, const RangePrefix &right) const {
+    return {left.records + right.records,
+            left.capsules + right.capsules,
+            left.bytes + right.bytes};
+  }
+};
+
+struct PendingOrderSource {
+  PendingReadView pending{};
+};
+
+__device__ inline PendingRecordCursor pending_from_encoded(
+    PendingReadView pending, std::uint32_t ref) {
+  return {pending,
+          ref >> gpulsmopt2_detail::kBatchPositionBits,
+          ref & ((1u << gpulsmopt2_detail::kBatchPositionBits) - 1u)};
+}
+
+__device__ inline PendingRecordCursor source_key(
+    PendingOrderSource source, std::uint32_t ref) {
+  return pending_from_encoded(source.pending, ref);
+}
+
+struct PendingOrderValue {
+  PendingRecordCursor record{};
+
+  __device__ std::uint64_t length() const {
+    if (record.payload().metadata & gpulsmopt2_detail::kRawTombstone)
+      return 0u;
+    const CapsuleHeader *object = record.header();
+    return object ? object->value_length : 4u;
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const CapsuleHeader *object = record.header();
+    if (object) {
+      const auto *bytes = reinterpret_cast<const std::uint8_t *>(object + 1u);
+      return bytes[object->key_length + position];
+    }
+    return static_cast<std::uint8_t>(
+        record.payload().value >> (8u * position));
+  }
+
+  __device__ std::uint32_t inline_word() const {
+    const CapsuleHeader *object = record.header();
+    if (!object) return record.payload().value;
+    std::uint32_t result = 0u;
+    const std::uint64_t count = object->value_length < 4u
+        ? object->value_length : 4u;
+    for (std::uint64_t position = 0u; position < count; ++position)
+      result |= std::uint32_t{byte(position)} << (8u * position);
+    return result;
+  }
+};
+
+__device__ inline PendingOrderValue source_value(
+    PendingOrderSource source, std::uint32_t ref) {
+  return {pending_from_encoded(source.pending, ref)};
+}
+
+__device__ inline bool source_tombstone(
+    PendingOrderSource source, std::uint32_t ref) {
+  return (pending_from_encoded(source.pending, ref).payload().metadata &
+          gpulsmopt2_detail::kRawTombstone) != 0u;
+}
+
+__device__ inline std::uint32_t source_summary(
+    PendingOrderSource source, std::uint32_t ref) {
+  return pending_from_encoded(source.pending, ref).payload().value;
+}
+
+__global__ void build_pending_age_refs(
+    PendingReadView pending, const std::uint32_t *slot_offsets,
+    std::uint32_t *refs) {
+  const std::uint32_t slot = blockIdx.y;
+  if (slot >= pending.batch_count) return;
+  const std::uint32_t count =
+      slot_offsets[slot + 1u] - slot_offsets[slot];
+  for (std::uint32_t local = blockIdx.x * blockDim.x + threadIdx.x;
+       local < count; local += blockDim.x * gridDim.x) {
+    const std::uint64_t physical =
+        std::uint64_t{slot} * pending.batch_capacity + local;
+    const auto payload = pending.payloads[physical];
+    const std::uint32_t position = payload.metadata &
+        ((1u << gpulsmopt2_detail::kBatchPositionBits) - 1u);
+    refs[slot_offsets[slot] + position] =
+        (slot << gpulsmopt2_detail::kBatchPositionBits) | local;
+  }
+}
+
+__device__ inline bool root_has_exact_section(
+    const RootBuildState &root, std::uint32_t section) {
+  const auto *heads = reinterpret_cast<const ExactHeadDescriptor *>(
+      root.exact_heads);
+  std::uint32_t low = 0u;
+  std::uint32_t high = root.exact_head_count;
+  const std::uint32_t target = section << 16u;
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (heads[middle].head < target) low = middle + 1u;
+    else high = middle;
+  }
+  return low < root.exact_head_count &&
+      (heads[low].head >> 16u) == section;
+}
+
+__global__ void mark_active_sections(
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const RootBuildState *roots, const std::uint32_t *levels,
+    std::uint32_t root_count, PendingReadView pending,
+    std::uint8_t *flags) {
+  const std::uint32_t section = blockIdx.x * blockDim.x + threadIdx.x;
+  if (section >= kSections) return;
+  bool active = false;
+  for (std::uint32_t source = 0u; source < root_count && !active; ++source) {
+    const std::uint32_t level = levels[source];
+    active = descriptors[
+        gpulsmopt2_detail::descriptor_index(section, level)].count() ||
+        root_has_exact_section(roots[level], section);
+  }
+  for (std::uint32_t slot = 0u;
+       slot < pending.batch_count && !active; ++slot) {
+    const std::uint64_t base = std::uint64_t{slot} * (kSections + 1u);
+    active = pending.offsets[base + section + 1u] !=
+        pending.offsets[base + section];
+  }
+  flags[section] = static_cast<std::uint8_t>(active);
+}
+
+__global__ void coalesce_queries(
+    RangeQueryBatch queries, const std::uint32_t *ordered,
+    RangeComponent *components, std::uint32_t *component_count,
+    unsigned long long *errors) {
+  if (blockIdx.x || threadIdx.x) return;
+  *component_count = 0u;
+  if (!queries.count) return;
+  std::uint32_t current_lower = ordered[0];
+  std::uint32_t current_upper = current_lower;
+  const DeviceKeyCursor first_lower{
+      queries.lower.keys, current_lower, queries.lower.head4_words};
+  const DeviceKeyCursor first_upper{
+      queries.upper.keys, current_upper, queries.upper.head4_words};
+  if (compare_keys(first_lower, first_upper) > 0) {
+    atomicAdd(errors, 1ull);
+    return;
+  }
+  for (std::uint32_t position = 1u; position < queries.count; ++position) {
+    const std::uint32_t query = ordered[position];
+    const DeviceKeyCursor lower{
+        queries.lower.keys, query, queries.lower.head4_words};
+    const DeviceKeyCursor upper{
+        queries.upper.keys, query, queries.upper.head4_words};
+    if (compare_keys(lower, upper) > 0) {
+      atomicAdd(errors, 1ull);
+      return;
+    }
+    const DeviceKeyCursor active_upper{
+        queries.upper.keys, current_upper, queries.upper.head4_words};
+    if (compare_keys(lower, active_upper) <= 0) {
+      if (compare_keys(active_upper, upper) < 0) current_upper = query;
+      continue;
+    }
+    components[*component_count] = {current_lower, current_upper, 0u, 0u};
+    ++*component_count;
+    current_lower = query;
+    current_upper = query;
+  }
+  components[*component_count] = {current_lower, current_upper, 0u, 0u};
+  ++*component_count;
+}
+
+__global__ void finish_count_scan(
+    const std::uint32_t *counts, const std::uint32_t *offsets,
+    std::uint32_t count, std::uint32_t *total) {
+  if (blockIdx.x || threadIdx.x) return;
+  *total = count ? offsets[count - 1u] + counts[count - 1u] : 0u;
+}
+
+__device__ inline void exact_head_bounds(
+    const RootBuildState &root, std::uint32_t section,
+    std::uint32_t &begin, std::uint32_t &end) {
+  const auto *heads = reinterpret_cast<const ExactHeadDescriptor *>(
+      root.exact_heads);
+  const std::uint32_t low_head = section << 16u;
+  const std::uint32_t high_head = section == 0xffffu
+      ? std::numeric_limits<std::uint32_t>::max()
+      : (section + 1u) << 16u;
+  begin = 0u;
+  end = root.exact_head_count;
+  while (begin < end) {
+    const std::uint32_t middle = begin + ((end - begin) >> 1u);
+    if (heads[middle].head < low_head) begin = middle + 1u;
+    else end = middle;
+  }
+  const std::uint32_t first = begin;
+  end = root.exact_head_count;
+  while (begin < end) {
+    const std::uint32_t middle = begin + ((end - begin) >> 1u);
+    const bool before = section == 0xffffu
+        ? true : heads[middle].head < high_head;
+    if (before) begin = middle + 1u;
+    else end = middle;
+  }
+  end = begin;
+  begin = first;
+}
+
+__device__ inline std::uint32_t lower_bound_ordinary_head(
+    gpulsmopt2_detail::ResidentRows arena,
+    gpulsmopt2_detail::Descriptor rows, std::uint16_t suffix) {
+  return gpulsmopt2_detail::lower_bound_rows(
+      arena + rows.offset(), rows.count(), suffix);
+}
+
+class ActiveSectionRoster {
+ public:
+  ActiveSectionRoster()
+      : flags_(kSections), sections_(kSections), count_(1u) {
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    check(cub::DeviceSelect::Flagged(
+              nullptr, temporary_bytes_, ids, flags_.data(),
+              sections_.data(), count_.data(), kSections),
+          "size active section select");
+    temporary_.reset(temporary_bytes_);
+  }
+
+  std::pair<float, double> rebuild(
+      const gpulsmopt2_detail::Descriptor *descriptors,
+      const RootBuildState *roots,
+      const std::vector<std::uint32_t> &levels,
+      PendingReadView pending, cudaStream_t stream) {
+    levels_.reset(levels.size());
+    if (!levels.empty())
+      check(cudaMemcpyAsync(levels_.data(), levels.data(), levels_.bytes(),
+                            cudaMemcpyHostToDevice, stream),
+            "copy active root levels");
+    const auto timing = time_once([&] {
+      mark_active_sections<<<blocks(kSections), kThreads, 0, stream>>>(
+          descriptors, roots, levels_.data(),
+          static_cast<std::uint32_t>(levels.size()), pending, flags_.data());
+      cub::CountingInputIterator<std::uint32_t> ids(0u);
+      std::size_t bytes = temporary_bytes_;
+      check(cub::DeviceSelect::Flagged(
+                temporary_.data(), bytes, ids, flags_.data(), sections_.data(),
+                count_.data(), kSections, stream),
+            "select active sections");
+    });
+    check(cudaMemcpy(&host_count_, count_.data(), sizeof(host_count_),
+                     cudaMemcpyDeviceToHost),
+          "copy active section count");
+    return timing;
+  }
+
+  const std::uint32_t *sections() const { return sections_.data(); }
+  const std::uint32_t *levels() const { return levels_.data(); }
+  std::uint32_t count() const { return host_count_; }
+  std::size_t bytes() const {
+    return flags_.bytes() + sections_.bytes() + count_.bytes() +
+        levels_.bytes() + temporary_.bytes();
+  }
+
+ private:
+  Buffer<std::uint8_t> flags_, temporary_;
+  Buffer<std::uint32_t> sections_, count_, levels_;
+  std::size_t temporary_bytes_{};
+  std::uint32_t host_count_{};
+};
+
+}  // namespace gpulsm_sparse::range_gate
+// END INLINED COMPONENT: gpulsm_sparse/range_common.cuh
+
+#include <cub/block/block_reduce.cuh>
+
+namespace gpulsm_sparse::rank_range {
+
+using namespace range_gate;
+
+constexpr std::uint32_t kTileRows = 1024u;
+constexpr std::uint32_t kMaximumSources = kLevels + 1u;
+constexpr std::uint32_t kResidentOrdinarySpan = 0u;
+constexpr std::uint32_t kResidentExactSpan = 1u;
+constexpr std::uint32_t kPendingSpan = 2u;
+constexpr std::uint32_t kTaskFinal = 0u;
+constexpr std::uint32_t kTaskDirect = 1u;
+constexpr std::uint32_t kTaskSplitLower = 2u;
+constexpr std::uint32_t kTaskSplitUpper = 3u;
+
+struct OrderSpan {
+  std::uint64_t physical_begin{};
+  std::uint64_t logical_begin{};
+  std::uint32_t count{};
+  std::uint32_t fixed_head{};
+  std::uint32_t kind{};
+  std::uint32_t reserved{};
+};
+
+struct OrderSource {
+  std::uint32_t span_begin{};
+  std::uint32_t span_count{};
+  std::uint32_t row_count{};
+  std::uint32_t recency{};
+  std::uint32_t level{};
+  std::uint32_t reserved{};
+};
+
+struct RankTask {
+  std::uint32_t component{};
+  std::uint32_t candidate_count{};
+  std::uint32_t mode{};
+  std::uint32_t active_source{};
+};
+
+struct RankView {
+  gpulsmopt2_detail::ResidentRows arena{};
+  const RootBuildState *roots{};
+  PendingReadView pending{};
+  const std::uint32_t *pending_refs{};
+  const OrderSource *sources{};
+  const OrderSpan *spans{};
+  std::uint32_t source_count{};
+};
+
+struct EndpointSource {
+  RangeQueryBatch queries{};
+};
+
+__device__ inline DeviceKeyCursor source_key(
+    EndpointSource source, std::uint32_t ref) {
+  const bool upper = ref >= source.queries.count;
+  const std::uint32_t query = upper ? ref - source.queries.count : ref;
+  const RecordBatchView batch = upper
+      ? source.queries.upper : source.queries.lower;
+  return {batch.keys, query, batch.head4_words};
+}
+
+struct EndpointValue {
+  __device__ std::uint64_t length() const { return 0u; }
+  __device__ std::uint8_t byte(std::uint64_t) const { return 0u; }
+  __device__ std::uint32_t inline_word() const { return 0u; }
+};
+
+__device__ inline EndpointValue source_value(
+    EndpointSource, std::uint32_t) {
+  return {};
+}
+
+__device__ inline bool source_tombstone(
+    EndpointSource, std::uint32_t) {
+  return false;
+}
+
+__device__ inline std::uint32_t source_summary(
+    EndpointSource, std::uint32_t) {
+  return 0u;
+}
+
+struct LocatedRecord {
+  RankView view{};
+  std::uint32_t source{};
+  std::uint32_t logical{};
+  OrderSpan span{};
+  std::uint32_t local{};
+
+  __device__ bool pending_record() const {
+    return span.kind == kPendingSpan;
+  }
+
+  __device__ std::uint32_t pending_ref() const {
+    return view.pending_refs[span.physical_begin + local];
+  }
+
+  __device__ std::uint64_t physical() const {
+    return span.physical_begin + local;
+  }
+
+  __device__ PendingRecordCursor pending_cursor() const {
+    return pending_from_encoded(view.pending, pending_ref());
+  }
+
+  __device__ DeviceCapsulePlane plane() const {
+    if (pending_record()) return {};
+    const RootBuildState &root = view.roots[view.sources[source].level];
+    return {reinterpret_cast<const CapsulePage *>(root.capsule_pages),
+            reinterpret_cast<const CapsuleIndex *>(root.capsule_indexes),
+            root.capsule_page_count, root.capsule_count};
+  }
+
+  __device__ gpulsmopt2_detail::Row row() const {
+    if (span.kind != kResidentExactSpan) return view.arena[physical()];
+    const RootBuildState &root = view.roots[view.sources[source].level];
+    const auto *rows = reinterpret_cast<const gpulsmopt2_detail::Row *>(
+        root.exact_rows);
+    return rows[exact_physical_offset(physical())];
+  }
+
+  __device__ ResidentKeyCursor resident_cursor() const {
+    const auto stored = row();
+    const std::uint32_t head = span.kind == kResidentExactSpan
+        ? span.fixed_head : span.fixed_head | stored.key;
+    return {head, physical(), stored, plane()};
+  }
+};
+
+__device__ inline OrderSpan locate_span(
+    RankView view, std::uint32_t source, std::uint32_t logical) {
+  const OrderSource entry = view.sources[source];
+  std::uint32_t low = 0u;
+  std::uint32_t high = entry.span_count;
+  while (low + 1u < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (view.spans[entry.span_begin + middle].logical_begin <= logical)
+      low = middle;
+    else
+      high = middle;
+  }
+  return view.spans[entry.span_begin + low];
+}
+
+__device__ inline LocatedRecord locate_record(
+    RankView view, std::uint32_t source, std::uint32_t logical) {
+  const OrderSpan span = locate_span(view, source, logical);
+  return {view, source, logical, span,
+          logical - static_cast<std::uint32_t>(span.logical_begin)};
+}
+
+struct RankKeyCursor {
+  RankView view{};
+  std::uint32_t source{};
+  std::uint32_t logical{};
+
+  __device__ LocatedRecord record() const {
+    return locate_record(view, source, logical);
+  }
+
+  __device__ std::uint32_t head4() const {
+    const auto found = record();
+    return found.pending_record() ? found.pending_cursor().head4()
+                                  : found.resident_cursor().head4();
+  }
+
+  __device__ std::uint64_t length() const {
+    const auto found = record();
+    return found.pending_record() ? found.pending_cursor().length()
+                                  : found.resident_cursor().length();
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const auto found = record();
+    return found.pending_record() ? found.pending_cursor().byte(position)
+                                  : found.resident_cursor().byte(position);
+  }
+};
+
+struct SpanKeyCursor {
+  RankView view{};
+  std::uint32_t source{};
+  OrderSpan span{};
+  std::uint32_t local{};
+
+  __device__ LocatedRecord record() const {
+    return {view, source,
+            static_cast<std::uint32_t>(span.logical_begin) + local,
+            span, local};
+  }
+
+  __device__ std::uint32_t head4() const {
+    const auto found = record();
+    return found.pending_record() ? found.pending_cursor().head4()
+                                  : found.resident_cursor().head4();
+  }
+
+  __device__ std::uint64_t length() const {
+    const auto found = record();
+    return found.pending_record() ? found.pending_cursor().length()
+                                  : found.resident_cursor().length();
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const auto found = record();
+    return found.pending_record() ? found.pending_cursor().byte(position)
+                                  : found.resident_cursor().byte(position);
+  }
+};
+
+__device__ inline std::uint32_t source_span_index(
+    RankView view, std::uint32_t source, std::uint32_t logical) {
+  const OrderSource entry = view.sources[source];
+  std::uint32_t low = 0u;
+  std::uint32_t high = entry.span_count;
+  while (low + 1u < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (view.spans[entry.span_begin + middle].logical_begin <= logical)
+      low = middle;
+    else
+      high = middle;
+  }
+  return entry.span_begin + low;
+}
+
+__device__ inline SpanKeyCursor direct_key(
+    RankView view, std::uint32_t source, std::uint32_t logical) {
+  const std::uint32_t span_index = source_span_index(view, source, logical);
+  const OrderSpan span = view.spans[span_index];
+  return {view, source, span,
+          logical - static_cast<std::uint32_t>(span.logical_begin)};
+}
+
+struct RankValueCursor {
+  LocatedRecord record{};
+
+  __device__ const CapsuleHeader *header() const {
+    if (record.pending_record()) return record.pending_cursor().header();
+    const auto stored = record.row();
+    return capsule_header(anchor_has_capsule(stored)
+        ? find_capsule(record.plane(), record.physical(),
+                       anchor_capsule_rank(stored))
+        : nullptr);
+  }
+
+  __device__ bool tombstone() const {
+    return record.pending_record()
+        ? (record.pending_cursor().payload().metadata &
+           gpulsmopt2_detail::kRawTombstone) != 0u
+        : (record.row().flags & gpulsmopt2_detail::kTombstone) != 0u;
+  }
+
+  __device__ std::uint64_t length() const {
+    if (tombstone()) return 0u;
+    const CapsuleHeader *object = header();
+    if (object) return object->value_length;
+    return record.pending_record() ? 4u : anchor_value_length(record.row());
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const CapsuleHeader *object = header();
+    if (object) {
+      const auto *bytes = reinterpret_cast<const std::uint8_t *>(object + 1u);
+      return bytes[object->key_length + position];
+    }
+    const std::uint32_t word = record.pending_record()
+        ? record.pending_cursor().payload().value : record.row().value;
+    return static_cast<std::uint8_t>(word >> (8u * position));
+  }
+
+  __device__ std::uint32_t inline_word() const {
+    return record.pending_record()
+        ? record.pending_cursor().payload().value : record.row().value;
+  }
+};
+
+__device__ inline RankValueCursor rank_value(
+    RankView view, std::uint32_t source, std::uint32_t logical) {
+  return {locate_record(view, source, logical)};
+}
+
+__device__ inline int compare_source_keys(
+    RankView view, std::uint32_t left_source, std::uint32_t left_row,
+    std::uint32_t right_source, std::uint32_t right_row) {
+  return compare_keys(RankKeyCursor{view, left_source, left_row},
+                      RankKeyCursor{view, right_source, right_row});
+}
+
+__device__ inline bool same_source_key(
+    RankView view, std::uint32_t left_source, std::uint32_t left_row,
+    std::uint32_t right_source, std::uint32_t right_row) {
+  const RankKeyCursor left{view, left_source, left_row};
+  const RankKeyCursor right{view, right_source, right_row};
+  if (left.head4() != right.head4() || left.length() != right.length())
+    return false;
+  return left.length() == 4u || compare_keys(left, right, 4u) == 0;
+}
+
+__device__ inline std::uint32_t lower_bound_query(
+    RankView view, std::uint32_t source, std::uint32_t begin,
+    std::uint32_t end, const DeviceKeyCursor &query, bool strict) {
+  if (begin >= end) return begin;
+  const int first_comparison = compare_keys(
+      direct_key(view, source, begin), query);
+  if (first_comparison > 0 || (!strict && first_comparison == 0))
+    return begin;
+  const int last_comparison = compare_keys(
+      direct_key(view, source, end - 1u), query);
+  if (last_comparison < 0 || (strict && last_comparison == 0))
+    return end;
+  const OrderSource entry = view.sources[source];
+  std::uint32_t span_low = source_span_index(view, source, begin);
+  std::uint32_t span_high = source_span_index(view, source, end - 1u) + 1u;
+  while (span_low < span_high) {
+    const std::uint32_t middle = span_low + ((span_high - span_low) >> 1u);
+    const OrderSpan span = view.spans[middle];
+    const std::uint32_t last = span.count - 1u;
+    const int comparison = compare_keys(
+        SpanKeyCursor{view, source, span, last}, query);
+    if (comparison < 0 || (strict && comparison == 0)) span_low = middle + 1u;
+    else span_high = middle;
+  }
+  if (span_low >= entry.span_begin + entry.span_count) return end;
+  const OrderSpan span = view.spans[span_low];
+  std::uint32_t low = max(
+      begin, static_cast<std::uint32_t>(span.logical_begin));
+  std::uint32_t high = min(
+      end, static_cast<std::uint32_t>(span.logical_begin) + span.count);
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    const int comparison = compare_keys(
+        SpanKeyCursor{view, source, span,
+                      middle - static_cast<std::uint32_t>(span.logical_begin)},
+        query);
+    if (comparison < 0 || (strict && comparison == 0)) low = middle + 1u;
+    else high = middle;
+  }
+  return low;
+}
+
+__device__ inline std::uint32_t lower_bound_pivot(
+    RankView view, std::uint32_t source, std::uint32_t begin,
+    std::uint32_t end, std::uint32_t pivot_source,
+    std::uint32_t pivot_row, bool strict) {
+  if (begin >= end) return begin;
+  const SpanKeyCursor pivot = direct_key(view, pivot_source, pivot_row);
+  const OrderSource entry = view.sources[source];
+  std::uint32_t span_low = source_span_index(view, source, begin);
+  std::uint32_t span_high = source_span_index(view, source, end - 1u) + 1u;
+  while (span_low < span_high) {
+    const std::uint32_t middle = span_low + ((span_high - span_low) >> 1u);
+    const OrderSpan span = view.spans[middle];
+    const int comparison = compare_keys(
+        SpanKeyCursor{view, source, span, span.count - 1u}, pivot);
+    if (comparison < 0 || (strict && comparison == 0)) span_low = middle + 1u;
+    else span_high = middle;
+  }
+  if (span_low >= entry.span_begin + entry.span_count) return end;
+  const OrderSpan span = view.spans[span_low];
+  std::uint32_t low = max(
+      begin, static_cast<std::uint32_t>(span.logical_begin));
+  std::uint32_t high = min(
+      end, static_cast<std::uint32_t>(span.logical_begin) + span.count);
+  while (low < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    const int comparison = compare_keys(
+        SpanKeyCursor{view, source, span,
+                      middle - static_cast<std::uint32_t>(span.logical_begin)},
+        pivot);
+    if (comparison < 0 || (strict && comparison == 0)) low = middle + 1u;
+    else high = middle;
+  }
+  return low;
+}
+
+__global__ void count_root_spans(
+    const std::uint32_t *sections, std::uint32_t section_count,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const RootBuildState *roots, const std::uint32_t *levels,
+    std::uint32_t root_count, std::uint32_t *span_counts,
+    std::uint32_t *row_counts) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t entries = root_count * section_count;
+  if (index >= entries) return;
+  const std::uint32_t root_slot = index / section_count;
+  const std::uint32_t section = sections[index % section_count];
+  const std::uint32_t level = levels[root_slot];
+  const RootBuildState root = roots[level];
+  const auto ordinary = descriptors[
+      gpulsmopt2_detail::descriptor_index(section, level)];
+  std::uint32_t exact_begin = 0u;
+  std::uint32_t exact_end = 0u;
+  exact_head_bounds(root, section, exact_begin, exact_end);
+  const auto *heads = reinterpret_cast<const ExactHeadDescriptor *>(
+      root.exact_heads);
+  std::uint32_t ordinary_position = 0u;
+  std::uint32_t spans = 0u;
+  std::uint32_t rows = 0u;
+  for (std::uint32_t exact = exact_begin; exact < exact_end; ++exact) {
+    const std::uint32_t position = lower_bound_ordinary_head(
+        arena, ordinary, static_cast<std::uint16_t>(heads[exact].head));
+    if (position > ordinary_position) ++spans;
+    if (heads[exact].count) ++spans;
+    rows += position - ordinary_position + heads[exact].count;
+    // The specialized projection retains one sentinel row for this exact
+    // head.  The logical range cursor expands the sidecar in its place.
+    ordinary_position = position + 1u;
+  }
+  if (ordinary_position < ordinary.count()) ++spans;
+  rows += ordinary.count() - ordinary_position;
+  span_counts[index] = spans;
+  row_counts[index] = rows;
+}
+
+__global__ void fill_root_spans(
+    const std::uint32_t *sections, std::uint32_t section_count,
+    gpulsmopt2_detail::ResidentRows arena,
+    const gpulsmopt2_detail::Descriptor *descriptors,
+    const RootBuildState *roots, const std::uint32_t *levels,
+    std::uint32_t root_count, const std::uint32_t *span_offsets,
+    const std::uint32_t *row_offsets, OrderSpan *spans,
+    unsigned long long *errors) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t entries = root_count * section_count;
+  if (index >= entries) return;
+  const std::uint32_t root_slot = index / section_count;
+  const std::uint32_t section = sections[index % section_count];
+  const std::uint32_t level = levels[root_slot];
+  const RootBuildState root = roots[level];
+  const auto ordinary = descriptors[
+      gpulsmopt2_detail::descriptor_index(section, level)];
+  std::uint32_t exact_begin = 0u;
+  std::uint32_t exact_end = 0u;
+  exact_head_bounds(root, section, exact_begin, exact_end);
+  const auto *heads = reinterpret_cast<const ExactHeadDescriptor *>(
+      root.exact_heads);
+  std::uint32_t ordinary_position = 0u;
+  std::uint64_t logical = row_offsets[index];
+  std::uint32_t output = span_offsets[index];
+  for (std::uint32_t exact = exact_begin; exact < exact_end; ++exact) {
+    const std::uint32_t position = lower_bound_ordinary_head(
+        arena, ordinary, static_cast<std::uint16_t>(heads[exact].head));
+    if (position > ordinary_position) {
+      const std::uint32_t count = position - ordinary_position;
+      spans[output++] = {ordinary.offset() + ordinary_position, logical,
+                         count, section << 16u,
+                         kResidentOrdinarySpan, 0u};
+      logical += count;
+    }
+    if (heads[exact].count) {
+      spans[output++] = {heads[exact].physical_begin, logical,
+                         heads[exact].count, heads[exact].head,
+                         kResidentExactSpan, 0u};
+      logical += heads[exact].count;
+    }
+    ordinary_position = position + 1u;
+  }
+  if (ordinary_position < ordinary.count()) {
+    const std::uint32_t count = ordinary.count() - ordinary_position;
+    spans[output++] = {ordinary.offset() + ordinary_position, logical,
+                       count, section << 16u,
+                       kResidentOrdinarySpan, 0u};
+  }
+  const std::uint32_t expected = index + 1u < entries
+      ? span_offsets[index + 1u] : output;
+  if (index + 1u < entries && output != expected)
+    atomicAdd(errors, 1ull);
+}
+
+__global__ void finish_roster_sources(
+    std::uint32_t section_count, const std::uint32_t *span_counts,
+    const std::uint32_t *span_offsets, const std::uint32_t *row_counts,
+    const std::uint32_t *row_offsets, const std::uint32_t *levels,
+    std::uint32_t root_count, std::uint32_t root_span_total,
+    std::uint32_t pending_rows, OrderSource *sources, OrderSpan *spans) {
+  const std::uint32_t source = blockIdx.x * blockDim.x + threadIdx.x;
+  if (source < root_count) {
+    const std::uint32_t first = source * section_count;
+    const std::uint32_t last = first + section_count - 1u;
+    const std::uint32_t span_begin = span_offsets[first];
+    const std::uint32_t span_end = span_offsets[last] + span_counts[last];
+    const std::uint32_t row_count = row_offsets[last] + row_counts[last];
+    sources[source] = {span_begin, span_end - span_begin, row_count,
+                       kLevels - levels[source], levels[source], 0u};
+  }
+  if (source == root_count && pending_rows) {
+    spans[root_span_total] = {0u, 0u, pending_rows, 0u, kPendingSpan, 0u};
+    sources[source] = {root_span_total, 1u, pending_rows,
+                       std::numeric_limits<std::uint32_t>::max(),
+                       kLevels, 0u};
+  }
+}
+
+__global__ void append_pending_source(
+    std::uint32_t root_count, std::uint32_t root_span_total,
+    std::uint32_t pending_rows, OrderSource *sources, OrderSpan *spans) {
+  if (blockIdx.x || threadIdx.x || !pending_rows) return;
+  spans[root_span_total] = {
+      0u, 0u, pending_rows, 0u, kPendingSpan, 0u};
+  sources[root_count] = {
+      root_span_total, 1u, pending_rows,
+      std::numeric_limits<std::uint32_t>::max(), kLevels, 0u};
+}
+
+__global__ void initialize_rank_tasks(
+    RangeQueryBatch queries, const RangeComponent *components,
+    std::uint32_t component_count, RankView view, RankTask *tasks,
+    std::uint32_t *begins, std::uint32_t *ends) {
+  const std::uint32_t component = blockIdx.x;
+  if (component >= component_count) return;
+  const RangeComponent interval = components[component];
+  const DeviceKeyCursor lower{
+      queries.lower.keys, interval.lower_ref, queries.lower.head4_words};
+  const DeviceKeyCursor upper{
+      queries.upper.keys, interval.upper_ref, queries.upper.head4_words};
+  __shared__ std::uint32_t total;
+  if (threadIdx.x == 0u) total = 0u;
+  __syncthreads();
+  for (std::uint32_t source = threadIdx.x; source < view.source_count;
+       source += blockDim.x) {
+    const std::uint32_t count = view.sources[source].row_count;
+    const std::uint32_t begin = lower_bound_query(
+        view, source, 0u, count, lower, false);
+    const std::uint32_t end = lower_bound_query(
+        view, source, begin, count, upper, true);
+    const std::uint64_t position =
+        std::uint64_t{component} * view.source_count + source;
+    begins[position] = begin;
+    ends[position] = end;
+    if (end > begin) atomicAdd(&total, end - begin);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0u)
+    tasks[component] = {component, total, kTaskFinal, 0u};
+}
+
+__global__ void classify_rank_tasks(
+    const RankTask *tasks, const std::uint32_t *task_count,
+    const std::uint32_t *begins, const std::uint32_t *ends,
+    RankView view, std::uint32_t *child_counts,
+    std::uint32_t *split_lowers, std::uint32_t *split_uppers,
+    RankTask *classified, std::uint32_t *oversized_count) {
+  __shared__ std::uint32_t order[kMaximumSources];
+  __shared__ std::uint32_t medians[kMaximumSources];
+  __shared__ std::uint32_t active_count;
+  __shared__ std::uint32_t active_source;
+  __shared__ std::uint32_t pivot_source;
+  __shared__ std::uint32_t pivot_row;
+  __shared__ std::uint32_t lower_total;
+  __shared__ std::uint32_t upper_total;
+  const std::uint32_t task = blockIdx.x;
+  if (task >= *task_count) return;
+  RankTask meta = tasks[task];
+  const std::uint64_t base = std::uint64_t{task} * view.source_count;
+  if (threadIdx.x == 0u) {
+    active_count = 0u;
+    active_source = 0u;
+    lower_total = 0u;
+    upper_total = 0u;
+    for (std::uint32_t source = 0u; source < view.source_count; ++source) {
+      const std::uint32_t count = ends[base + source] - begins[base + source];
+      if (!count) continue;
+      active_source = source;
+      order[active_count] = source;
+      medians[active_count] = begins[base + source] + count / 2u;
+      ++active_count;
+    }
+    meta.active_source = active_source;
+    if (meta.candidate_count <= kTileRows) {
+      meta.mode = kTaskFinal;
+      child_counts[task] = 1u;
+    } else if (active_count == 1u) {
+      meta.mode = kTaskDirect;
+      child_counts[task] =
+          (meta.candidate_count + kTileRows - 1u) / kTileRows;
+      atomicAdd(oversized_count, 1u);
+    } else {
+      for (std::uint32_t index = 1u; index < active_count; ++index) {
+        const std::uint32_t source = order[index];
+        const std::uint32_t row = medians[index];
+        std::uint32_t position = index;
+        while (position && compare_keys(
+                   direct_key(view, source, row),
+                   direct_key(view, order[position - 1u],
+                              medians[position - 1u])) < 0) {
+          order[position] = order[position - 1u];
+          medians[position] = medians[position - 1u];
+          --position;
+        }
+        order[position] = source;
+        medians[position] = row;
+      }
+      std::uint64_t prefix = 0u;
+      const std::uint64_t half =
+          (static_cast<std::uint64_t>(meta.candidate_count) + 1u) / 2u;
+      pivot_source = order[active_count - 1u];
+      pivot_row = medians[active_count - 1u];
+      for (std::uint32_t index = 0u; index < active_count; ++index) {
+        const std::uint32_t source = order[index];
+        prefix += ends[base + source] - begins[base + source];
+        if (prefix >= half) {
+          pivot_source = source;
+          pivot_row = medians[index];
+          break;
+        }
+      }
+      child_counts[task] = 2u;
+      atomicAdd(oversized_count, 1u);
+    }
+    classified[task] = meta;
+  }
+  __syncthreads();
+  if (meta.candidate_count <= kTileRows || active_count == 1u) return;
+  for (std::uint32_t source = threadIdx.x; source < view.source_count;
+       source += blockDim.x) {
+    const std::uint32_t begin = begins[base + source];
+    const std::uint32_t end = ends[base + source];
+    const std::uint32_t low = lower_bound_pivot(
+        view, source, begin, end, pivot_source, pivot_row, false);
+    const std::uint32_t high = lower_bound_pivot(
+        view, source, low, end, pivot_source, pivot_row, true);
+    split_lowers[base + source] = low;
+    split_uppers[base + source] = high;
+    atomicAdd(&lower_total, low - begin);
+    atomicAdd(&upper_total, high - begin);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    const std::uint32_t lower_distance = lower_total > meta.candidate_count / 2u
+        ? lower_total - meta.candidate_count / 2u
+        : meta.candidate_count / 2u - lower_total;
+    const std::uint32_t upper_distance = upper_total > meta.candidate_count / 2u
+        ? upper_total - meta.candidate_count / 2u
+        : meta.candidate_count / 2u - upper_total;
+    classified[task].mode = upper_distance < lower_distance
+        ? kTaskSplitUpper : kTaskSplitLower;
+  }
+}
+
+__global__ void emit_rank_children(
+    const RankTask *tasks, const RankTask *classified,
+    const std::uint32_t *task_count, const std::uint32_t *child_offsets,
+    const std::uint32_t *begins, const std::uint32_t *ends,
+    const std::uint32_t *split_lowers, const std::uint32_t *split_uppers,
+    std::uint32_t source_count, RankTask *children,
+    std::uint32_t *child_begins, std::uint32_t *child_ends) {
+  const std::uint32_t task = blockIdx.x;
+  if (task >= *task_count) return;
+  const RankTask input = tasks[task];
+  const RankTask plan = classified[task];
+  const std::uint32_t output = child_offsets[task];
+  const std::uint64_t input_base = std::uint64_t{task} * source_count;
+  if (plan.mode == kTaskFinal) {
+    if (threadIdx.x == 0u) children[output] = input;
+    for (std::uint32_t source = threadIdx.x; source < source_count;
+         source += blockDim.x) {
+      const std::uint64_t destination =
+          std::uint64_t{output} * source_count + source;
+      child_begins[destination] = begins[input_base + source];
+      child_ends[destination] = ends[input_base + source];
+    }
+    return;
+  }
+  if (plan.mode == kTaskDirect) {
+    const std::uint32_t source = plan.active_source;
+    const std::uint32_t first = begins[input_base + source];
+    const std::uint32_t count = ends[input_base + source] - first;
+    const std::uint32_t pieces = (count + kTileRows - 1u) / kTileRows;
+    for (std::uint32_t piece = threadIdx.x; piece < pieces;
+         piece += blockDim.x) {
+      const std::uint32_t child = output + piece;
+      const std::uint32_t begin = first + piece * kTileRows;
+      const std::uint32_t end = min(first + count, begin + kTileRows);
+      children[child] = {input.component, end - begin, kTaskFinal, source};
+    }
+    for (std::uint32_t flat = threadIdx.x;
+         flat < pieces * source_count; flat += blockDim.x) {
+      const std::uint32_t piece = flat / source_count;
+      const std::uint32_t slot = flat % source_count;
+      const std::uint32_t child = output + piece;
+      const std::uint64_t destination =
+          std::uint64_t{child} * source_count + slot;
+      if (slot == source) {
+        const std::uint32_t begin = first + piece * kTileRows;
+        child_begins[destination] = begin;
+        child_ends[destination] = min(first + count, begin + kTileRows);
+      } else {
+        child_begins[destination] = begins[input_base + slot];
+        child_ends[destination] = begins[input_base + slot];
+      }
+    }
+    return;
+  }
+  const bool upper = plan.mode == kTaskSplitUpper;
+  std::uint32_t left_count = 0u;
+  std::uint32_t right_count = 0u;
+  for (std::uint32_t source = threadIdx.x; source < source_count;
+       source += blockDim.x) {
+    const std::uint32_t begin = begins[input_base + source];
+    const std::uint32_t end = ends[input_base + source];
+    const std::uint32_t cut = upper ? split_uppers[input_base + source]
+                                    : split_lowers[input_base + source];
+    const std::uint64_t left = std::uint64_t{output} * source_count + source;
+    const std::uint64_t right = left + source_count;
+    child_begins[left] = begin;
+    child_ends[left] = cut;
+    child_begins[right] = cut;
+    child_ends[right] = end;
+    atomicAdd(reinterpret_cast<unsigned int *>(&children[output].candidate_count),
+              cut - begin);
+    atomicAdd(reinterpret_cast<unsigned int *>(
+                  &children[output + 1u].candidate_count), end - cut);
+    left_count += cut - begin;
+    right_count += end - cut;
+  }
+  if (threadIdx.x == 0u) {
+    children[output].component = input.component;
+    children[output].mode = kTaskFinal;
+    children[output].active_source = 0u;
+    children[output + 1u].component = input.component;
+    children[output + 1u].mode = kTaskFinal;
+    children[output + 1u].active_source = 0u;
+  }
+}
+
+__global__ void clear_rank_tasks(RankTask *tasks, std::uint32_t begin,
+                                 std::uint32_t count) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count) tasks[begin + index] = {};
+}
+
+__device__ inline std::uint32_t token_source(std::uint64_t token) {
+  return static_cast<std::uint32_t>(token >> 32u);
+}
+
+__device__ inline std::uint32_t token_row(std::uint64_t token) {
+  return static_cast<std::uint32_t>(token);
+}
+
+__device__ inline bool token_less(
+    RankView view, std::uint64_t left, std::uint64_t right) {
+  const std::uint32_t left_source = token_source(left);
+  const std::uint32_t right_source = token_source(right);
+  const int comparison = compare_source_keys(
+      view, left_source, token_row(left), right_source, token_row(right));
+  if (comparison) return comparison < 0;
+  const std::uint32_t left_age = view.sources[left_source].recency;
+  const std::uint32_t right_age = view.sources[right_source].recency;
+  if (left_age != right_age) return left_age > right_age;
+  return left_source < right_source;
+}
+
+__device__ inline std::uint32_t merge_partition(
+    RankView view, const std::uint64_t *left, std::uint32_t left_count,
+    const std::uint64_t *right, std::uint32_t right_count,
+    std::uint32_t diagonal) {
+  std::uint32_t low = diagonal > right_count ? diagonal - right_count : 0u;
+  std::uint32_t high = min(diagonal, left_count);
+  while (low <= high) {
+    const std::uint32_t i = (low + high) >> 1u;
+    const std::uint32_t j = diagonal - i;
+    if (i && j < right_count && token_less(view, right[j], left[i - 1u]))
+      high = i - 1u;
+    else if (j && i < left_count &&
+             !token_less(view, right[j - 1u], left[i]))
+      low = i + 1u;
+    else
+      return i;
+  }
+  return low;
+}
+
+__device__ inline std::uint64_t *merge_rank_task(
+    RankView view, const std::uint32_t *begins,
+    const std::uint32_t *ends, std::uint64_t *tokens_a,
+    std::uint64_t *tokens_b, std::uint32_t *segments,
+    std::uint32_t &total, unsigned long long *errors) {
+  if (threadIdx.x == 0u) {
+    total = 0u;
+    segments[0] = 0u;
+    for (std::uint32_t source = 0u; source < view.source_count; ++source) {
+      total += ends[source] - begins[source];
+      segments[source + 1u] = total;
+    }
+    if (total > kTileRows) atomicAdd(errors, 1ull);
+  }
+  __syncthreads();
+  if (total > kTileRows) return tokens_a;
+  for (std::uint32_t source = 0u; source < view.source_count; ++source) {
+    const std::uint32_t count = ends[source] - begins[source];
+    for (std::uint32_t local = threadIdx.x; local < count;
+         local += blockDim.x)
+      tokens_a[segments[source] + local] =
+          (std::uint64_t{source} << 32u) | (begins[source] + local);
+  }
+  __syncthreads();
+  std::uint32_t segment_count = view.source_count;
+  bool ping = false;
+  while (segment_count > 1u) {
+    const std::uint64_t *input = ping ? tokens_b : tokens_a;
+    std::uint64_t *output = ping ? tokens_a : tokens_b;
+    const std::uint32_t pairs = segment_count / 2u;
+    for (std::uint32_t pair = 0u; pair < pairs; ++pair) {
+      const std::uint32_t first = segments[pair * 2u];
+      const std::uint32_t middle = segments[pair * 2u + 1u];
+      const std::uint32_t last = segments[pair * 2u + 2u];
+      const std::uint32_t left_count = middle - first;
+      const std::uint32_t right_count = last - middle;
+      for (std::uint32_t diagonal = threadIdx.x;
+           diagonal < left_count + right_count;
+           diagonal += blockDim.x) {
+        const std::uint32_t i = merge_partition(
+            view, input + first, left_count, input + middle,
+            right_count, diagonal);
+        const std::uint32_t j = diagonal - i;
+        const bool take_left = i < left_count &&
+            (j >= right_count ||
+             !token_less(view, input[middle + j], input[first + i]));
+        output[first + diagonal] = take_left
+            ? input[first + i] : input[middle + j];
+      }
+    }
+    if (segment_count & 1u) {
+      const std::uint32_t begin = segments[segment_count - 1u];
+      const std::uint32_t end = segments[segment_count];
+      for (std::uint32_t index = begin + threadIdx.x;
+           index < end; index += blockDim.x)
+        output[index] = input[index];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      const std::uint32_t next = (segment_count + 1u) / 2u;
+      for (std::uint32_t segment = 1u; segment < next; ++segment)
+        segments[segment] = segments[segment * 2u];
+      segments[next] = total;
+    }
+    __syncthreads();
+    segment_count = (segment_count + 1u) / 2u;
+    ping = !ping;
+  }
+  return ping ? tokens_b : tokens_a;
+}
+
+__device__ inline bool token_live(
+    RankView view, const std::uint64_t *tokens, std::uint32_t index) {
+  const std::uint64_t token = tokens[index];
+  if (index && same_source_key(
+          view, token_source(tokens[index - 1u]),
+          token_row(tokens[index - 1u]), token_source(token),
+          token_row(token)))
+    return false;
+  return !rank_value(
+      view, token_source(token), token_row(token)).tombstone();
+}
+
+struct OutputAnchor {
+  std::uint32_t head{};
+  std::uint32_t value{};
+};
+
+struct OutputCapsule {
+  std::uint64_t anchor_row{};
+  CapsuleIndex index{};
+};
+
+struct CopyObject {
+  std::uint32_t source{};
+  std::uint32_t row{};
+  std::uint64_t destination{};
+};
+
+struct OutputChunk {
+  std::uint64_t physical_begin{};
+  std::uint64_t logical_begin{};
+  std::uint64_t capsule_begin{};
+  std::uint32_t count{};
+  std::uint32_t capsule_count{};
+  std::uint32_t component{};
+  std::uint32_t task{};
+};
+
+struct OutputView {
+  const OutputAnchor *anchors{};
+  const OutputCapsule *capsules{};
+  const OutputChunk *chunks{};
+  const std::uint64_t *logical_offsets{};
+  std::uint32_t chunk_count{};
+};
+
+__device__ inline std::uint32_t output_chunk(
+    OutputView output, std::uint64_t logical) {
+  std::uint32_t low = 0u;
+  std::uint32_t high = output.chunk_count;
+  while (low + 1u < high) {
+    const std::uint32_t middle = low + ((high - low) >> 1u);
+    if (output.logical_offsets[middle] <= logical) low = middle;
+    else high = middle;
+  }
+  return low;
+}
+
+struct OutputKeyCursor {
+  OutputView output{};
+  std::uint64_t logical{};
+
+  __device__ OutputChunk chunk() const {
+    return output.chunks[output_chunk(output, logical)];
+  }
+
+  __device__ std::uint64_t physical() const {
+    const OutputChunk part = chunk();
+    return part.physical_begin + logical - part.logical_begin;
+  }
+
+  __device__ OutputAnchor anchor() const {
+    return output.anchors[physical()];
+  }
+
+  __device__ const CapsuleHeader *header() const {
+    const OutputChunk part = chunk();
+    const std::uint64_t row = physical();
+    std::uint32_t low = 0u;
+    std::uint32_t high = part.capsule_count;
+    while (low < high) {
+      const std::uint32_t middle = low + ((high - low) >> 1u);
+      if (output.capsules[part.capsule_begin + middle].anchor_row < row)
+        low = middle + 1u;
+      else
+        high = middle;
+    }
+    if (low == part.capsule_count) return nullptr;
+    const OutputCapsule capsule = output.capsules[part.capsule_begin + low];
+    return capsule.anchor_row == row
+        ? reinterpret_cast<const CapsuleHeader *>(capsule.index.address)
+        : nullptr;
+  }
+
+  __device__ std::uint32_t head4() const { return anchor().head; }
+
+  __device__ std::uint64_t length() const {
+    const CapsuleHeader *object = header();
+    return object ? object->key_length : 4u;
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const CapsuleHeader *object = header();
+    if (object)
+      return reinterpret_cast<const std::uint8_t *>(object + 1u)[position];
+    return static_cast<std::uint8_t>(
+        head4() >> (24u - static_cast<std::uint32_t>(position) * 8u));
+  }
+};
+
+struct OutputValueCursor {
+  OutputKeyCursor key{};
+
+  __device__ std::uint64_t length() const {
+    const CapsuleHeader *object = key.header();
+    return object ? object->value_length : 4u;
+  }
+
+  __device__ std::uint8_t byte(std::uint64_t position) const {
+    const CapsuleHeader *object = key.header();
+    if (object) {
+      const auto *bytes = reinterpret_cast<const std::uint8_t *>(object + 1u);
+      return bytes[object->key_length + position];
+    }
+    return static_cast<std::uint8_t>(key.anchor().value >> (8u * position));
+  }
+
+  __device__ std::uint32_t inline_word() const {
+    return key.anchor().value;
+  }
+};
+
+__global__ void emit_rank_tasks(
+    const RankTask *tasks, const std::uint32_t *task_count,
+    const std::uint32_t *begins, const std::uint32_t *ends,
+    RankView view, OutputAnchor *output_anchors,
+    std::uint64_t anchor_capacity, OutputCapsule *output_capsules,
+    std::uint64_t capsule_capacity, std::uint8_t *output_bytes,
+    std::uint64_t byte_capacity, CopyObject *copy_objects,
+    OutputChunk *chunks, std::uint64_t *chunk_counts,
+    RangeCounters *counters, unsigned long long *errors) {
+  using BlockScan = cub::BlockScan<RangePrefix, kThreads>;
+  __shared__ std::uint64_t tokens_a[kTileRows];
+  __shared__ std::uint64_t tokens_b[kTileRows];
+  __shared__ std::uint32_t segments[kMaximumSources + 1u];
+  __shared__ typename BlockScan::TempStorage scan;
+  __shared__ std::uint32_t total;
+  __shared__ unsigned long long record_total;
+  __shared__ unsigned long long capsule_total;
+  __shared__ unsigned long long byte_total;
+  __shared__ unsigned long long record_base;
+  __shared__ unsigned long long capsule_base;
+  __shared__ unsigned long long byte_base;
+  __shared__ unsigned long long running_records;
+  __shared__ unsigned long long running_capsules;
+  __shared__ unsigned long long running_bytes;
+  const std::uint32_t task = blockIdx.x;
+  if (task >= *task_count) return;
+  const std::uint64_t bounds = std::uint64_t{task} * view.source_count;
+  std::uint64_t *tokens = merge_rank_task(
+      view, begins + bounds, ends + bounds, tokens_a, tokens_b,
+      segments, total, errors);
+  if (total > kTileRows) return;
+  if (threadIdx.x == 0u) {
+    record_total = 0u;
+    capsule_total = 0u;
+    byte_total = 0u;
+  }
+  __syncthreads();
+  std::uint64_t local_records = 0u;
+  std::uint64_t local_capsules = 0u;
+  std::uint64_t local_bytes = 0u;
+  for (std::uint32_t index = threadIdx.x; index < total;
+       index += blockDim.x) {
+    if (!token_live(view, tokens, index)) continue;
+    const std::uint64_t token = tokens[index];
+    const RankKeyCursor key{
+        view, token_source(token), token_row(token)};
+    const RankValueCursor value = rank_value(
+        view, token_source(token), token_row(token));
+    const bool capsule = key.length() != 4u || value.length() != 4u;
+    ++local_records;
+    local_capsules += capsule;
+    if (capsule) {
+      std::uint64_t object_bytes = 0u;
+      if (!capsule_object_bytes(key.length(), value.length(), object_bytes))
+        atomicAdd(errors, 1ull);
+      local_bytes += object_bytes;
+    }
+  }
+  if (local_records) atomicAdd(&record_total, local_records);
+  if (local_capsules) atomicAdd(&capsule_total, local_capsules);
+  if (local_bytes) atomicAdd(&byte_total, local_bytes);
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    record_base = atomicAdd(&counters->records, record_total);
+    capsule_base = atomicAdd(&counters->capsule_indexes, capsule_total);
+    byte_base = atomicAdd(&counters->capsule_bytes, byte_total);
+    running_records = 0u;
+    running_capsules = 0u;
+    running_bytes = 0u;
+    if (record_base + record_total > anchor_capacity ||
+        capsule_base + capsule_total > capsule_capacity ||
+        byte_base + byte_total > byte_capacity)
+      atomicOr(&counters->status, kOutputOverflow);
+    chunks[task] = {record_base, 0u, capsule_base,
+                    static_cast<std::uint32_t>(record_total),
+                    static_cast<std::uint32_t>(capsule_total),
+                    tasks[task].component, task};
+    chunk_counts[task] = record_total;
+  }
+  __syncthreads();
+  const bool writable = record_base + record_total <= anchor_capacity &&
+      capsule_base + capsule_total <= capsule_capacity &&
+      byte_base + byte_total <= byte_capacity;
+  for (std::uint32_t chunk = 0u; chunk < total; chunk += blockDim.x) {
+    const std::uint32_t index = chunk + threadIdx.x;
+    const bool live = index < total && token_live(view, tokens, index);
+    std::uint64_t token = 0u;
+    RangePrefix item{};
+    if (live) {
+      token = tokens[index];
+      const RankKeyCursor key{
+          view, token_source(token), token_row(token)};
+      const RankValueCursor value = rank_value(
+          view, token_source(token), token_row(token));
+      const bool capsule = key.length() != 4u || value.length() != 4u;
+      item.records = 1u;
+      item.capsules = capsule;
+      if (capsule) capsule_object_bytes(
+          key.length(), value.length(), item.bytes);
+    }
+    RangePrefix prefix{};
+    RangePrefix aggregate{};
+    BlockScan(scan).ExclusiveScan(
+        item, prefix, RangePrefix{}, AddRangePrefix{}, aggregate);
+    __syncthreads();
+    if (live && writable) {
+      const std::uint32_t source = token_source(token);
+      const std::uint32_t row = token_row(token);
+      const RankKeyCursor key{view, source, row};
+      const RankValueCursor value = rank_value(view, source, row);
+      const std::uint64_t output = record_base + running_records +
+          prefix.records;
+      output_anchors[output] = {key.head4(), value.inline_word()};
+      if (item.capsules) {
+        const std::uint64_t capsule = capsule_base + running_capsules +
+            prefix.capsules;
+        const std::uint64_t object_offset = byte_base + running_bytes +
+            prefix.bytes;
+        const CapsuleIndex index_entry{
+            reinterpret_cast<std::uint64_t>(output_bytes + object_offset),
+            rejection_hash(key), 0u};
+        output_capsules[capsule] = {output, index_entry};
+        copy_objects[capsule] = {source, row,
+                                index_entry.address};
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      running_records += aggregate.records;
+      running_capsules += aggregate.capsules;
+      running_bytes += aggregate.bytes;
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void copy_output_capsules(
+    const CopyObject *objects, std::uint64_t capacity,
+    const RangeCounters *counters, RankView view) {
+  const std::uint64_t object = blockIdx.x;
+  if (object >= capacity || object >= counters->capsule_indexes ||
+      counters->status)
+    return;
+  const CopyObject copy = objects[object];
+  const RankKeyCursor key{view, copy.source, copy.row};
+  const RankValueCursor value = rank_value(view, copy.source, copy.row);
+  auto *header = reinterpret_cast<CapsuleHeader *>(copy.destination);
+  if (threadIdx.x == 0u)
+    *header = {key.length(), value.length(), 0u, 0u};
+  auto *bytes = reinterpret_cast<std::uint8_t *>(header + 1u);
+  for (std::uint64_t position = threadIdx.x;
+       position < key.length() + value.length(); position += blockDim.x) {
+    bytes[position] = position < key.length()
+        ? key.byte(position) : value.byte(position - key.length());
+  }
+}
+
+__global__ void finish_output(
+    OutputChunk *chunks, const std::uint64_t *logical_offsets,
+    const std::uint32_t *chunk_count, const RangeCounters *counters,
+    RangeReceipt *receipt) {
+  const std::uint32_t chunk = blockIdx.x * blockDim.x + threadIdx.x;
+  if (chunk < *chunk_count)
+    chunks[chunk].logical_begin = logical_offsets[chunk];
+  if (!chunk) {
+    receipt->records = counters->records;
+    receipt->capsule_indexes = counters->capsule_indexes;
+    receipt->capsule_bytes = counters->capsule_bytes;
+    receipt->chunks = *chunk_count;
+    receipt->status = counters->status;
+  }
+}
+
+__device__ inline std::uint64_t lower_bound_output(
+    OutputView output, std::uint64_t begin, std::uint64_t end,
+    const DeviceKeyCursor &query, bool strict) {
+  while (begin < end) {
+    const std::uint64_t middle = begin + ((end - begin) >> 1u);
+    const int comparison = compare_keys(OutputKeyCursor{output, middle}, query);
+    if (comparison < 0 || (strict && comparison == 0)) begin = middle + 1u;
+    else end = middle;
+  }
+  return begin;
+}
+
+__global__ void mark_endpoint_groups(
+    EndpointSource source, const std::uint32_t *ordered,
+    std::uint32_t count, std::uint32_t *flags) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= count) return;
+  if (!position) {
+    flags[position] = 1u;
+    return;
+  }
+  const std::uint32_t current = ordered[position];
+  const std::uint32_t previous = ordered[position - 1u];
+  const bool current_upper = current >= source.queries.count;
+  const bool previous_upper = previous >= source.queries.count;
+  flags[position] = static_cast<std::uint32_t>(
+      current_upper != previous_upper ||
+      compare_keys(source_key(source, current),
+                   source_key(source, previous)) != 0);
+}
+
+__global__ void scatter_unique_endpoints(
+    const std::uint32_t *ordered, const std::uint32_t *flags,
+    const std::uint32_t *group_ids, std::uint32_t count,
+    std::uint32_t *unique_refs) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position < count && flags[position])
+    unique_refs[group_ids[position]] = ordered[position];
+}
+
+__global__ void map_unique_endpoints(
+    EndpointSource source, const std::uint32_t *unique_refs,
+    const std::uint32_t *unique_count, OutputView output,
+    const RangeReceipt *receipt, std::uint64_t *unique_ranks) {
+  const std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+  if (group >= *unique_count) return;
+  const std::uint32_t ref = unique_refs[group];
+  const bool upper = ref >= source.queries.count;
+  unique_ranks[group] = receipt->status ? 0u : lower_bound_output(
+      output, 0u, receipt->records, source_key(source, ref), upper);
+}
+
+__global__ void scatter_endpoint_slices(
+    EndpointSource source, const std::uint32_t *ordered,
+    const std::uint32_t *flags, const std::uint32_t *group_ids,
+    const std::uint64_t *unique_ranks,
+    std::uint32_t count, std::uint64_t *endpoint_ranks) {
+  const std::uint32_t position = blockIdx.x * blockDim.x + threadIdx.x;
+  if (position >= count) return;
+  const std::uint32_t ref = ordered[position];
+  const std::uint32_t group =
+      group_ids[position] + flags[position] - 1u;
+  endpoint_ranks[ref] = unique_ranks[group];
+}
+
+__global__ void assemble_endpoint_slices(
+    std::uint32_t query_count, const std::uint64_t *endpoint_ranks,
+    const RangeReceipt *receipt, RangeSlice *slices) {
+  const std::uint32_t query = blockIdx.x * blockDim.x + threadIdx.x;
+  if (query >= query_count) return;
+  slices[query] = receipt->status
+      ? RangeSlice{0u, 0u, 0u, receipt->status}
+      : RangeSlice{endpoint_ranks[query],
+                   endpoint_ranks[query_count + query], 0u, 0u};
+}
+
+class RosterStorage {
+ public:
+  RosterStorage(std::uint32_t roots, std::uint32_t sections,
+                std::uint32_t span_capacity)
+      : root_count_(roots), section_count_(sections),
+        span_counts_(std::uint64_t{roots} * sections),
+        span_offsets_(std::uint64_t{roots} * sections),
+        row_counts_(std::uint64_t{roots} * sections),
+        row_offsets_(std::uint64_t{roots} * sections),
+        spans_(span_capacity + 1u), sources_(roots + 1u), errors_(1u) {
+    std::size_t span_bytes = 0u;
+    std::size_t row_bytes = 0u;
+    const std::uint32_t entries = roots * sections;
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, span_bytes, span_counts_.data(),
+              span_offsets_.data(), entries),
+          "size root span scan");
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, row_bytes, row_counts_.data(), row_offsets_.data(),
+              sections),
+          "size root row scan");
+    scan_.reset(std::max(span_bytes, row_bytes));
+    span_scan_bytes_ = span_bytes;
+    row_scan_bytes_ = row_bytes;
+  }
+
+  std::pair<float, double> build(
+      gpulsmopt2_detail::ResidentRows arena,
+      const gpulsmopt2_detail::Descriptor *descriptors,
+      ActiveSectionRoster &active, const RootBuildState *roots,
+      cudaStream_t stream) {
+    const std::uint32_t entries = root_count_ * section_count_;
+    check(cudaMemsetAsync(errors_.data(), 0, errors_.bytes(), stream),
+          "clear roster errors");
+    const auto timing = time_once([&] {
+      count_root_spans<<<blocks(entries), kThreads, 0, stream>>>(
+          active.sections(), section_count_, arena, descriptors,
+          roots, active.levels(),
+          root_count_, span_counts_.data(), row_counts_.data());
+      std::size_t bytes = span_scan_bytes_;
+      check(cub::DeviceScan::ExclusiveSum(
+                scan_.data(), bytes, span_counts_.data(),
+                span_offsets_.data(), entries, stream),
+            "scan root spans");
+      for (std::uint32_t root = 0u; root < root_count_; ++root) {
+        bytes = row_scan_bytes_;
+        check(cub::DeviceScan::ExclusiveSum(
+                  scan_.data(), bytes,
+                  row_counts_.data() + std::uint64_t{root} * section_count_,
+                  row_offsets_.data() + std::uint64_t{root} * section_count_,
+                  section_count_, stream),
+              "scan root logical rows");
+      }
+      fill_root_spans<<<blocks(entries), kThreads, 0, stream>>>(
+          active.sections(), section_count_, arena, descriptors,
+          roots, active.levels(),
+          root_count_, span_offsets_.data(), row_offsets_.data(),
+          spans_.data(), errors_.data());
+    });
+    const std::uint32_t last = entries - 1u;
+    std::uint32_t last_offset = 0u;
+    std::uint32_t last_count = 0u;
+    check(cudaMemcpy(&last_offset, span_offsets_.data() + last,
+                     sizeof(last_offset), cudaMemcpyDeviceToHost),
+          "copy root span offset");
+    check(cudaMemcpy(&last_count, span_counts_.data() + last,
+                     sizeof(last_count), cudaMemcpyDeviceToHost),
+          "copy root span count");
+    root_span_total_ = last_offset + last_count;
+    if (root_span_total_ + 1u > spans_.size())
+      throw std::length_error("root roster span capacity");
+    finish_roster_sources<<<blocks(root_count_ + 1u), kThreads, 0, stream>>>(
+        section_count_, span_counts_.data(), span_offsets_.data(),
+        row_counts_.data(), row_offsets_.data(), active.levels(), root_count_,
+        root_span_total_, 0u, sources_.data(), spans_.data());
+    check(cudaStreamSynchronize(stream), "finish root roster");
+    unsigned long long errors = 0u;
+    check(cudaMemcpy(&errors, errors_.data(), sizeof(errors),
+                     cudaMemcpyDeviceToHost), "copy roster errors");
+    if (errors) throw std::runtime_error("root roster validation");
+    return timing;
+  }
+
+  void append_pending(std::uint32_t rows, cudaStream_t stream) {
+    if (rows)
+      append_pending_source<<<1u, 1u, 0, stream>>>(
+          root_count_, root_span_total_, rows, sources_.data(), spans_.data());
+  }
+
+  const OrderSource *sources() const { return sources_.data(); }
+  const OrderSpan *spans() const { return spans_.data(); }
+  std::uint32_t root_count() const { return root_count_; }
+  std::uint32_t root_span_total() const { return root_span_total_; }
+  std::size_t bytes() const {
+    return span_counts_.bytes() + span_offsets_.bytes() +
+        row_counts_.bytes() + row_offsets_.bytes() + spans_.bytes() +
+        sources_.bytes() + scan_.bytes() + errors_.bytes();
+  }
+
+ private:
+  std::uint32_t root_count_{};
+  std::uint32_t section_count_{};
+  std::uint32_t root_span_total_{};
+  Buffer<std::uint32_t> span_counts_, span_offsets_;
+  Buffer<std::uint32_t> row_counts_, row_offsets_;
+  Buffer<OrderSpan> spans_;
+  Buffer<OrderSource> sources_;
+  Buffer<std::uint8_t> scan_;
+  Buffer<unsigned long long> errors_;
+  std::size_t span_scan_bytes_{};
+  std::size_t row_scan_bytes_{};
+};
+
+class OutputStorage {
+ public:
+  OutputStorage(std::uint64_t rows, std::uint64_t capsules,
+                std::uint64_t bytes, std::uint32_t tasks,
+                std::uint32_t queries)
+      : anchors_(rows), capsules_(capsules), bytes_(bytes),
+        copy_objects_(capsules), chunks_(tasks), chunk_counts_(tasks),
+        logical_offsets_(tasks), counters_(1u), receipt_(1u),
+        slices_(queries) {
+    std::size_t scan_bytes = 0u;
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, scan_bytes, chunk_counts_.data(),
+              logical_offsets_.data(), tasks),
+          "size rank output scan");
+    scan_bytes_ = scan_bytes;
+    scan_.reset(scan_bytes);
+  }
+
+  void clear(cudaStream_t stream) {
+    check(cudaMemsetAsync(counters_.data(), 0, counters_.bytes(), stream),
+          "clear rank output counters");
+    check(cudaMemsetAsync(receipt_.data(), 0, receipt_.bytes(), stream),
+          "clear rank output receipt");
+  }
+
+  OutputView view(std::uint32_t tasks) const {
+    return {anchors_.data(), capsules_.data(), chunks_.data(),
+            logical_offsets_.data(), tasks};
+  }
+
+  std::size_t bytes() const {
+    return anchors_.bytes() + capsules_.bytes() + bytes_.bytes() +
+        copy_objects_.bytes() + chunks_.bytes() + chunk_counts_.bytes() +
+        logical_offsets_.bytes() + counters_.bytes() + receipt_.bytes() +
+        slices_.bytes() + scan_.bytes();
+  }
+
+  Buffer<OutputAnchor> anchors_;
+  Buffer<OutputCapsule> capsules_;
+  Buffer<std::uint8_t> bytes_;
+  Buffer<CopyObject> copy_objects_;
+  Buffer<OutputChunk> chunks_;
+  Buffer<std::uint64_t> chunk_counts_, logical_offsets_;
+  Buffer<RangeCounters> counters_;
+  Buffer<RangeReceipt> receipt_;
+  Buffer<RangeSlice> slices_;
+  Buffer<std::uint8_t> scan_;
+  std::size_t scan_bytes_{};
+};
+
+struct EnumerationResult {
+  float gpu_ms{};
+  double wall_ms{};
+  RangeReceipt receipt{};
+  std::uint32_t components{};
+  std::uint32_t tasks{};
+  std::uint32_t pending_winners{};
+  std::uint32_t planner_rounds{};
+  unsigned long long errors{};
+};
+
+class Workspace {
+ public:
+  Workspace(std::uint32_t max_rows, std::uint32_t max_queries,
+            std::uint32_t max_tasks, std::uint32_t source_count)
+      : max_rows_(max_rows), max_queries_(max_queries),
+        max_tasks_(max_tasks), source_count_(source_count),
+        lower_order_(max_queries), endpoint_order_(2u * max_queries),
+        pending_order_(max_rows),
+        pending_age_refs_(max_rows), pending_slot_offsets_(
+            gpulsmopt2_detail::kBatchesPerEpoch + 1u),
+        components_(max_queries), component_count_(1u),
+        tasks_a_(max_tasks), tasks_b_(max_tasks),
+        classified_(max_tasks), task_count_a_(1u), task_count_b_(1u),
+        child_counts_(max_tasks), child_offsets_(max_tasks),
+        begins_a_(std::uint64_t{max_tasks} * source_count),
+        ends_a_(std::uint64_t{max_tasks} * source_count),
+        begins_b_(std::uint64_t{max_tasks} * source_count),
+        ends_b_(std::uint64_t{max_tasks} * source_count),
+        split_lowers_(std::uint64_t{max_tasks} * source_count),
+        split_uppers_(std::uint64_t{max_tasks} * source_count),
+        oversized_count_(1u), endpoint_flags_(2u * max_queries),
+        endpoint_group_ids_(2u * max_queries),
+        unique_endpoint_refs_(2u * max_queries),
+        unique_endpoint_count_(1u), unique_endpoint_ranks_(2u * max_queries),
+        endpoint_ranks_(2u * max_queries),
+        errors_(1u) {
+    std::size_t bytes = 0u;
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, bytes, child_counts_.data(), child_offsets_.data(),
+              max_tasks),
+          "size rank task scan");
+    task_scan_bytes_ = bytes;
+    task_scan_.reset(bytes);
+    bytes = 0u;
+    check(cub::DeviceScan::ExclusiveSum(
+              nullptr, bytes, endpoint_flags_.data(),
+              endpoint_group_ids_.data(), 2u * max_queries),
+          "size endpoint group scan");
+    endpoint_scan_bytes_ = bytes;
+    endpoint_scan_.reset(bytes);
+  }
+
+  EnumerationResult enumerate(
+      RosterStorage &roster, RangeQueryBatch queries,
+      OutputStorage &output, PendingReadView pending,
+      const std::uint32_t *host_batch_counts,
+      gpulsmopt2_detail::ResidentRows arena,
+      const RootBuildState *roots, cudaStream_t stream) {
+    if (queries.count > max_queries_)
+      throw std::length_error("rank query capacity");
+    std::array<std::uint32_t,
+               gpulsmopt2_detail::kBatchesPerEpoch + 1u> slot_offsets{};
+    for (std::uint32_t slot = 0u; slot < pending.batch_count; ++slot)
+      slot_offsets[slot + 1u] = slot_offsets[slot] +
+          host_batch_counts[slot];
+    const std::uint32_t pending_rows = slot_offsets[pending.batch_count];
+    if (pending_rows > max_rows_)
+      throw std::length_error("rank pending row capacity");
+    check(cudaMemcpyAsync(pending_slot_offsets_.data(), slot_offsets.data(),
+                          sizeof(slot_offsets), cudaMemcpyHostToDevice, stream),
+          "copy rank pending offsets");
+    std::uint32_t pending_winners = 0u;
+    std::uint32_t components = 0u;
+    std::uint32_t task_count = 0u;
+    std::uint32_t rounds = 0u;
+    check(cudaMemsetAsync(errors_.data(), 0, errors_.bytes(), stream),
+          "clear rank errors");
+    output.clear(stream);
+    const auto timing = time_once([&] {
+      if (pending_rows) {
+        const dim3 grid(128u, pending.batch_count);
+        build_pending_age_refs<<<grid, kThreads, 0, stream>>>(
+            pending, pending_slot_offsets_.data(), pending_age_refs_.data());
+        const auto ordered = pending_order_.order(
+            PendingOrderSource{pending}, pending_rows, stream, nullptr,
+            pending_age_refs_.data());
+        pending_winners = ordered.winner_count;
+      }
+      roster.append_pending(pending_winners, stream);
+      const std::uint32_t actual_sources = roster.root_count() +
+          (pending_winners ? 1u : 0u);
+      if (actual_sources != source_count_)
+        throw std::runtime_error("rank source count changed");
+      RankView view{arena, roots, pending,
+                    pending_order_.winners(), roster.sources(),
+                    roster.spans(), actual_sources};
+      lower_order_.order(
+          QueryOrderSource{queries.lower}, queries.count, stream);
+      coalesce_queries<<<1u, 1u, 0, stream>>>(
+          queries, lower_order_.ordered(), components_.data(),
+          component_count_.data(), errors_.data());
+      check(cudaMemcpyAsync(&components, component_count_.data(),
+                            sizeof(components), cudaMemcpyDeviceToHost,
+                            stream), "copy rank component count");
+      check(cudaStreamSynchronize(stream), "wait rank components");
+      if (!components || components > max_tasks_)
+        throw std::length_error("rank component capacity");
+      task_count = components;
+      check(cudaMemcpyAsync(task_count_a_.data(), &task_count,
+                            sizeof(task_count), cudaMemcpyHostToDevice,
+                            stream), "set initial rank task count");
+      initialize_rank_tasks<<<components, kThreads, 0, stream>>>(
+          queries, components_.data(), components, view, tasks_a_.data(),
+          begins_a_.data(), ends_a_.data());
+      RankTask *current_tasks = tasks_a_.data();
+      RankTask *next_tasks = tasks_b_.data();
+      std::uint32_t *current_count = task_count_a_.data();
+      std::uint32_t *next_count = task_count_b_.data();
+      std::uint32_t *current_begins = begins_a_.data();
+      std::uint32_t *current_ends = ends_a_.data();
+      std::uint32_t *next_begins = begins_b_.data();
+      std::uint32_t *next_ends = ends_b_.data();
+      for (rounds = 0u; rounds < 32u; ++rounds) {
+        check(cudaMemsetAsync(oversized_count_.data(), 0,
+                              oversized_count_.bytes(), stream),
+              "clear rank oversized count");
+        classify_rank_tasks<<<task_count, kThreads, 0, stream>>>(
+            current_tasks, current_count, current_begins, current_ends,
+            view, child_counts_.data(), split_lowers_.data(),
+            split_uppers_.data(), classified_.data(),
+            oversized_count_.data());
+        std::uint32_t oversized = 0u;
+        check(cudaMemcpyAsync(&oversized, oversized_count_.data(),
+                              sizeof(oversized), cudaMemcpyDeviceToHost,
+                              stream), "copy rank oversized count");
+        check(cudaStreamSynchronize(stream), "wait rank classification");
+        if (!oversized) break;
+        std::size_t bytes = task_scan_bytes_;
+        check(cub::DeviceScan::ExclusiveSum(
+                  task_scan_.data(), bytes, child_counts_.data(),
+                  child_offsets_.data(), task_count, stream),
+              "scan rank children");
+        finish_count_scan<<<1u, 1u, 0, stream>>>(
+            child_counts_.data(), child_offsets_.data(), task_count,
+            next_count);
+        std::uint32_t next_host = 0u;
+        check(cudaMemcpyAsync(&next_host, next_count, sizeof(next_host),
+                              cudaMemcpyDeviceToHost, stream),
+              "copy rank child count");
+        check(cudaStreamSynchronize(stream), "wait rank child count");
+        if (!next_host || next_host > max_tasks_)
+          throw std::length_error("rank planner task capacity");
+        clear_rank_tasks<<<blocks(next_host), kThreads, 0, stream>>>(
+            next_tasks, 0u, next_host);
+        emit_rank_children<<<task_count, kThreads, 0, stream>>>(
+            current_tasks, classified_.data(), current_count,
+            child_offsets_.data(), current_begins, current_ends,
+            split_lowers_.data(), split_uppers_.data(), source_count_,
+            next_tasks, next_begins, next_ends);
+        std::swap(current_tasks, next_tasks);
+        std::swap(current_count, next_count);
+        std::swap(current_begins, next_begins);
+        std::swap(current_ends, next_ends);
+        task_count = next_host;
+      }
+      if (rounds == 32u)
+        throw std::runtime_error("rank planner did not converge");
+      emit_rank_tasks<<<task_count, kThreads, 0, stream>>>(
+          current_tasks, current_count, current_begins, current_ends, view,
+          output.anchors_.data(), output.anchors_.size(),
+          output.capsules_.data(), output.capsules_.size(),
+          output.bytes_.data(), output.bytes_.size(),
+          output.copy_objects_.data(), output.chunks_.data(),
+          output.chunk_counts_.data(), output.counters_.data(),
+          errors_.data());
+      if (output.capsules_.size())
+        copy_output_capsules<<<output.capsules_.size(), kThreads, 0, stream>>>(
+            output.copy_objects_.data(), output.capsules_.size(),
+            output.counters_.data(), view);
+      std::size_t bytes = output.scan_bytes_;
+      check(cub::DeviceScan::ExclusiveSum(
+                output.scan_.data(), bytes, output.chunk_counts_.data(),
+                output.logical_offsets_.data(), task_count, stream),
+            "scan rank output chunks");
+      finish_output<<<blocks(task_count), kThreads, 0, stream>>>(
+          output.chunks_.data(), output.logical_offsets_.data(),
+          current_count, output.counters_.data(), output.receipt_.data());
+      const EndpointSource endpoints{queries};
+      const std::uint32_t endpoint_count = 2u * queries.count;
+      endpoint_order_.order(endpoints, endpoint_count, stream);
+      mark_endpoint_groups<<<blocks(endpoint_count), kThreads, 0, stream>>>(
+          endpoints, endpoint_order_.ordered(), endpoint_count,
+          endpoint_flags_.data());
+      bytes = endpoint_scan_bytes_;
+      check(cub::DeviceScan::ExclusiveSum(
+                endpoint_scan_.data(), bytes, endpoint_flags_.data(),
+                endpoint_group_ids_.data(), endpoint_count, stream),
+            "scan endpoint groups");
+      finish_count_scan<<<1u, 1u, 0, stream>>>(
+          endpoint_flags_.data(), endpoint_group_ids_.data(),
+          endpoint_count, unique_endpoint_count_.data());
+      scatter_unique_endpoints<<<blocks(endpoint_count), kThreads, 0,
+          stream>>>(endpoint_order_.ordered(), endpoint_flags_.data(),
+                    endpoint_group_ids_.data(), endpoint_count,
+                    unique_endpoint_refs_.data());
+      map_unique_endpoints<<<blocks(endpoint_count), kThreads, 0, stream>>>(
+          endpoints, unique_endpoint_refs_.data(),
+          unique_endpoint_count_.data(), output.view(task_count),
+          output.receipt_.data(), unique_endpoint_ranks_.data());
+      scatter_endpoint_slices<<<blocks(endpoint_count), kThreads, 0,
+          stream>>>(endpoints, endpoint_order_.ordered(),
+                    endpoint_flags_.data(), endpoint_group_ids_.data(),
+                    unique_endpoint_ranks_.data(), endpoint_count,
+                    endpoint_ranks_.data());
+      assemble_endpoint_slices<<<blocks(queries.count), kThreads, 0,
+          stream>>>(queries.count, endpoint_ranks_.data(),
+                    output.receipt_.data(), output.slices_.data());
+    });
+    RangeReceipt receipt{};
+    unsigned long long errors = 0u;
+    check(cudaMemcpy(&receipt, output.receipt_.data(), sizeof(receipt),
+                     cudaMemcpyDeviceToHost), "copy rank receipt");
+    check(cudaMemcpy(&errors, errors_.data(), sizeof(errors),
+                     cudaMemcpyDeviceToHost), "copy rank errors");
+    return {timing.first, timing.second, receipt, components, task_count,
+            pending_winners, rounds, errors};
+  }
+
+  std::size_t bytes() const {
+    return lower_order_.bytes() + endpoint_order_.bytes() +
+        pending_order_.bytes() +
+        pending_age_refs_.bytes() + pending_slot_offsets_.bytes() +
+        components_.bytes() + component_count_.bytes() + tasks_a_.bytes() +
+        tasks_b_.bytes() + classified_.bytes() + task_count_a_.bytes() +
+        task_count_b_.bytes() + child_counts_.bytes() +
+        child_offsets_.bytes() + begins_a_.bytes() + ends_a_.bytes() +
+        begins_b_.bytes() + ends_b_.bytes() + split_lowers_.bytes() +
+        split_uppers_.bytes() + oversized_count_.bytes() +
+        endpoint_flags_.bytes() + endpoint_group_ids_.bytes() +
+        unique_endpoint_refs_.bytes() + unique_endpoint_count_.bytes() +
+        unique_endpoint_ranks_.bytes() + endpoint_ranks_.bytes() +
+        task_scan_.bytes() +
+        endpoint_scan_.bytes() + errors_.bytes();
+  }
+
+ private:
+  std::uint32_t max_rows_{};
+  std::uint32_t max_queries_{};
+  std::uint32_t max_tasks_{};
+  std::uint32_t source_count_{};
+  ExactOrderWorkspace lower_order_, endpoint_order_;
+  ExactOrderWorkspace pending_order_;
+  Buffer<std::uint32_t> pending_age_refs_, pending_slot_offsets_;
+  Buffer<RangeComponent> components_;
+  Buffer<std::uint32_t> component_count_;
+  Buffer<RankTask> tasks_a_, tasks_b_, classified_;
+  Buffer<std::uint32_t> task_count_a_, task_count_b_;
+  Buffer<std::uint32_t> child_counts_, child_offsets_;
+  Buffer<std::uint32_t> begins_a_, ends_a_, begins_b_, ends_b_;
+  Buffer<std::uint32_t> split_lowers_, split_uppers_;
+  Buffer<std::uint32_t> oversized_count_;
+  Buffer<std::uint32_t> endpoint_flags_, endpoint_group_ids_;
+  Buffer<std::uint32_t> unique_endpoint_refs_, unique_endpoint_count_;
+  Buffer<std::uint64_t> unique_endpoint_ranks_, endpoint_ranks_;
+  Buffer<std::uint8_t> task_scan_, endpoint_scan_;
+  std::size_t task_scan_bytes_{};
+  std::size_t endpoint_scan_bytes_{};
+  Buffer<unsigned long long> errors_;
+};
+
+struct PreparedReadState {
+  std::vector<std::uint32_t> levels;
+  std::array<RootBuildState, kLevels> roots{};
+  std::array<std::uint32_t,
+             gpulsmopt2_detail::kBatchesPerEpoch> batch_counts{};
+  PendingReadView pending{};
+  std::uint32_t pending_rows{};
+  std::uint64_t candidate_rows{};
+  std::uint64_t capsule_count{};
+  std::uint64_t capsule_bytes{};
+};
+
+inline std::uint32_t roster_capacity(
+    const PreparedReadState &state, std::uint32_t active_sections) {
+  std::uint64_t exact = 0u;
+  for (const std::uint32_t level : state.levels)
+    exact += state.roots[level].exact_head_count;
+  const std::uint64_t capacity =
+      std::uint64_t{state.levels.size()} * active_sections + 2u * exact + 1u;
+  if (capacity > std::numeric_limits<std::uint32_t>::max())
+    throw std::length_error("range roster capacity overflow");
+  return static_cast<std::uint32_t>(capacity);
+}
+
+__global__ void reduce_range_slices(
+    OutputView output, const RangeSlice *slices,
+    std::uint32_t query_count, std::uint32_t *sums) {
+  using BlockReduce = cub::BlockReduce<std::uint32_t, kThreads>;
+  __shared__ typename BlockReduce::TempStorage reduction;
+  const std::uint32_t query = blockIdx.x;
+  if (query >= query_count) return;
+  const RangeSlice slice = slices[query];
+  std::uint32_t local = 0u;
+  if (!slice.status) {
+    for (std::uint64_t row = slice.begin + threadIdx.x;
+         row < slice.end; row += blockDim.x)
+      local += OutputValueCursor{OutputKeyCursor{output, row}}.inline_word();
+  }
+  const std::uint32_t total = BlockReduce(reduction).Sum(local);
+  if (!threadIdx.x) sums[query] = slice.status ? 0u : total;
+}
+
+
+}  // namespace gpulsm_sparse::rank_range
+// END INLINED COMPONENT: gpulsm_sparse/range.cuh
 
 class GPULSMOpt {
 public:
@@ -9619,7 +17960,6 @@ private:
         operation_radix_storage_offset(batch_capacity_);
     operation_workspace_.grow(radix_offset + required);
     std::uint8_t *storage = operation_workspace_.data() + radix_offset;
-    radix_storage_.attach(storage, required);
     radix_keys_.attach(reinterpret_cast<std::uint32_t *>(storage), capacity);
     radix_ids_out_.attach(
         reinterpret_cast<std::uint32_t *>(storage + ids_bytes), capacity);
@@ -10011,7 +18351,6 @@ private:
   gpulsmopt2_detail::Buffer<std::uint8_t> admission_temp_;
   std::uint32_t level_counts_[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint32_t raw_batch_counts_[gpulsmopt2_detail::kBatchesPerEpoch]{};
-  gpulsmopt2_detail::Buffer<std::uint8_t> radix_storage_;
   gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
 
   std::array<std::shared_ptr<gpulsm_sparse::StagedRootOverlay>,
