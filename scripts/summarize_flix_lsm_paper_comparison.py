@@ -113,23 +113,40 @@ def aggregate(frame, groups):
     return pd.DataFrame(rows)
 
 
+def ordered_systems(frame):
+    present = set(frame["system"])
+    preferred = [system for system in ("GPULSMOpt", "LSMu")
+                 if system in present]
+    return preferred + sorted(present - set(preferred))
+
+
+def grouped_summary_bars(axis, frame):
+    batch_logs = np.sort(frame["batch_log"].unique())
+    systems = ordered_systems(frame)
+    width = 0.8 / max(len(systems), 1)
+    for ordinal, system in enumerate(systems):
+        group = (frame[frame["system"] == system]
+                 .set_index("batch_log")
+                 .reindex(batch_logs))
+        rates = group["harmonic_mean_rate_mops"].to_numpy(dtype=float)
+        offset = (ordinal - (len(systems) - 1) / 2.0) * width
+        axis.bar(
+            batch_logs + offset, rates, width=width,
+            color=SYSTEM_COLORS.get(system, "#777777"),
+            edgecolor="black", linewidth=0.35, label=system)
+    axis.set_xticks(batch_logs)
+    axis.grid(axis="y", alpha=0.25)
+    axis.set_axisbelow(True)
+
+
 def graph_insertion(summary, output):
     if summary.empty:
         return
-    figure, axis = plt.subplots(figsize=(9, 5.5))
-    for system, group in summary.groupby("system"):
-        group = group.sort_values("batch_log")
-        color = SYSTEM_COLORS.get(system)
-        axis.fill_between(
-            group["batch_log"], group["minimum_rate_mops"],
-            group["maximum_rate_mops"], color=color, alpha=0.14)
-        axis.plot(
-            group["batch_log"], group["harmonic_mean_rate_mops"],
-            "o-", color=color, label=system)
+    figure, axis = plt.subplots(figsize=(11, 5.5))
+    grouped_summary_bars(axis, summary)
     axis.set_title("Batch insertion throughput (paper Table II metric)")
     axis.set_xlabel("log2(external batch size)")
     axis.set_ylabel("M records/s")
-    axis.grid(alpha=0.25)
     axis.legend()
     figure.tight_layout()
     figure.savefig(output, dpi=180)
@@ -143,18 +160,9 @@ def graph_lookup(summary, output):
     scenarios = ("all_existing", "none_existing")
     for axis, scenario in zip(axes, scenarios):
         selected = summary[summary["scenario"] == scenario]
-        for system, group in selected.groupby("system"):
-            group = group.sort_values("batch_log")
-            axis.fill_between(
-                group["batch_log"], group["minimum_rate_mops"],
-                group["maximum_rate_mops"],
-                color=SYSTEM_COLORS.get(system), alpha=0.14)
-            axis.plot(
-                group["batch_log"], group["harmonic_mean_rate_mops"],
-                "o-", color=SYSTEM_COLORS.get(system), label=system)
+        grouped_summary_bars(axis, selected)
         axis.set_title(scenario.replace("_", " "))
         axis.set_xlabel("log2(external batch size)")
-        axis.grid(alpha=0.25)
     axes[0].set_ylabel("M queries/s")
     axes[0].legend()
     figure.suptitle("Point lookup throughput (paper Table III metric)")
@@ -169,19 +177,10 @@ def graph_range(summary, output):
     figure, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
     for axis, expected_hits in zip(axes, (8, 1024)):
         selected = summary[summary["expected_hits"] == expected_hits]
-        for system, group in selected.groupby("system"):
-            group = group.sort_values("batch_log")
-            axis.fill_between(
-                group["batch_log"], group["minimum_rate_mops"],
-                group["maximum_rate_mops"],
-                color=SYSTEM_COLORS.get(system), alpha=0.14)
-            axis.plot(
-                group["batch_log"], group["harmonic_mean_rate_mops"],
-                "o-", color=SYSTEM_COLORS.get(system), label=system)
+        grouped_summary_bars(axis, selected)
         axis.set_title(f"L={expected_hits}")
         axis.set_ylabel("M queries/s")
         axis.set_xlabel("log2(external batch size)")
-        axis.grid(alpha=0.25)
     axes[0].legend()
     figure.suptitle("Range-enumeration throughput (paper Table IV metric)")
     figure.tight_layout()
@@ -196,20 +195,34 @@ def graph_effective_insertion(insertion, output):
     figure, axes = plt.subplots(2, 2, figsize=(12, 9), sharex=False)
     for axis, batch_log in zip(axes.flat, (17, 18, 19, 20)):
         batch = selected[selected["batch_log"] == batch_log]
-        for system, group in batch.groupby("system"):
-            group = group.sort_values("resident_elements")
-            stride = max(1, len(group) // 256)
-            sample = group.iloc[::stride]
-            if not sample.empty and sample.index[-1] != group.index[-1]:
-                sample = pd.concat([sample, group.tail(1)])
-            axis.plot(
-                sample["resident_elements"] / 1e6,
-                sample["effective_rate_mops"],
-                color=SYSTEM_COLORS.get(system), label=system)
+        resident_states = np.sort(batch["resident_elements"].unique())
+        sample_count = min(64, len(resident_states))
+        sample_indices = np.unique(np.linspace(
+            0, len(resident_states) - 1, sample_count, dtype=int))
+        sampled_states = resident_states[sample_indices]
+        positions = sampled_states.astype(float) / 1e6
+        systems = ordered_systems(batch)
+        if len(positions) > 1:
+            group_width = float(np.min(np.diff(positions))) * 0.8
+        else:
+            group_width = max(float(positions[0]) * 0.25, 0.1)
+        width = group_width / max(len(systems), 1)
+        for ordinal, system in enumerate(systems):
+            group = (batch[batch["system"] == system]
+                     .set_index("resident_elements")
+                     .reindex(sampled_states))
+            offset = (ordinal - (len(systems) - 1) / 2.0) * width
+            axis.bar(
+                positions + offset,
+                group["effective_rate_mops"].to_numpy(dtype=float),
+                width=width,
+                color=SYSTEM_COLORS.get(system, "#777777"),
+                edgecolor="black", linewidth=0.25, label=system)
         axis.set_title(f"b=2^{batch_log}")
         axis.set_xlabel("Resident records (millions)")
         axis.set_ylabel("M records/s")
-        axis.grid(alpha=0.25)
+        axis.grid(axis="y", alpha=0.25)
+        axis.set_axisbelow(True)
     handles = []
     labels = []
     for axis in axes.flat:
@@ -230,16 +243,24 @@ def graph_batch_latency(insertion, output):
     selected = insertion[insertion["batch_log"] == 19]
     if selected.empty:
         return
-    figure, axis = plt.subplots(figsize=(9, 5.5))
-    for system, group in selected.groupby("system"):
-        group = group.sort_values("r")
-        axis.plot(
-            group["r"], group["time_ms"], linewidth=1,
-            color=SYSTEM_COLORS.get(system), label=system)
+    figure, axis = plt.subplots(figsize=(11, 5.5))
+    systems = ordered_systems(selected)
+    group_width = 0.8
+    width = group_width / max(len(systems), 1)
+    for ordinal, system in enumerate(systems):
+        group = selected[selected["system"] == system].sort_values("r")
+        offset = (ordinal - (len(systems) - 1) / 2.0) * width
+        axis.bar(
+            group["r"].to_numpy(dtype=float) + offset,
+            group["time_ms"], width=width,
+            color=SYSTEM_COLORS.get(system, "#777777"),
+            edgecolor="black", linewidth=0.2, label=system)
     axis.set_title("Per-batch insertion latency, b=2^19 (paper Figure 4a)")
     axis.set_xlabel("Submitted batches")
     axis.set_ylabel("Milliseconds")
-    axis.grid(alpha=0.25)
+    axis.set_xlim(0.5, float(selected["r"].max()) + 0.5)
+    axis.grid(axis="y", alpha=0.25)
+    axis.set_axisbelow(True)
     axis.legend()
     figure.tight_layout()
     figure.savefig(output, dpi=180)
