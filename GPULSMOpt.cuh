@@ -13671,12 +13671,9 @@ public:
         nullptr, admission_scan_bytes, admission_counts_.data(),
         raw_offsets_.data(), gpulsmopt2_detail::kQuotients + 1u, 0));
     admission_temp_.resize(admission_scan_bytes);
-    int device = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp properties{};
-    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-    initialize_resident_workspace(properties);
-    initialize_canonical_workspace(properties);
+    const DeviceCapabilities capabilities = query_device_capabilities();
+    initialize_resident_workspace(capabilities);
+    initialize_canonical_workspace(capabilities);
     initialize_canonical_publication_graphs();
     CUDA_CHECK(cudaEventRecord(operation_done_, 0));
     reset_updates(0);
@@ -15426,6 +15423,36 @@ public:
   }
 
 private:
+  struct DeviceCapabilities {
+    int multiprocessors{};
+    bool cooperative_launch{};
+    std::size_t shared_memory{};
+    std::size_t optin_shared_memory{};
+  };
+
+  static DeviceCapabilities query_device_capabilities() {
+    int device = 0;
+    int multiprocessors = 0;
+    int cooperative_launch = 0;
+    int shared_memory = 0;
+    int optin_shared_memory = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &cooperative_launch, cudaDevAttrCooperativeLaunch, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &shared_memory, cudaDevAttrMaxSharedMemoryPerBlock, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &optin_shared_memory,
+        cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    if (multiprocessors <= 0 || shared_memory <= 0)
+      throw std::runtime_error("invalid CUDA device capabilities");
+    return {multiprocessors, cooperative_launch != 0,
+            static_cast<std::size_t>(shared_memory),
+            static_cast<std::size_t>(optin_shared_memory)};
+  }
+
   gpulsmopt2_detail::ResidentRows resident_rows() {
     return {arena_key_flags_.data(), arena_values_.data()};
   }
@@ -15588,7 +15615,7 @@ private:
   }
 
   void initialize_resident_workspace(
-      const cudaDeviceProp &properties) {
+      const DeviceCapabilities &capabilities) {
     std::array<gpulsmopt2_detail::LevelStorageSpan,
                gpulsmopt2_detail::kMaximumLevels> spans{};
     std::uint64_t cursor = 0u;
@@ -15634,7 +15661,7 @@ private:
     maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
     resident_scan_temp_.resize(maximum_scan_bytes);
 
-    if (!properties.cooperativeLaunch)
+    if (!capabilities.cooperative_launch)
       throw std::runtime_error(
           "GPULSMOpt TQRJ requires cooperative kernel launch support");
     int blocks_per_sm = 0;
@@ -15644,11 +15671,11 @@ private:
     // Size the hash grid from device occupancy.
     tqrj_hash_worker_blocks_ = static_cast<std::uint32_t>(
         std::max(1, std::min(4, blocks_per_sm)) *
-        properties.multiProcessorCount);
+        capabilities.multiprocessors);
     blocks_per_sm = 0;
     resident_planner_blocks_ = static_cast<std::uint32_t>(std::max<std::size_t>(
         1u, std::min<std::size_t>(maximum_resident_jobs_,
-            static_cast<std::size_t>(properties.multiProcessorCount) * 4u)));
+            static_cast<std::size_t>(capabilities.multiprocessors) * 4u)));
     blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
@@ -15656,18 +15683,18 @@ private:
             gpulsmopt2_detail::SumRowsAggregate>,
         gpulsmopt2_detail::kSectionRangeThreads, 0u));
     range_section_blocks_ = static_cast<std::uint32_t>(
-        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
+        std::max(1, blocks_per_sm) * capabilities.multiprocessors);
   }
 
   void initialize_canonical_workspace(
-      const cudaDeviceProp &properties) {
+      const DeviceCapabilities &capabilities) {
     int blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
         gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<false>,
         gpulsmopt2_detail::kFoundationCompactionThreads, 0u));
     canonical_epoch_resolver_blocks_ = static_cast<std::uint32_t>(
-        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
+        std::max(1, blocks_per_sm) * capabilities.multiprocessors);
     canonical_epoch_workspace_slots_ = static_cast<std::uint32_t>(
         canonical_epoch_workspace_.size() /
         gpulsmopt2_detail::kCanonicalResolverSuffixes);
@@ -15682,8 +15709,8 @@ private:
         &tournament_attributes,
         gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel));
     const std::size_t optin_shared_bytes = std::max<std::size_t>(
-        properties.sharedMemPerBlock,
-        properties.sharedMemPerBlockOptin);
+        capabilities.shared_memory,
+        capabilities.optin_shared_memory);
     const std::size_t maximum_dynamic_shared_bytes =
         optin_shared_bytes > tournament_attributes.sharedSizeBytes
             ? optin_shared_bytes - tournament_attributes.sharedSizeBytes
@@ -15759,7 +15786,7 @@ private:
             "GPULSMOpt tournament cannot become resident");
       canonical_tournament_blocks_[source_count] =
           static_cast<std::uint32_t>(
-              blocks_per_sm * properties.multiProcessorCount);
+              blocks_per_sm * capabilities.multiprocessors);
     }
     CUDA_CHECK(cudaMemset(
         canonical_cell_counts_.data(), 0,
