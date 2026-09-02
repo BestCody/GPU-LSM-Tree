@@ -46,6 +46,9 @@ constexpr std::uint32_t kLocalRankBits = 7u;
 constexpr std::uint32_t kLocalRankEntries =
     kQuotients * (1u << kLocalRankBits);
 constexpr std::uint32_t kThreads = 256u;
+constexpr std::uint32_t kBulkRootSinkItemsPerThread = 8u;
+constexpr std::uint32_t kBulkRootSinkTileRows =
+    kThreads * kBulkRootSinkItemsPerThread;
 constexpr std::uint32_t kTqrjHashThreads = 1024u;
 static_assert(kTqrjHashThreads <= 1024u &&
               (kTqrjHashThreads & 31u) == 0u);
@@ -2646,26 +2649,122 @@ __global__ void build_query_quotient_offsets_kernel(
   offsets[q] = low;
 }
 
-__global__ void mark_last_key_kernel(
-    const std::uint32_t *keys, std::uint32_t count, std::uint8_t *keep) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) return;
-  keep[i] = i + 1u == count || keys[i] != keys[i + 1u];
+__device__ __forceinline__ bool bulk_root_sink_terminal(
+    const std::uint32_t *keys, std::uint32_t count,
+    std::uint64_t position, std::uint32_t key) {
+  return position + 1u == count || key != keys[position + 1u];
 }
 
-__global__ void gather_initial_level_kernel(
+// The immutable root is assigned in deterministic, contiguous tiles.  The
+// terminal row of each equal-key run is the same winner selected by the old
+// stable-sort + DeviceSelect pipeline, but only one count per tile survives.
+__global__ void count_bulk_root_sink_tiles_kernel(
+    const std::uint32_t *keys, std::uint32_t count,
+    std::uint32_t *tile_counts) {
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  const std::uint64_t tile_begin =
+      std::uint64_t{blockIdx.x} * kBulkRootSinkTileRows;
+  const std::uint64_t thread_begin = tile_begin +
+      std::uint64_t{threadIdx.x} * kBulkRootSinkItemsPerThread;
+  std::uint32_t local_count = 0u;
+  for (std::uint32_t item = 0u;
+       item < kBulkRootSinkItemsPerThread; ++item) {
+    const std::uint64_t position = thread_begin + item;
+    if (position < count) {
+      const std::uint32_t key = keys[position];
+      local_count += bulk_root_sink_terminal(
+          keys, count, position, key);
+    }
+  }
+  std::uint32_t unused_prefix = 0u, tile_count = 0u;
+  BlockScan(scan_storage).ExclusiveSum(
+      local_count, unused_prefix, tile_count);
+  if (threadIdx.x == 0u) tile_counts[blockIdx.x] = tile_count;
+}
+
+// Repeat the terminal predicate after the small tile-count scan and deposit
+// each winner directly into its final resident slot.  No selected-ID stream,
+// publication-key stream, publication-row stream, or resident copy exists.
+__global__ void deposit_bulk_root_sink_kernel(
     const std::uint32_t *sorted_keys,
     const std::uint32_t *sorted_values,
-    const std::uint32_t *selected,
     std::uint32_t count,
-    std::uint32_t *level_keys,
-    Row *level_rows) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) return;
-  const std::uint32_t source = selected[i];
-  const std::uint32_t key = sorted_keys[source];
-  level_keys[i] = key;
-  level_rows[i] = make_row(key, sorted_values[source], 0u);
+    const std::uint32_t *tile_offsets,
+    ResidentRows arena,
+    std::uint64_t destination) {
+  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  const std::uint64_t tile_begin =
+      std::uint64_t{blockIdx.x} * kBulkRootSinkTileRows;
+  const std::uint64_t thread_begin = tile_begin +
+      std::uint64_t{threadIdx.x} * kBulkRootSinkItemsPerThread;
+  std::uint32_t keys[kBulkRootSinkItemsPerThread];
+  bool terminal[kBulkRootSinkItemsPerThread];
+  std::uint32_t local_count = 0u;
+  #pragma unroll
+  for (std::uint32_t item = 0u;
+       item < kBulkRootSinkItemsPerThread; ++item) {
+    const std::uint64_t position = thread_begin + item;
+    if (position < count) {
+      keys[item] = sorted_keys[position];
+      terminal[item] = bulk_root_sink_terminal(
+          sorted_keys, count, position, keys[item]);
+      local_count += terminal[item];
+    } else {
+      keys[item] = 0u;
+      terminal[item] = false;
+    }
+  }
+  std::uint32_t thread_prefix = 0u, unused_total = 0u;
+  BlockScan(scan_storage).ExclusiveSum(
+      local_count, thread_prefix, unused_total);
+  std::uint32_t local_rank = 0u;
+  #pragma unroll
+  for (std::uint32_t item = 0u;
+       item < kBulkRootSinkItemsPerThread; ++item) {
+    if (!terminal[item]) continue;
+    const std::uint64_t position = thread_begin + item;
+    const std::uint64_t output = destination +
+        tile_offsets[blockIdx.x] + thread_prefix + local_rank++;
+    arena.store(output, make_row(
+        keys[item], sorted_values[position], 0u));
+  }
+}
+
+// Map each quotient boundary from raw sorted position to compacted resident
+// rank.  Only the at-most-one partial tile before a boundary is inspected;
+// completed tiles are represented by their scanned survivor counts.
+__global__ void build_bulk_root_sink_quotient_offsets_kernel(
+    const std::uint32_t *sorted_keys,
+    std::uint32_t count,
+    const std::uint32_t *tile_offsets,
+    std::uint32_t tile_count,
+    std::uint32_t *quotient_offsets) {
+  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q > kQuotients) return;
+  if (q == kQuotients) {
+    quotient_offsets[q] = tile_offsets[tile_count];
+    return;
+  }
+
+  const std::uint32_t target = q << 16u;
+  std::uint32_t low = 0u, high = count;
+  while (low < high) {
+    const std::uint32_t middle = (low + high) >> 1u;
+    if (sorted_keys[middle] < target) low = middle + 1u;
+    else high = middle;
+  }
+  const std::uint32_t position = low;
+  const std::uint32_t tile = position / kBulkRootSinkTileRows;
+  std::uint32_t survivor_rank = tile_offsets[tile];
+  const std::uint32_t tile_begin = tile * kBulkRootSinkTileRows;
+  for (std::uint32_t i = tile_begin; i < position; ++i) {
+    const std::uint32_t key = sorted_keys[i];
+    survivor_rank += bulk_root_sink_terminal(
+        sorted_keys, count, i, key);
+  }
+  quotient_offsets[q] = survivor_rank;
 }
 
 __device__ __forceinline__ std::uint64_t pack_canonical_epoch_job(
@@ -14157,58 +14256,55 @@ public:
     }
     const std::uint32_t n = static_cast<std::uint32_t>(count);
     gpulsmopt2_detail::Buffer<std::uint32_t> sorted_keys(n), sorted_values(n);
-    gpulsmopt2_detail::Buffer<std::uint8_t> keep(n);
-    gpulsmopt2_detail::Buffer<std::uint32_t> selected_ids(n);
-    gpulsmopt2_detail::Buffer<std::uint32_t> selected_count(1u);
+    const std::uint32_t tile_count = static_cast<std::uint32_t>(
+        (count + gpulsmopt2_detail::kBulkRootSinkTileRows - 1u) /
+        gpulsmopt2_detail::kBulkRootSinkTileRows);
+    gpulsmopt2_detail::Buffer<std::uint32_t> tile_counts(tile_count + 1u);
+    gpulsmopt2_detail::Buffer<std::uint32_t> tile_offsets(tile_count + 1u);
     std::size_t sort_bytes{};
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, sort_bytes, keys, sorted_keys.data(), values,
         sorted_values.data(), n, 0, 32, stream));
-    gpulsmopt2_detail::Buffer<std::uint8_t> sort_temp(sort_bytes);
+    std::size_t scan_bytes{};
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, scan_bytes, tile_counts.data(), tile_offsets.data(),
+        tile_count + 1u, stream));
+    gpulsmopt2_detail::Buffer<std::uint8_t> temporary(
+        std::max(sort_bytes, scan_bytes));
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        sort_temp.data(), sort_bytes, keys, sorted_keys.data(), values,
+        temporary.data(), sort_bytes, keys, sorted_keys.data(), values,
         sorted_values.data(), n, 0, 32, stream));
-    gpulsmopt2_detail::mark_last_key_kernel<<<
-        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
-        sorted_keys.data(), n, keep.data());
+    gpulsmopt2_detail::count_bulk_root_sink_tiles_kernel<<<
+        tile_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
+            sorted_keys.data(), n, tile_counts.data());
     CUDA_CHECK(cudaGetLastError());
-    cub::CountingInputIterator<std::uint32_t> input_ids(0u);
-    std::size_t select_bytes{};
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        nullptr, select_bytes, input_ids, keep.data(), selected_ids.data(),
-        selected_count.data(), n, stream));
-    gpulsmopt2_detail::Buffer<std::uint8_t> select_temp(select_bytes);
-    CUDA_CHECK(cub::DeviceSelect::Flagged(
-        select_temp.data(), select_bytes, input_ids, keep.data(),
-        selected_ids.data(), selected_count.data(), n, stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        tile_counts.data() + tile_count, 0, sizeof(std::uint32_t), stream));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        temporary.data(), scan_bytes, tile_counts.data(),
+        tile_offsets.data(), tile_count + 1u, stream));
     std::uint32_t base_count{};
-    CUDA_CHECK(cudaMemcpyAsync(&base_count, selected_count.data(),
+    CUDA_CHECK(cudaMemcpyAsync(&base_count, tile_offsets.data() + tile_count,
                                sizeof(base_count), cudaMemcpyDeviceToHost,
                                stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const std::uint32_t level = initial_level_for_records(base_count);
     ensure_level_storage_mapped(level, stream);
-    ensure_publication_capacity(base_count, stream);
-    gpulsmopt2_detail::gather_initial_level_kernel<<<
-        blocks(base_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
-            sorted_keys.data(), sorted_values.data(), selected_ids.data(),
-            base_count, publication_keys_a_.data(),
-            publication_rows_a_.data());
-    CUDA_CHECK(cudaGetLastError());
-    gpulsmopt2_detail::build_query_quotient_offsets_kernel<<<
-        blocks(gpulsmopt2_detail::kQuotients + 1u),
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
-            publication_keys_a_.data(), base_count,
-            foundation_source_offsets_.data());
     const std::uint64_t destination = level_begin(level);
     const std::uint64_t capacity = level_capacity(level);
     if (base_count > capacity)
       throw std::bad_alloc();
-    gpulsmopt2_detail::copy_canonical_epoch_kernel<<<
-        blocks(base_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
-            publication_rows_a_.data(), selected_count.data(),
-            resident_rows(), destination);
+    gpulsmopt2_detail::deposit_bulk_root_sink_kernel<<<
+        tile_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
+            sorted_keys.data(), sorted_values.data(), n,
+            tile_offsets.data(), resident_rows(), destination);
+    gpulsmopt2_detail::build_bulk_root_sink_quotient_offsets_kernel<<<
+        blocks(gpulsmopt2_detail::kQuotients + 1u),
+        gpulsmopt2_detail::kThreads, 0, stream>>>(
+            sorted_keys.data(), n, tile_offsets.data(), tile_count,
+            foundation_source_offsets_.data());
+    CUDA_CHECK(cudaGetLastError());
     gpulsmopt2_detail::ResidentPublicationPlan build_plan{};
     build_plan.destination_level = level;
     build_plan.output_begin = destination;

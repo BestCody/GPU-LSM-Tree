@@ -11,9 +11,12 @@ option(FLIX_BUILD_LSMU_PAPER_SWEEP
        "Build the standalone GPU LSM paper sweep" OFF)
 option(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP
        "Build the GPULSMOpt GPU LSM paper sweep" OFF)
+option(FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST
+       "Build the GPULSMOpt RootSink correctness test" OFF)
 
 set(FLIX_NEEDS_OPTIX ON)
-if(FLIX_BUILD_LSMU_PAPER_SWEEP OR FLIX_BUILD_GPULSMOPT_PAPER_SWEEP)
+if(FLIX_BUILD_LSMU_PAPER_SWEEP OR FLIX_BUILD_GPULSMOPT_PAPER_SWEEP OR
+   FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST)
   set(FLIX_NEEDS_OPTIX OFF)
 elseif(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
    IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB)")
@@ -136,6 +139,16 @@ if(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP)
           GPULSMOPT PAPER_SWEEP_GPULSMOPT UNSORTED_PROBES_CHECKS
           GPULSMOPT_BATCH_CAPACITY=1048576)
   configure_paper_sweep_target(gpulsmopt_paper_sweep)
+endif()
+
+if(FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST)
+  enable_testing()
+  add_executable(gpulsmopt_rootsink_test gpulsmopt_rootsink_test.cu)
+  target_include_directories(gpulsmopt_rootsink_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_rootsink_test)
+  add_test(NAME gpulsmopt_rootsink_correctness
+           COMMAND gpulsmopt_rootsink_test)
 endif()
 
 set_target_properties(index_prototype PROPERTIES
