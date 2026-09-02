@@ -2661,6 +2661,13 @@ __device__ __forceinline__ bool bulk_root_sink_terminal(
   return position + 1u == count || key != keys[position + 1u];
 }
 
+struct BulkRootSinkMaximum {
+  __host__ __device__ __forceinline__ std::uint32_t operator()(
+      std::uint32_t left, std::uint32_t right) const {
+    return left > right ? left : right;
+  }
+};
+
 // Count the newest row in each equal-key run.
 __global__ void count_bulk_root_sink_tiles_kernel(
     const std::uint32_t *keys, std::uint32_t count,
@@ -2693,6 +2700,7 @@ __global__ void deposit_bulk_root_sink_kernel(
     const std::uint32_t *sorted_values,
     std::uint32_t count,
     const std::uint32_t *tile_offsets,
+    std::uint32_t *quotient_end_markers,
     ResidentRows arena,
     std::uint64_t destination) {
   using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
@@ -2721,50 +2729,31 @@ __global__ void deposit_bulk_root_sink_kernel(
   std::uint32_t thread_prefix = 0u, unused_total = 0u;
   BlockScan(scan_storage).ExclusiveSum(
       local_count, thread_prefix, unused_total);
+  bool inspect_quotient_boundaries = false;
+  if (thread_begin < count) {
+    const std::uint64_t after =
+        thread_begin + kBulkRootSinkItemsPerThread;
+    inspect_quotient_boundaries = after >= count ||
+        (keys[0] >> 16u) != (sorted_keys[after] >> 16u);
+  }
   std::uint32_t local_rank = 0u;
   #pragma unroll
   for (std::uint32_t item = 0u;
        item < kBulkRootSinkItemsPerThread; ++item) {
     if (!terminal[item]) continue;
     const std::uint64_t position = thread_begin + item;
-    const std::uint64_t output = destination +
+    const std::uint32_t output_rank =
         tile_offsets[blockIdx.x] + thread_prefix + local_rank++;
+    const std::uint64_t output = destination + output_rank;
     arena.store(output, make_row(
         keys[item], sorted_values[position], 0u));
+    if (inspect_quotient_boundaries) {
+      const std::uint32_t quotient = keys[item] >> 16u;
+      if (position + 1u == count ||
+          (sorted_keys[position + 1u] >> 16u) != quotient)
+        quotient_end_markers[quotient + 1u] = output_rank + 1u;
+    }
   }
-}
-
-// Map section starts to compacted resident ranks.
-__global__ void build_bulk_root_sink_quotient_offsets_kernel(
-    const std::uint32_t *sorted_keys,
-    std::uint32_t count,
-    const std::uint32_t *tile_offsets,
-    std::uint32_t tile_count,
-    std::uint32_t *quotient_offsets) {
-  const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kQuotients) return;
-  if (q == kQuotients) {
-    quotient_offsets[q] = tile_offsets[tile_count];
-    return;
-  }
-
-  const std::uint32_t target = q << 16u;
-  std::uint32_t low = 0u, high = count;
-  while (low < high) {
-    const std::uint32_t middle = (low + high) >> 1u;
-    if (sorted_keys[middle] < target) low = middle + 1u;
-    else high = middle;
-  }
-  const std::uint32_t position = low;
-  const std::uint32_t tile = position / kBulkRootSinkTileRows;
-  std::uint32_t survivor_rank = tile_offsets[tile];
-  const std::uint32_t tile_begin = tile * kBulkRootSinkTileRows;
-  for (std::uint32_t i = tile_begin; i < position; ++i) {
-    const std::uint32_t key = sorted_keys[i];
-    survivor_rank += bulk_root_sink_terminal(
-        sorted_keys, count, i, key);
-  }
-  quotient_offsets[q] = survivor_rank;
 }
 
 __device__ __forceinline__ std::uint64_t pack_canonical_epoch_job(
@@ -13650,33 +13639,9 @@ public:
         arena_values_(gpulsmopt2_detail::maximum_resident_elements<
                           gpulsmopt2_detail::Row>(),
                       level_pool_capacity_),
-        descriptors_(std::size_t{gpulsmopt2_detail::kQuotients} *
-                     gpulsmopt2_detail::kMaximumLevels),
-        route_headers_(std::size_t{gpulsmopt2_detail::kQuotients} *
-                       gpulsmopt2_detail::kMaximumLevels),
         route_slices_(route_stride_ * canonical_level_count_,
                       route_stride_ * canonical_level_count_),
-        route_logical_begins_(
-            route_stride_ * canonical_level_count_),
-        route_quotients_(
-            route_stride_ * canonical_level_count_),
-        level_q_logical_offsets_(
-            std::size_t{canonical_level_count_} *
-            (gpulsmopt2_detail::kQuotients + 1u)),
-        device_manifests_(2u),
-        active_device_manifest_(1u),
-        query_occupied_level_mask_(1u),
-        device_sparse_manifests_(2u),
-        device_pending_sparse_states_(
-            gpulsmopt2_detail::kBatchesPerEpoch),
-        sealed_device_command_(1u),
-        sealed_device_receipt_(1u),
-        resident_plan_(1u),
         publication_receipt_(1u),
-        level_storage_spans_(gpulsmopt2_detail::kMaximumLevels),
-        canonical_cell_ranks_(
-            std::size_t{canonical_level_count_} *
-                gpulsmopt2_detail::kLocalRankEntries),
         phase_workspace_(phase_workspace_maximum_bytes(
                              publication_capacity_,
                              level_zero_capacity_, batch_capacity_),
@@ -13685,42 +13650,17 @@ public:
                              level_zero_capacity_, batch_capacity_)),
         operation_workspace_(),
         sealed_workspace_(),
-        canonical_job_prefixes_(maximum_resident_jobs_),
-        canonical_next_job_(1u),
         raw_keys_(),
-        raw_payloads_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
-        raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
-                     (gpulsmopt2_detail::kQuotients + 1u)),
-        raw_signatures_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
-                        gpulsmopt2_detail::kQuotients),
-        raw_epoch_signatures_(gpulsmopt2_detail::kQuotients),
         publication_keys_a_(gpulsmopt2_detail::kMaximumPublicationRows,
             std::min(publication_capacity_,
                 batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
         publication_rows_a_(gpulsmopt2_detail::kMaximumPublicationRows,
             std::min(publication_capacity_,
                 batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
-        publication_selected_count_(1u),
-        foundation_source_offsets_(gpulsmopt2_detail::kQuotients + 1u),
-        foundation_section_output_counts_(gpulsmopt2_detail::kQuotients + 1u),
-        balanced_merge_raw_counts_(gpulsmopt2_detail::kQuotients),
-        resident_tile_job_counts_(gpulsmopt2_detail::kPlanningTiles + 1u),
-        resident_tile_job_offsets_(gpulsmopt2_detail::kPlanningTiles + 1u),
-        resident_job_raw_reservations_(maximum_resident_jobs_ + 1u),
-        balanced_merge_jobs_(maximum_resident_jobs_),
-        local_epoch_overflow_flag_(1u),
-        admission_counts_(gpulsmopt2_detail::kQuotients + 1u),
-        range_partials_(gpulsmopt2_detail::kRangeSchedulerBlocks),
-        range_reduction_completion_(1u),
-        range_fragment_total_(1u),
         range_total_receipt_(1u),
-        range_hot_counts_(gpulsmopt2_detail::kQuotients + 1u),
-        range_hot_offsets_(gpulsmopt2_detail::kQuotients + 1u),
-        range_hot_window_offsets_(gpulsmopt2_detail::kQuotients + 1u),
-        range_hot_descriptors_(gpulsmopt2_detail::kQuotients),
-        range_hot_selected_count_(1u),
         range_hot_total_receipt_(1u),
         range_hot_offsets_receipt_(gpulsmopt2_detail::kQuotients + 1u) {
+    initialize_static_workspace_views();
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
     initialize_phase_workspace_views();
@@ -13731,8 +13671,12 @@ public:
         nullptr, admission_scan_bytes, admission_counts_.data(),
         raw_offsets_.data(), gpulsmopt2_detail::kQuotients + 1u, 0));
     admission_temp_.resize(admission_scan_bytes);
-    initialize_resident_workspace();
-    initialize_canonical_workspace();
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    initialize_resident_workspace(properties);
+    initialize_canonical_workspace(properties);
     initialize_canonical_publication_graphs();
     CUDA_CHECK(cudaEventRecord(operation_done_, 0));
     reset_updates(0);
@@ -13786,6 +13730,11 @@ public:
             bulk_storage + bulk_layout.sorted_values);
     std::uint8_t *temporary =
         bulk_storage + bulk_layout.temporary;
+    std::uint32_t *quotient_end_markers =
+        reinterpret_cast<std::uint32_t *>(
+            bulk_storage + bulk_layout.quotient_end_markers);
+    std::uint8_t *quotient_scan_temporary =
+        bulk_storage + bulk_layout.quotient_scan_temporary;
     std::uint32_t *tile_counts =
         reinterpret_cast<std::uint32_t *>(
             bulk_storage + bulk_layout.tile_counts);
@@ -13818,16 +13767,21 @@ public:
     const std::uint64_t capacity = level_capacity(level);
     if (base_count > capacity)
       throw std::bad_alloc();
+    CUDA_CHECK(cudaMemsetAsync(
+        quotient_end_markers, 0,
+        (gpulsmopt2_detail::kQuotients + 1u) *
+            sizeof(std::uint32_t), stream));
     gpulsmopt2_detail::deposit_bulk_root_sink_kernel<<<
         tile_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
             sorted_keys, sorted_values, n,
-            tile_offsets, resident_rows(), destination);
-    gpulsmopt2_detail::build_bulk_root_sink_quotient_offsets_kernel<<<
-        blocks(gpulsmopt2_detail::kQuotients + 1u),
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
-            sorted_keys, n, tile_offsets, tile_count,
-            foundation_source_offsets_.data());
-    CUDA_CHECK(cudaGetLastError());
+            tile_offsets, quotient_end_markers,
+            resident_rows(), destination);
+    std::size_t quotient_scan_bytes = bulk_layout.quotient_scan_bytes;
+    CUDA_CHECK(cub::DeviceScan::InclusiveScan(
+        quotient_scan_temporary, quotient_scan_bytes,
+        quotient_end_markers, foundation_source_offsets_.data(),
+        gpulsmopt2_detail::BulkRootSinkMaximum{},
+        gpulsmopt2_detail::kQuotients + 1u, stream));
     gpulsmopt2_detail::ResidentPublicationPlan build_plan{};
     build_plan.destination_level = level;
     build_plan.output_begin = destination;
@@ -15633,7 +15587,8 @@ private:
                           : gpulsmopt2_detail::kMaximumLevels;
   }
 
-  void initialize_resident_workspace() {
+  void initialize_resident_workspace(
+      const cudaDeviceProp &properties) {
     std::array<gpulsmopt2_detail::LevelStorageSpan,
                gpulsmopt2_detail::kMaximumLevels> spans{};
     std::uint64_t cursor = 0u;
@@ -15679,10 +15634,6 @@ private:
     maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
     resident_scan_temp_.resize(maximum_scan_bytes);
 
-    int device = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp properties{};
-    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     if (!properties.cooperativeLaunch)
       throw std::runtime_error(
           "GPULSMOpt TQRJ requires cooperative kernel launch support");
@@ -15708,11 +15659,8 @@ private:
         std::max(1, blocks_per_sm) * properties.multiProcessorCount);
   }
 
-  void initialize_canonical_workspace() {
-    int device = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp properties{};
-    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+  void initialize_canonical_workspace(
+      const cudaDeviceProp &properties) {
     int blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
@@ -16125,16 +16073,149 @@ private:
     std::size_t sorted_keys{};
     std::size_t sorted_values{};
     std::size_t temporary{};
+    std::size_t quotient_end_markers{};
+    std::size_t quotient_scan_temporary{};
     std::size_t tile_counts{};
     std::size_t tile_offsets{};
     std::size_t sort_bytes{};
     std::size_t scan_bytes{};
+    std::size_t quotient_scan_bytes{};
+    std::size_t temporary_bytes{};
     std::size_t total_bytes{};
   };
 
   static std::size_t align_phase_workspace(std::size_t bytes,
                                            std::size_t alignment = 256u) {
     return (bytes + alignment - 1u) / alignment * alignment;
+  }
+
+  class StaticWorkspaceBuilder {
+   public:
+    explicit StaticWorkspaceBuilder(std::uint8_t *storage = nullptr)
+        : storage_(storage) {}
+
+    template <class T>
+    void append(gpulsmopt2_detail::Buffer<T> &view, std::size_t count) {
+      append_view<T>(view, count);
+    }
+
+    template <class T>
+    void append(gpulsm_sparse::Buffer<T> &view, std::size_t count) {
+      append_view<T>(view, count);
+    }
+
+    std::size_t bytes() const {
+      return align_phase_workspace(cursor_);
+    }
+
+   private:
+    template <class T, class BufferType>
+    void append_view(BufferType &view, std::size_t count) {
+      cursor_ = align_phase_workspace(cursor_);
+      if (count > (std::numeric_limits<std::size_t>::max() - cursor_) /
+                      sizeof(T))
+        throw std::length_error("static workspace capacity");
+      if (storage_)
+        view.attach(reinterpret_cast<T *>(storage_ + cursor_), count);
+      cursor_ += count * sizeof(T);
+    }
+
+    std::uint8_t *storage_{};
+    std::size_t cursor_{};
+  };
+
+  void initialize_static_workspace_views() {
+    const auto append_views = [&](StaticWorkspaceBuilder &layout) {
+      layout.append(
+          descriptors_, std::size_t{gpulsmopt2_detail::kQuotients} *
+              gpulsmopt2_detail::kMaximumLevels);
+      layout.append(
+          route_headers_, std::size_t{gpulsmopt2_detail::kQuotients} *
+              gpulsmopt2_detail::kMaximumLevels);
+      layout.append(
+          route_logical_begins_, route_stride_ * canonical_level_count_);
+      layout.append(
+          route_quotients_, route_stride_ * canonical_level_count_);
+      layout.append(
+          level_q_logical_offsets_,
+          std::size_t{canonical_level_count_} *
+              (gpulsmopt2_detail::kQuotients + 1u));
+      layout.append(device_manifests_, 2u);
+      layout.append(active_device_manifest_, 1u);
+      layout.append(query_occupied_level_mask_, 1u);
+      layout.append(device_sparse_manifests_, 2u);
+      layout.append(
+          device_pending_sparse_states_,
+          gpulsmopt2_detail::kBatchesPerEpoch);
+      layout.append(sealed_device_command_, 1u);
+      layout.append(sealed_device_receipt_, 1u);
+      layout.append(resident_plan_, 1u);
+      layout.append(
+          level_storage_spans_, gpulsmopt2_detail::kMaximumLevels);
+      layout.append(
+          canonical_cell_ranks_,
+          std::size_t{canonical_level_count_} *
+              gpulsmopt2_detail::kLocalRankEntries);
+      layout.append(canonical_job_prefixes_, maximum_resident_jobs_);
+      layout.append(canonical_next_job_, 1u);
+      layout.append(
+          raw_payloads_,
+          std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
+              batch_capacity_);
+      layout.append(
+          raw_offsets_,
+          std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
+              (gpulsmopt2_detail::kQuotients + 1u));
+      layout.append(
+          raw_signatures_,
+          std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
+              gpulsmopt2_detail::kQuotients);
+      layout.append(
+          raw_epoch_signatures_, gpulsmopt2_detail::kQuotients);
+      layout.append(publication_selected_count_, 1u);
+      layout.append(
+          foundation_source_offsets_,
+          gpulsmopt2_detail::kQuotients + 1u);
+      layout.append(
+          foundation_section_output_counts_,
+          gpulsmopt2_detail::kQuotients + 1u);
+      layout.append(
+          balanced_merge_raw_counts_, gpulsmopt2_detail::kQuotients);
+      layout.append(
+          resident_tile_job_counts_,
+          gpulsmopt2_detail::kPlanningTiles + 1u);
+      layout.append(
+          resident_tile_job_offsets_,
+          gpulsmopt2_detail::kPlanningTiles + 1u);
+      layout.append(
+          resident_job_raw_reservations_, maximum_resident_jobs_ + 1u);
+      layout.append(balanced_merge_jobs_, maximum_resident_jobs_);
+      layout.append(local_epoch_overflow_flag_, 1u);
+      layout.append(
+          admission_counts_, gpulsmopt2_detail::kQuotients + 1u);
+      layout.append(
+          range_partials_, gpulsmopt2_detail::kRangeSchedulerBlocks);
+      layout.append(range_reduction_completion_, 1u);
+      layout.append(range_fragment_total_, 1u);
+      layout.append(
+          range_hot_counts_, gpulsmopt2_detail::kQuotients + 1u);
+      layout.append(
+          range_hot_offsets_, gpulsmopt2_detail::kQuotients + 1u);
+      layout.append(
+          range_hot_window_offsets_,
+          gpulsmopt2_detail::kQuotients + 1u);
+      layout.append(
+          range_hot_descriptors_, gpulsmopt2_detail::kQuotients);
+      layout.append(range_hot_selected_count_, 1u);
+    };
+
+    StaticWorkspaceBuilder measurement;
+    append_views(measurement);
+    static_workspace_.resize(measurement.bytes());
+    StaticWorkspaceBuilder attachment(static_workspace_.data());
+    append_views(attachment);
+    if (attachment.bytes() != static_workspace_.size())
+      throw std::logic_error("static workspace layout mismatch");
   }
 
   static PhaseBulkWorkspaceLayout phase_bulk_workspace_layout(
@@ -16151,14 +16232,27 @@ private:
         nullptr, layout.sort_bytes, rows, rows, rows, rows, n, 0, 32));
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, layout.scan_bytes, rows, rows, tiles + 1u, 0));
+    CUDA_CHECK(cub::DeviceScan::InclusiveScan(
+        nullptr, layout.quotient_scan_bytes, rows, rows,
+        gpulsmopt2_detail::BulkRootSinkMaximum{},
+        gpulsmopt2_detail::kQuotients + 1u, 0));
     std::size_t offset = 0u;
     layout.sorted_keys = align_phase_workspace(offset);
     offset = layout.sorted_keys + count * sizeof(std::uint32_t);
     layout.sorted_values = align_phase_workspace(offset);
     offset = layout.sorted_values + count * sizeof(std::uint32_t);
     layout.temporary = align_phase_workspace(offset);
-    offset = layout.temporary +
-        std::max(layout.sort_bytes, layout.scan_bytes);
+    layout.quotient_end_markers = layout.temporary;
+    layout.quotient_scan_temporary = align_phase_workspace(
+        layout.quotient_end_markers +
+        (gpulsmopt2_detail::kQuotients + 1u) *
+            sizeof(std::uint32_t));
+    const std::size_t quotient_phase_bytes =
+        layout.quotient_scan_temporary - layout.temporary +
+        layout.quotient_scan_bytes;
+    layout.temporary_bytes = std::max(
+        {layout.sort_bytes, layout.scan_bytes, quotient_phase_bytes});
+    offset = layout.temporary + layout.temporary_bytes;
     layout.tile_counts = align_phase_workspace(
         offset, alignof(std::uint32_t));
     offset = layout.tile_counts +
@@ -17971,6 +18065,7 @@ private:
 
   gpulsmopt2_detail::VirtualBuffer<std::uint32_t> arena_key_flags_;
   gpulsmopt2_detail::VirtualBuffer<std::uint32_t> arena_values_;
+  gpulsmopt2_detail::Buffer<std::uint8_t> static_workspace_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RouteHeader> route_headers_;
   gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::RouteSlice>
