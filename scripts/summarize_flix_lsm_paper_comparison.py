@@ -270,12 +270,26 @@ def graph_batch_latency(insertion, output):
 def graph_bulk(bulk, output):
     if bulk.empty:
         return
-    figure, axis = plt.subplots(figsize=(7, 5))
+    required = {
+        "system", "build_rate_mops", "complete_rate_mops",
+    }
+    missing = required - set(bulk.columns)
+    if missing:
+        raise RuntimeError(
+            "bulk results use the legacy unmatched timing boundary; "
+            "rerun both bulk cases (missing " + ", ".join(sorted(missing)) +
+            ")")
+    figure, axes = plt.subplots(1, 2, figsize=(11, 5), sharey=True)
     colors = [SYSTEM_COLORS.get(value, "#777777") for value in bulk["system"]]
-    axis.bar(bulk["system"], bulk["rate_mops"], color=colors)
-    axis.set_title("Bulk-build throughput")
-    axis.set_ylabel("M records/s")
-    axis.grid(axis="y", alpha=0.25)
+    for axis, column, title in (
+            (axes[0], "build_rate_mops", "Build-only (GPU)"),
+            (axes[1], "complete_rate_mops", "Complete (setup + build)")):
+        axis.bar(bulk["system"], bulk[column], color=colors)
+        axis.set_title(title)
+        axis.grid(axis="y", alpha=0.25)
+        axis.set_axisbelow(True)
+    axes[0].set_ylabel("M records/s")
+    figure.suptitle("Bulk-build throughput")
     figure.tight_layout()
     figure.savefig(output, dpi=180)
     plt.close(figure)
@@ -391,10 +405,18 @@ def main():
             "explicit cleanup operation.\n\n")
         if not bulk.empty:
             report.write("## Bulk build\n\n")
+            report.write(
+                "Build-only GPU time excludes persistent structure setup "
+                "for both systems. Complete wall time includes setup, the "
+                "build call, and the final device synchronization. Input "
+                "preparation, sorting, temporary build storage, root "
+                "construction, and publication remain inside build-only "
+                "timing.\n\n")
             write_markdown_table(
                 report, bulk,
-                ["system", "elements", "gpu_time_ms", "rate_mops",
-                 "gpu_resident_bytes"])
+                ["system", "elements", "build_gpu_time_ms",
+                 "complete_wall_time_ms", "build_rate_mops",
+                 "complete_rate_mops", "gpu_resident_bytes"])
             report.write("\n")
         if not insertion_summary.empty:
             report.write("## Batch insertion summary\n\n")
@@ -434,7 +456,8 @@ def main():
             (
                 "bulk_build_throughput_n2p27.png",
                 "Bulk-build throughput at N = 2^27",
-                "GPULSMOpt and LSMu bulk-build throughput for 2^27 records",
+                "Build-only GPU and complete end-to-end bulk-build "
+                "throughput for 2^27 records",
             ),
             (
                 "batch_insertion_throughput_by_batch_size.png",

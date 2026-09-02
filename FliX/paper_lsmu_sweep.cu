@@ -858,14 +858,14 @@ void run_bulk_build(const options &configuration)
     size_t total_memory = 0;
     PAPER_CUDA(cudaMemGetInfo(&free_memory, &total_memory));
     index_type index;
-    double gpu_time_ms = 0;
+    double build_gpu_time_ms = 0;
     size_t resident_bytes = 0;
-    const double wall_time_ms = measure_wall_ms([&] {
+    const double complete_wall_time_ms = measure_wall_ms([&] {
         index.build(
             keys.ptr(), element_count, element_count, free_memory,
-            &gpu_time_ms, &resident_bytes);
+            &build_gpu_time_ms, &resident_bytes);
+        PAPER_CUDA(cudaDeviceSynchronize());
     });
-    PAPER_CUDA(cudaDeviceSynchronize());
 
     const std::uint32_t validation_count =
         std::min<std::uint32_t>(element_count, std::uint32_t{1} << 18);
@@ -896,12 +896,14 @@ void run_bulk_build(const options &configuration)
 
     const auto output_path = configuration.output_directory / "bulk_build.csv";
     std::ofstream output(output_path);
-    output << "system,batch_log,elements,gpu_time_ms,wall_time_ms,"
-              "rate_mops,gpu_resident_bytes\n";
+    output << "system,batch_log,elements,build_gpu_time_ms,"
+              "complete_wall_time_ms,build_rate_mops,"
+              "complete_rate_mops,gpu_resident_bytes\n";
     output << std::setprecision(12)
            << index_name << ',' << BatchLog << ',' << element_count << ','
-           << gpu_time_ms << ',' << wall_time_ms << ','
-           << element_count / gpu_time_ms / 1000.0 << ','
+           << build_gpu_time_ms << ',' << complete_wall_time_ms << ','
+           << element_count / build_gpu_time_ms / 1000.0 << ','
+           << element_count / complete_wall_time_ms / 1000.0 << ','
            << resident_bytes << '\n';
     output.flush();
     std::ofstream complete(

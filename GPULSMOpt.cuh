@@ -4,6 +4,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
+#include <cub/block/block_reduce.cuh>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
@@ -23,6 +24,9 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thrust/execution_policy.h>
+#include <thrust/merge.h>
+#include <utility>
 #include <vector>
 
 #ifndef CUDA_CHECK
@@ -75,10 +79,7 @@ constexpr std::uint32_t kAdmissionCtaGroupMaximum = 64u;
 constexpr std::uint32_t kAdmissionCtaHashSlots = 128u;
 static_assert((kAdmissionCtaHashSlots &
                (kAdmissionCtaHashSlots - 1u)) == 0u);
-// TQRJ groups queries by the same sections already used by pending runs.
-// Ordinary sections use a compact exact directory in shared memory; overflow
-// sections share one phase-recycled exact-key hash table.  Both executors scan
-// each owned pending-run section once.
+// TQRJ scans each owned pending section once.
 constexpr std::uint32_t kTqrjDenseRowsPerSection = 8u;
 constexpr std::uint32_t kTqrjMinimumBatches = 5u;
 constexpr std::uint32_t kTqrjDirectCapacity = 1280u;
@@ -87,9 +88,7 @@ constexpr std::uint32_t kTqrjDirectIntervalLimit = 64u;
 constexpr std::uint32_t kTqrjPairFindThreshold = 16u;
 constexpr std::uint32_t kTqrjDirectPendingRows = 1u << 16u;
 constexpr std::uint32_t kTqrjHashTileRows = 2048u;
-// One four-byte overflow-table slot stores an exact-query owner plus a small
-// placement fingerprint.  The fingerprint can only reject candidates: every
-// accepted match is confirmed against the complete query key.
+// Fingerprints reject; complete keys confirm matches.
 constexpr std::uint32_t kTqrjHashOwnerBits = 25u;
 constexpr std::uint32_t kTqrjHashOwnerMask =
     (1u << kTqrjHashOwnerBits) - 1u;
@@ -125,24 +124,12 @@ constexpr std::uint32_t kPlanningTiles = 128u;
 constexpr std::uint32_t kPlanningTileQuotients =
     kQuotients / kPlanningTiles;
 constexpr std::uint32_t kMaximumMergeSources = kMaximumLevels + 1u;
-constexpr std::uint32_t kBalancedMergeCapacityCeiling =
-    kFoundationCompactionThreads * 32u;
 constexpr std::uint32_t kCanonicalTournamentMinimumSources =
-    2u;
-static_assert(kCanonicalTournamentMinimumSources >= 2u &&
+    1u;
+static_assert(kCanonicalTournamentMinimumSources >= 1u &&
               kCanonicalTournamentMinimumSources <= kMaximumMergeSources);
 constexpr std::uint32_t kCanonicalJobQuotients = 16u;
-constexpr std::uint32_t kCanonicalCandidateBits = 12u;
-constexpr std::uint32_t kCanonicalCandidateLimit =
-    1u << kCanonicalCandidateBits;
-constexpr std::uint32_t kCanonicalTombstoneWords =
-    kCanonicalCandidateLimit / 32u;
-constexpr std::uint32_t kCanonicalCapacityAdjustment =
-    (kCanonicalTombstoneWords * sizeof(std::uint32_t) +
-     2u * sizeof(std::uint32_t) - 1u) /
-    (2u * sizeof(std::uint32_t));
 static_assert(kCanonicalJobQuotients == 1u << 4u);
-static_assert(kBalancedMergeCapacityCeiling <= kCanonicalCandidateLimit * 2u);
 constexpr std::uint32_t kCanonicalResolverSuffixes = 1u << 16u;
 constexpr std::uint32_t kCanonicalTournamentChains = 128u;
 constexpr std::uint32_t kCanonicalTournamentTasks =
@@ -153,9 +140,7 @@ constexpr std::uint32_t kCanonicalTournamentReferenceMask =
 static_assert(kFoundationCellKeys ==
               (1u << kCanonicalTournamentReferenceBits));
 using CanonicalTournamentReference = std::uint16_t;
-// The actual capacity is selected per source count from the device's
-// occupancy limits.  This is only the structural limit imposed by the
-// 16-bit per-task offsets, not a workload-specific tuning constant.
+// Tape indices limit each job to 65,535 rows.
 constexpr std::uint32_t kCanonicalTournamentCapacityCeiling =
     std::numeric_limits<std::uint16_t>::max();
 constexpr std::uint32_t kMergeSourceBits = 7u;
@@ -186,9 +171,9 @@ canonical_tournament_body_bytes(
   const std::size_t states =
       std::size_t{kCanonicalTournamentChains} * source_count;
   bytes = canonical_align_bytes(bytes, alignof(std::uint32_t));
-  bytes += states * sizeof(std::uint32_t);  // packed cursors
+  bytes += states * sizeof(std::uint32_t);
   bytes = canonical_align_bytes(bytes, alignof(std::uint32_t));
-  bytes += states * sizeof(std::uint32_t);  // source heads
+  bytes += states * sizeof(std::uint32_t);
   const std::size_t source_quotients =
       std::size_t{quotient_count} * source_count;
   bytes = canonical_align_bytes(bytes, alignof(std::uint64_t));
@@ -222,9 +207,7 @@ __host__ __device__ __forceinline__ std::uint32_t
 canonical_tournament_capacity(
     std::size_t shared_bytes, std::uint32_t source_count,
     std::uint32_t quotient_count) {
-  // All production tournament allocations are 16-byte aligned.  With the
-  // tape placed before two-byte task arrays, its capacity is linear in the
-  // remaining bytes; no search or workload-derived threshold is needed.
+  // Tournament storage is 16-byte aligned.
   const std::size_t usable_bytes = shared_bytes & ~std::size_t{15u};
   const std::size_t fixed_bytes =
       canonical_tournament_body_bytes(
@@ -241,10 +224,7 @@ canonical_tournament_capacity(
 
 inline std::size_t canonical_tournament_workspace_bytes(
     std::uint32_t capacity, std::uint32_t source_count) {
-  // CUDA assigns one shared-memory budget to every block in a launch.  Size
-  // that budget for the widest supported job; each block then lays out its
-  // temporary arrays from the actual job span and gives the remainder to the
-  // survivor tape.
+  // Size shared memory for the widest job span.
   return canonical_tournament_layout_bytes(
       capacity, source_count, kCanonicalJobQuotients);
 }
@@ -282,9 +262,10 @@ inline std::size_t initial_storage_capacity(
 }
 
 inline std::size_t initial_level_capacity(
-    std::size_t requested, std::size_t fallback,
+    std::size_t requested, std::size_t default_capacity,
     std::size_t maximum) {
-  const std::size_t capacity = requested ? requested : fallback;
+  const std::size_t capacity = requested
+      ? requested : default_capacity;
   return std::min(maximum, std::max<std::size_t>(1u, capacity));
 }
 
@@ -304,12 +285,7 @@ struct CanonicalLevelLayout {
   std::uint32_t level_count{};
 };
 
-// A radix-4 tier owns up to three immutable, equal-capacity slots.  The
-// fourth run is carried into the next tier.  A partially configured final
-// tier may have fewer slots; when none of those slots can hold the complete
-// dictionary, append one lazily mapped full-capacity consolidation slot.
-// That final slot preserves indefinite update/rollover support without
-// charging normal construction for an otherwise unused full-size bank.
+// Each radix-4 tier holds three immutable runs.
 inline CanonicalLevelLayout canonical_level_layout(
     std::size_t maximum_raw_rows, std::size_t epoch_capacity) {
   CanonicalLevelLayout layout{};
@@ -437,23 +413,6 @@ static_assert(sizeof(Row) == 8u);
 static_assert(sizeof(RawAssignment) == 12u);
 static_assert(sizeof(RawPayload) == 8u);
 static_assert(alignof(RawPayload) == 8u);
-
-inline std::size_t canonical_capacity_reservation_bytes(
-    std::uint32_t capacity) {
-  // Preserve the established fixed and per-record safety margin used when
-  // sizing canonical jobs.  The production kernels allocate their actual
-  // shared-memory layouts independently after this capacity is selected.
-  constexpr std::uint32_t reservation_cells = 2u * kFoundationCells;
-  constexpr std::size_t cell_words =
-      (reservation_cells + 2u) + reservation_cells + reservation_cells +
-      reservation_cells + (reservation_cells + 1u);
-  const std::size_t tombstone_bytes =
-      std::size_t{(capacity + 31u) / 32u} * sizeof(std::uint32_t);
-  const std::size_t cell_bytes = cell_words * sizeof(std::uint16_t);
-  return std::size_t{capacity} * sizeof(std::uint32_t) +
-      std::size_t{capacity + 1u} * sizeof(std::uint16_t) * 2u +
-      tombstone_bytes + cell_bytes;
-}
 
 constexpr std::uint32_t kRawTombstone = 0x80000000u;
 
@@ -784,6 +743,7 @@ inline VmmFunctions &vmm_functions() {
 
 template <class T> class VirtualBuffer {
 public:
+  VirtualBuffer() = default;
   VirtualBuffer(std::size_t maximum_count, std::size_t initial_count) {
     reserve(maximum_count);
     grow(initial_count);
@@ -794,10 +754,26 @@ public:
   VirtualBuffer &operator=(VirtualBuffer &&) = delete;
   ~VirtualBuffer() { release(); }
 
+  void attach(T *pointer, std::size_t maximum_count,
+              std::size_t current_count) {
+    if (!pointer || !maximum_count || current_count > maximum_count)
+      throw std::invalid_argument("invalid virtual buffer attachment");
+    release();
+    external_ = true;
+    address_ = reinterpret_cast<CUdeviceptr>(pointer);
+    maximum_count_ = maximum_count;
+    reserved_bytes_ = maximum_count * sizeof(T);
+    mapped_bytes_ = current_count * sizeof(T);
+  }
+
   void grow(std::size_t requested_count) {
     if (requested_count <= size()) return;
     if (requested_count > maximum_count_)
       throw std::bad_alloc();
+    if (external_) {
+      mapped_bytes_ = requested_count * sizeof(T);
+      return;
+    }
     std::size_t target_count = requested_count;
     if (mapped_bytes_) {
       const std::size_t doubled = std::min(
@@ -830,6 +806,29 @@ public:
     }
     mappings_.push_back({mapped_bytes_, extension, handle});
     mapped_bytes_ = target_bytes;
+  }
+
+  void shrink(std::size_t requested_count) {
+    if (requested_count > size())
+      throw std::invalid_argument("virtual buffer shrink growth");
+    if (external_) {
+      mapped_bytes_ = requested_count * sizeof(T);
+      return;
+    }
+    const std::size_t target_bytes =
+        requested_count ? align_up(requested_count * sizeof(T)) : 0u;
+    auto &functions = vmm_functions();
+    while (!mappings_.empty() &&
+           mappings_.back().offset >= target_bytes) {
+      const Mapping mapping = mappings_.back();
+      GPULSMOPT_CU_CHECK(functions.unmap(
+          address_ + mapping.offset, mapping.bytes));
+      GPULSMOPT_CU_CHECK(functions.release(mapping.handle));
+      mappings_.pop_back();
+      mapped_bytes_ = mapping.offset;
+    }
+    if (mapped_bytes_ != target_bytes)
+      throw std::invalid_argument("unaligned virtual buffer shrink");
   }
 
   T *data() {
@@ -868,6 +867,14 @@ private:
 
   void release() noexcept {
     if (!address_) return;
+    if (external_) {
+      address_ = 0u;
+      reserved_bytes_ = 0u;
+      mapped_bytes_ = 0u;
+      maximum_count_ = 0u;
+      external_ = false;
+      return;
+    }
     auto &functions = vmm_functions();
     for (auto it = mappings_.rbegin(); it != mappings_.rend(); ++it) {
       functions.unmap(address_ + it->offset, it->bytes);
@@ -883,6 +890,7 @@ private:
   std::size_t reserved_bytes_{};
   std::size_t mapped_bytes_{};
   std::size_t maximum_count_{};
+  bool external_{};
   CUmemAllocationProp property_{};
   std::vector<Mapping> mappings_;
 };
@@ -2404,9 +2412,7 @@ __global__ void count_admission_quotients_kernel(
     reservation_ranks[i] = global_bases[local_slot] + local_rank;
 }
 
-// Lookup compilation mirrors the admission counter's aggregation, but also
-// records the quotients that actually occur.  Subsequent TQRJ work is bounded
-// by queries/active tasks rather than a launch over the quotient domain.
+// Compile lookup work only for queried sections.
 __global__ void count_lookup_quotients_kernel(
     const std::uint32_t *keys, std::uint32_t count,
     std::uint32_t *quotient_counts,
@@ -2602,7 +2608,7 @@ __global__ void scatter_admission_records_kernel(
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
 
-  // Expose all coalesced input loads before the quotient-dependent lookup.
+  // Publish loads before dependent lookup.
   const std::uint32_t key = keys[i];
   const std::uint32_t rank = reservation_ranks[i];
   std::uint32_t value = 0u;
@@ -2655,9 +2661,7 @@ __device__ __forceinline__ bool bulk_root_sink_terminal(
   return position + 1u == count || key != keys[position + 1u];
 }
 
-// The immutable root is assigned in deterministic, contiguous tiles.  The
-// terminal row of each equal-key run is the same winner selected by the old
-// stable-sort + DeviceSelect pipeline, but only one count per tile survives.
+// Count the newest row in each equal-key run.
 __global__ void count_bulk_root_sink_tiles_kernel(
     const std::uint32_t *keys, std::uint32_t count,
     std::uint32_t *tile_counts) {
@@ -2683,9 +2687,7 @@ __global__ void count_bulk_root_sink_tiles_kernel(
   if (threadIdx.x == 0u) tile_counts[blockIdx.x] = tile_count;
 }
 
-// Repeat the terminal predicate after the small tile-count scan and deposit
-// each winner directly into its final resident slot.  No selected-ID stream,
-// publication-key stream, publication-row stream, or resident copy exists.
+// Write winners directly to resident storage.
 __global__ void deposit_bulk_root_sink_kernel(
     const std::uint32_t *sorted_keys,
     const std::uint32_t *sorted_values,
@@ -2732,9 +2734,7 @@ __global__ void deposit_bulk_root_sink_kernel(
   }
 }
 
-// Map each quotient boundary from raw sorted position to compacted resident
-// rank.  Only the at-most-one partial tile before a boundary is inspected;
-// completed tiles are represented by their scanned survivor counts.
+// Map section starts to compacted resident ranks.
 __global__ void build_bulk_root_sink_quotient_offsets_kernel(
     const std::uint32_t *sorted_keys,
     std::uint32_t count,
@@ -3139,8 +3139,7 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
   }
 }
 
-// Count grouped raw intervals without suffix sorting.
-// GPU-resident publication.
+// Count grouped intervals for resident publication.
 
 __device__ __forceinline__ void emit_resident_job(
     BalancedMergeJob *jobs, std::uint64_t *job_raw_reservations,
@@ -3223,11 +3222,7 @@ __global__ void initialize_device_manifest_kernel(
   *query_occupied_level_mask = manifest.occupied_level_mask;
 }
 
-// Canonical radix-4 quotient-run carry.  Three immutable quotient-major runs
-// may coexist in each regular tier.  Slots fill from high id to low id so the
-// existing low-to-high query traversal still observes newest data first.
-// The fourth run carries into the next tier.  The persistent directory is a
-// quotient prefix plus 128 exact cell starts per physical run.
+// A fourth run carries into the next radix-4 tier.
 
 __global__ void choose_canonical_publication_path_kernel(
     const std::uint32_t *selected_count,
@@ -3252,15 +3247,13 @@ __global__ void choose_canonical_publication_path_kernel(
     const std::uint32_t filled = static_cast<std::uint32_t>(
         __popcll(occupied & tier_mask));
     if (filled < slots) {
-      // The next lower id is newer than every occupied sibling.
+      // Lower slot IDs are newer.
       natural_destination = tier_begin + slots - 1u - filled;
       destination_tier_begin = tier_begin;
       break;
     }
   }
-  // A partial final tier cannot necessarily hold every live row in one run.
-  // Its optional full-capacity terminal slot is used only after all regular
-  // slots fill, and is mapped lazily by the host before this graph launches.
+  // The final slot holds a full-capacity carry.
   if (natural_destination == kMaximumLevels &&
       regular_level_count < level_count &&
       !(occupied & (std::uint64_t{1} << regular_level_count))) {
@@ -3441,9 +3434,7 @@ __global__ void emit_canonical_planning_jobs_kernel(
         run_begin, run_end, run_rows);
     run_rows = 0u;
   };
-  // The raw counts are no longer needed after the tile snapshot.  Reuse that
-  // buffer as a sparse quotient-to-hot-job directory so boundary discovery
-  // visits each oversized quotient once instead of rediscovering it per job.
+  // Reuse counts as the oversized-job directory.
   for (std::uint32_t local_q = 0u;
        local_q < kPlanningTileQuotients; ++local_q) {
     const std::uint32_t q = first + local_q;
@@ -3652,8 +3643,7 @@ __global__ void resolve_canonical_job_boundaries_kernel(
   const std::uint32_t lane = threadIdx.x & 31u;
   const DeviceManifestSnapshot manifest = load_active_manifest(
       manifests, active_manifest);
-  // One warp owns all pieces of an oversized quotient.  It computes the
-  // total once and carries each exact boundary prefix into the next piece.
+  // One warp partitions each oversized section.
   for (std::uint32_t q = blockIdx.x;
        q < kQuotients && !plan->status; q += gridDim.x) {
     const std::uint64_t encoded = hot_jobs[q];
@@ -3712,71 +3702,7 @@ __global__ void validate_canonical_plan_kernel(
     plan->status |= kPublicationJobOverflow;
 }
 
-__device__ __forceinline__ std::uint32_t canonical_merge_partition(
-    const std::uint32_t *left, std::uint32_t left_count,
-    const std::uint32_t *right, std::uint32_t right_count,
-    std::uint32_t diagonal) {
-  std::uint32_t low = diagonal > right_count
-      ? diagonal - right_count : 0u;
-  std::uint32_t high = min(diagonal, left_count);
-  while (low <= high) {
-    const std::uint32_t li = (low + high) >> 1u;
-    const std::uint32_t ri = diagonal - li;
-    if (li && ri < right_count && right[ri] < left[li - 1u]) {
-      high = li - 1u;
-    } else if (ri && li < left_count && left[li] < right[ri - 1u]) {
-      low = li + 1u;
-    } else {
-      return li;
-    }
-  }
-  return low;
-}
-
-__device__ __forceinline__ void canonical_merge_interval(
-    const std::uint32_t *left, std::uint32_t left_count,
-    const std::uint32_t *right, std::uint32_t right_count,
-    std::uint32_t *output, std::uint32_t begin, std::uint32_t end) {
-  std::uint32_t li = canonical_merge_partition(
-      left, left_count, right, right_count, begin);
-  std::uint32_t ri = begin - li;
-  for (std::uint32_t position = begin; position < end; ++position) {
-    const bool take_left = ri >= right_count ||
-        (li < left_count && left[li] < right[ri]);
-    output[position] = take_left ? left[li++] : right[ri++];
-  }
-}
-
-__device__ __forceinline__ Row canonical_candidate_row(
-    std::uint32_t candidate, std::uint32_t local_q,
-    std::uint32_t source_count,
-    const std::uint16_t *source_candidate_offsets,
-    const std::uint16_t *source_q_offsets,
-    const std::uint64_t *source_q_positions,
-    const Row *epoch_rows, ResidentRows arena) {
-  std::uint32_t low = 1u, high = source_count;
-  while (low < high) {
-    const std::uint32_t middle = (low + high) >> 1u;
-    if (source_candidate_offsets[middle] <= candidate)
-      low = middle + 1u;
-    else
-      high = middle;
-  }
-  const std::uint32_t source = low - 1u;
-  const std::uint32_t source_local =
-      candidate - source_candidate_offsets[source];
-  const std::uint16_t *q_offsets = source_q_offsets +
-      source * (kCanonicalJobQuotients + 1u);
-  const std::uint64_t position = source_q_positions[
-      source * kCanonicalJobQuotients + local_q] +
-      source_local - q_offsets[local_q];
-  return source == 0u ? epoch_rows[position] : arena[position];
-}
-
-// Single-pass output allocation.  State 1 publishes a local count; state 2
-// publishes the exclusive prefix.  A job may accumulate across any number of
-// count-ready predecessors instead of waiting for every predecessor to finish
-// its own prefix handoff.
+// Jobs publish counts and claim output prefixes.
 __device__ __forceinline__ unsigned long long canonical_job_prefix(
     std::uint32_t job_index, std::uint32_t count,
     CanonicalJobPrefix *prefixes) {
@@ -3807,373 +3733,12 @@ __device__ __forceinline__ unsigned long long canonical_job_prefix(
   return prefix;
 }
 
-__global__ void canonical_fallback_carry_jobs_kernel(
-    BalancedMergeJob *jobs, ResidentPublicationPlan *plan,
-    const Row *epoch_rows, const std::uint32_t *epoch_offsets,
-    const std::uint32_t *epoch_counts,
-    ResidentRows arena, const Descriptor *descriptors,
-    const LevelStorageSpan *level_spans,
-    const std::uint32_t *level_q_offsets,
-    const DeviceManifest *manifests,
-    const std::uint32_t *active_manifest,
-    CanonicalJobPrefix *prefixes, std::uint32_t *next_job,
-    std::uint32_t *cell_counts) {
-  constexpr std::uint32_t kThreads = kFoundationCompactionThreads;
-  constexpr std::uint32_t kSourceSlots = kMaximumMergeSources;
-  constexpr std::uint32_t kMaximumItemsPerThread =
-      (kCanonicalCandidateLimit + kThreads - 1u) / kThreads;
-  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
-  __shared__ typename BlockScan::TempStorage scan_storage;
-  extern __shared__ __align__(16) unsigned char workspace[];
-  std::uint32_t *plane_a = reinterpret_cast<std::uint32_t *>(workspace);
-  std::uint32_t *plane_b = plane_a + plan->job_capacity;
-
-  __shared__ std::uint16_t source_candidate_offsets[kSourceSlots];
-  __shared__ std::uint16_t source_lengths[kSourceSlots];
-  __shared__ std::uint16_t source_levels[kSourceSlots];
-  __shared__ std::uint16_t source_q_offsets[
-      kSourceSlots * (kCanonicalJobQuotients + 1u)];
-  __shared__ std::uint64_t source_q_positions[
-      kSourceSlots * kCanonicalJobQuotients];
-  __shared__ std::uint16_t physical_sources[kSourceSlots];
-  __shared__ std::uint16_t run_offsets[kSourceSlots];
-  __shared__ std::uint16_t run_lengths[kSourceSlots];
-  __shared__ std::uint32_t tombstone_words[kCanonicalTombstoneWords];
-  __shared__ std::uint32_t source_count_shared;
-  __shared__ std::uint32_t physical_run_count_shared;
-  __shared__ std::uint32_t run_count_shared;
-  __shared__ std::uint32_t small_count_shared;
-  __shared__ std::uint32_t largest_count_shared;
-  __shared__ std::uint32_t task_rows_shared;
-  __shared__ std::uint32_t job_valid_shared;
-  __shared__ unsigned long long output_prefix_shared;
-
-  const DeviceManifestSnapshot manifest = load_active_manifest(
-      manifests, active_manifest);
-  while (!plan->status) {
-    __shared__ std::uint32_t job_index_shared;
-    if (threadIdx.x == 0u)
-      job_index_shared = atomicAdd(next_job, 1u);
-    __syncthreads();
-    const std::uint32_t job_index = job_index_shared;
-    if (job_index >= plan->job_count) return;
-    const BalancedMergeJob job = jobs[job_index];
-    const std::uint32_t quotient_count =
-        job.quotient_end - job.quotient_begin;
-    for (std::uint32_t word = threadIdx.x;
-         word < kCanonicalTombstoneWords;
-         word += blockDim.x)
-      tombstone_words[word] = 0u;
-
-    if (threadIdx.x == 0u) {
-      const std::uint32_t expected_sources = plan->source_count;
-      std::uint32_t source_count = 0u;
-      source_levels[source_count++] = kMaximumLevels;
-      std::uint64_t levels = manifest.occupied_level_mask &
-          canonical_source_level_mask(plan);
-      while (levels && source_count < kSourceSlots) {
-        const std::uint32_t level =
-            static_cast<std::uint32_t>(__ffsll(levels) - 1);
-        levels &= levels - 1u;
-        source_levels[source_count++] = static_cast<std::uint16_t>(level);
-      }
-      source_count_shared = source_count;
-      std::uint32_t candidate_cursor = 0u;
-      std::uint32_t largest_source = 0u;
-      std::uint32_t largest_count = 0u;
-      for (std::uint32_t source = 0u; source < source_count; ++source) {
-        const std::uint32_t level = source_levels[source];
-        std::uint16_t *q_offsets = source_q_offsets +
-            source * (kCanonicalJobQuotients + 1u);
-        std::uint64_t *q_positions = source_q_positions +
-            source * kCanonicalJobQuotients;
-        std::uint32_t count = 0u;
-        for (std::uint32_t local_q = 0u;
-             local_q < quotient_count; ++local_q) {
-          const std::uint32_t q = job.quotient_begin + local_q;
-          const std::uint64_t key_base = std::uint64_t{q} << 16u;
-          const std::uint32_t suffix_begin = local_q == 0u
-              ? static_cast<std::uint32_t>(job.key_begin - key_base) : 0u;
-          const std::uint32_t suffix_end = local_q + 1u == quotient_count
-              ? static_cast<std::uint32_t>(job.key_end - key_base)
-              : (1u << 16u);
-          std::uint64_t section_begin = 0u;
-          std::uint32_t section_count = 0u;
-          if (source == 0u) {
-            section_begin = epoch_offsets[q];
-            section_count = epoch_counts[q];
-          } else {
-            const Descriptor rows =
-                descriptors[descriptor_index(q, level)];
-            section_begin = rows.offset();
-            section_count = rows.count();
-          }
-          std::uint32_t begin = 0u, end = section_count;
-          if (source == 0u) {
-            begin = lower_bound_rows(
-                epoch_rows + section_begin, section_count, suffix_begin);
-            if (suffix_end != (1u << 16u))
-              end = begin + lower_bound_rows(
-                  epoch_rows + section_begin + begin,
-                  section_count - begin, suffix_end);
-          } else {
-            begin = lower_bound_rows(
-                arena + section_begin, section_count, suffix_begin);
-            if (suffix_end != (1u << 16u))
-              end = begin + lower_bound_rows(
-                  arena + section_begin + begin,
-                  section_count - begin, suffix_end);
-          }
-          q_offsets[local_q] = static_cast<std::uint16_t>(count);
-          q_positions[local_q] = section_begin + begin;
-          count += end - begin;
-        }
-        q_offsets[quotient_count] = static_cast<std::uint16_t>(count);
-        source_candidate_offsets[source] =
-            static_cast<std::uint16_t>(candidate_cursor);
-        source_lengths[source] = static_cast<std::uint16_t>(count);
-        candidate_cursor += count;
-        if (count >= largest_count) {
-          largest_count = count;
-          largest_source = source;
-        }
-      }
-      std::uint32_t physical_count = 0u;
-      std::uint32_t physical_cursor = 0u;
-      for (std::uint32_t source = 0u; source < source_count; ++source) {
-        if (source == largest_source || !source_lengths[source]) continue;
-        physical_sources[physical_count] = static_cast<std::uint16_t>(source);
-        run_offsets[physical_count] =
-            static_cast<std::uint16_t>(physical_cursor);
-        run_lengths[physical_count] = source_lengths[source];
-        physical_cursor += source_lengths[source];
-        ++physical_count;
-      }
-      const std::uint32_t small_count = physical_cursor;
-      if (largest_count) {
-        physical_sources[physical_count] =
-            static_cast<std::uint16_t>(largest_source);
-        run_offsets[physical_count] =
-            static_cast<std::uint16_t>(physical_cursor);
-        run_lengths[physical_count] =
-            static_cast<std::uint16_t>(largest_count);
-        ++physical_count;
-      }
-      physical_run_count_shared = physical_count;
-      run_count_shared = physical_count ? physical_count - 1u : 0u;
-      small_count_shared = small_count;
-      largest_count_shared = largest_count;
-      task_rows_shared = candidate_cursor;
-      job_valid_shared = source_count == expected_sources &&
-          quotient_count && quotient_count <= kCanonicalJobQuotients &&
-          candidate_cursor <= plan->job_capacity &&
-          candidate_cursor < kCanonicalCandidateLimit;
-      atomicAdd(reinterpret_cast<unsigned long long *>(
-                    &plan->raw_reservation),
-                static_cast<unsigned long long>(candidate_cursor));
-      if (!job_valid_shared)
-        atomicOr(&plan->status, kPublicationJobTooLarge);
-    }
-    __syncthreads();
-
-    if (!job_valid_shared) {
-      if (threadIdx.x == 0u) {
-        canonical_job_prefix(job_index, 0u, prefixes);
-      }
-      __syncthreads();
-      continue;
-    }
-
-    for (std::uint32_t physical = 0u;
-         physical < physical_run_count_shared; ++physical) {
-      const std::uint32_t source = physical_sources[physical];
-      const std::uint32_t count = source_lengths[source];
-      const std::uint32_t destination = run_offsets[physical];
-      const std::uint16_t *q_offsets = source_q_offsets +
-          source * (kCanonicalJobQuotients + 1u);
-      std::uint32_t local_q = 0u;
-      for (std::uint32_t position = threadIdx.x;
-           position < count; position += blockDim.x) {
-        while (local_q + 1u < quotient_count &&
-               position >= q_offsets[local_q + 1u])
-          ++local_q;
-        const std::uint64_t physical_position = source_q_positions[
-            source * kCanonicalJobQuotients + local_q] +
-            position - q_offsets[local_q];
-        const Row row = source == 0u
-            ? epoch_rows[physical_position]
-            : arena[physical_position];
-        const std::uint32_t candidate =
-            source_candidate_offsets[source] + position;
-        const std::uint32_t record =
-            (local_q << 28u) |
-            (std::uint32_t{row.key} << kCanonicalCandidateBits) |
-            candidate;
-        plane_a[destination + position] = record;
-        if (row.flags & kTombstone)
-          atomicOr(tombstone_words + (candidate >> 5u),
-                   1u << (candidate & 31u));
-        if (physical + 1u == physical_run_count_shared)
-          plane_b[destination + position] = record;
-      }
-    }
-    __syncthreads();
-
-    bool input_is_a = true;
-    while (run_count_shared > 1u) {
-      const std::uint32_t *input = input_is_a ? plane_a : plane_b;
-      std::uint32_t *output = input_is_a ? plane_b : plane_a;
-      const std::uint32_t items =
-          (small_count_shared + kThreads - 1u) / kThreads;
-      std::uint32_t position = threadIdx.x * items;
-      const std::uint32_t thread_end = min(
-          position + items, small_count_shared);
-      while (position < thread_end) {
-        std::uint32_t pair = 0u;
-        while (pair * 2u < run_count_shared) {
-          const std::uint32_t first = pair * 2u;
-          const std::uint32_t pair_rows = run_lengths[first] +
-              (first + 1u < run_count_shared
-                   ? run_lengths[first + 1u] : 0u);
-          if (position < run_offsets[first] + pair_rows) break;
-          ++pair;
-        }
-        const std::uint32_t first = pair * 2u;
-        const std::uint32_t begin = run_offsets[first];
-        const std::uint32_t left_count = run_lengths[first];
-        const std::uint32_t right_count = first + 1u < run_count_shared
-            ? run_lengths[first + 1u] : 0u;
-        const std::uint32_t pair_end = begin + left_count + right_count;
-        const std::uint32_t output_end = min(thread_end, pair_end);
-        if (!right_count) {
-          while (position < output_end) {
-            output[position] = input[position];
-            ++position;
-          }
-        } else {
-          canonical_merge_interval(
-              input + begin, left_count, input + begin + left_count,
-              right_count, output + begin, position - begin,
-              output_end - begin);
-          position = output_end;
-        }
-      }
-      __syncthreads();
-      if (threadIdx.x == 0u) {
-        const std::uint32_t old_count = run_count_shared;
-        const std::uint32_t next_count = (old_count + 1u) >> 1u;
-        for (std::uint32_t next = 0u; next < next_count; ++next) {
-          const std::uint32_t first = next * 2u;
-          run_offsets[next] = run_offsets[first];
-          run_lengths[next] = static_cast<std::uint16_t>(
-              run_lengths[first] +
-              (first + 1u < old_count ? run_lengths[first + 1u] : 0u));
-        }
-        run_count_shared = next_count;
-      }
-      input_is_a = !input_is_a;
-      __syncthreads();
-    }
-
-    const std::uint32_t *small_input = input_is_a ? plane_a : plane_b;
-    std::uint32_t *final_output = input_is_a ? plane_b : plane_a;
-    const std::uint32_t *sorted = small_input;
-    if (small_count_shared && largest_count_shared) {
-      const std::uint32_t items =
-          (task_rows_shared + kThreads - 1u) / kThreads;
-      const std::uint32_t begin = threadIdx.x * items;
-      const std::uint32_t end = min(begin + items, task_rows_shared);
-      if (begin < end)
-        canonical_merge_interval(
-            small_input, small_count_shared,
-            small_input + small_count_shared, largest_count_shared,
-            final_output, begin, end);
-      sorted = final_output;
-    }
-    __syncthreads();
-
-    const std::uint32_t items_per_thread =
-        (task_rows_shared + kThreads - 1u) / kThreads;
-    const std::uint32_t thread_begin = threadIdx.x * items_per_thread;
-    const std::uint32_t thread_end = min(
-        thread_begin + items_per_thread, task_rows_shared);
-    std::uint32_t local_live = 0u;
-    std::uint32_t live_records[kMaximumItemsPerThread]{};
-    std::uint32_t previous_logical_key =
-        thread_begin && thread_begin < thread_end
-        ? sorted[thread_begin - 1u] >> kCanonicalCandidateBits
-        : std::numeric_limits<std::uint32_t>::max();
-    for (std::uint32_t position = thread_begin;
-         position < thread_end; ++position) {
-      const std::uint32_t record = sorted[position];
-      const std::uint32_t logical_key = record >> kCanonicalCandidateBits;
-      const bool first = previous_logical_key != logical_key;
-      previous_logical_key = logical_key;
-      if (!first) continue;
-      const std::uint32_t candidate =
-          record & (kCanonicalCandidateLimit - 1u);
-      if (!plan->keep_tombstones &&
-          (tombstone_words[candidate >> 5u] &
-           (1u << (candidate & 31u))))
-        continue;
-      live_records[local_live++] = record;
-    }
-    std::uint32_t thread_output{}, job_output_count{};
-    BlockScan(scan_storage).ExclusiveSum(
-        local_live, thread_output, job_output_count);
-    if (threadIdx.x == 0u) {
-      const unsigned long long prefix = canonical_job_prefix(
-          job_index, job_output_count, prefixes);
-      output_prefix_shared = prefix;
-      if (job_index + 1u == plan->job_count)
-        plan->survivor_count = prefix + job_output_count;
-      if (plan->source_level_limit == plan->destination_level &&
-          prefix + job_output_count > plan->output_capacity) {
-        job_valid_shared = 0u;
-        atomicOr(&plan->status, kPublicationOutputOverflow);
-      }
-    }
-    __syncthreads();
-
-    if (!job_valid_shared) continue;
-
-    constexpr unsigned full_warp = 0xffffffffu;
-    const std::uint32_t lane = threadIdx.x & 31u;
-    for (std::uint32_t local = 0u;
-         local < kMaximumItemsPerThread; ++local) {
-      const bool valid = local < local_live;
-      const unsigned active = __ballot_sync(full_warp, valid);
-      if (!valid) continue;
-      const std::uint32_t record = live_records[local];
-      const std::uint32_t candidate =
-          record & (kCanonicalCandidateLimit - 1u);
-      const std::uint32_t local_q = record >> 28u;
-      const Row row = canonical_candidate_row(
-          candidate, local_q, source_count_shared,
-          source_candidate_offsets, source_q_offsets,
-          source_q_positions, epoch_rows, arena);
-      arena.store(
-          plan->output_begin + output_prefix_shared + thread_output + local,
-          row);
-      const std::uint32_t q = job.quotient_begin + local_q;
-      const std::uint32_t cell =
-          q * kFoundationCells + row.key / kFoundationCellKeys;
-      const unsigned peers = __match_any_sync(active, cell);
-      if (lane == static_cast<std::uint32_t>(__ffs(peers) - 1u))
-        atomicAdd(cell_counts + cell, __popc(peers));
-    }
-    __syncthreads();
-  }
-}
-
 struct CanonicalTournamentSlice {
   std::uint32_t begin{};
   std::uint32_t count{};
 };
 
-// The cache overlay resolves the physical source location once for each
-// source/quotient pair.  Cell discovery can then start directly from that
-// base instead of following source -> level -> descriptor -> offset again.
+// Cache each source section's physical base.
 __device__ __forceinline__ CanonicalTournamentSlice
 canonical_tournament_cell_slice(
     std::uint32_t source, std::uint32_t level, std::uint32_t q,
@@ -4297,13 +3862,7 @@ __device__ __forceinline__ std::uint8_t canonical_tournament_child(
       ? static_cast<std::uint8_t>(source) : 0xffu;
 }
 
-// A cell is one independent sorted merge chain.  One hundred twenty-eight
-// chains execute in
-// parallel and dynamically claim cells.  Each chain keeps one head per source
-// and an updateable tournament tree; advancing a source changes only O(log k)
-// comparisons.  The algorithm is identical for every k up to the structural
-// level bound, and reads each selected row only once after survivor offsets are
-// known.
+// Each chain merges one sorted key cell.
 __global__ __launch_bounds__(kFoundationCompactionThreads)
 void canonical_tournament_carry_jobs_kernel(
     BalancedMergeJob *jobs, const std::uint64_t *reservations,
@@ -4336,8 +3895,7 @@ void canonical_tournament_carry_jobs_kernel(
 
   const DeviceManifestSnapshot manifest = load_active_manifest(
       manifests, active_manifest);
-  // The source set is fixed for the publication, so build it once per block
-  // instead of once for every dynamically claimed job.
+  // Build the source list once per block.
   if (threadIdx.x == 0u) {
     std::uint32_t source_count = 0u;
     source_levels[source_count++] = kMaximumLevels;
@@ -4539,9 +4097,7 @@ void canonical_tournament_carry_jobs_kernel(
           const std::uint64_t source_base = source_bases[
               std::size_t{local_q} * source_count + source];
 
-          // This is the next required row, not a speculative read.  Issue it
-          // before survivor bookkeeping so its latency can overlap the
-          // duplicate and tombstone work below.
+          // Prefetch before survivor bookkeeping.
           std::uint32_t advanced_head = 1u << 16u;
           if (left)
             advanced_head = canonical_tournament_source_head(
@@ -4550,11 +4106,7 @@ void canonical_tournament_carry_jobs_kernel(
 
           if (key != previous_key) {
             if (plan->keep_tombstones || !(head & (1u << 17u))) {
-              // Canonical epoch and level runs contain at most one row for
-              // each logical key.  Therefore a source contributes at most
-              // the 512 key positions in one cell.  Duplicate user writes
-              // are resolved before this merge; they are not an external
-              // unique-key requirement.
+              // Each source has one row per key.
               survivor_tape[tape_begin + survivor_count++] =
                   static_cast<std::uint16_t>(
                       (source << kCanonicalTournamentReferenceBits) |
@@ -4642,10 +4194,7 @@ void canonical_tournament_carry_jobs_kernel(
 
     if (!job_valid_shared) continue;
 
-    // Each warp materializes contiguous output positions.  Besides coalescing
-    // the final stores, lanes that need the same source slice share one rank
-    // lookup.  This works for every source count and avoids a per-source
-    // register array.
+    // Materialize contiguous output by warp.
     constexpr unsigned kFullWarp = 0xffffffffu;
     const std::uint32_t lane = threadIdx.x & 31u;
     const std::uint32_t warp = threadIdx.x >> 5u;
@@ -4924,39 +4473,29 @@ __global__ void canonical_lookup_with_pending_kernel(
       __ldg(occupied_mask), query_ids);
 }
 
-inline std::uint32_t select_canonical_merge_capacity() {
+inline std::uint32_t select_canonical_merge_capacity(
+    std::uint32_t maximum_sources) {
+  if (maximum_sources < kCanonicalTournamentMinimumSources ||
+      maximum_sources > kMaximumMergeSources)
+    throw std::invalid_argument("invalid tournament source count");
   int maximum_blocks = 0;
   CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &maximum_blocks, canonical_fallback_carry_jobs_kernel,
+      &maximum_blocks, canonical_tournament_carry_jobs_kernel,
       kFoundationCompactionThreads, 0u));
-  // Three larger jobs per SM outperform a greater number of smaller jobs:
-  // they reduce planning and boundary work while retaining enough warps to
-  // hide the fallback merge's latency.
   const int desired_blocks = std::max(1, std::min(3, maximum_blocks));
   std::size_t shared_budget = 0u;
   CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(
-      &shared_budget, canonical_fallback_carry_jobs_kernel, desired_blocks,
-      kFoundationCompactionThreads));
-
-  // Retain the established job-capacity calculation, deriving its shared
-  // memory budget from the production canonical kernel.
-  // Overlay cell cursors on the second index plane.
-  const std::uint32_t minimum_capacity = std::max(
-      kMaximumMergeSources, 4u * kFoundationCells + 1u);
-  std::uint32_t block_low = minimum_capacity;
-  std::uint32_t block_high = kBalancedMergeCapacityCeiling;
-  while (block_low < block_high) {
-    const std::uint32_t middle =
-        block_low + (block_high - block_low + 1u) / 2u;
-    if (canonical_capacity_reservation_bytes(middle) <= shared_budget)
-      block_low = middle;
-    else
-      block_high = middle - 1u;
-  }
-  if (block_low < minimum_capacity)
-    throw std::runtime_error("insufficient shared memory for GPULSMOpt merge");
-  // Keep both index planes four-byte aligned.
-  return (block_low & 1u) ? block_low : block_low - 1u;
+      &shared_budget, canonical_tournament_carry_jobs_kernel,
+      desired_blocks, kFoundationCompactionThreads));
+  std::uint32_t capacity = canonical_tournament_capacity(
+      shared_budget, maximum_sources, kCanonicalJobQuotients);
+  while (capacity && canonical_tournament_workspace_bytes(
+             capacity, maximum_sources) > shared_budget)
+    --capacity;
+  if (capacity <= kMaximumMergeSources)
+    throw std::runtime_error(
+        "insufficient shared memory for GPULSMOpt tournament");
+  return capacity;
 }
 
 __device__ __forceinline__ std::uint32_t tqrj_directory_find(
@@ -4972,8 +4511,7 @@ __device__ __forceinline__ std::uint32_t tqrj_directory_find(
     return kInvalid;
   }
 
-  // Preserve first-owner order while aligning the remaining probe to one
-  // 32-bit shared load for each pair of exact 16-bit suffixes.
+  // Preserve owner order while probing suffix pairs.
   if (position < end) {
     if (directory_suffixes[position] == target) return position;
     ++position;
@@ -5004,8 +4542,7 @@ __device__ __forceinline__ unsigned long long tqrj_pending_token(
       (order << 33u) | (live << 32u) | payload.value);
 }
 
-// All lanes call this helper.  Matching lanes with the same exact owner
-// collapse to one atomic update, for either shared or global winner storage.
+// Aggregate matching lanes by exact owner.
 __device__ __forceinline__ void tqrj_warp_atomic_max(
     bool matched, std::uint32_t owner, unsigned long long token,
     unsigned long long *winners) {
@@ -5037,10 +4574,7 @@ struct TqrjHashTile {
   std::uint32_t begin;
 };
 
-// Typed names for storage borrowed by one dense lookup.  The owning buffers
-// retain their other operation-specific names because publication, canonical,
-// range, and TQRJ execute under the same operation lock.  These aliases add no
-// storage; they only make TQRJ's phase lifetimes explicit at its launch site.
+// TQRJ aliases reuse operation-locked storage.
 struct TqrjLookupWorkspace {
   std::uint32_t *grouped_queries;
   std::uint32_t *query_ids;
@@ -5106,9 +4640,7 @@ __device__ __forceinline__ void tqrj_write_result(
       canonical_cell_ranks, occupied_levels, query_ids);
 }
 
-// One block owns one ordinary quotient.  Oversized, high-pending, or locally
-// concentrated tasks are enqueued for the one size-independent skew executor
-// below.
+// Each block owns one ordinary quotient.
 __global__ void tqrj_direct_lookup_kernel(
     const std::uint32_t *queries, std::uint32_t *out_values,
     std::uint8_t *out_found, const std::uint32_t *active_quotients,
@@ -5154,9 +4686,7 @@ __global__ void tqrj_direct_lookup_kernel(
   directory_counts[threadIdx.x] = 0u;
   __syncthreads();
 
-  // Direct radix addressing: the upper suffix byte chooses one of 256 exact
-  // compact lists.  Only actual queries are counted and scattered; unlike a
-  // fixed-capacity block sort, small direct tasks do no padded directory work.
+  // Direct tasks index compact suffix lists.
   for (std::uint32_t local = threadIdx.x; local < query_count;
        local += blockDim.x) {
     const std::uint32_t suffix =
@@ -5195,9 +4725,7 @@ __global__ void tqrj_direct_lookup_kernel(
   }
   __syncthreads();
 
-  // The existing raw layout already gives this quotient one contiguous
-  // section in every admission batch.  Assign batches to warps so the short
-  // sections in the measured workload execute concurrently.
+  // Assign contiguous pending batches to warps.
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t warp = threadIdx.x >> 5u;
   constexpr std::uint32_t kWarps = kThreads / 32u;
@@ -5246,9 +4774,7 @@ __host__ __device__ constexpr std::uint32_t tqrj_hash_tile_count(
   return (rows + kTqrjHashTileRows - 1u) / kTqrjHashTileRows;
 }
 
-// Exact overflow directory.  Capacity is proportional to the number of
-// queries that actually overflow compact CSR; it has no key-domain term and
-// no power-of-two discontinuity.
+// Size overflow storage from actual queries.
 __host__ __device__ constexpr std::uint64_t tqrj_hash_seed(
     std::uint32_t attempt) {
   return attempt == 0u ? 0x6a09e667f3bcc909ull
@@ -5381,8 +4907,7 @@ __global__ void tqrj_hash_lookup_kernel(
   const std::uint32_t global_stride = blockDim.x * gridDim.x;
   const std::uint32_t lane = threadIdx.x & 31u;
 
-  // First materialize balanced query and pending tiles and count only the
-  // queries that actually overflowed direct matching.
+  // Materialize direct-match overflow only.
   for (std::uint32_t task_index = blockIdx.x;
        task_index < tasks_in_queue; task_index += gridDim.x) {
     if (threadIdx.x == 0u) {
@@ -5418,9 +4943,7 @@ __global__ void tqrj_hash_lookup_kernel(
   grid.sync();
   if (counters[5]) return;
 
-  // Bounded retries protect normal inputs from probe clusters.  The final
-  // attempt may probe the complete under-full table, preserving exact
-  // completion independently of fingerprints and the bounded probe limit.
+  // The last retry may probe the complete table.
   for (std::uint32_t attempt = 0u; attempt < kTqrjHashAttempts; ++attempt) {
     if (global_thread == 0u) counters[3] = 0u;
     for (std::uint32_t slot = global_thread; slot < hash_capacity;
@@ -5454,9 +4977,7 @@ __global__ void tqrj_hash_lookup_kernel(
               grouped_queries, query_index, hash_table, hash_capacity, seed,
               probe_limit, counters + 3u);
         owner = __shfl_sync(peers, owner, leader);
-        // The caller-provided result slot is dead until final emission.  It
-        // holds this query's canonical owner so grouped full keys remain
-        // available for exact pending probes without another owner array.
+        // Reuse result slots for canonical owners.
         out_values[query_ids[query_index]] = owner;
       }
     }
@@ -5469,8 +4990,7 @@ __global__ void tqrj_hash_lookup_kernel(
     grid.sync();
   }
 
-  // One existing 64-bit slot per grouped query becomes winner storage.  The
-  // grouped key plane remains unchanged for exact table probes.
+  // Reuse grouped-query slots for winners.
   for (std::uint32_t tile_index = blockIdx.x;
        tile_index < query_tile_count; tile_index += gridDim.x) {
     const TqrjHashTile tile = query_tiles[tile_index];
@@ -5732,18 +5252,6 @@ __global__ void successor_with_pending_kernel(
 
 }
 
-// BEGIN INLINED COMPONENT: gpulsm_sparse/pending.cuh
-
-// BEGIN INLINED COMPONENT: gpulsm_sparse/capsule_lifecycle.cuh
-
-// BEGIN INLINED COMPONENT: gpulsm_sparse/exact.cuh
-
-// BEGIN INLINED COMPONENT: gpulsm_sparse/capsule.cuh
-
-// BEGIN INLINED COMPONENT: gpulsm_sparse/common.cuh
-
-#include <utility>
-
 namespace gpulsm_sparse {
 
 constexpr std::uint32_t kThreads = 256u;
@@ -5780,14 +5288,23 @@ class Buffer {
 
   void reset(std::size_t count) {
     clear();
+    owns_ = true;
     count_ = count;
     if (count) check(cudaMalloc(&pointer_, count * sizeof(T)), "cudaMalloc");
   }
 
+  void attach(T *pointer, std::size_t count) {
+    clear();
+    pointer_ = pointer;
+    count_ = count;
+    owns_ = false;
+  }
+
   void clear() noexcept {
-    if (pointer_) cudaFree(pointer_);
+    if (pointer_ && owns_) cudaFree(pointer_);
     pointer_ = nullptr;
     count_ = 0u;
+    owns_ = true;
   }
 
   T *data() const { return pointer_; }
@@ -5797,15 +5314,16 @@ class Buffer {
   void swap(Buffer &other) noexcept {
     std::swap(pointer_, other.pointer_);
     std::swap(count_, other.count_);
+    std::swap(owns_, other.owns_);
   }
 
  private:
   T *pointer_{};
   std::size_t count_{};
+  bool owns_{true};
 };
 
-// This is the validated structural radix-4 forest planner.  It describes
-// final roots symbolically so a sealed call materializes only those roots.
+// Plan final radix-4 roots before materialization.
 struct PlannedRoot {
   std::uint64_t resident_sources{};
   std::uint64_t raw_begin{};
@@ -5934,9 +5452,7 @@ inline ForestPlan plan_forest(
   return plan;
 }
 
-// Sparse descriptors hang off the authoritative GPULSMOpt level/pending
-// state.  They describe only exceptional storage; ordinary masks, rows,
-// offsets, and counts remain owned by GPULSMOpt.
+// Sparse metadata describes exceptional records only.
 struct RootBuildState {
   std::uint32_t level{};
   std::uint32_t generation{};
@@ -5992,8 +5508,7 @@ enum : std::uint32_t {
   kSparseHasCapsules = 1u << 1u,
 };
 
-// This table is indexed by the restored manifest generation.  It contains no
-// ordinary mask, row, count, offset, or routing metadata.
+// Index sparse metadata by manifest generation.
 struct DeviceSparseManifest {
   DeviceSparseLevelState levels[gpulsmopt2_detail::kMaximumLevels]{};
   std::uint64_t exact_level_mask{};
@@ -6143,7 +5658,6 @@ inline RecordBatchView inline_u32_batch(
 }
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/common.cuh
 
 namespace gpulsm_sparse {
 
@@ -6381,12 +5895,6 @@ class CapsuleSegment {
   std::uint64_t mapped_bytes() const { return mapped_bytes_; }
   std::uint64_t live_bytes() const { return live_bytes_; }
   std::uint64_t garbage_bytes() const { return garbage_bytes_; }
-  void set_usage(std::uint64_t live, std::uint64_t garbage) {
-    if (live > mapped_bytes_ || garbage > mapped_bytes_ - live)
-      throw std::overflow_error("invalid capsule usage");
-    live_bytes_ = live;
-    garbage_bytes_ = garbage;
-  }
   void commit_usage(std::uint64_t live, std::uint64_t garbage) noexcept {
     live_bytes_ = live;
     garbage_bytes_ = garbage;
@@ -6574,9 +6082,7 @@ __device__ __forceinline__ const CapsuleHeader *capsule_header(
 
 struct CompletionSourceView {
   RecordBatchView incoming{};
-  // Direct root construction supplies the prototype's stable head-sorted
-  // input order.  Sparse refinement can then gather only roster heads; it
-  // never creates a second full incoming record bank.
+  // Gather sparse heads from stable input order.
   const std::uint32_t *incoming_sorted_heads{};
   const std::uint32_t *incoming_sorted_refs{};
   std::uint32_t incoming_records{};
@@ -6610,10 +6116,6 @@ struct CompletionKeyCursor {
   __device__ std::uint64_t pending_physical() const {
     return std::uint64_t{completion_slot(ref)} * source.batch_capacity +
         completion_local(ref);
-  }
-
-  __device__ gpulsmopt2_detail::RawPayload pending_payload() const {
-    return source.pending_payloads[pending_physical()];
   }
 
   __device__ const CapsuleIndex *pending_capsule() const {
@@ -7005,20 +6507,7 @@ __device__ inline const CapsuleIndex *source_owned_capsule(
   return TerminalKeyCursor<IncomingSource>{source, ref}.capsule();
 }
 
-__device__ __forceinline__ bool exact_key_equal(
-    const DeviceKeyCursor &query, const ResidentKeyCursor &stored) {
-  if (query.length() != stored.length()) return false;
-  if (query.length() && rejection_hash(query) !=
-      (stored.capsule() ? stored.capsule()->rejection
-                        : rejection_hash(query)))
-    return false;
-  for (std::uint64_t position = 0u; position < query.length(); ++position)
-    if (query.byte(position) != stored.byte(position)) return false;
-  return true;
-}
-
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/capsule.cuh
 
 namespace gpulsm_sparse {
 
@@ -7536,7 +7025,6 @@ class ExactOrderWorkspace {
 };
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/exact.cuh
 
 namespace gpulsm_sparse {
 
@@ -7711,7 +7199,6 @@ __global__ void emit_capsule_objects(
 }
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/capsule_lifecycle.cuh
 
 namespace gpulsm_sparse {
 
@@ -8038,10 +7525,7 @@ class PendingWorkspace {
     overlay.live_bytes = capsule_bytes;
     overlay.garbage_bytes = 0u;
 
-    // Every capsule-valued head participates in sparse lifecycle work, even
-    // when its key is an ordinary four-byte key and only its value is long.
-    // This reuses the pending prototype's existing sort/RLE scratch after
-    // capsule emission, so no capacity-sized permanent head plane is added.
+    // Long values participate in capsule ownership.
     make_pending_special_entries<<<blocks(capsules), kThreads, 0, stream>>>(
         source, capsule_inputs_.data(), capsules, exact_heads_.data(),
         capsule_refs_a_.data());
@@ -8188,14 +7672,6 @@ class PendingWorkspace {
 };
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/pending.cuh
-// BEGIN INLINED COMPONENT: gpulsm_sparse/refine.cuh
-
-// BEGIN INLINED COMPONENT: gpulsm_sparse/fan_in.cuh
-
-
-#include <thrust/execution_policy.h>
-#include <thrust/merge.h>
 
 namespace gpulsm_sparse {
 
@@ -8210,11 +7686,7 @@ struct TerminalRefLess {
 
   __device__ std::uint64_t age(std::uint32_t ref) const {
     const TerminalCandidate &candidate = source.candidates[ref];
-    // This is the canonical GPULSMOpt source order: pending is source zero
-    // and resident levels are visited in ascending level order, so a smaller
-    // resident level is newer.  Express that order as an increasing age so
-    // the prototype's mark-last rule selects the same winner as the original
-    // carry without mirroring epoch metadata for ordinary roots.
+    // Lower source numbers are newer.
     return candidate.source == kTerminalIncomingSource
         ? std::numeric_limits<std::uint64_t>::max()
         : std::numeric_limits<std::uint64_t>::max() - 1u -
@@ -8256,11 +7728,7 @@ __global__ void mark_last_terminal_key(
                    source_key(source, merged[position + 1u])) != 0);
 }
 
-// Direct production extraction of exact_fanin_gate.cu: sorted exact streams
-// are merged pairwise with thrust::merge, then the last (newest) member of
-// each equal-key group is selected.  The merge tree is allowed to have more
-// than the benchmark's four leaves because a terminal radix carry can expose
-// any number of already-sorted resident roots.
+// Merge exact-key streams and keep newest records.
 class ExactFanInWorkspace {
  public:
   struct Result {
@@ -8371,7 +7839,6 @@ class ExactFanInWorkspace {
 };
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/fan_in.cuh
 
 namespace gpulsm_sparse {
 
@@ -8404,10 +7871,7 @@ __device__ __forceinline__ std::uint64_t find_projection_row(
       ? rows.offset() + local : ~std::uint64_t{0};
 }
 
-// Mixed epochs retain one non-tombstone placeholder for every observed
-// exceptional head until exact refinement has resolved all complete keys.
-// This is the required pre-winner deferral: a newer different long key may
-// not erase the projection needed by an older surviving key.
+// Keep one placeholder until exact-key refinement.
 __global__ void patch_epoch_sparse_placeholders(
     const std::uint32_t *roster, std::uint32_t roster_count,
     const std::uint32_t *section_offsets,
@@ -8832,10 +8296,7 @@ struct SparseRefinementResult {
   std::uint64_t allocated_capsule_bytes{};
 };
 
-// Mixed publication is one receipt-backed commit.  The original ordinary
-// manifest layout is preserved byte-for-byte; this companion kernel copies
-// its publication rule and updates the sparse-only table before performing
-// the same single active-index flip.
+// Publish ordinary and sparse metadata together.
 __global__ void publish_refined_manifest_kernel(
     gpulsmopt2_detail::ResidentPublicationPlan *plan,
     gpulsmopt2_detail::DeviceManifest *manifests,
@@ -9028,9 +8489,7 @@ class SparseRefinementWorkspace {
             device_roots_.data()};
   }
 
-  // Direct bulk/sealed roots already have a sorted, deduplicated sparse-head
-  // roster from the transplanted root builder.  Stage that sparse list only;
-  // ordinary projection metadata remains exclusively in GPULSMOpt.
+  // Stage only the deduplicated sparse roster.
   PreparedRoster prepare_direct_roster(
       const std::uint32_t *heads, std::uint32_t count,
       cudaStream_t stream) {
@@ -9053,10 +8512,6 @@ class SparseRefinementWorkspace {
                           cudaMemcpyHostToDevice, stream),
           "stage direct sparse roster count");
     return {roster_.data(), count, nullptr, 0u, device_roots_.data()};
-  }
-
-  const std::vector<CapsuleSegmentOwnership *> &lifecycle_owners() const {
-    return lifecycle_owners_;
   }
 
   std::size_t bytes() const;
@@ -9830,15 +9285,11 @@ inline std::size_t SparseRefinementWorkspace::bytes() const {
 }
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/refine.cuh
-// BEGIN INLINED COMPONENT: gpulsm_sparse/bulk.cuh
 
 
 namespace gpulsm_sparse {
 
-// Direct extraction of the observed-head front of the closure prototype's
-// UniversalRootWorkspace.  It produces exactly one restored projection row
-// per head and compacts only exceptional head groups for exact refinement.
+// Compact exceptional groups for exact refinement.
 template <class Source>
 __device__ __forceinline__ bool direct_source_requires_sparse(
     Source source, std::uint32_t ref) {
@@ -9906,8 +9357,7 @@ __global__ void emit_direct_projection(
     projection_rows[group] = exact_group_row(head, 0u);
     return;
   }
-  // DeviceRadixSort is stable, so the last member of an ordinary head group
-  // is the newest input update, matching restored bulk/admission chronology.
+  // Stable sorting leaves the newest head last.
   const std::uint32_t ref = sorted_refs[
       group_starts[group] + group_counts[group] - 1u];
   const bool tombstone = source_tombstone(source, ref);
@@ -10178,15 +9628,11 @@ __global__ void initialize_direct_sparse_manifest(
 }
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/bulk.cuh
-// BEGIN INLINED COMPONENT: gpulsm_sparse/sealed.cuh
 
 
 namespace gpulsm_sparse {
 
-// Validated specialized sealed-anchor builder transplanted from
-// closure_spine.cuh.  It remains an all-inline builder: mixed intervals use
-// DirectRootWorkspace plus the same sparse refinement instead.
+// Build sealed anchors from sorted projection rows.
 __global__ void mark_last_sealed_key(
     const std::uint32_t *keys, std::uint32_t count, std::uint8_t *keep) {
   const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -10263,28 +9709,47 @@ __global__ void build_sealed_epoch_counts_and_ranks(
 
 class SealedWorkspace {
  public:
-  explicit SealedWorkspace(std::uint32_t capacity)
-      : capacity_(capacity), sorted_keys_(capacity),
-        sorted_values_(capacity), keep_(capacity), selected_(capacity),
-        selected_count_(1u), section_offsets_(kSections + 1u),
-        section_counts_(kSections + 1u), epoch_rows_(capacity),
-        epoch_ranks_(gpulsmopt2_detail::kLocalRankEntries) {
-    std::size_t bytes = 0u;
-    check(cub::DeviceRadixSort::SortPairs(
-              nullptr, bytes, sorted_keys_.data(), sorted_keys_.data(),
-              sorted_values_.data(), sorted_values_.data(), capacity_,
-              0, 32),
-          "size sealed sort");
-    sort_bytes_ = bytes;
-    sort_temporary_.reset(bytes);
-    cub::CountingInputIterator<std::uint32_t> ids(0u);
-    bytes = 0u;
-    check(cub::DeviceSelect::Flagged(
-              nullptr, bytes, ids, keep_.data(), selected_.data(),
-              selected_count_.data(), capacity_),
-          "size sealed selection");
-    select_bytes_ = bytes;
-    select_temporary_.reset(bytes);
+  SealedWorkspace(std::uint32_t capacity, std::uint8_t *storage,
+                  std::size_t storage_bytes)
+      : capacity_(capacity) {
+    const StorageLayout layout = storage_layout(capacity);
+    if (!storage || storage_bytes < layout.total_bytes)
+      throw std::length_error("sealed workspace backing storage");
+    sorted_keys_.attach(reinterpret_cast<std::uint32_t *>(
+                            storage + layout.sorted_keys),
+                        capacity);
+    sorted_values_.attach(reinterpret_cast<std::uint32_t *>(
+                              storage + layout.sorted_values),
+                          capacity);
+    keep_.attach(storage + layout.keep, capacity);
+    selected_.attach(reinterpret_cast<std::uint32_t *>(
+                         storage + layout.selected),
+                     capacity);
+    selected_count_.attach(reinterpret_cast<std::uint32_t *>(
+                               storage + layout.selected_count),
+                           1u);
+    section_offsets_.attach(reinterpret_cast<std::uint32_t *>(
+                                storage + layout.section_offsets),
+                            kSections + 1u);
+    section_counts_.attach(reinterpret_cast<std::uint32_t *>(
+                               storage + layout.section_counts),
+                           kSections + 1u);
+    epoch_rows_.attach(reinterpret_cast<gpulsmopt2_detail::Row *>(
+                           storage + layout.epoch_rows),
+                       capacity);
+    epoch_ranks_.attach(reinterpret_cast<std::uint16_t *>(
+                            storage + layout.epoch_ranks),
+                        gpulsmopt2_detail::kLocalRankEntries);
+    sort_temporary_.attach(storage + layout.sort_temporary,
+                           layout.sort_bytes);
+    select_temporary_.attach(storage + layout.select_temporary,
+                             layout.select_bytes);
+    sort_bytes_ = layout.sort_bytes;
+    select_bytes_ = layout.select_bytes;
+  }
+
+  static std::size_t required_bytes(std::uint32_t capacity) {
+    return storage_layout(capacity).total_bytes;
   }
 
   std::uint32_t capacity() const { return capacity_; }
@@ -10357,6 +9822,76 @@ class SealedWorkspace {
   }
 
  private:
+  struct StorageLayout {
+    std::size_t sorted_keys{};
+    std::size_t sorted_values{};
+    std::size_t keep{};
+    std::size_t selected{};
+    std::size_t selected_count{};
+    std::size_t section_offsets{};
+    std::size_t section_counts{};
+    std::size_t epoch_rows{};
+    std::size_t epoch_ranks{};
+    std::size_t sort_temporary{};
+    std::size_t select_temporary{};
+    std::size_t sort_bytes{};
+    std::size_t select_bytes{};
+    std::size_t total_bytes{};
+  };
+
+  static StorageLayout storage_layout(std::uint32_t capacity) {
+    StorageLayout layout{};
+    std::uint32_t *rows = nullptr;
+    std::uint8_t *flags = nullptr;
+    check(cub::DeviceRadixSort::SortPairs(
+              nullptr, layout.sort_bytes, rows, rows, rows, rows,
+              capacity, 0, 32),
+          "size attached sealed sort");
+    cub::CountingInputIterator<std::uint32_t> ids(0u);
+    check(cub::DeviceSelect::Flagged(
+              nullptr, layout.select_bytes, ids, flags, rows, rows,
+              capacity),
+          "size attached sealed selection");
+    std::size_t offset = 0u;
+    const auto place = [&](std::size_t bytes, std::size_t alignment) {
+      offset = (offset + alignment - 1u) / alignment * alignment;
+      const std::size_t result = offset;
+      offset += bytes;
+      return result;
+    };
+    layout.sorted_keys = place(
+        std::size_t{capacity} * sizeof(std::uint32_t),
+        alignof(std::uint32_t));
+    layout.sorted_values = place(
+        std::size_t{capacity} * sizeof(std::uint32_t),
+        alignof(std::uint32_t));
+    layout.keep = place(capacity, alignof(std::uint8_t));
+    layout.selected = place(
+        std::size_t{capacity} * sizeof(std::uint32_t),
+        alignof(std::uint32_t));
+    layout.selected_count = place(
+        sizeof(std::uint32_t), alignof(std::uint32_t));
+    layout.section_offsets = place(
+        std::size_t{kSections + 1u} * sizeof(std::uint32_t),
+        alignof(std::uint32_t));
+    layout.section_counts = place(
+        std::size_t{kSections + 1u} * sizeof(std::uint32_t),
+        alignof(std::uint32_t));
+    layout.epoch_rows = place(
+        std::size_t{capacity} * sizeof(gpulsmopt2_detail::Row),
+        alignof(gpulsmopt2_detail::Row));
+    layout.epoch_ranks = place(
+        std::size_t{gpulsmopt2_detail::kLocalRankEntries} *
+            sizeof(std::uint16_t),
+        alignof(std::uint16_t));
+    layout.sort_temporary = place(
+        layout.sort_bytes, alignof(std::uint32_t));
+    layout.select_temporary = place(
+        layout.select_bytes, alignof(std::uint32_t));
+    layout.total_bytes = offset;
+    return layout;
+  }
+
   std::uint32_t capacity_{};
   Buffer<std::uint32_t> sorted_keys_, sorted_values_;
   Buffer<std::uint8_t> keep_;
@@ -10384,9 +9919,7 @@ struct SealedForestReceipt {
   std::uint32_t status{};
 };
 
-// One publication for every final materialized root.  This is the prototype
-// multi-root receipt rule grafted onto the original ordinary manifest and
-// the sparse-only companion table; it introduces no wrapper manifest.
+// Publish all materialized roots in one commit.
 __global__ void publish_sealed_forest(
     const SealedForestCommand *command,
     gpulsmopt2_detail::DeviceManifest *manifests,
@@ -10461,15 +9994,11 @@ __global__ void publish_sealed_forest(
 }
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/sealed.cuh
-// BEGIN INLINED COMPONENT: gpulsm_sparse/read.cuh
 
 
 namespace gpulsm_sparse {
 
-// The restored FliX result plane and the optional complete-value sink share
-// one final-store helper.  Sparse reads never allocate an intermediate
-// `found` array.
+// Write lookup results without a found scratch array.
 struct SparseLookupOutput {
   std::uint32_t *summaries{};
   DeviceByteSink values{};
@@ -11020,9 +10549,7 @@ __device__ __forceinline__ void write_sparse_tqrj_result(
   write_resident_match(output, match, destination);
 }
 
-// This is the prototype's direct group owner adapted onto the restored TQRJ
-// routing.  Exact owners are compared as complete keys before a pending
-// winner is accepted; ordinary owners retain head-only matching.
+// Compare deferred owners by complete key.
 __global__ void sparse_tqrj_direct_lookup_kernel(
     RecordBatchView queries, SparseLookupOutput output,
     const std::uint32_t *grouped_heads,
@@ -11269,9 +10796,7 @@ __device__ __forceinline__ std::uint32_t sparse_hash_find(
             exact_flags, table, capacity, seed);
 }
 
-// The prototype's exact hash matcher is grafted into the restored overflow
-// queue.  Ordinary entries remain keyed by four-byte heads; deferred entries
-// are keyed and compared by complete key.
+// Match deferred overflow entries by complete key.
 __global__ __launch_bounds__(gpulsmopt2_detail::kTqrjHashThreads, 1)
 void sparse_tqrj_hash_lookup_kernel(
     gpulsmopt2_detail::TqrjHashTask *tasks,
@@ -11556,8 +11081,6 @@ class SparseReadWorkspace {
 };
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/read.cuh
-// BEGIN INLINED COMPONENT: gpulsm_sparse/ordered_read.cuh
 
 
 namespace gpulsm_sparse {
@@ -11582,8 +11105,7 @@ struct HeadKeyCursor {
 };
 
 struct SuccessorKeyCursor {
-  // 1: ordinary four-byte head, 2: pending complete key,
-  // 3: resident complete key.
+  // Kinds: 1 ordinary, 2 pending, 3 resident.
   std::uint32_t kind{};
   std::uint32_t head{};
   PendingReadView pending{};
@@ -12013,11 +11535,6 @@ __global__ void sparse_successor_kernel(
 }
 
 }  // namespace gpulsm_sparse
-// END INLINED COMPONENT: gpulsm_sparse/ordered_read.cuh
-// BEGIN INLINED COMPONENT: gpulsm_sparse/range.cuh
-
-// BEGIN INLINED COMPONENT: gpulsm_sparse/range_common.cuh
-
 
 namespace gpulsm_sparse::range_gate {
 
@@ -12371,9 +11888,6 @@ class ActiveSectionRoster {
 };
 
 }  // namespace gpulsm_sparse::range_gate
-// END INLINED COMPONENT: gpulsm_sparse/range_common.cuh
-
-#include <cub/block/block_reduce.cuh>
 
 namespace gpulsm_sparse::rank_range {
 
@@ -12781,8 +12295,7 @@ __global__ void count_root_spans(
     if (position > ordinary_position) ++spans;
     if (heads[exact].count) ++spans;
     rows += position - ordinary_position + heads[exact].count;
-    // The specialized projection retains one sentinel row for this exact
-    // head.  The logical range cursor expands the sidecar in its place.
+    // Expand exact sidecars at their sentinel rows.
     ordinary_position = position + 1u;
   }
   if (ordinary_position < ordinary.count()) ++spans;
@@ -14079,7 +13592,6 @@ __global__ void reduce_range_slices(
 
 
 }  // namespace gpulsm_sparse::rank_range
-// END INLINED COMPONENT: gpulsm_sparse/range.cuh
 
 class GPULSMOpt {
 public:
@@ -14124,11 +13636,10 @@ public:
         canonical_level_count_(gpulsmopt2_detail::canonical_level_count(
             publication_capacity_, level_zero_capacity_)),
         resident_merge_capacity_(
-            gpulsmopt2_detail::select_canonical_merge_capacity() -
-            gpulsmopt2_detail::kCanonicalCapacityAdjustment),
-        canonical_merge_workspace_bytes_(
-            std::size_t{resident_merge_capacity_} *
-            sizeof(std::uint32_t) * 2u),
+            gpulsmopt2_detail::select_canonical_merge_capacity(
+                std::min(
+                    gpulsmopt2_detail::kMaximumMergeSources,
+                    std::max(2u, canonical_level_count_ + 1u)))),
         maximum_resident_jobs_(
             gpulsmopt2_detail::maximum_resident_merge_jobs(
                 publication_capacity_, resident_merge_capacity_)),
@@ -14166,14 +13677,17 @@ public:
         canonical_cell_ranks_(
             std::size_t{canonical_level_count_} *
                 gpulsmopt2_detail::kLocalRankEntries),
-        operation_workspace_(
-            operation_workspace_maximum_bytes(batch_capacity_),
-            operation_workspace_initial_bytes(batch_capacity_)),
-        sealed_workspace_(make_sealed_workspace(
-            publication_capacity_, level_zero_capacity_)),
+        phase_workspace_(phase_workspace_maximum_bytes(
+                             publication_capacity_,
+                             level_zero_capacity_, batch_capacity_),
+                         phase_workspace_initial_bytes(
+                             publication_capacity_,
+                             level_zero_capacity_, batch_capacity_)),
+        operation_workspace_(),
+        sealed_workspace_(),
         canonical_job_prefixes_(maximum_resident_jobs_),
         canonical_next_job_(1u),
-        raw_keys_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
+        raw_keys_(),
         raw_payloads_(gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_),
         raw_offsets_(std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
                      (gpulsmopt2_detail::kQuotients + 1u)),
@@ -14209,6 +13723,7 @@ public:
         range_hot_offsets_receipt_(gpulsmopt2_detail::kQuotients + 1u) {
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
+    initialize_phase_workspace_views();
     initialize_operation_workspace_views();
     ensure_radix_workspace(batch_capacity_);
     std::size_t admission_scan_bytes{};
@@ -14255,36 +13770,44 @@ public:
       return;
     }
     const std::uint32_t n = static_cast<std::uint32_t>(count);
-    gpulsmopt2_detail::Buffer<std::uint32_t> sorted_keys(n), sorted_values(n);
     const std::uint32_t tile_count = static_cast<std::uint32_t>(
         (count + gpulsmopt2_detail::kBulkRootSinkTileRows - 1u) /
         gpulsmopt2_detail::kBulkRootSinkTileRows);
-    gpulsmopt2_detail::Buffer<std::uint32_t> tile_counts(tile_count + 1u);
-    gpulsmopt2_detail::Buffer<std::uint32_t> tile_offsets(tile_count + 1u);
-    std::size_t sort_bytes{};
+    const std::size_t phase_restore_bytes = phase_workspace_.size();
+    const PhaseBulkWorkspaceLayout bulk_layout =
+        phase_bulk_workspace_layout(count);
+    phase_workspace_.grow(bulk_layout.total_bytes);
+    std::uint8_t *bulk_storage = phase_workspace_.data();
+    std::uint32_t *sorted_keys =
+        reinterpret_cast<std::uint32_t *>(
+            bulk_storage + bulk_layout.sorted_keys);
+    std::uint32_t *sorted_values =
+        reinterpret_cast<std::uint32_t *>(
+            bulk_storage + bulk_layout.sorted_values);
+    std::uint8_t *temporary =
+        bulk_storage + bulk_layout.temporary;
+    std::uint32_t *tile_counts =
+        reinterpret_cast<std::uint32_t *>(
+            bulk_storage + bulk_layout.tile_counts);
+    std::uint32_t *tile_offsets =
+        reinterpret_cast<std::uint32_t *>(
+            bulk_storage + bulk_layout.tile_offsets);
+    std::size_t sort_bytes = bulk_layout.sort_bytes;
+    std::size_t scan_bytes = bulk_layout.scan_bytes;
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, sort_bytes, keys, sorted_keys.data(), values,
-        sorted_values.data(), n, 0, 32, stream));
-    std::size_t scan_bytes{};
-    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, scan_bytes, tile_counts.data(), tile_offsets.data(),
-        tile_count + 1u, stream));
-    gpulsmopt2_detail::Buffer<std::uint8_t> temporary(
-        std::max(sort_bytes, scan_bytes));
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        temporary.data(), sort_bytes, keys, sorted_keys.data(), values,
-        sorted_values.data(), n, 0, 32, stream));
+        temporary, sort_bytes, keys, sorted_keys, values,
+        sorted_values, n, 0, 32, stream));
     gpulsmopt2_detail::count_bulk_root_sink_tiles_kernel<<<
         tile_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
-            sorted_keys.data(), n, tile_counts.data());
+            sorted_keys, n, tile_counts);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemsetAsync(
-        tile_counts.data() + tile_count, 0, sizeof(std::uint32_t), stream));
+        tile_counts + tile_count, 0, sizeof(std::uint32_t), stream));
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        temporary.data(), scan_bytes, tile_counts.data(),
-        tile_offsets.data(), tile_count + 1u, stream));
+        temporary, scan_bytes, tile_counts,
+        tile_offsets, tile_count + 1u, stream));
     std::uint32_t base_count{};
-    CUDA_CHECK(cudaMemcpyAsync(&base_count, tile_offsets.data() + tile_count,
+    CUDA_CHECK(cudaMemcpyAsync(&base_count, tile_offsets + tile_count,
                                sizeof(base_count), cudaMemcpyDeviceToHost,
                                stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -14297,12 +13820,12 @@ public:
       throw std::bad_alloc();
     gpulsmopt2_detail::deposit_bulk_root_sink_kernel<<<
         tile_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
-            sorted_keys.data(), sorted_values.data(), n,
-            tile_offsets.data(), resident_rows(), destination);
+            sorted_keys, sorted_values, n,
+            tile_offsets, resident_rows(), destination);
     gpulsmopt2_detail::build_bulk_root_sink_quotient_offsets_kernel<<<
         blocks(gpulsmopt2_detail::kQuotients + 1u),
         gpulsmopt2_detail::kThreads, 0, stream>>>(
-            sorted_keys.data(), n, tile_offsets.data(), tile_count,
+            sorted_keys, n, tile_offsets, tile_count,
             foundation_source_offsets_.data());
     CUDA_CHECK(cudaGetLastError());
     gpulsmopt2_detail::ResidentPublicationPlan build_plan{};
@@ -14336,13 +13859,14 @@ public:
     refresh_active_levels();
     CUDA_CHECK(cudaGetLastError());
     end_operation(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    phase_workspace_.shrink(phase_restore_bytes);
   }
 
   void bulk_build(const DeviceRecordBatchView &batch,
                   cudaStream_t stream) {
     validate_record_batch(batch);
-    // This is the protected representation-capability dispatch: call the
-    // restored bulk_build entry itself, with no universal or sparse setup.
+    // Use ordinary bulk build for supported records.
     if (ordinary_compatible(batch) &&
         batch.uniform_operation == DeviceMutation::put) {
       bulk_build(
@@ -14943,10 +14467,7 @@ private:
     const std::uint32_t slot = pending_batches_;
     if (slot >= gpulsmopt2_detail::kBatchesPerEpoch)
       throw std::logic_error("GPULSMOpt pending slot overflow");
-    // Ordinary epochs deliberately do not touch sparse state.  Clear the
-    // tiny sparse slot table lazily when the first exceptional tile of a new
-    // generation arrives, so untouched ordinary slots can never expose
-    // pointers retained from an older epoch.
+    // Clear sparse slots on the first exceptional tile.
     if (pending_sparse_device_generation_ != pending_sparse_generation_) {
       CUDA_CHECK(cudaMemsetAsync(
           device_pending_sparse_states_.data(), 0,
@@ -15033,9 +14554,7 @@ private:
     std::uint8_t *operation_storage = operation_workspace_.data();
     std::uint32_t *query_ids = reinterpret_cast<std::uint32_t *>(
         operation_storage);
-    // Reservation ranks are dead immediately after scatter.  Their phase
-    // starts at the exact table's later phase address, so no copy or second
-    // allocation is needed.
+    // Reuse reservation ranks after scatter.
     std::uint32_t *reservation_ranks =
         reinterpret_cast<std::uint32_t *>(
             operation_storage + tqrj_hash_table_offset(batch_capacity_));
@@ -15890,6 +15409,7 @@ public:
     const std::size_t rollover_rank_bytes = canonical_rollover_epoch_ranks_
         ? canonical_rollover_epoch_ranks_->size() * sizeof(std::uint16_t)
         : 0u;
+    const std::size_t phase_backed_bytes = phase_workspace_.size();
     const std::uint64_t restored = rollover_rank_bytes +
         arena_key_flags_.size() * sizeof(std::uint32_t) +
         arena_values_.size() * sizeof(std::uint32_t) +
@@ -15909,12 +15429,10 @@ public:
         level_storage_spans_.size() *
             sizeof(gpulsmopt2_detail::LevelStorageSpan) +
         canonical_cell_ranks_.size() * sizeof(std::uint16_t) +
-        operation_workspace_.size() * sizeof(std::uint8_t) +
-        (sealed_workspace_ ? sealed_workspace_->bytes() : 0u) +
+        phase_backed_bytes +
         canonical_job_prefixes_.size() *
             sizeof(gpulsmopt2_detail::CanonicalJobPrefix) +
         canonical_next_job_.size() * sizeof(std::uint32_t) +
-        raw_keys_.size() * sizeof(std::uint32_t) +
         raw_payloads_.size() * sizeof(gpulsmopt2_detail::RawPayload) +
         raw_offsets_.size() * sizeof(std::uint32_t) +
         raw_signatures_.size() * sizeof(std::uint64_t) +
@@ -16091,8 +15609,7 @@ private:
     if (rows_ready && canonical_rollover_epoch_ranks_)
       return;
 
-    // VMM mapping is paid only on the first rollover. Normal construction and
-    // all carries that still have an unused level keep their previous cost.
+    // Map the rollover bank on first use.
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (!rows_ready) {
       arena_key_flags_.grow(required);
@@ -16173,9 +15690,7 @@ private:
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm, gpulsmopt2_detail::tqrj_hash_lookup_kernel,
         gpulsmopt2_detail::kTqrjHashThreads, 0u));
-    // The single hash executor derives its worker grid only from kernel
-    // resources and hardware parallelism, independently of query count and
-    // quotient skew.
+    // Size the hash grid from device occupancy.
     tqrj_hash_worker_blocks_ = static_cast<std::uint32_t>(
         std::max(1, std::min(4, blocks_per_sm)) *
         properties.multiProcessorCount);
@@ -16194,14 +15709,6 @@ private:
   }
 
   void initialize_canonical_workspace() {
-    if (resident_merge_capacity_ >=
-        gpulsmopt2_detail::kCanonicalCandidateLimit)
-      throw std::logic_error(
-          "GPULSMOpt canonical job capacity does not fit 12 bits");
-    CUDA_CHECK(cudaFuncSetAttribute(
-        gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(canonical_merge_workspace_bytes_)));
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp properties{};
@@ -16221,7 +15728,7 @@ private:
 
     const std::uint32_t maximum_sources = std::min(
         gpulsmopt2_detail::kMaximumMergeSources,
-        std::max(1u, canonical_level_count_ + 1u));
+        std::max(2u, canonical_level_count_ + 1u));
     cudaFuncAttributes tournament_attributes{};
     CUDA_CHECK(cudaFuncGetAttributes(
         &tournament_attributes,
@@ -16233,7 +15740,9 @@ private:
         optin_shared_bytes > tournament_attributes.sharedSizeBytes
             ? optin_shared_bytes - tournament_attributes.sharedSizeBytes
             : 0u;
-    canonical_job_capacities_.fill(resident_merge_capacity_);
+    canonical_job_capacities_.fill(0u);
+    canonical_tournament_shared_bytes_.fill(0u);
+    canonical_tournament_blocks_.fill(0u);
     std::size_t tournament_attribute_bytes = 0u;
     for (std::uint32_t source_count =
              gpulsmopt2_detail::kCanonicalTournamentMinimumSources;
@@ -16251,14 +15760,14 @@ private:
             shared_bytes));
         return blocks;
       };
-      const int baseline_blocks = active_blocks(resident_merge_capacity_);
-      if (!baseline_blocks) break;
-      // Grow the widest job shape only while preserving the occupancy
-      // supported by the general merge capacity on this device.
-      const int desired_blocks = baseline_blocks;
+      const int desired_blocks =
+          active_blocks(resident_merge_capacity_);
+      if (!desired_blocks)
+        throw std::runtime_error(
+            "unsupported GPULSMOpt tournament source shape");
       std::uint32_t low = resident_merge_capacity_;
-      std::uint32_t high = std::max(
-          low, gpulsmopt2_detail::kCanonicalTournamentCapacityCeiling);
+      std::uint32_t high =
+          gpulsmopt2_detail::kCanonicalTournamentCapacityCeiling;
       while (low < high) {
         const std::uint32_t middle =
             low + (high - low + 1u) / 2u;
@@ -16267,56 +15776,43 @@ private:
         else
           high = middle - 1u;
       }
-      const std::uint32_t widest_job_capacity = low;
       const std::size_t shared_bytes =
           gpulsmopt2_detail::canonical_tournament_workspace_bytes(
-              widest_job_capacity, source_count);
+              low, source_count);
       const std::uint32_t capacity =
           gpulsmopt2_detail::canonical_tournament_capacity(
               shared_bytes, source_count, 1u);
       if (!capacity)
         throw std::logic_error(
-            "GPULSMOpt tournament workspace has no job capacity");
+            "GPULSMOpt tournament has no job capacity");
       canonical_job_capacities_[source_count] = capacity;
-      canonical_tournament_shared_bytes_[source_count] = shared_bytes;
+      canonical_tournament_shared_bytes_[source_count] =
+          shared_bytes;
       tournament_attribute_bytes =
           std::max(tournament_attribute_bytes, shared_bytes);
     }
-    if (tournament_attribute_bytes)
-      CUDA_CHECK(cudaFuncSetAttribute(
-          gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(tournament_attribute_bytes)));
+    CUDA_CHECK(cudaFuncSetAttribute(
+        gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(tournament_attribute_bytes)));
     for (std::uint32_t source_count =
              gpulsmopt2_detail::kCanonicalTournamentMinimumSources;
          source_count <= maximum_sources; ++source_count) {
       const std::size_t shared_bytes =
           canonical_tournament_shared_bytes_[source_count];
-      if (!shared_bytes) break;
       blocks_per_sm = 0;
       CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &blocks_per_sm,
           gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
           gpulsmopt2_detail::kFoundationCompactionThreads,
           shared_bytes));
-      if (!blocks_per_sm) {
-        canonical_job_capacities_[source_count] = resident_merge_capacity_;
-        canonical_tournament_shared_bytes_[source_count] = 0u;
-        continue;
-      }
+      if (!blocks_per_sm)
+        throw std::runtime_error(
+            "GPULSMOpt tournament cannot become resident");
       canonical_tournament_blocks_[source_count] =
           static_cast<std::uint32_t>(
               blocks_per_sm * properties.multiProcessorCount);
     }
-
-    blocks_per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm,
-        gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel,
-        gpulsmopt2_detail::kFoundationCompactionThreads,
-        canonical_merge_workspace_bytes_));
-    canonical_fallback_blocks_ = static_cast<std::uint32_t>(
-        std::max(1, blocks_per_sm) * properties.multiProcessorCount);
     CUDA_CHECK(cudaMemset(
         canonical_cell_counts_.data(), 0,
         canonical_cell_counts_.size() * sizeof(std::uint32_t)));
@@ -16327,7 +15823,6 @@ private:
     CUDA_CHECK(cudaMemset(
         canonical_next_job_.data(), 0, sizeof(std::uint32_t)));
   }
-
   cudaGraphExec_t capture_canonical_publication_graph(
       cudaStream_t capture_stream, std::uint32_t destination,
       std::uint32_t source_count, bool direct_epoch) {
@@ -16618,22 +16113,149 @@ private:
     return result;
   }
 
-  static std::unique_ptr<gpulsm_sparse::SealedWorkspace>
-  make_sealed_workspace(std::size_t publication_capacity,
-                        std::size_t level_zero_capacity) {
-    const std::size_t capacity =
-        gpulsmopt2_detail::canonical_level_layout(
-            publication_capacity, level_zero_capacity)
-            .highest_regular_capacity;
-    // A single epoch remains on the restored publication path.  Provision
-    // reusable sealed storage only when the configured forest can fuse
-    // multiple epochs, exactly as LSMu sizes insertion storage from max_size
-    // before its insertion timer starts.
-    if (capacity <= level_zero_capacity) return {};
+  static std::size_t sealed_workspace_capacity(
+      std::size_t publication_capacity,
+      std::size_t level_zero_capacity) {
+    return gpulsmopt2_detail::canonical_level_layout(
+        publication_capacity, level_zero_capacity)
+        .highest_regular_capacity;
+  }
+
+  struct PhaseBulkWorkspaceLayout {
+    std::size_t sorted_keys{};
+    std::size_t sorted_values{};
+    std::size_t temporary{};
+    std::size_t tile_counts{};
+    std::size_t tile_offsets{};
+    std::size_t sort_bytes{};
+    std::size_t scan_bytes{};
+    std::size_t total_bytes{};
+  };
+
+  static std::size_t align_phase_workspace(std::size_t bytes,
+                                           std::size_t alignment = 256u) {
+    return (bytes + alignment - 1u) / alignment * alignment;
+  }
+
+  static PhaseBulkWorkspaceLayout phase_bulk_workspace_layout(
+      std::size_t count) {
+    if (!count || count > std::numeric_limits<std::uint32_t>::max())
+      throw std::length_error("phase bulk workspace capacity");
+    const std::uint32_t n = static_cast<std::uint32_t>(count);
+    const std::size_t tiles =
+        (count + gpulsmopt2_detail::kBulkRootSinkTileRows - 1u) /
+        gpulsmopt2_detail::kBulkRootSinkTileRows;
+    std::uint32_t *rows = nullptr;
+    PhaseBulkWorkspaceLayout layout{};
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, layout.sort_bytes, rows, rows, rows, rows, n, 0, 32));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, layout.scan_bytes, rows, rows, tiles + 1u, 0));
+    std::size_t offset = 0u;
+    layout.sorted_keys = align_phase_workspace(offset);
+    offset = layout.sorted_keys + count * sizeof(std::uint32_t);
+    layout.sorted_values = align_phase_workspace(offset);
+    offset = layout.sorted_values + count * sizeof(std::uint32_t);
+    layout.temporary = align_phase_workspace(offset);
+    offset = layout.temporary +
+        std::max(layout.sort_bytes, layout.scan_bytes);
+    layout.tile_counts = align_phase_workspace(
+        offset, alignof(std::uint32_t));
+    offset = layout.tile_counts +
+        (tiles + 1u) * sizeof(std::uint32_t);
+    layout.tile_offsets = align_phase_workspace(
+        offset, alignof(std::uint32_t));
+    layout.total_bytes = layout.tile_offsets +
+        (tiles + 1u) * sizeof(std::uint32_t);
+    return layout;
+  }
+
+  static std::size_t phase_sealed_workspace_bytes(
+      std::size_t publication_capacity,
+      std::size_t level_zero_capacity) {
+    const std::size_t capacity = sealed_workspace_capacity(
+        publication_capacity, level_zero_capacity);
+    if (capacity <= level_zero_capacity) return 0u;
     if (capacity > std::numeric_limits<std::uint32_t>::max())
-      throw std::length_error("sealed workspace exceeds 32-bit capacity");
-    return std::make_unique<gpulsm_sparse::SealedWorkspace>(
+      throw std::length_error("phase sealed workspace capacity");
+    return gpulsm_sparse::SealedWorkspace::required_bytes(
         static_cast<std::uint32_t>(capacity));
+  }
+
+  static std::size_t phase_raw_keys_offset(
+      std::size_t publication_capacity,
+      std::size_t level_zero_capacity) {
+    return align_phase_workspace(phase_sealed_workspace_bytes(
+        publication_capacity, level_zero_capacity));
+  }
+
+  static std::size_t phase_operation_workspace_offset(
+      std::size_t publication_capacity,
+      std::size_t level_zero_capacity,
+      std::size_t batch_capacity) {
+    return align_phase_workspace(
+        phase_raw_keys_offset(
+            publication_capacity, level_zero_capacity) +
+        gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity *
+            sizeof(std::uint32_t));
+  }
+
+  static std::size_t phase_normal_workspace_bytes(
+      std::size_t publication_capacity,
+      std::size_t level_zero_capacity,
+      std::size_t batch_capacity,
+      std::size_t operation_bytes) {
+    return phase_operation_workspace_offset(
+               publication_capacity, level_zero_capacity,
+               batch_capacity) + operation_bytes;
+  }
+
+  static std::size_t phase_workspace_initial_bytes(
+      std::size_t publication_capacity,
+      std::size_t level_zero_capacity,
+      std::size_t batch_capacity) {
+    return phase_normal_workspace_bytes(
+        publication_capacity, level_zero_capacity, batch_capacity,
+        operation_workspace_initial_bytes(batch_capacity));
+  }
+
+  static std::size_t phase_workspace_maximum_bytes(
+      std::size_t publication_capacity,
+      std::size_t level_zero_capacity,
+      std::size_t batch_capacity) {
+    return std::max(
+        phase_normal_workspace_bytes(
+            publication_capacity, level_zero_capacity, batch_capacity,
+            operation_workspace_maximum_bytes(batch_capacity)),
+        phase_bulk_workspace_layout(publication_capacity).total_bytes);
+  }
+
+  void initialize_phase_workspace_views() {
+    std::uint8_t *storage = phase_workspace_.data();
+    const std::size_t sealed_capacity = sealed_workspace_capacity(
+        publication_capacity_, level_zero_capacity_);
+    const std::size_t sealed_bytes = phase_sealed_workspace_bytes(
+        publication_capacity_, level_zero_capacity_);
+    if (sealed_bytes) {
+      sealed_workspace_ = std::make_unique<
+          gpulsm_sparse::SealedWorkspace>(
+              static_cast<std::uint32_t>(sealed_capacity), storage,
+              sealed_bytes);
+    }
+    const std::size_t raw_offset = phase_raw_keys_offset(
+        publication_capacity_, level_zero_capacity_);
+    raw_keys_.attach(
+        reinterpret_cast<std::uint32_t *>(storage + raw_offset),
+        gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_);
+    const std::size_t operation_offset = phase_operation_workspace_offset(
+        publication_capacity_, level_zero_capacity_, batch_capacity_);
+    const std::size_t operation_maximum =
+        operation_workspace_maximum_bytes(batch_capacity_);
+    const std::size_t operation_initial =
+        operation_workspace_initial_bytes(batch_capacity_);
+    operation_workspace_.attach(
+        storage + operation_offset, operation_maximum,
+        operation_initial);
   }
 
   std::uint32_t build_sealed_inline_root(
@@ -16695,6 +16317,12 @@ private:
     if (!resident_sources ||
         source_count > gpulsmopt2_detail::kMaximumMergeSources)
       throw std::invalid_argument("invalid sealed carry sources");
+    if (source_count >= canonical_job_capacities_.size() ||
+        !canonical_job_capacities_[source_count] ||
+        !canonical_tournament_shared_bytes_[source_count] ||
+        !canonical_tournament_blocks_[source_count])
+      throw std::logic_error(
+          "unsupported sealed tournament source shape");
     const std::uint32_t source_limit = 63u -
         static_cast<std::uint32_t>(__builtin_clzll(resident_sources));
     const std::uint64_t source_prefix = source_limit == 63u
@@ -16716,16 +16344,9 @@ private:
     plan.output_generation = generation;
     plan.output_begin = destination;
     plan.output_capacity = capacity;
-    plan.job_capacity =
-        source_count < canonical_job_capacities_.size() &&
-                canonical_job_capacities_[source_count]
-            ? canonical_job_capacities_[source_count]
-            : resident_merge_capacity_;
-    plan.tournament_workspace_bytes =
-        source_count < canonical_tournament_shared_bytes_.size()
-            ? static_cast<std::uint32_t>(
-                  canonical_tournament_shared_bytes_[source_count])
-            : 0u;
+    plan.job_capacity = canonical_job_capacities_[source_count];
+    plan.tournament_workspace_bytes = static_cast<std::uint32_t>(
+        canonical_tournament_shared_bytes_[source_count]);
     plan.status = selected > capacity
         ? gpulsmopt2_detail::kPublicationOutputOverflow
         : gpulsmopt2_detail::kPublicationSuccess;
@@ -16776,32 +16397,17 @@ private:
         epoch_rows, section_offsets, section_counts, epoch_ranks,
         resident_rows(), descriptors_.data(), canonical_cell_ranks_.data(),
         device_manifests_.data(), active_device_manifest_.data());
-    if (source_count < canonical_tournament_blocks_.size() &&
-        canonical_tournament_blocks_[source_count]) {
-      gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel<<<
-          canonical_tournament_blocks_[source_count],
-          gpulsmopt2_detail::kFoundationCompactionThreads,
-          canonical_tournament_shared_bytes_[source_count], stream>>>(
-          balanced_merge_jobs_.data(),
-          resident_job_raw_reservations_.data(), resident_plan_.data(),
-          epoch_rows, section_offsets, section_counts, epoch_ranks,
-          resident_rows(), descriptors_.data(), level_storage_spans_.data(),
-          canonical_cell_ranks_.data(), device_manifests_.data(),
-          active_device_manifest_.data(), canonical_job_prefixes_.data(),
-          canonical_next_job_.data(), canonical_cell_counts_.data());
-    } else {
-      gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel<<<
-          canonical_fallback_blocks_,
-          gpulsmopt2_detail::kFoundationCompactionThreads,
-          canonical_merge_workspace_bytes_, stream>>>(
-          balanced_merge_jobs_.data(), resident_plan_.data(),
-          epoch_rows, section_offsets, section_counts, resident_rows(),
-          descriptors_.data(),
-          level_storage_spans_.data(), level_q_logical_offsets_.data(),
-          device_manifests_.data(), active_device_manifest_.data(),
-          canonical_job_prefixes_.data(), canonical_next_job_.data(),
-          canonical_cell_counts_.data());
-    }
+    gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel<<<
+        canonical_tournament_blocks_[source_count],
+        gpulsmopt2_detail::kFoundationCompactionThreads,
+        canonical_tournament_shared_bytes_[source_count], stream>>>(
+        balanced_merge_jobs_.data(),
+        resident_job_raw_reservations_.data(), resident_plan_.data(),
+        epoch_rows, section_offsets, section_counts, epoch_ranks,
+        resident_rows(), descriptors_.data(), level_storage_spans_.data(),
+        canonical_cell_ranks_.data(), device_manifests_.data(),
+        active_device_manifest_.data(), canonical_job_prefixes_.data(),
+        canonical_next_job_.data(), canonical_cell_counts_.data());
     gpulsmopt2_detail::build_canonical_rank_from_counts_kernel<<<
         gpulsmopt2_detail::kQuotients,
         gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
@@ -16932,8 +16538,7 @@ private:
       generation =
           (manifest.levels[root.destination].storage_generation ^ 1u) & 1u;
     }
-    // A consumed nonterminal destination is reused only after
-    // next_sealed_output has scheduled every old reader of that slot.
+    // Reuse a slot after its readers are queued.
     if (generation) command.output_generation_bits |= bit;
     return generation;
   }
@@ -16954,8 +16559,7 @@ private:
         sealed_device_command_.data(), device_manifests_.data(),
         device_sparse_manifests_.data(), active_device_manifest_.data(),
         query_occupied_level_mask_.data(), sealed_device_receipt_.data());
-    // Preserve the sparse table's shared-index invariant for the next
-    // untouched ordinary publication graph.
+    // Mirror sparse metadata before ordinary publication.
     CUDA_CHECK(cudaMemcpyAsync(
         device_sparse_manifests_.data() + active,
         device_sparse_manifests_.data() + (active ^ 1u),
@@ -17506,9 +17110,13 @@ private:
       bool publish_manifest = true,
       const std::uint32_t *sparse_roster = nullptr,
       std::uint32_t sparse_roster_count = 0u) {
-    // This check must precede epoch resolution: that stage indexes the rank
-    // directory with destination and therefore cannot safely discover the
-    // capacity error itself.
+    if (source_count >= canonical_job_capacities_.size() ||
+        !canonical_job_capacities_[source_count] ||
+        !canonical_tournament_shared_bytes_[source_count] ||
+        !canonical_tournament_blocks_[source_count])
+      throw std::logic_error(
+          "unsupported publication tournament source shape");
+    // Validate destination before rank indexing.
     if (destination >= canonical_level_count_) {
       auto &failure = publication_receipt_.data()[0];
       failure = {};
@@ -17549,15 +17157,10 @@ private:
           level_begin(destination), direct_epoch);
     }
     const std::uint32_t job_capacity =
-        source_count < canonical_job_capacities_.size() &&
-                canonical_job_capacities_[source_count]
-            ? canonical_job_capacities_[source_count]
-            : resident_merge_capacity_;
+        canonical_job_capacities_[source_count];
     const std::uint32_t tournament_workspace_bytes =
-        source_count < canonical_tournament_shared_bytes_.size()
-            ? static_cast<std::uint32_t>(
-                  canonical_tournament_shared_bytes_[source_count])
-            : 0u;
+        static_cast<std::uint32_t>(
+            canonical_tournament_shared_bytes_[source_count]);
     gpulsmopt2_detail::choose_canonical_publication_path_kernel<<<
         1, 1, 0, stream>>>(
             publication_selected_count_.data(), device_manifests_.data(),
@@ -17628,40 +17231,23 @@ private:
               resident_rows(), descriptors_.data(),
               canonical_cell_ranks_.data(), device_manifests_.data(),
               active_device_manifest_.data());
-      if (source_count < canonical_tournament_blocks_.size() &&
-          canonical_tournament_blocks_[source_count]) {
-        const std::size_t tournament_shared_bytes =
-            canonical_tournament_shared_bytes_[source_count];
-        gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel<<<
-            canonical_tournament_blocks_[source_count],
-            gpulsmopt2_detail::kFoundationCompactionThreads,
-            tournament_shared_bytes, stream>>>(
-                balanced_merge_jobs_.data(),
-                resident_job_raw_reservations_.data(),
-                resident_plan_.data(), publication_rows_a_.data(),
-                foundation_source_offsets_.data(),
-                foundation_section_output_counts_.data(),
-                epoch_ranks,
-                resident_rows(), descriptors_.data(),
-                level_storage_spans_.data(), canonical_cell_ranks_.data(),
-                device_manifests_.data(), active_device_manifest_.data(),
-                canonical_job_prefixes_.data(), canonical_next_job_.data(),
-                canonical_cell_counts_.data());
-      } else {
-        gpulsmopt2_detail::canonical_fallback_carry_jobs_kernel<<<
-            canonical_fallback_blocks_,
-            gpulsmopt2_detail::kFoundationCompactionThreads,
-            canonical_merge_workspace_bytes_, stream>>>(
-                balanced_merge_jobs_.data(), resident_plan_.data(),
-                publication_rows_a_.data(),
-                foundation_source_offsets_.data(),
-                foundation_section_output_counts_.data(), resident_rows(),
-                descriptors_.data(), level_storage_spans_.data(),
-                level_q_logical_offsets_.data(), device_manifests_.data(),
-                active_device_manifest_.data(),
-                canonical_job_prefixes_.data(), canonical_next_job_.data(),
-                canonical_cell_counts_.data());
-      }
+      const std::size_t tournament_shared_bytes =
+          canonical_tournament_shared_bytes_[source_count];
+      gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel<<<
+          canonical_tournament_blocks_[source_count],
+          gpulsmopt2_detail::kFoundationCompactionThreads,
+          tournament_shared_bytes, stream>>>(
+              balanced_merge_jobs_.data(),
+              resident_job_raw_reservations_.data(),
+              resident_plan_.data(), publication_rows_a_.data(),
+              foundation_source_offsets_.data(),
+              foundation_section_output_counts_.data(),
+              epoch_ranks,
+              resident_rows(), descriptors_.data(),
+              level_storage_spans_.data(), canonical_cell_ranks_.data(),
+              device_manifests_.data(), active_device_manifest_.data(),
+              canonical_job_prefixes_.data(), canonical_next_job_.data(),
+              canonical_cell_counts_.data());
       gpulsmopt2_detail::build_canonical_rank_from_counts_kernel<<<
           gpulsmopt2_detail::kQuotients,
           gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
@@ -17746,9 +17332,7 @@ private:
     const bool top_level_rollover =
         destination >= canonical_level_count_;
     if (top_level_rollover) {
-      // Recycle the full hierarchy into the alternate bank of its top level.
-      // This is what lets arbitrarily many partially filled epochs proceed
-      // while the number of live rows still fits the configured capacity.
+      // Recycle the top level through its alternate bank.
       ensure_canonical_top_rollover_bank(stream);
       destination = canonical_level_count_ - 1u;
       const std::uint64_t source_mask = destination ==
@@ -17892,9 +17476,7 @@ private:
         query_occupied_level_mask_.data(),
         sparse_flags ? staged->device_state.data() : nullptr,
         sparse_flags);
-    // The active ordinary index is shared with sparse metadata.  Keep the
-    // tiny sparse table identical in both slots after a mixed commit so a
-    // later all-ordinary graph can flip its original manifest unchanged.
+    // Mirror sparse state across both manifest slots.
     CUDA_CHECK(cudaMemcpyAsync(
         device_sparse_manifests_.data() + plan.active_manifest,
         device_sparse_manifests_.data() + plan.inactive_manifest,
@@ -17929,7 +17511,6 @@ private:
     CUDA_CHECK(cudaGetLastError());
 
     if (!receipt_in_graph) {
-      // Copy the receipt to pinned host memory.
       CUDA_CHECK(cudaMemcpyAsync(
           publication_receipt_.data(), resident_plan_.data(),
           sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
@@ -18054,7 +17635,11 @@ private:
     const std::size_t required = ids_bytes * 3u + query_offset_bytes;
     const std::size_t radix_offset =
         operation_radix_storage_offset(batch_capacity_);
-    operation_workspace_.grow(radix_offset + required);
+    const std::size_t operation_required = radix_offset + required;
+    const std::size_t operation_offset = phase_operation_workspace_offset(
+        publication_capacity_, level_zero_capacity_, batch_capacity_);
+    phase_workspace_.grow(operation_offset + operation_required);
+    operation_workspace_.grow(operation_required);
     std::uint8_t *storage = operation_workspace_.data() + radix_offset;
     radix_keys_.attach(reinterpret_cast<std::uint32_t *>(storage), capacity);
     radix_ids_out_.attach(
@@ -18345,7 +17930,6 @@ private:
              gpulsmopt2_detail::kMaximumLevels>
       level_storage_spans_host_{};
   std::uint32_t resident_merge_capacity_{};
-  std::size_t canonical_merge_workspace_bytes_{};
   std::size_t maximum_resident_jobs_{};
   std::size_t route_stride_{};
   mutable std::mutex operation_mutex_;
@@ -18370,7 +17954,6 @@ private:
   std::array<cudaGraphExec_t,
              gpulsmopt2_detail::kMaximumLevels>
       canonical_publication_graph_execs_{};
-  std::uint32_t canonical_fallback_blocks_{};
   std::array<std::uint32_t,
              gpulsmopt2_detail::kMaximumMergeSources + 1u>
       canonical_tournament_blocks_{};
@@ -18416,6 +17999,7 @@ private:
   gpulsmopt2_detail::Buffer<std::uint16_t> canonical_cell_ranks_;
   std::unique_ptr<gpulsmopt2_detail::Buffer<std::uint16_t>>
       canonical_rollover_epoch_ranks_;
+  gpulsmopt2_detail::VirtualBuffer<std::uint8_t> phase_workspace_;
   gpulsmopt2_detail::VirtualBuffer<std::uint8_t> operation_workspace_;
   std::unique_ptr<gpulsm_sparse::SealedWorkspace> sealed_workspace_;
   gpulsmopt2_detail::Buffer<std::uint32_t> canonical_cell_counts_;

@@ -197,6 +197,8 @@ mkdir -p "$RESULT_DIR/logs" "$RESULT_DIR/gpulsmopt" "$RESULT_DIR/lsmu"
   echo "query_limit_log=$QUERY_LIMIT_LOG"
   echo "range_chunk_log=$RANGE_CHUNK_LOG"
   echo "query_operations=lookup,range_enumeration_checksum"
+  echo "bulk_build_gpu_scope=setup_excluded"
+  echo "bulk_complete_wall_scope=setup_build_and_final_sync"
   echo "gpulsmopt_internal_batch_capacity_log=20"
   echo "cuda_compiler=$CUDA_COMPILER"
   echo "cuda_arch=$CUDA_ARCH"
@@ -343,7 +345,10 @@ run_bulk_case()
 {
   local system=$1
   local system_dir="$RESULT_DIR/$system"
-  if [[ -f "$system_dir/complete_bulk" ]]; then
+  local bulk_file="$system_dir/bulk_build.csv"
+  if [[ -f "$system_dir/complete_bulk" ]] &&
+     head -n 1 "$bulk_file" 2>/dev/null | \
+       rg -q 'build_gpu_time_ms,complete_wall_time_ms,build_rate_mops,complete_rate_mops'; then
     echo "Skipping completed $system bulk build"
     return
   fi

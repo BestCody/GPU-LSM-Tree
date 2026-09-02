@@ -206,8 +206,6 @@ public:
       throw std::runtime_error("GPULSMOpt supports at most 2^31-1 records");
     }
 
-    build_values_buffer_.resize(size);
-
     const size_t configured_batch_capacity =
         gpulsmopt_adapter_detail::batch_capacity();
     const size_t config_batch_capacity = std::max<size_t>(
@@ -218,8 +216,10 @@ public:
     config.batch_capacity = config_batch_capacity;
     config.level_zero_capacity =
         gpulsmopt_adapter_detail::level_zero_capacity();
-    gpulsmopt_adapter_detail::scoped_cuda_event_timer timer(0, build_time_ms);
     dictionary_ = std::make_unique<GPULSMOpt>(config);
+
+    gpulsmopt_adapter_detail::scoped_cuda_event_timer timer(0, build_time_ms);
+    build_values_buffer_.resize(size);
     gpulsmopt_adapter_detail::fill_sequence(
         reinterpret_cast<std::uint32_t *>(build_values_buffer_.ptr()), size, 0);
 
