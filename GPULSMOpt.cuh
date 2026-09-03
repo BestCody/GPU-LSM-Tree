@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -539,6 +540,17 @@ struct ResidentPublicationPlan {
 
 static_assert(sizeof(ResidentPublicationPlan) == 80u);
 
+struct PinnedReceipts {
+  ResidentPublicationPlan publication;
+  std::uint64_t range_total;
+  std::uint64_t range_hot_total;
+  std::uint64_t range_hot_offsets[kQuotients + 1u];
+};
+
+static_assert(sizeof(PinnedReceipts) ==
+              sizeof(ResidentPublicationPlan) +
+                  (kQuotients + 3u) * sizeof(std::uint64_t));
+
 __device__ __forceinline__ std::uint32_t canonical_job_capacity(
     const ResidentPublicationPlan *plan, std::uint32_t quotient_count) {
   if (plan->tournament_workspace_bytes)
@@ -678,14 +690,34 @@ private:
 template <class T> class PinnedBuffer {
 public:
   explicit PinnedBuffer(std::size_t count) {
-    if (count)
-      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void **>(&pointer_),
-                                count * sizeof(T)));
+    if (!count) return;
+    if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
+      throw std::bad_alloc();
+    constexpr std::size_t alignment = 4096u;
+    const std::size_t bytes = count * sizeof(T);
+    if (bytes > std::numeric_limits<std::size_t>::max() -
+                    (alignment - 1u))
+      throw std::bad_alloc();
+    const std::size_t allocation_bytes =
+        (bytes + alignment - 1u) / alignment * alignment;
+    pointer_ = static_cast<T *>(
+        std::aligned_alloc(alignment, allocation_bytes));
+    if (!pointer_) throw std::bad_alloc();
+    const cudaError_t error = cudaHostRegister(
+        pointer_, allocation_bytes, cudaHostRegisterDefault);
+    if (error != cudaSuccess) {
+      std::free(pointer_);
+      pointer_ = nullptr;
+      CUDA_CHECK(error);
+    }
   }
   PinnedBuffer(const PinnedBuffer &) = delete;
   PinnedBuffer &operator=(const PinnedBuffer &) = delete;
   ~PinnedBuffer() {
-    if (pointer_) cudaFreeHost(pointer_);
+    if (pointer_) {
+      cudaHostUnregister(pointer_);
+      std::free(pointer_);
+    }
   }
   T *data() { return pointer_; }
 
@@ -2703,55 +2735,68 @@ __global__ void deposit_bulk_root_sink_kernel(
     std::uint32_t *quotient_end_markers,
     ResidentRows arena,
     std::uint64_t destination) {
-  using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
-  __shared__ typename BlockScan::TempStorage scan_storage;
+  constexpr std::uint32_t kWarpSize = 32u;
+  constexpr std::uint32_t kWarps = kThreads / kWarpSize;
+  constexpr std::uint32_t kGroups =
+      kBulkRootSinkItemsPerThread * kWarps;
+  __shared__ std::uint32_t group_offsets[kGroups + 1u];
   const std::uint64_t tile_begin =
       std::uint64_t{blockIdx.x} * kBulkRootSinkTileRows;
-  const std::uint64_t thread_begin = tile_begin +
-      std::uint64_t{threadIdx.x} * kBulkRootSinkItemsPerThread;
+  const std::uint32_t lane = threadIdx.x & (kWarpSize - 1u);
+  const std::uint32_t warp = threadIdx.x / kWarpSize;
   std::uint32_t keys[kBulkRootSinkItemsPerThread];
   bool terminal[kBulkRootSinkItemsPerThread];
-  std::uint32_t local_count = 0u;
+  bool quotient_terminal[kBulkRootSinkItemsPerThread];
+  if (threadIdx.x == 0u) group_offsets[0] = 0u;
   #pragma unroll
   for (std::uint32_t item = 0u;
        item < kBulkRootSinkItemsPerThread; ++item) {
-    const std::uint64_t position = thread_begin + item;
+    const std::uint64_t position = tile_begin +
+        std::uint64_t{item} * kThreads + threadIdx.x;
+    keys[item] = 0u;
     if (position < count) {
       keys[item] = sorted_keys[position];
-      terminal[item] = bulk_root_sink_terminal(
-          sorted_keys, count, position, keys[item]);
-      local_count += terminal[item];
-    } else {
-      keys[item] = 0u;
-      terminal[item] = false;
+    }
+    std::uint32_t next = __shfl_down_sync(~0u, keys[item], 1u);
+    if (lane + 1u == kWarpSize && position + 1u < count)
+      next = sorted_keys[position + 1u];
+    const bool final = position + 1u == count;
+    terminal[item] = position < count &&
+        (final || keys[item] != next);
+    quotient_terminal[item] = terminal[item] &&
+        (final || (keys[item] >> 16u) != (next >> 16u));
+    const std::uint32_t mask = __ballot_sync(~0u, terminal[item]);
+    if (lane == 0u) {
+      const std::uint32_t group = item * kWarps + warp;
+      group_offsets[group + 1u] = __popc(mask);
     }
   }
-  std::uint32_t thread_prefix = 0u, unused_total = 0u;
-  BlockScan(scan_storage).ExclusiveSum(
-      local_count, thread_prefix, unused_total);
-  bool inspect_quotient_boundaries = false;
-  if (thread_begin < count) {
-    const std::uint64_t after =
-        thread_begin + kBulkRootSinkItemsPerThread;
-    inspect_quotient_boundaries = after >= count ||
-        (keys[0] >> 16u) != (sorted_keys[after] >> 16u);
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    #pragma unroll
+    for (std::uint32_t group = 1u; group <= kGroups; ++group)
+      group_offsets[group] += group_offsets[group - 1u];
   }
-  std::uint32_t local_rank = 0u;
+  __syncthreads();
+  const std::uint32_t lower_lanes = lane
+      ? ~0u >> (kWarpSize - lane) : 0u;
   #pragma unroll
   for (std::uint32_t item = 0u;
        item < kBulkRootSinkItemsPerThread; ++item) {
+    const std::uint32_t mask = __ballot_sync(~0u, terminal[item]);
     if (!terminal[item]) continue;
-    const std::uint64_t position = thread_begin + item;
+    const std::uint64_t position = tile_begin +
+        std::uint64_t{item} * kThreads + threadIdx.x;
+    const std::uint32_t group = item * kWarps + warp;
     const std::uint32_t output_rank =
-        tile_offsets[blockIdx.x] + thread_prefix + local_rank++;
+        tile_offsets[blockIdx.x] + group_offsets[group] +
+        __popc(mask & lower_lanes);
     const std::uint64_t output = destination + output_rank;
     arena.store(output, make_row(
         keys[item], sorted_values[position], 0u));
-    if (inspect_quotient_boundaries) {
+    if (quotient_terminal[item]) {
       const std::uint32_t quotient = keys[item] >> 16u;
-      if (position + 1u == count ||
-          (sorted_keys[position + 1u] >> 16u) != quotient)
-        quotient_end_markers[quotient + 1u] = output_rank + 1u;
+      quotient_end_markers[quotient + 1u] = output_rank + 1u;
     }
   }
 }
@@ -13584,6 +13629,8 @@ __global__ void reduce_range_slices(
 
 class GPULSMOpt {
 public:
+  struct BulkBootstrapTag {};
+
   struct DeviceKeyBatch {
     const std::uint32_t *keys = nullptr;
     std::size_t count = 0u;
@@ -13607,6 +13654,13 @@ public:
   };
 
   explicit GPULSMOpt(const DictionaryConfig &config)
+      : GPULSMOpt(config, false) {}
+
+  GPULSMOpt(const DictionaryConfig &config, BulkBootstrapTag)
+      : GPULSMOpt(config, true) {}
+
+private:
+  GPULSMOpt(const DictionaryConfig &config, bool defer_publication_graphs)
       : batch_capacity_(std::min(
             gpulsmopt2_detail::kMaximumOperationTile,
             std::max<std::size_t>(1u, config.batch_capacity))),
@@ -13641,7 +13695,7 @@ public:
                       level_pool_capacity_),
         route_slices_(route_stride_ * canonical_level_count_,
                       route_stride_ * canonical_level_count_),
-        publication_receipt_(1u),
+        pinned_receipts_(1u),
         phase_workspace_(phase_workspace_maximum_bytes(
                              publication_capacity_,
                              level_zero_capacity_, batch_capacity_),
@@ -13656,10 +13710,7 @@ public:
                 batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
         publication_rows_a_(gpulsmopt2_detail::kMaximumPublicationRows,
             std::min(publication_capacity_,
-                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
-        range_total_receipt_(1u),
-        range_hot_total_receipt_(1u),
-        range_hot_offsets_receipt_(gpulsmopt2_detail::kQuotients + 1u) {
+                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)) {
     initialize_static_workspace_views();
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
@@ -13674,12 +13725,14 @@ public:
     const DeviceCapabilities capabilities = query_device_capabilities();
     initialize_resident_workspace(capabilities);
     initialize_canonical_workspace(capabilities);
-    initialize_canonical_publication_graphs();
+    if (!defer_publication_graphs)
+      initialize_canonical_publication_graphs();
     CUDA_CHECK(cudaEventRecord(operation_done_, 0));
     reset_updates(0);
     CUDA_CHECK(cudaEventRecord(operation_done_, 0));
   }
 
+public:
   GPULSMOpt(const GPULSMOpt &) = delete;
   GPULSMOpt &operator=(const GPULSMOpt &) = delete;
 
@@ -13707,6 +13760,7 @@ public:
     begin_operation(stream);
     reset_updates(stream);
     if (!count) {
+      initialize_canonical_publication_graphs();
       end_operation(stream);
       return;
     }
@@ -13752,6 +13806,7 @@ public:
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         temporary, scan_bytes, tile_counts,
         tile_offsets, tile_count + 1u, stream));
+    initialize_canonical_publication_graphs();
     std::uint32_t base_count{};
     CUDA_CHECK(cudaMemcpyAsync(&base_count, tile_offsets + tile_count,
                                sizeof(base_count), cudaMemcpyDeviceToHost,
@@ -13833,6 +13888,7 @@ public:
           "GPULSMOpt direct mixed root exceeds locator capacity");
     begin_operation(stream);
     reset_updates(stream);
+    initialize_canonical_publication_graphs();
     if (!batch.count) {
       end_operation(stream);
       return;
@@ -15129,7 +15185,7 @@ private:
           range_hot_offsets_.data(),
           gpulsmopt2_detail::kQuotients + 1u, stream));
       CUDA_CHECK(cudaMemcpyAsync(
-          range_hot_total_receipt_.data(),
+          range_hot_total_receipt(),
           range_hot_offsets_.data() + gpulsmopt2_detail::kQuotients,
           sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
     }
@@ -15177,10 +15233,10 @@ private:
           range_query_temp_, reduce_bytes, counts,
           range_fragment_total_.data(), query_count, stream));
       CUDA_CHECK(cudaMemcpyAsync(
-          range_total_receipt_.data(), range_fragment_total_.data(),
+          range_total_receipt(), range_fragment_total_.data(),
           sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      const std::uint64_t total = range_total_receipt_.data()[0];
+      const std::uint64_t total = range_total_receipt()[0];
       if (total > std::numeric_limits<std::uint32_t>::max()) {
         // Reject fragment totals above 32 bits.
         end_operation(stream);
@@ -15195,7 +15251,7 @@ private:
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     const std::uint64_t hot_total = may_have_crowded_newer
-        ? range_hot_total_receipt_.data()[0] : 0u;
+        ? range_hot_total_receipt()[0] : 0u;
     if (hot_total) materialize_range_hot_sections(hot_total, stream);
     const bool hot_ready = hot_total != 0u;
     if (!fragment_count) {
@@ -15815,21 +15871,51 @@ private:
   }
 
   void initialize_canonical_publication_graphs() {
-    cudaStream_t capture_stream{};
-    CUDA_CHECK(cudaStreamCreateWithFlags(
-        &capture_stream, cudaStreamNonBlocking));
+    if (canonical_publication_graphs_ready_) return;
+    const cudaStream_t capture_stream = cudaStreamPerThread;
+    const std::uint32_t direct_levels = std::min(
+        3u, canonical_regular_level_count_);
     for (std::uint32_t destination = 0u;
-         destination < canonical_level_count_; ++destination) {
-      const std::uint32_t tier_begin = destination <
-              canonical_regular_level_count_
-          ? (destination / 3u) * 3u : canonical_regular_level_count_;
-      const bool direct_epoch = tier_begin == 0u;
-      const std::uint32_t source_count = 1u + tier_begin;
+         destination < direct_levels; ++destination) {
+      const std::uint32_t source_count = 1u;
       canonical_publication_graph_execs_[destination] =
           capture_canonical_publication_graph(
-              capture_stream, destination, source_count, direct_epoch);
+              capture_stream, destination, source_count, true);
     }
-    CUDA_CHECK(cudaStreamDestroy(capture_stream));
+    for (std::uint32_t tier_begin = 3u;
+         tier_begin < canonical_regular_level_count_; tier_begin += 3u) {
+      const std::uint32_t source_count = 1u + tier_begin;
+      canonical_publication_graph_execs_[tier_begin] =
+          capture_canonical_publication_graph(
+              capture_stream, tier_begin, source_count, false);
+    }
+    if (canonical_regular_level_count_ < canonical_level_count_) {
+      const std::uint32_t tier_begin = canonical_regular_level_count_;
+      canonical_publication_graph_execs_[tier_begin] =
+          capture_canonical_publication_graph(
+              capture_stream, tier_begin, 1u + tier_begin, false);
+    }
+    canonical_publication_graphs_ready_ = true;
+  }
+
+  gpulsmopt2_detail::PinnedReceipts &pinned_receipts() {
+    return *pinned_receipts_.data();
+  }
+
+  gpulsmopt2_detail::ResidentPublicationPlan *publication_receipt() {
+    return &pinned_receipts().publication;
+  }
+
+  std::uint64_t *range_total_receipt() {
+    return &pinned_receipts().range_total;
+  }
+
+  std::uint64_t *range_hot_total_receipt() {
+    return &pinned_receipts().range_hot_total;
+  }
+
+  std::uint64_t *range_hot_offsets_receipt() {
+    return pinned_receipts().range_hot_offsets;
   }
 
   void ensure_publication_capacity(std::size_t count,
@@ -15902,7 +15988,7 @@ private:
   void apply_publication_receipt() {
     if (!publication_receipt_pending_) return;
     const gpulsmopt2_detail::ResidentPublicationPlan &receipt =
-        publication_receipt_.data()[0];
+        publication_receipt()[0];
     publication_receipt_pending_ = false;
     publication_failure_status_ = receipt.status;
     if (receipt.status != gpulsmopt2_detail::kPublicationSuccess) {
@@ -17239,7 +17325,7 @@ private:
           "unsupported publication tournament source shape");
     // Validate destination before rank indexing.
     if (destination >= canonical_level_count_) {
-      auto &failure = publication_receipt_.data()[0];
+      auto &failure = publication_receipt()[0];
       failure = {};
       failure.selected_count = pending_records_;
       failure.destination_level = destination;
@@ -17251,7 +17337,7 @@ private:
           cudaMemcpyHostToDevice, stream));
       if (include_receipt) {
         CUDA_CHECK(cudaMemcpyAsync(
-            publication_receipt_.data(), resident_plan_.data(),
+            publication_receipt(), resident_plan_.data(),
             sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
             cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemsetAsync(
@@ -17260,10 +17346,15 @@ private:
       }
       return;
     }
+    const std::uint32_t tier_begin = destination <
+            canonical_regular_level_count_
+        ? (destination / 3u) * 3u : canonical_regular_level_count_;
+    const std::uint32_t epoch_rank_level = direct_epoch
+        ? destination : tier_begin;
     std::uint16_t *epoch_ranks = top_level_rollover
         ? canonical_rollover_epoch_ranks_->data()
         : canonical_cell_ranks_.data() +
-              std::size_t{destination} *
+              std::size_t{epoch_rank_level} *
                   gpulsmopt2_detail::kLocalRankEntries;
     launch_canonical_epoch_resolution(
         stream, direct_epoch, destination, epoch_ranks);
@@ -17400,7 +17491,7 @@ private:
               query_occupied_level_mask_.data());
     if (include_receipt) {
       CUDA_CHECK(cudaMemcpyAsync(
-          publication_receipt_.data(), resident_plan_.data(),
+          publication_receipt(), resident_plan_.data(),
           sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
           cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaMemsetAsync(
@@ -17470,9 +17561,11 @@ private:
             canonical_regular_level_count_
         ? (destination / 3u) * 3u : canonical_regular_level_count_;
     const bool graph_compatible = tier_begin != 0u || direct_epoch;
+    const std::uint32_t graph_index = direct_epoch
+        ? destination : tier_begin;
     cudaGraphExec_t graph_exec = !top_level_rollover && graph_compatible &&
-            destination < canonical_publication_graph_execs_.size()
-        ? canonical_publication_graph_execs_[destination] : nullptr;
+            graph_index < canonical_publication_graph_execs_.size()
+        ? canonical_publication_graph_execs_[graph_index] : nullptr;
     if (graph_exec) {
       CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
       return true;
@@ -17633,7 +17726,7 @@ private:
 
     if (!receipt_in_graph) {
       CUDA_CHECK(cudaMemcpyAsync(
-          publication_receipt_.data(), resident_plan_.data(),
+          publication_receipt(), resident_plan_.data(),
           sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
           cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaMemsetAsync(
@@ -17792,11 +17885,11 @@ private:
                          static_cast<std::uint32_t>(total)});
     } else {
       CUDA_CHECK(cudaMemcpyAsync(
-          range_hot_offsets_receipt_.data(), range_hot_offsets_.data(),
+          range_hot_offsets_receipt(), range_hot_offsets_.data(),
           (gpulsmopt2_detail::kQuotients + 1u) * sizeof(std::uint64_t),
           cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      const std::uint64_t *offsets = range_hot_offsets_receipt_.data();
+      const std::uint64_t *offsets = range_hot_offsets_receipt();
       std::uint32_t begin = 0u;
       while (begin < gpulsmopt2_detail::kQuotients &&
              offsets[begin] < total) {
@@ -18075,6 +18168,7 @@ private:
   std::array<cudaGraphExec_t,
              gpulsmopt2_detail::kMaximumLevels>
       canonical_publication_graph_execs_{};
+  bool canonical_publication_graphs_ready_{};
   std::array<std::uint32_t,
              gpulsmopt2_detail::kMaximumMergeSources + 1u>
       canonical_tournament_blocks_{};
@@ -18114,8 +18208,8 @@ private:
       sealed_device_receipt_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::ResidentPublicationPlan>
       resident_plan_;
-  gpulsmopt2_detail::PinnedBuffer<
-      gpulsmopt2_detail::ResidentPublicationPlan> publication_receipt_;
+  gpulsmopt2_detail::PinnedBuffer<gpulsmopt2_detail::PinnedReceipts>
+      pinned_receipts_;
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::LevelStorageSpan>
       level_storage_spans_;
   gpulsmopt2_detail::Buffer<std::uint16_t> canonical_cell_ranks_;
@@ -18185,7 +18279,6 @@ private:
   gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_reduction_completion_;
   gpulsmopt2_detail::Buffer<std::uint64_t> range_fragment_total_;
-  gpulsmopt2_detail::PinnedBuffer<std::uint64_t> range_total_receipt_;
   gpulsmopt2_detail::Buffer<std::uint64_t> range_hot_counts_,
       range_hot_offsets_, range_hot_tokens_a_, range_hot_tokens_b_;
   gpulsmopt2_detail::Buffer<std::uint32_t> range_hot_window_offsets_,
@@ -18193,8 +18286,6 @@ private:
   gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor>
       range_hot_descriptors_;
   gpulsmopt2_detail::Buffer<std::uint8_t> range_hot_temp_;
-  gpulsmopt2_detail::PinnedBuffer<std::uint64_t> range_hot_total_receipt_,
-      range_hot_offsets_receipt_;
   std::size_t range_hot_token_capacity_{};
   gpulsmopt2_detail::Buffer<std::uint8_t> range_query_storage_,
       range_fragment_storage_, range_section_storage_;

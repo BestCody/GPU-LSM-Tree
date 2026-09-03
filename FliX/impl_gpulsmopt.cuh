@@ -216,7 +216,8 @@ public:
     config.batch_capacity = config_batch_capacity;
     config.level_zero_capacity =
         gpulsmopt_adapter_detail::level_zero_capacity();
-    dictionary_ = std::make_unique<GPULSMOpt>(config);
+    dictionary_ = std::make_unique<GPULSMOpt>(
+        config, GPULSMOpt::BulkBootstrapTag{});
 
     gpulsmopt_adapter_detail::scoped_cuda_event_timer timer(0, build_time_ms);
     build_values_buffer_.resize(size);
