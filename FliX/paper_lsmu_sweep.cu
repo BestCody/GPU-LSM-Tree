@@ -1,5 +1,11 @@
 #include <iostream>
 
+// The adapter uses this value when sizing its first level, so its default must
+// be visible before the adapter is included, just like an explicit build flag.
+#ifndef PAPER_LSM_BATCH_LOG
+#define PAPER_LSM_BATCH_LOG 16
+#endif
+
 #include "utilities.cuh"
 
 #if defined(PAPER_SWEEP_GPULSMOPT)
@@ -25,10 +31,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#ifndef PAPER_LSM_BATCH_LOG
-#define PAPER_LSM_BATCH_LOG 16
-#endif
 
 namespace
 {
@@ -421,7 +423,10 @@ void write_metadata(const options &configuration)
            << gpulsmopt2_detail::kCanonicalTournamentCapacityCeiling << '\n';
     output << "gpulsmopt_canonical_tournament_workspace="
            << "elastic_by_job_shape\n";
-    output << "gpulsmopt_canonical_publication_graph=1\n";
+    output << "gpulsmopt_canonical_publication_graph=0\n";
+    output << "gpulsmopt_epoch_trigger=record_budget_or_batch_limit\n";
+    output << "gpulsmopt_sealed_workspace=lazy\n";
+    output << "gpulsmopt_lookup_routing=automatic_large_single_run\n";
     output << "gpulsmopt_maximum_batch_capacity="
            << gpulsmopt_adapter_detail::batch_capacity() << '\n';
     output << "gpulsmopt_level_zero_capacity="

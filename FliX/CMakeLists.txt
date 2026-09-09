@@ -13,10 +13,15 @@ option(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP
        "Build the GPULSMOpt GPU LSM paper sweep" OFF)
 option(FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST
        "Build the GPULSMOpt RootSink correctness test" OFF)
+option(FLIX_BUILD_GPULSMOPT_TILE_TEST
+       "Build the GPULSMOpt tile lookup correctness test" OFF)
+option(FLIX_BUILD_GPULSMOPT_SIMPLIFICATION_TEST
+       "Build GPULSMOpt admission and lookup regression checks" OFF)
 
 set(FLIX_NEEDS_OPTIX ON)
 if(FLIX_BUILD_LSMU_PAPER_SWEEP OR FLIX_BUILD_GPULSMOPT_PAPER_SWEEP OR
-   FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST)
+   FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST OR FLIX_BUILD_GPULSMOPT_TILE_TEST OR
+   FLIX_BUILD_GPULSMOPT_SIMPLIFICATION_TEST)
   set(FLIX_NEEDS_OPTIX OFF)
 elseif(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
    IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB)")
@@ -149,6 +154,51 @@ if(FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST)
   configure_paper_sweep_target(gpulsmopt_rootsink_test)
   add_test(NAME gpulsmopt_rootsink_correctness
            COMMAND gpulsmopt_rootsink_test)
+endif()
+
+if(FLIX_BUILD_GPULSMOPT_TILE_TEST)
+  enable_testing()
+  add_executable(gpulsmopt_tile_lookup_test ../tests/gpulsmopt_tile_lookup_test.cu)
+  target_include_directories(gpulsmopt_tile_lookup_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_tile_lookup_test)
+  add_test(NAME gpulsmopt_tile_lookup_correctness
+           COMMAND gpulsmopt_tile_lookup_test)
+endif()
+
+if(FLIX_BUILD_GPULSMOPT_SIMPLIFICATION_TEST)
+  enable_testing()
+  add_executable(gpulsmopt_simplification_test
+          ../tests/gpulsmopt_simplification_test.cu)
+  target_include_directories(gpulsmopt_simplification_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_simplification_test)
+  add_test(NAME gpulsmopt_simplification_correctness
+           COMMAND gpulsmopt_simplification_test)
+  add_executable(gpulsmopt_sealed_consolidation_test
+          ../tests/gpulsmopt_sealed_consolidation_test.cu)
+  target_include_directories(gpulsmopt_sealed_consolidation_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_sealed_consolidation_test)
+  add_test(NAME gpulsmopt_sealed_consolidation_correctness
+           COMMAND gpulsmopt_sealed_consolidation_test)
+  add_executable(gpulsmopt_state_cleanup_test
+          ../tests/gpulsmopt_state_cleanup_test.cu)
+  target_include_directories(gpulsmopt_state_cleanup_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_state_cleanup_test)
+  add_test(NAME gpulsmopt_state_cleanup_correctness
+           COMMAND gpulsmopt_state_cleanup_test)
+  add_executable(gpulsmopt_memory_test ../tests/gpulsmopt_memory_test.cu)
+  target_include_directories(gpulsmopt_memory_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_memory_test)
+  add_test(NAME gpulsmopt_memory_correctness COMMAND gpulsmopt_memory_test)
+  add_executable(gpulsmopt_dead_code_test ../tests/gpulsmopt_dead_code_test.cu)
+  target_include_directories(gpulsmopt_dead_code_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_dead_code_test)
+  add_test(NAME gpulsmopt_dead_code_correctness COMMAND gpulsmopt_dead_code_test)
 endif()
 
 set_target_properties(index_prototype PROPERTIES

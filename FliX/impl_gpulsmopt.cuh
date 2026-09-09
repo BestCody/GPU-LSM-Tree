@@ -172,7 +172,10 @@ public:
         {"carry_merge", "general_tournament_with_shared_memory_fallback"},
         {"tournament_workspace", "elastic_by_job_shape"},
         {"epoch_resolution", "quotient_local_direct_with_oversized_fallback"},
-        {"publication_graph", "enabled"},
+        {"publication_graph", "disabled"},
+        {"epoch_trigger", "record_budget_or_batch_limit"},
+        {"sealed_workspace", "lazy"},
+        {"lookup_routing", "automatic_large_single_run"},
         {"resident_directory", "quotient_offsets_and_128_cell_starts"},
         {"range", "visible_row_fragments"},
         {"epoch_batches",
@@ -257,10 +260,11 @@ public:
     batch.out_values = reinterpret_cast<std::uint32_t *>(result);
     batch.out_found = nullptr;
 #ifdef UNSORTED_PROBES_CHECKS
-    dictionary_->lookup(batch, stream);
+    constexpr bool grouped = false;
 #else
-    dictionary_->lookup(batch, stream, true);
+    constexpr bool grouped = true;
 #endif
+    dictionary_->lookup(batch, stream, grouped);
   }
 
   void multi_lookup_sum(const key_type *keys, value_type *result, size_t size,
