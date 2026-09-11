@@ -25,6 +25,7 @@
 // #include "coarse_granular_lookups.cuh"
 #include "coarse_granular_lookups_tile.cuh"
 #include "coarse_granular_lookups_tile_bulk.cuh"
+#include "coarse_granular_range_queries.cuh"
 // #include "coarse_granular_lookups_tile.cuh"
 
 #include "coarse_granular_combined_updates.cuh"
@@ -606,7 +607,8 @@ OptixTraversableHandle rebuild_structures(
     // Free space and Swap the pointers
     ordered_node_pairs_buffer.free();
     ordered_node_pairs_buffer.swap(representative_temp_buffer);
-    allocation_buffer.zero();
+    if (allocation_buffer.num_elements != 0)
+        allocation_buffer.zero();
     CUERR                                                               // clear Allocation Buffer after copying the  nodes
                                                                         // update partition counts
         partition_count_with_overflow = new_bucket_count_with_overflow; // total_nodes_used_from_AR + partition_count_with_overflow;
@@ -742,7 +744,8 @@ void build_structures_bucket_layer(
     CUERR
     allocation_buffer.alloc(node_stride * extra_allocated_nodes);
     CUERR
-    allocation_buffer.zero();
+    if (extra_allocated_nodes != 0)
+        allocation_buffer.zero();
     CUERR
     maxvalues_buffer.alloc(partition_count_with_overflow);
     CUERR
@@ -903,7 +906,7 @@ void rebuild_structures_bucket_layer(
         partition_count_with_overflow = new_bucket_count_with_overflow; // total_nodes_used_from_AR + partition_count_with_overflow;
     partition_count = partition_count_with_overflow - 1;
 
-    reuse_list_buffer.alloc(partition_count_with_overflow);
+    reuse_list_buffer.resize(partition_count_with_overflow);
     CUERR
     reuse_list_buffer.zero();
     CUERR
@@ -1433,6 +1436,8 @@ class cg_rtx_index_updates
 
 public:
     using key_type = key_type_;
+    static constexpr bool requires_sorted_updates = true;
+    static constexpr bool requires_sorted_lookup = true;
 
 private:
     cuda_buffer<uint8_t> as_buffer;
@@ -1443,6 +1448,7 @@ private:
     cuda_buffer<smallsize> reuse_list_buffer;
 
     cuda_buffer<smallsize> bucket_values_buffer;
+    cuda_buffer<smallsize> range_query_sums_buffer;
 
     // add a buffer for static tree
     //  Meta data
@@ -1478,7 +1484,7 @@ public:
     static constexpr const char *name = "cg_rtx_index_updates";
     static constexpr operation_support can_lookup = operation_support::async;
     static constexpr operation_support can_multi_lookup = operation_support::none;
-    static constexpr operation_support can_range_lookup = operation_support::none;
+    static constexpr operation_support can_range_lookup = operation_support::async;
     static constexpr operation_support can_update = operation_support::async;
     static constexpr operation_support can_successor = operation_support::async;
 
@@ -1542,6 +1548,11 @@ public:
 
         return total_nodes_without_initial;
         // return total_nodes_without_initial*2;
+    }
+
+    static size_t estimate_build_bytes(size_t size)
+    {
+        return estimate_build_bytes(size, size);
     }
 
     static size_t estimate_build_bytes(size_t size, size_t maxsize)
@@ -1628,7 +1639,8 @@ public:
         const size_t nodes_bytes = static_cast<size_t>(total_nodes_used_from_AR) * node_stride;
 
         // Totals (preserve original: exclude AS buffer from returned total)
-        const size_t sum_all = pairs_sz + nodes_bytes + maxvals_sz + launch_params_sz;
+        const size_t sum_all = pairs_sz + nodes_bytes + maxvals_sz + launch_params_sz
+                             + range_query_sums_buffer.size_in_bytes();
         const size_t sum_with_as = sum_all + as_sz;
 
         //  snapshot
@@ -1707,7 +1719,12 @@ public:
         return; // total_nodes_used_from_AR > total_allocation_region_nodes;
     }
 
-    // void build(const key_type *keys, size_t keysize, double *build_time_ms, size_t *build_bytes)
+    void build(const key_type *keys, size_t size, double *build_time_ms, size_t *build_bytes)
+    {
+        build_bucket_layer_only(keys, size, size, std::numeric_limits<size_t>::max(),
+                                build_time_ms, build_bytes);
+    }
+
     void build_bucket_layer_only(const key_type *keys, size_t size, size_t max_size, size_t available_memory_bytes, double *build_time_ms, size_t *build_bytes)
     {
         // DEBUG_BUILD_PARAMS("START BUILD: Fill Size", 1, keysize);
@@ -2639,8 +2656,27 @@ public:
 
     void range_lookup_sum(const key_type *lower, const key_type *upper, smallsize *result, size_t size, cudaStream_t stream)
     {
+        if (size == 0)
+            return;
+        if (size > std::numeric_limits<smallsize>::max())
+            throw std::overflow_error("FliX range batch exceeds 32-bit query indices");
 
-        // todo
+        const smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
+        const smallsize bucket_blocks = SDIV(
+            partition_count_with_overflow * TILE_SIZE, threads_per_block);
+        if (range_query_sums_buffer.num_elements != partition_count_with_overflow)
+            range_query_sums_buffer.resize(partition_count_with_overflow);
+
+        // Upstream FliX recomputes sums for every range call.
+        precompute_bucket_offset_sums_kernel<key_type>
+            <<<bucket_blocks, threads_per_block, 0, stream>>>(
+                launch_params_buffer.ptr(), range_query_sums_buffer.ptr());
+        C2EX
+        lookup_kernel_tile_ordered_rq_sums<key_type>
+            <<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
+                launch_params_buffer.ptr(), lower, upper,
+                range_query_sums_buffer.ptr(), result, static_cast<smallsize>(size));
+        C2EX
     }
 
 
@@ -2683,10 +2719,11 @@ public:
         launch_params_buffer.free();
         allocation_buffer.free();
         maxvalues_buffer.free();
-        // reuse_list_buffer.free();
+        reuse_list_buffer.free();
         copy_buffer.free();
         tree_buffer.free();
         bucket_values_buffer.free();
+        range_query_sums_buffer.free();
         // copy_update_list.free();
         // copy_offset_list.free();
     }

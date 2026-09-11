@@ -8,7 +8,9 @@
 
 #include "utilities.cuh"
 
-#if defined(PAPER_SWEEP_GPULSMOPT)
+#if defined(PAPER_SWEEP_COMMON)
+#include "paper_backends.cuh"
+#elif defined(PAPER_SWEEP_GPULSMOPT)
 #include "impl_gpulsmopt.cuh"
 #else
 #include "impl_lsm_tree.cuh"
@@ -27,6 +29,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -38,7 +41,11 @@ namespace
 using key_type = std::uint32_t;
 using clock_type = std::chrono::steady_clock;
 
-#if defined(PAPER_SWEEP_GPULSMOPT)
+#if defined(PAPER_SWEEP_COMMON)
+constexpr const char *index_name = paper_backend_name;
+template <unsigned BatchLog>
+using paper_index_type = selected_paper_backend;
+#elif defined(PAPER_SWEEP_GPULSMOPT)
 constexpr const char *index_name = "GPULSMOpt";
 template <unsigned BatchLog>
 using paper_index_type = gpulsmopt<key_type>;
@@ -65,7 +72,12 @@ void check_cuda(cudaError_t error, const char *expression)
 
 __host__ __device__ key_type key_for_index(std::uint32_t index)
 {
-    return (index * 747796405u + 289133645u) & key_mask;
+    const auto key = (index * 747796405u + 289133645u) & key_mask;
+#if defined(PAPER_SWEEP_COMMON)
+    return key + 2u;
+#else
+    return key;
+#endif
 }
 
 __host__ __device__ std::uint32_t mix32(std::uint32_t value)
@@ -291,6 +303,8 @@ struct options
     bool profile_all_inserts = false;
     bool forced_unified_validation = false;
     bool construction_only = false;
+    bool skip_ranges = false;
+    bool skip_deletions = false;
 #if defined(PAPER_SWEEP_GPULSMOPT)
     bool include_count = false;
 #else
@@ -372,6 +386,10 @@ options parse_options(int argc, char **argv)
         }
         else if (argument == "--range-only")
             result.include_count = false;
+        else if (argument == "--skip-ranges")
+            result.skip_ranges = true;
+        else if (argument == "--skip-deletions")
+            result.skip_deletions = true;
         else
             throw std::invalid_argument("unknown argument: " + argument);
     }
@@ -399,6 +417,12 @@ void write_metadata(const options &configuration)
     cudaDeviceProp properties{};
     PAPER_CUDA(cudaGetDeviceProperties(&properties, 0));
     output << "paper=1707.05354v2.pdf\n";
+#if defined(PAPER_SWEEP_COMMON)
+    output << "protocol=common_initialized_v1\n"
+              "lookup_timing=complete_unsorted_v1\n"
+              "first_state=bulk_build_not_insertion\n"
+              "values=original_insertion_ordinal\n";
+#endif
     output << "index=" << index_name << '\n';
     output << "gpu=" << properties.name << '\n';
     output << "batch_log=" << batch_log << '\n';
@@ -406,7 +430,11 @@ void write_metadata(const options &configuration)
     output << "query_limit_log=" << configuration.query_limit_log << '\n';
     output << "range_chunk_log=" << configuration.range_chunk_log << '\n';
     output << "count_enabled=" << configuration.include_count << '\n';
+#if defined(PAPER_SWEEP_COMMON)
+    output << "range_implementation=value_sum_with_result_checksum\n";
+#else
     output << "range_implementation=enumeration_checksum\n";
+#endif
     output << "profile_insert_r=" << configuration.profile_insert_r << '\n';
     output << "profile_all_inserts=" << configuration.profile_all_inserts << '\n';
     output << "forced_unified_validation="
@@ -846,6 +874,7 @@ range_measurement run_count_and_range(
     return measurement;
 }
 
+#if !defined(PAPER_SWEEP_COMMON)
 template <unsigned BatchLog>
 void run_bulk_build(const options &configuration)
 {
@@ -1295,6 +1324,10 @@ void run_cleanup_sweep(const options &)
 
 #endif
 
+#else
+#include "paper_common_sweep.cuh"
+#endif
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1305,6 +1338,9 @@ int main(int argc, char **argv)
         PAPER_CUDA(cudaSetDevice(0));
         PAPER_CUDA(cudaFree(0));
         write_metadata(configuration);
+#if defined(PAPER_SWEEP_COMMON)
+        run_common_sweep(configuration);
+#else
         if (configuration.bulk_sweep)
             run_bulk_build<batch_log>(configuration);
         if (configuration.main_sweep)
@@ -1316,6 +1352,7 @@ int main(int argc, char **argv)
             run_forced_unified_validation(configuration);
         if (configuration.construction_only)
             run_construction_probe(configuration);
+#endif
 #endif
         return 0;
     }

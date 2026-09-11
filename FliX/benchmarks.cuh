@@ -13,6 +13,7 @@
 #include "definitions.cuh"
 #include "result_collector.h"
 #include "utilities.cuh"
+#include "benchmark_inputs.cuh"
 
 #if !defined(GPULSMOPT)
 #include <nvtx3/nvtx3.hpp>
@@ -81,8 +82,16 @@ void benchmark_point_query(
     std::vector<test_configuration> test_configuration_options {
         {
             "test",
+#ifdef INITIAL_BUILD_SIZE
+            {INITIAL_BUILD_SIZE},
+#else
             {26}, // log_build_size_options
+#endif
+#ifdef INITIAL_PROBE_SIZE
+            {INITIAL_PROBE_SIZE},
+#else
             {27}, // log_probe_size_options
+#endif
             //{{0, 0}}, // misses_percent_options
             {{0, 0}, {1, 0}, {10, 0}, {20, 0}, {50, 0}, {100, 0}}, // misses_percent_options
             {100}, // build_key_uniformity_percent_options
@@ -193,7 +202,8 @@ void benchmark_point_query(
     for (auto sort_insert : tc.sort_insert_options) {
     for (auto sort_probe : tc.sort_probe_options) {
 
-        auto key_bits_used = single_plane && sizeof(key_type) > 4 ? 46 : sizeof(key_type) * 8;
+        const auto key_bits_used = std::min<size_t>(FLIX_BENCHMARK_KEY_BITS,
+            single_plane && sizeof(key_type) > 4 ? 46 : sizeof(key_type) * 8);
 
         std::cerr << "experiment " << tc.description << " for " << index_type::short_description() << std::endl;
         std::cerr << "  bits: " << sizeof(key_type) * 8 << std::endl;
@@ -224,7 +234,8 @@ void benchmark_point_query(
         size_t key_multiplicity = size_t{1} << log_key_multiplicity;
 
         // index does not support operation
-        bool skip = key_multiplicity > 1 ? !index_type::can_multi_lookup : !index_type::can_lookup;
+        bool skip = key_multiplicity > 1 ? !static_cast<bool>(index_type::can_multi_lookup)
+                                        : !static_cast<bool>(index_type::can_lookup);
         if (skip) continue;
 
         // not enough memory
@@ -312,7 +323,7 @@ void benchmark_point_query(
                     nvtx3::scoped_range_in<nvtx_benchmark_domain> sort_batch{"sort"};
 #endif
                     timer.start();
-                    untimed_sort(sort_temp_buffer.raw_ptr, sort_temp_bytes, probe_keys_buffer.ptr(), sorted_probe_keys_buffer.ptr(), probe_size);
+                    untimed_sort(sort_temp_buffer.raw_ptr, sort_temp_bytes, probe_keys_buffer.ptr(), sorted_probe_keys_buffer.ptr(), probe_size, 0);
                     timer.stop();
                     probe_keys_pointer = sorted_probe_keys_buffer;
                     sort_time_ms = timer.time_ms();

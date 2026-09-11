@@ -503,4 +503,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--suite" in sys.argv:
+        from flix_paper_reporting import summarize
+        summarize(sys.argv[1], no_plots="--no-plots" in sys.argv)
+    else:
+        main()

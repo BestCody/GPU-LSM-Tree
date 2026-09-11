@@ -562,10 +562,11 @@ public:
     static constexpr key_type max_supported_key =
         lsm_paper_key<key_type>::max_user_key;
     static constexpr bool stores_tombstones = true;
+    static constexpr size_t update_storage_granularity = size_t{1} << batch_size_log;
 
 private:
     static constexpr size_t threads_per_block = 256;
-    static constexpr size_t batch_size = size_t{1} << batch_size_log;
+    static constexpr size_t batch_size = update_storage_granularity;
 
     cuda_buffer<key_type> level_keys_buffer;
     cuda_buffer<smallsize> level_values_buffer;

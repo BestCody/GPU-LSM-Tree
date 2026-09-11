@@ -259,7 +259,7 @@ public:
     batch.count = size;
     batch.out_values = reinterpret_cast<std::uint32_t *>(result);
     batch.out_found = nullptr;
-#ifdef UNSORTED_PROBES_CHECKS
+#if defined(UNSORTED_PROBES_CHECKS) || defined(FLIX_COMPLETE_UNSORTED_LOOKUP)
     constexpr bool grouped = false;
 #else
     constexpr bool grouped = true;

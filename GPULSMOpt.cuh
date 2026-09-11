@@ -3238,6 +3238,7 @@ __device__ __forceinline__ std::uint32_t canonical_cell_prefix_warp(
        level < source_end; level += 32u) {
     if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
     const Descriptor rows = descriptors[descriptor_index(q, level)];
+    if (!rows.count()) continue;
     total += cell < kFoundationCells
         ? cell_ranks[
               std::size_t{level} * kLocalRankEntries +
@@ -3280,6 +3281,7 @@ canonical_combined_cell_prefix_warp(
        level < source_end; level += 32u) {
     if (!level_is_occupied(manifest.occupied_level_mask, level)) continue;
     const Descriptor rows = descriptors[descriptor_index(q, level)];
+    if (!rows.count()) continue;
     const std::uint16_t *ranks = cell_ranks +
         std::size_t{level} * kLocalRankEntries +
         std::size_t{q} * kFoundationCells;

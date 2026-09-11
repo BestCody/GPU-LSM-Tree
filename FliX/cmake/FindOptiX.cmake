@@ -43,6 +43,8 @@ else()
   find_path(searched_OptiX_INSTALL_DIR
     NAME include/optix.h
     PATHS
+    "${OptiX_INSTALL_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/../../ext/optix"
     "$ENV{HOME}/NVIDIA-OptiX-SDK-8.0.0-linux64-x86_64"
     "$ENV{OptiX_INSTALL_DIR}"
   )

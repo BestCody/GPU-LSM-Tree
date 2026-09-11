@@ -7,6 +7,9 @@ endif()
 set(CMAKE_CUDA_STANDARD 17)
 
 option(FLIX_USE_KEY_CACHE "Reuse generated benchmark key caches" OFF)
+set(FLIX_BENCHMARK_KEY_BITS 31 CACHE STRING "Common FliX benchmark key domain width")
+option(FLIX_ENABLE_PROFILING "Enable host profiling instrumentation" OFF)
+option(FLIX_BUILD_COMMON_PAPER_SWEEP "Build the selected backend's common paper sweep" OFF)
 option(FLIX_BUILD_LSMU_PAPER_SWEEP
        "Build the standalone GPU LSM paper sweep" OFF)
 option(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP
@@ -24,7 +27,7 @@ if(FLIX_BUILD_LSMU_PAPER_SWEEP OR FLIX_BUILD_GPULSMOPT_PAPER_SWEEP OR
    FLIX_BUILD_GPULSMOPT_SIMPLIFICATION_TEST)
   set(FLIX_NEEDS_OPTIX OFF)
 elseif(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
-   IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB)")
+   IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB|SORTED_ARRAY)")
   set(FLIX_NEEDS_OPTIX OFF)
 endif()
 
@@ -132,6 +135,20 @@ function(configure_paper_sweep_target target_name)
   endif()
 endfunction()
 
+if(FLIX_BUILD_COMMON_PAPER_SWEEP)
+  add_executable(paper_sweep paper_lsmu_sweep.cu
+                 ${FLIX_EMBEDDED_PTX} ${FLIX_OPTIONAL_SOURCES})
+  target_compile_definitions(paper_sweep PRIVATE PAPER_SWEEP_COMMON
+          UNSORTED_PROBES_CHECKS FLIX_COMPLETE_UNSORTED_LOOKUP)
+  configure_paper_sweep_target(paper_sweep)
+  if(FLIX_USE_EXTERNAL_NVTX)
+    target_link_libraries(paper_sweep PRIVATE nvtx3-cpp)
+  endif()
+  if(FLIX_NEEDS_OPTIX)
+    target_link_libraries(paper_sweep PRIVATE CUDA::cuda_driver)
+  endif()
+endif()
+
 if(FLIX_BUILD_LSMU_PAPER_SWEEP)
   add_executable(lsmu_paper_sweep paper_lsmu_sweep.cu)
   target_compile_definitions(lsmu_paper_sweep PRIVATE LSM_TREE)
@@ -221,15 +238,12 @@ endif()
 # 120 BLACKWELL
 
 target_compile_options(index_prototype PRIVATE $<$<COMPILE_LANGUAGE:CXX>:
-        # profiling
-        -g -shared-libgcc -fno-omit-frame-pointer
         -Wall -Wextra -Wpedantic -Werror
         ${OpenMP_CXX_FLAGS}
         >)
 
 target_compile_options(index_prototype PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-        # profiling
-        --debug --profile --generate-line-info
+        --generate-line-info
         #-funwind-tables -fno-omit-frame-pointer
         --extended-lambda --use_fast_math --expt-relaxed-constexpr
         -O3
@@ -237,6 +251,14 @@ target_compile_options(index_prototype PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
 #        -Xcompiler=-Wall -Xcompiler=-Wextra -Xcompiler=-Wpedantic
         >)
 
+target_compile_definitions(index_prototype PRIVATE
+        UNSORTED_PROBES_CHECKS FLIX_COMPLETE_UNSORTED_LOOKUP
+        FLIX_BENCHMARK_KEY_BITS=${FLIX_BENCHMARK_KEY_BITS})
+if(FLIX_ENABLE_PROFILING)
+  target_compile_options(index_prototype PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:-g;-shared-libgcc;-fno-omit-frame-pointer>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:--debug;--profile>")
+endif()
 
 
 target_link_libraries(index_prototype PRIVATE

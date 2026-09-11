@@ -22,6 +22,10 @@
 #if defined(FLIX_NEEDS_OPTIX)
 #include <optix.h>
 #include <optix_stubs.h>
+#endif
+
+#if defined(FLIX_NEEDS_OPTIX) || defined(HASHTABLE_SLAB) || \
+    defined(HASHTABLE_WARPCORE) || defined(SORTED_ARRAY)
 #include "../ext/cudahelpers/cuda_helpers.cuh"
 #else
 #ifndef HOSTDEVICEQUALIFIER

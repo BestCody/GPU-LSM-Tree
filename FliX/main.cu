@@ -28,6 +28,9 @@
 #if defined(GPULSMOPT)
 #include "impl_gpulsmopt.cuh"
 #endif
+#if defined(SORTED_ARRAY)
+#include "impl_binsearch.cuh"
+#endif
 #if defined(FLIX_NEEDS_OPTIX)
 #include "impl_binsearch.cuh"
 #include "impl_rtx_index.cuh"
@@ -191,6 +194,8 @@ rc::result_collector rc;
     #elif defined(GPULSMOPT)
         #pragma message "GPULSMOPT=YES"
         benchmark_updates<gpulsmopt<key32>>(rc, runs);
+    #elif defined(SORTED_ARRAY)
+        benchmark_updates<sorted_array<key32>>(rc, runs);
     #else
         printf("No Baselines Selected \n");
     #endif

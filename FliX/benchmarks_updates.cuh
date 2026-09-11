@@ -25,11 +25,14 @@
 #include <limits>
 #include <random>
 #include <type_traits>
+#include <thrust/system/cuda/execution_policy.h>
 #include <iostream>
 #include <stdexcept>
 
 #include <filesystem> // To check file existence
 // #include "utilities.cuh"
+#include "benchmark_inputs.cuh"
+#include "benchmark_lookup.cuh"
 #include "input_generation.h"
 #include "benchmarks.cuh" // for benchmark_range_query (merged range-sum benchmark)
 
@@ -226,27 +229,43 @@ struct benchmark_supports_successor<index_type, std::void_t<decltype(index_type:
     : std::bool_constant<index_type::can_successor == operation_support::async> {};
 
 template <typename index_type, typename = void>
-struct benchmark_index_key_limit
-{
-    static constexpr typename index_type::key_type value =
-        max_usable_key<typename index_type::key_type>();
-};
-
-template <typename index_type>
-struct benchmark_index_key_limit<
-    index_type, std::void_t<decltype(index_type::max_supported_key)>>
-{
-    static constexpr typename index_type::key_type value =
-        index_type::max_supported_key;
-};
-
-template <typename index_type, typename = void>
 struct benchmark_index_stores_tombstones : std::false_type {};
 
 template <typename index_type>
 struct benchmark_index_stores_tombstones<
     index_type, std::void_t<decltype(index_type::stores_tombstones)>>
     : std::bool_constant<index_type::stores_tombstones> {};
+
+template <typename index_type, typename = void>
+struct benchmark_update_storage_granularity
+    : std::integral_constant<size_t, 1> {};
+
+template <typename index_type>
+struct benchmark_update_storage_granularity<
+    index_type, std::void_t<decltype(index_type::update_storage_granularity)>>
+    : std::integral_constant<size_t, index_type::update_storage_granularity> {};
+
+template <typename index_type, typename = void>
+struct benchmark_requires_sorted_updates : std::false_type {};
+
+template <typename index_type>
+struct benchmark_requires_sorted_updates<
+    index_type, std::void_t<decltype(index_type::requires_sorted_updates)>>
+    : std::bool_constant<index_type::requires_sorted_updates> {};
+
+template <typename index_type>
+void prepare_update_inputs(typename index_type::key_type *keys,
+                           smallsize *values, size_t size, cudaStream_t stream)
+{
+    if constexpr (benchmark_requires_sorted_updates<index_type>::value)
+    {
+        if (size < 2) return;
+        if (values)
+            thrust::sort_by_key(thrust::cuda::par.on(stream), keys, keys + size, values);
+        else
+            thrust::sort(thrust::cuda::par.on(stream), keys, keys + size);
+    }
+}
 
 template <typename key_t>
 void key_only_sort_device_timed2(const cuda_buffer<key_t> &d_keys_in,
@@ -1379,7 +1398,7 @@ void benchmark_updates(
         std::vector<key_type> generated_keys;
         generate_keys_file(
             key_generation_size, min_usable_key<key_type>(),
-            benchmark_index_key_limit<index_type>::value,
+            flix_benchmark::common_max_key<index_type>(),
             generated_keys, "keys_cache.txt");
         // generate_keys(key_generation_size, min_usable_key<key_type>(), max_usable_key<key_type>(), generated_keys);
 
@@ -1398,7 +1417,7 @@ void benchmark_updates(
             build_size,          // Number of uniform keys
             insert_batch_size,   // Number of insert keys
             min_usable_key<key_type>(),
-            benchmark_index_key_limit<index_type>::value,
+            flix_benchmark::common_max_key<index_type>(),
             generated_keys);
 
         // Print build_size
@@ -1421,7 +1440,7 @@ void benchmark_updates(
             insert_batch_size,   // Number of insert keys
             tc.batch_count,      // Number of batches
             min_usable_key<key_type>(),
-            benchmark_index_key_limit<index_type>::value,
+            flix_benchmark::common_max_key<index_type>(),
             generated_keys,
             shift_insert_range,
             percentage_distribution_dense_keys, // Percentage of keys in the dense pattern (25% of the total key range)
@@ -1439,11 +1458,23 @@ void benchmark_updates(
 #endif
 
         key_generation_size = generated_keys.size();
-        const size_t index_capacity_size =
-            key_generation_size +
-            (benchmark_index_stores_tombstones<index_type>::value
-                 ? delete_batch_size * tc.batch_count
-                 : 0);
+        flix_benchmark::input_checksum workload_keys_checksum;
+        workload_keys_checksum.add(build_size);
+        workload_keys_checksum.add(generated_keys);
+        constexpr size_t storage_granularity =
+            benchmark_update_storage_granularity<index_type>::value;
+        static_assert(storage_granularity > 0, "Storage granularity must be positive");
+        const auto padded_size = [](size_t size) {
+            return size == 0 ? size_t{0} :
+                (1 + (size - 1) / storage_granularity) * storage_granularity;
+        };
+        // Fixed-size LSM batches consume padding on every call.
+        const size_t index_capacity_size = std::max(
+            key_generation_size,
+            padded_size(build_size) + tc.batch_count *
+                (padded_size(insert_batch_size) +
+                 (benchmark_index_stores_tombstones<index_type>::value
+                      ? padded_size(delete_batch_size) : 0)));
 
 #ifdef PRINT_GENERATED_KEYS
 #pragma message "PRINT_GENERATED_HYBRID_KEYS=YES"
@@ -1512,6 +1543,7 @@ void benchmark_updates(
 
             // initial build (untimed)
             index_type index;
+            flix_benchmark::lookup_workspace<key_type> lookup_workspace;
             // index.build(insert_delete_keys_buffer.ptr(), active_range_end - active_range_start, nullptr, nullptr);
 #ifdef DEBUG_BENCHMARK_OUTPUT
             next_free = index.allocation_buffer_next_free();
@@ -1572,7 +1604,10 @@ void benchmark_updates(
 #endif
                 std::vector<key_type> last_deleted_keys;
                 bool did_delete_this_step = false;
-                double deleted_keys_probe_time_ms = 0.0;
+                flix_benchmark::lookup_times hit_times, miss_times, deleted_times;
+                flix_benchmark::input_checksum request_checksum;
+                request_checksum.add(step);
+                size_t hit_count = 0, miss_count = 0, deleted_count = 0;
 
                 double insert_or_delete_time_ms = 0;
                 double probe_time_ms = 0;
@@ -1580,9 +1615,7 @@ void benchmark_updates(
                 double successor_misses_probe_time_ms = 0;
 
                 double rebuild_time_ms = 0;
-                double sort_time_ms = 0;
                 double probe_miss_time_ms = 0;
-                double scatter_time_ms = 0;
 
                 double index_layer_time_ms = 0;
                 double bucket_layer_time_ms = 0;
@@ -1648,10 +1681,9 @@ void benchmark_updates(
                             generated_keys.begin() + inserted_range_end + insert_batch_size);
                         std::vector<smallsize> associated_offsets(insert_batch_size);
                         std::iota(associated_offsets.begin(), associated_offsets.end(), inserted_range_end);
-                        // unsorted insert batch (pre-sort disabled for the GPU LSM Opt benchmark):
-                        // auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
-                        // apply_permutation(relevant_inserts, sort_perm);
-                        // apply_permutation(associated_offsets, sort_perm);
+                        request_checksum.add(1);
+                        request_checksum.add(relevant_inserts);
+                        request_checksum.add(associated_offsets);
                         insert_keys_buffer.upload(relevant_inserts.data(), insert_batch_size);
                         insert_offsets_buffer.upload(associated_offsets.data(), insert_batch_size);
                         C2EX
@@ -1676,7 +1708,8 @@ void benchmark_updates(
                         std::vector<key_type> relevant_deletes =
                             draw_uniform_live_deletes<key_type>(
                                 delete_batch_size, live_keys, delete_gen);
-                        std::sort(relevant_deletes.begin(), relevant_deletes.end());
+                        request_checksum.add(2);
+                        request_checksum.add(relevant_deletes);
                         delete_keys_buffer.upload(relevant_deletes.data(), delete_batch_size);
                         C2EX
                                 std::cerr
@@ -1695,6 +1728,10 @@ void benchmark_updates(
                         */
                     }
                     timer.start();
+                    prepare_update_inputs<index_type>(insert_keys_buffer.ptr(),
+                        insert_offsets_buffer.ptr(), insert_batch_size, 0);
+                    prepare_update_inputs<index_type>(delete_keys_buffer.ptr(),
+                        nullptr, delete_batch_size, 0);
                     index.insert_and_remove(insert_keys_buffer.ptr(), insert_offsets_buffer.ptr(), insert_batch_size, delete_keys_buffer.ptr(), 0);
                     timer.stop();
                     insert_or_delete_time_ms = timer.time_ms();
@@ -1718,16 +1755,18 @@ void benchmark_updates(
                             generated_keys.begin() + ins_end);
                         std::vector<smallsize> associated_offsets(insert_batch_size);
                         std::iota(associated_offsets.begin(), associated_offsets.end(), ins_begin);
-                        // unsorted insert batch (pre-sort disabled for the GPU LSM Opt benchmark):
-                        // auto sort_perm = sort_permutation(relevant_inserts, std::less<key_type>());
-                        // apply_permutation(relevant_inserts, sort_perm);
-                        // apply_permutation(associated_offsets, sort_perm);
+                        request_checksum.add(1);
+                        request_checksum.add(relevant_inserts);
+                        request_checksum.add(associated_offsets);
                         insert_delete_keys_buffer.upload(relevant_inserts.data(), insert_batch_size);
                         insert_offsets_buffer.upload(associated_offsets.data(), insert_batch_size);
                         C2EX
                                 std::cerr
                             << "      insert size: " << insert_batch_size << std::endl;
                         timer.start();
+                        // Charge required ordering to the update measurement.
+                        prepare_update_inputs<index_type>(insert_delete_keys_buffer.ptr(),
+                            insert_offsets_buffer.ptr(), insert_batch_size, 0);
                         index.insert(insert_delete_keys_buffer.ptr(), insert_offsets_buffer.ptr(), insert_batch_size, 0);
                         timer.stop();
                         insert_or_delete_time_ms = timer.time_ms();
@@ -1757,12 +1796,15 @@ void benchmark_updates(
                         std::vector<key_type> relevant_deletes =
                             draw_uniform_live_deletes<key_type>(
                                 delete_batch_size, live_keys, delete_gen);
-                        std::sort(relevant_deletes.begin(), relevant_deletes.end());
+                        request_checksum.add(2);
+                        request_checksum.add(relevant_deletes);
                         insert_delete_keys_buffer.upload(relevant_deletes.data(), delete_batch_size);
                         C2EX
                                 std::cerr
                             << "delete size: " << delete_batch_size << std::endl;
                         timer.start();
+                        prepare_update_inputs<index_type>(insert_delete_keys_buffer.ptr(),
+                            nullptr, delete_batch_size, 0);
                         index.remove(insert_delete_keys_buffer.ptr(), delete_batch_size, 0);
                         timer.stop();
                         insert_or_delete_time_ms = timer.time_ms();
@@ -1795,60 +1837,13 @@ void benchmark_updates(
                         del_result_buffer.alloc(del_probe_size);
                         del_probe_keys_buffer.upload(last_deleted_keys.data(), del_probe_size);
 
-                        static cuda_buffer<key_type> d_del_sorted_keys;
-                        static cuda_buffer<uint32_t> d_del_perm_sorted;
-                        static cuda_buffer<uint8_t> d_del_aux;
-                        cuda_buffer<smallsize> tmp_results_sorted;
-
-                        tmp_results_sorted.alloc(del_probe_size);
-                        {
-                            std::vector<smallsize> init_miss_results(del_probe_size, static_cast<smallsize>(2));
-                            tmp_results_sorted.upload(init_miss_results.data(), del_probe_size);
-                        }
-
-                        double del_sort_time_ms = 0.0;
-                        key_only_sort_device_timed<key_type>(
-                            del_probe_keys_buffer,
-                            del_probe_size,
-                            d_del_sorted_keys,
-                            d_del_perm_sorted,
-                            d_del_aux,
-                            &del_sort_time_ms,
-                            0 // stream
-                        );
-
-                        cudaDeviceSynchronize();
-                        C2EX
-
-                            timer.start();
-#ifdef BASELINES
-                        index.lookup(d_del_sorted_keys.ptr(),
-                                     tmp_results_sorted.ptr(),
-                                     del_probe_size, 0);
-#else
-                        index.lookups_ordered(d_del_sorted_keys.ptr(),
-                                              tmp_results_sorted.ptr(),
-                                              del_probe_size, 0);
-#endif
-                        timer.stop();
-                        deleted_keys_probe_time_ms = timer.time_ms();
-
-                        cudaDeviceSynchronize();
-                        C2EX
-
-                            scatter_sorted_to_original<smallsize>(
-                                tmp_results_sorted,
-                                d_del_perm_sorted,
-                                del_result_buffer,
-                                del_probe_size, 0);
-
-                        cudaDeviceSynchronize();
-                        C2EX
-
-                            auto del_probe_result = del_result_buffer.download(del_probe_size);
-
-                        cudaDeviceSynchronize();
-                        C2EX
+                        request_checksum.add(3);
+                        request_checksum.add(last_deleted_keys);
+                        deleted_count = del_probe_size;
+                        deleted_times = lookup_workspace.lookup(index,
+                            del_probe_keys_buffer.ptr(), del_result_buffer.ptr(),
+                            del_probe_size);
+                        auto del_probe_result = del_result_buffer.download(del_probe_size);
 
                             // Validate: every just-deleted key MUST be a miss
                             check_all_misses_results<key_type>(del_probe_result, last_deleted_keys);
@@ -1859,10 +1854,6 @@ void benchmark_updates(
                             break;
                         }
 
-                        //std::cerr << "    --Post-Delete Miss-Probe Time: -> "
-                         //         << deleted_keys_probe_time_ms << " ms"
-                           //       << " (keys=" << del_probe_size << ", sort=" << del_sort_time_ms << " ms)"
-                            //      << std::endl;
                     }
                 }
 
@@ -1944,536 +1935,89 @@ void benchmark_updates(
 #endif
                 //*************************************************************************** */
             probe:;
-                // ===============================
-
-                //*************************************************************************** */
-
-                // SECOND APPROACH WITH NO INDEX LAYER and SORTED PROBES
                 if (!live_keys.empty())
                 {
-                    sort_time_ms = 0.0;
                     std::vector<key_type> probe_keys;
                     std::vector<smallsize> expected_result;
-
-                    draw_live_probes(
-                        probe_size, live_keys, live_map,
-                        probe_keys, expected_result);
-
-                    // Keep original host order for validation
-                    const auto probe_keys_orig = probe_keys;
-
-                    // Upload once (unsorted)
-                    probe_keys_buffer.upload(probe_keys.data(), probe_size);
-                    result_buffer.zero();
-
-                    const bool sort_probes = true;
-                    if (sort_probes)
+                    draw_live_probes(probe_size, live_keys, live_map,
+                                     probe_keys, expected_result);
+                    request_checksum.add(4);
+                    request_checksum.add(probe_keys);
+                    request_checksum.add(expected_result);
+                    hit_count = probe_keys.size();
+                    probe_keys_buffer.upload(probe_keys.data(), hit_count);
+                    hit_times = lookup_workspace.lookup(index,
+                        probe_keys_buffer.ptr(), result_buffer.ptr(), hit_count);
+                    probe_time_ms = hit_times.total_ms;
+                    correct = is_matching_result(probe_keys, probe_keys,
+                        expected_result, result_buffer, error_message);
+                    if (!correct)
                     {
-                                // Persistent/reused buffers across iterations
-                        static cuda_buffer<key_type> d_sorted_keys;
-                        static cuda_buffer<uint32_t> d_perm_sorted;
-                        static cuda_buffer<uint32_t> d_perm_in;  // NEW: reuse permutation input
-                        static cuda_buffer<uint8_t> d_aux;       // reused scratch
+                        std::cerr << " -> SKIP " << error_message << std::endl;
+                        break;
+                    }
 
-                        static cuda_buffer<smallsize> tmp_results_sorted;
-                        if (tmp_results_sorted.size_in_bytes() < probe_size * sizeof(smallsize)) {
-                            tmp_results_sorted.alloc(probe_size);
-                        }
-                        tmp_results_sorted.zero();
-
-#if !defined(UNSORTED_PROBES_CHECKS)
-
-                            // --- Timed key-only sort ---
-                        double sort_time_ms_local = 0.0;
-                        key_only_sort_device_timed_debug<key_type>(
-                            probe_keys_buffer, probe_size,
-                            d_sorted_keys, d_perm_sorted, d_perm_in, d_aux,   // UPDATED args
-                            &sort_time_ms_local, 0
-                        );
-                        sort_time_ms = sort_time_ms_local;
-
-                        cudaDeviceSynchronize();
-                        C2EX
-                        std::cerr
-                            << "       Sort: " << sort_time_ms << "ms-"
-                            << " probe_size: " << probe_size << std::endl;
-                                // --- Lookups on sorted keys ---
-
-#else
-                        // d_sorted_keys = probe_keys_orig;
-                        std::cerr << "NO Sort:  probe_size: " << probe_size;
-#endif
-                        // timer.clear();
-
-#ifdef BASELINES
-#pragma message "BASELINS SORTED Lookups"
-
-#if !defined(UNSORTED_PROBES_CHECKS)
-#pragma message "Using BASELINE SORTED LOOKUP in LOOKUPS"
-                        if (step == 0) // Dummy Probe round to warm up
-                        {
-                            // timer.stop();
-                            index.lookup(d_sorted_keys.ptr(),
-                                         tmp_results_sorted.ptr(),
-                                         20, 0);
-                            // timer.start();
-                        }
+                    if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
+                    {
+                        lookup_workspace.prepare_ordered(probe_keys_buffer.ptr(), hit_count, 0);
+                        cuda_buffer<key_type> successor_results;
+                        successor_results.alloc(hit_count);
                         timer.start();
-                        index.lookup(d_sorted_keys.ptr(),
-                                     tmp_results_sorted.ptr(),
-                                     probe_size, 0);
-
-#else
-#pragma message "Using BASELINE UNSORTED LOOKUP in LOOKUPS"
-
-                        if (step == 0) // Dummy Probe round to warm up
-                        {
-                            // timer.stop();
-                            index.lookup(probe_keys_buffer.ptr(),
-                                         result_buffer.ptr(),
-                                         20, 0);
-                            // timer.start();
-                        }
-                        timer.start();
-                        index.lookup(probe_keys_buffer.ptr(),
-                                     result_buffer.ptr(),
-                                     probe_size, 0);
-#endif
-
-#else
-
-#pragma message "Using REGULAR CGRXU LOOKUPS"
-                        if (step == 0) // Dummy Probe round to warm up
-                        {
-                            // timer.stop();
-                            index.lookups_ordered(d_sorted_keys.ptr(),
-                                                  tmp_results_sorted.ptr(),
-                                                  20, 0);
-
-                            // timer.start();
-                        }
-
-                        timer.start();
-                        index.lookups_ordered(d_sorted_keys.ptr(),
-                                              tmp_results_sorted.ptr(),
-                                              probe_size, 0);
-#endif
+                        index.lookups_successor(lookup_workspace.sorted_keys.ptr(),
+                            successor_results.ptr(), hit_count, 0);
                         timer.stop();
+                        successor_hits_probe_time_ms = timer.time_ms();
+                        auto sorted_keys = lookup_workspace.sorted_keys.download(hit_count);
+                        auto results = successor_results.download(hit_count);
+                        assert_vectors_equal(sorted_keys, results);
+                    }
+                }
 
-                        probe_time_ms = timer.time_ms();
-                        cudaDeviceSynchronize();
-                        C2EX
-
-#if !defined(UNSORTED_PROBES_CHECKS)
-                            timer.start();
-                        // --- Scatter back to original order expected by checks :) ---
-                        scatter_sorted_to_original<smallsize>(tmp_results_sorted,
-                                                              d_perm_sorted,
-                                                              result_buffer,
-                                                              probe_size, 0);
-                        timer.stop();
-                        scatter_time_ms = timer.time_ms();
-                        cudaDeviceSynchronize();
-                        C2EX
-#endif
-
-                            // Validate using original order
-                            correct = is_matching_result(probe_keys_orig, probe_keys_orig, expected_result, result_buffer, error_message);
+                // Future insertions provide the same miss queries for every backend.
+                if (inserted_range_end < key_generation_size)
+                {
+                    std::vector<key_type> probe_keys_misses;
+                    std::vector<smallsize> expected_result_misses;
+                    draw_probes(probe_size, generated_keys, inserted_range_end,
+                        key_generation_size, supports_updates,
+                        probe_keys_misses, expected_result_misses);
+                    probe_keys_misses.erase(std::remove_if(probe_keys_misses.begin(),
+                        probe_keys_misses.end(), [&](key_type key) {
+                            return live_map.find(key) != live_map.end();
+                        }), probe_keys_misses.end());
+                    miss_count = probe_keys_misses.size();
+                    request_checksum.add(5);
+                    request_checksum.add(probe_keys_misses);
+                    if (miss_count > 0)
+                    {
+                        probe_keys_buffer.upload(probe_keys_misses.data(), miss_count);
+                        miss_times = lookup_workspace.lookup(index,
+                            probe_keys_buffer.ptr(), result_buffer.ptr(), miss_count);
+                        probe_miss_time_ms = miss_times.total_ms;
+                        auto results = result_buffer.download(miss_count);
+                        correct = is_all_misses(results, error_message);
                         if (!correct)
                         {
                             std::cerr << " -> SKIP " << error_message << std::endl;
                             break;
                         }
 
-                        // ----------------------------------------------------------------------
-                        // ----------------------------------------------------------------------
-                        // First Largest Operation
-
-                        // SECOND APPROACH WITH NO INDEX LAYER and SORTED PROBES
-
                         if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
                         {
-                            // sort_time_ms = 0.0;
-                            // std::vector<key_type> probe_keys;
-                            // std::vector<smallsize> expected_result;
-
-                            // draw_probes(probe_size, generated_keys, 0, inserted_range_end,
-                            //             !supports_updates, probe_keys, expected_result);
-
-                            // Keep original host order for validation
-                            // probe_keys_orig = probe_keys;
-
-                              // Upload once (unsorted)
-                            probe_keys_buffer.upload(probe_keys.data(), probe_size);
-                            result_keys_buffer.zero();
-
-                            static cuda_buffer<key_type> tmp_results_sorted_keys;
-                            ensure_cuda_buffer_elements(tmp_results_sorted_keys, probe_size);
-                            tmp_results_sorted_keys.zero();
-                                                       
-
-                            //  std::cerr << "Received Successor Keys: " << " Successor probe_size: " << probe_size << std::endl;
-                            // --- Lookups on sorted keys ---
-
-#ifdef BASELINES
-#pragma message "BASELINS SUCCSSOR SORTED Lookups"
-                            if (step == 0) // Dummy Probe round to warm up
-                            {
-                                // timer.stop();
-                                index.lookups_successor(d_sorted_keys.ptr(), tmp_results_sorted.ptr(), 20, 0);
-                                // timer.start();
-                            }
-                            std::cerr << "Before SUCCESSOR LOOKUP in BASELINES\n"
-                                      << std::endl;
+                            lookup_workspace.prepare_ordered(probe_keys_buffer.ptr(), miss_count, 0);
+                            cuda_buffer<key_type> successor_results;
+                            successor_results.alloc(miss_count);
                             timer.start();
-                            index.lookups_successor(d_sorted_keys.ptr(), tmp_results_sorted_keys.ptr(), probe_size, 0);
-                            // std::cerr << "After SUCCESSOR LOOKUP in BASELINES\n" << std::endl;
-
-#else
-#pragma message "Using REGULAR CGRXU LOOKUPS"
-                            if (step == 0) // Dummy Probe round to warm up
-                            {
-                                // timer.stop();
-                                index.lookups_successor(d_sorted_keys.ptr(), tmp_results_sorted.ptr(), 20, 0);
-
-                                // timer.start();
-                            }
-
-                            timer.start();
-                            index.lookups_successor(d_sorted_keys.ptr(),
-                                                    tmp_results_sorted_keys.ptr(),
-                                                    probe_size, 0);
-#endif
+                            index.lookups_successor(lookup_workspace.sorted_keys.ptr(),
+                                successor_results.ptr(), miss_count, 0);
                             timer.stop();
-
-                            // std::cerr << "After TIMER SUCCESSOR LOOKUP " << std::endl;
-
-                            successor_hits_probe_time_ms = timer.time_ms();
-                            cudaDeviceSynchronize();
-                            C2EX
-                            //       std::cerr
-                            //  << "After TIMER ASSIGNMENT" << std::endl;
-
-                            // print out all tmp_results_sorted for debugging
-
-#ifdef DEBUG_SUCCESSOR_RESULTS
-                            {
-                                auto succ_results = tmp_results_sorted_keys.download(probe_size);
-                                std::cerr << " Successor Results: ";
-                                for (size_t i = 0; i < succ_results.size(); ++i)
-                                {
-                                    std::cerr << "Result " << i << ": " << succ_results[i] << " " << std::endl;
-                                }
-                                // std::cerr << std::endl;
-                            }
-#endif
-                            // std::cerr   << " Before CHECK VERIFICATION ASSIGNMENT " << std::endl;
-
-                            { // Verification Block
-                                auto succ_results = tmp_results_sorted_keys.download(probe_size);
-                                auto sorted_keys = d_sorted_keys.download(probe_size); // <-- download first
-
-                                assert_vectors_equal<key_type>(
-                                    sorted_keys, succ_results,
-                                    "d_sorted_keys", "tmp_results_sorted_keys");
-                            }
-
-                            // std::cerr   << " After CHECK VERIFICATION ASSIGNMENT " << std::endl;
-
-                            std::cerr
-                                << "    -> Successor All Hits Probe Time: -> "
-                                << successor_hits_probe_time_ms << " ms"
-                                << " (keys=" << probe_size << ", sort=" << sort_time_ms << " ms)"
-                                << std::endl;
+                            successor_misses_probe_time_ms = timer.time_ms();
+                            auto sorted_keys = lookup_workspace.sorted_keys.download(miss_count);
+                            auto results = successor_results.download(miss_count);
+                            assert_ceiling_results(sorted_keys, results, live_keys);
                         }
-
-                        d_aux.free();
-                        d_sorted_keys.free();
-                        d_perm_sorted.free();
-                        d_perm_in.free();
                     }
                 }
-                // ----------------------------------------------------------------------
-
-#if !defined(UNSORTED_PROBES_CHECKS)
-                if (inserted_range_end < key_generation_size)
-                {
-                    std::vector<key_type> probe_keys_misses;
-                    bool skip_miss2_checks = false;
-                    std::vector<smallsize> expected_result_misses;
-                    smallsize probe_size_misses = probe_size;
-                    smallsize totalleftover_keys = key_generation_size - inserted_range_end;
-                    // bool skip_miss2_checks = false;
-
-                    DBG_MISS2_CERR("  ----> Sorting 2nd miss probes: introduced range end " << inserted_range_end
-                                                                                          << " probe size misses " << probe_size_misses);
-
-                    smallsize actual_generated_key_size = generated_keys.size();
-
-                    DBG_MISS2_CERR("Drawing second miss probes beginning " << inserted_range_end
-                                                                           << " to " << key_generation_size
-                                                                           << " generated key size " << actual_generated_key_size
-                                                                           << " requested probe miss size " << probe_size_misses);
-
-                    if (totalleftover_keys < 20)
-                    {
-                        probe_size_misses = totalleftover_keys;
-                        DBG_MISS2_CERR(" Adjusted probe miss size to leftover keys of size: --> " << probe_size_misses);
-                        skip_miss2_checks = true;
-                        DBG_MISS2_CERR(" SKIPPING  miss 2 checks due to small leftover key size ");
-                    }
-
-                    if (!skip_miss2_checks)
-                    {
-                        draw_probes(probe_size_misses, generated_keys, inserted_range_end, key_generation_size,
-                                    supports_updates, probe_keys_misses, expected_result_misses);
-
-                        // drop "miss" probes that are actually present as duplicates, so all-misses stays valid
-                        {
-                            size_t kept = 0;
-                            for (size_t r = 0; r < probe_keys_misses.size(); ++r)
-                            {
-                                if (live_map.find(probe_keys_misses[r]) == live_map.end())
-                                {
-                                    probe_keys_misses[kept] = probe_keys_misses[r];
-                                    expected_result_misses[kept] = expected_result_misses[r];
-                                    ++kept;
-                                }
-                            }
-                            probe_keys_misses.resize(kept);
-                            expected_result_misses.resize(kept);
-                            probe_size_misses = static_cast<smallsize>(kept);
-                        }
-                        // skip_miss2_checks = true;
-
-                        DBG_MISS2_CERR("Probe size misses: " << probe_size_misses);
-
-#ifdef DEBUG_MISS2
-                        for (size_t i = 0; i < probe_keys_misses.size(); ++i)
-                        {
-                            if (probe_keys_misses[i] == 0)
-                            {
-                                std::cerr << " ERROR: Found a probe key with value 0 at index " << i << std::endl;
-                            }
-                        }
-#endif
-
-                        DBG_MISS2_CERR("Uploading second miss probes " << std::endl);
-
-                        probe_keys_buffer.upload(probe_keys_misses.data(), probe_size_misses);
-                        result_buffer.zero();
-                        result_keys_buffer.zero();
-
-                        // initialize the result_buffer to all values of 2 (i.e., miss) ---ADDED CHECK
-                        {
-                            std::vector<smallsize> init_miss_results(probe_size_misses, static_cast<smallsize>(2));
-                            result_buffer.upload(init_miss_results.data(), probe_size_misses);
-                        }
-
-                        const bool sort_probes = true;
-
-                        DBG_MISS2_CERR("introduced range end " << inserted_range_end
-                                                           << ", key_generation_size " << key_generation_size
-                                                           << " and probe misses size " << probe_size_misses);
-
-                        if (sort_probes && (probe_size_misses > 0))
-                        {
-                            static cuda_buffer<key_type> d_sorted_keys;
-                            static cuda_buffer<uint32_t> d_perm_sorted;
-                            static cuda_buffer<uint32_t> d_perm_in;  // NEW: reuse permutation input
-                            static cuda_buffer<uint8_t> d_aux;       // reused scratch
-                                    //-- cuda_buffer<smallsize> tmp_results_sorted;
-                           //---- cuda_buffer<key_type> tmp_results_sorted_keys; // ADDED for Successor
-                           // -- tmp_results_sorted.alloc(probe_size_misses);
-                          //----  tmp_results_sorted_keys.alloc(probe_size_misses);
-                           //-- tmp_results_sorted.zero();
-                           //---- tmp_results_sorted_keys.zero();
-
-                              static cuda_buffer<smallsize> tmp_results_sorted;
-                                ensure_cuda_buffer_elements(tmp_results_sorted, probe_size_misses);
-                             tmp_results_sorted.zero();
-
-                              static cuda_buffer<key_type> tmp_results_sorted_keys;
-                            ensure_cuda_buffer_elements(tmp_results_sorted_keys, probe_size_misses);
-                            tmp_results_sorted_keys.zero();
-
-
-                            double sort_time_ms_local = 0.0;
-
-                            key_only_sort_device_timed_debug<key_type>(
-                                probe_keys_buffer,
-                                probe_size_misses,
-                                d_sorted_keys,
-                                d_perm_sorted, d_perm_in,
-                                d_aux,
-                                &sort_time_ms_local,
-                                0 // stream
-                            );
-
-                            cudaDeviceSynchronize();
-                            C2EX
-
-
-#ifdef DEBUG_MISS2
-                            /* {
-                                auto top_sorted_keys = d_sorted_keys.download(std::min<size_t>(15, probe_size_misses));
-                                std::cerr << " Top sorted keys for 2nd MISS probes: ";
-                                for (const auto &key : top_sorted_keys)
-                                {
-                                    std::cerr << key << " ";
-                                }
-                                std::cerr << std::endl;
-                            } */
-#endif
-
-                            cudaDeviceSynchronize();
-                            C2EX
-
-                                timer.start();
-#ifdef BASELINES
-#pragma message "Using BASELINE SORTED LOOKUP for MISS 2 CHECKS"
-                            DBG_MISS2_CERR("Performing Baseline lookups 2nd MISS LOOKUPS ");
-
-                            index.lookup(d_sorted_keys.ptr(),
-                                         tmp_results_sorted.ptr(),
-                                         probe_size_misses, 0);
-#else
-                            DBG_MISS2_CERR("Performing lookups_ordered 2nd MISS LOOKUPS ");
-
-                            index.lookups_ordered(d_sorted_keys.ptr(),
-                                                  tmp_results_sorted.ptr(),
-                                                  probe_size_misses, 0);
-#endif
-
-                            timer.stop();
-                            probe_miss_time_ms = timer.time_ms();
-
-                            cudaDeviceSynchronize();
-                            C2EX
-
-                                scatter_sorted_to_original<smallsize>(tmp_results_sorted,
-                                                                      d_perm_sorted,
-                                                                      result_buffer,
-                                                                      probe_size_misses, 0);
-                            cudaDeviceSynchronize();
-                            C2EX
-
-                                auto result = result_buffer.download(probe_size_misses);
-
-                            cudaDeviceSynchronize();
-                            C2EX
-
-                                /*        // print out all values of the result buffer in one line if possible
-                                        std::cerr
-                                    << " Printing Miss 2 Results: ";
-                                for (size_t i = 0; i < result.size(); ++i)
-                                {
-                                    std::cerr << "next: " << result[i] << " ";
-                                }
-                                std::cerr << std::endl;  */
-
-                                // ------>  if (!(index.name == "lsm_tree" && do_delete))
-                                //{
-                                DBG_MISS2_CERR("Checking Miss 2 results ");
-
-                            check_all_misses_results<key_type>(result, probe_keys_misses);
-                            correct = is_all_misses(result, error_message);
-                            if (!correct)
-                            {
-                                std::cerr << " -> SKIP " << error_message << std::endl;
-                                break;
-                            }
-
-                            // SUCCESSSOR ------
-                            if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
-                            {
-#ifdef BASELINES
-#pragma message "Using BASELINE SUCCESSOR MISS in LOOKUPS"
-                                // if (step == 0) // Dummy Probe round to warm up
-                                //{
-                                //  timer.stop();
-                                //   index.lookups_successor(d_sorted_keys.ptr(), tmp_results_sorted.ptr(), 20, 0);
-                                //  timer.start();
-                                // }
-                                timer.start();
-                                index.lookups_successor(d_sorted_keys.ptr(), tmp_results_sorted_keys.ptr(), probe_size, 0);
-
-#else
-
-#pragma message "Using REGULAR CGRXU SUCSSOR MISS LOOKUPS"
-                                // if (step == 0) // Dummy Probe round to warm up
-                                // {
-                                // timer.stop();
-                                // ---- index.lookups_successor(d_sorted_keys.ptr(),
-                                //     tmp_results_sorted.ptr(),
-                                //   20, 0);
-
-                                // timer.start();
-                                //}
-
-                                timer.start();
-                                index.lookups_successor(d_sorted_keys.ptr(),
-                                                        tmp_results_sorted_keys.ptr(),
-                                                        probe_size, 0);
-#endif
-                                timer.stop();
-
-                                successor_misses_probe_time_ms = timer.time_ms();
-                                cudaDeviceSynchronize();
-                                C2EX
-
-                                // print out all tmp_results_sorted_keys for debugging
-
-#ifdef DEBUG_SUCCESSOR_RESULTS
-                                {
-                                    auto succ_results = tmp_results_sorted_keys.download(probe_size);
-                                    std::cerr << " Successor MISS Results: ";
-                                    for (size_t i = 0; i < succ_results.size(); ++i)
-                                    {
-                                        std::cerr << "Result " << i << ": " << succ_results[i] << " " << std::endl;
-                                    }
-                                    // std::cerr << std::endl;
-                                }
-#endif
-                                { // Verification Block
-
-                                    //  std::cerr << "Before Miss Successor Verificaiton" << std::endl;
-
-                                    // Download a = d_sorted_keys (sorted miss-probe keys)
-                                    auto a_sorted_miss_keys = d_sorted_keys.download(probe_size_misses);
-
-                                    // Download b = tmp_results_sorted_keys (successor results)
-                                    auto b_succ_miss_keys = tmp_results_sorted_keys.download(probe_size_misses);
-
-                                    assert_ceiling_results<key_type>(
-                                        a_sorted_miss_keys,
-                                        b_succ_miss_keys,
-                                        live_keys,
-                                        "d_sorted_keys(miss)",
-                                        "tmp_results_sorted_keys(miss)",
-                                        "live_keys");
-                                }
-
-                                std::cerr
-                                    << "    -> Successor All MISSES Probe Time: -> "
-                                    << successor_misses_probe_time_ms << " ms"
-                                    << " (keys=" << probe_size << ", sort=" << sort_time_ms << " ms)"
-                                    << std::endl;
-                                    
-                            } // if perform successor probes
-
-                        d_aux.free();
-                        d_sorted_keys.free();
-                        d_perm_sorted.free();
-                        d_perm_in.free();
-
-                        } // if sorted probes
-                    } // if skip_miss2_checks
-                }
-
-#endif // unsorted checks
-
-                // ----------------------------------------------------------------------
 
                 // PRINT PROBE TIME HERE
                 std::cerr << "    --Probe Time: -> " << probe_time_ms << " ms" << std::endl;
@@ -2501,6 +2045,18 @@ void benchmark_updates(
                         .add_parameter("index_id", index_id)
                         .add_parameter("run", run)
                         .add_parameter("key_bits", sizeof(key_type) * 8)
+                        .add_parameter("workload_key_bits", FLIX_BENCHMARK_KEY_BITS)
+                        .add_parameter("workload_min_key", min_usable_key<key_type>())
+                        .add_parameter("workload_max_key", flix_benchmark::common_max_key<index_type>())
+                        .add_parameter("workload_keys_checksum", workload_keys_checksum.str())
+                        .add_parameter("request_checksum", request_checksum.str())
+                        .add_parameter("checksum_format", "fnv1a64_u64le_v1")
+                        .add_parameter("lookup_timing", "complete_unsorted_v1")
+                        .add_parameter("probe_input_order", "unsorted")
+                        .add_parameter("external_lookup_sort", flix_benchmark::requires_ordered_lookup<index_type>::value)
+                        .add_parameter("hit_query_count", hit_count)
+                        .add_parameter("miss_query_count", miss_count)
+                        .add_parameter("deleted_query_count", deleted_count)
                         .add_parameter("build_size_log", tc.build_size_log)
                         .add_parameter("probe_size_log", tc.probe_size_log)
                         .add_parameter("batch_count", tc.batch_count)
@@ -2521,8 +2077,20 @@ void benchmark_updates(
                         .add_parameter("after_update_size", after_update_size)
                         .add_measurement("insert_or_delete_time_ms", insert_or_delete_time_ms)
                         .add_measurement("probe_time_ms", probe_time_ms)
-                        .add_measurement("sort_time_ms", sort_time_ms)
+                        .add_measurement("probe_wall_time_ms", hit_times.wall_ms)
+                        .add_measurement("probe_prepare_time_ms", hit_times.prepare_ms)
+                        .add_measurement("probe_search_time_ms", hit_times.search_ms)
+                        .add_measurement("probe_restore_time_ms", hit_times.restore_ms)
                         .add_measurement("probe_miss_time_ms", probe_miss_time_ms)
+                        .add_measurement("probe_miss_wall_time_ms", miss_times.wall_ms)
+                        .add_measurement("probe_miss_prepare_time_ms", miss_times.prepare_ms)
+                        .add_measurement("probe_miss_search_time_ms", miss_times.search_ms)
+                        .add_measurement("probe_miss_restore_time_ms", miss_times.restore_ms)
+                        .add_measurement("deleted_keys_probe_time_ms", deleted_times.total_ms)
+                        .add_measurement("deleted_keys_probe_wall_time_ms", deleted_times.wall_ms)
+                        .add_measurement("deleted_keys_probe_prepare_time_ms", deleted_times.prepare_ms)
+                        .add_measurement("deleted_keys_probe_search_time_ms", deleted_times.search_ms)
+                        .add_measurement("deleted_keys_probe_restore_time_ms", deleted_times.restore_ms)
                         .add_measurement("successor_hits_probe_time_ms", successor_hits_probe_time_ms)
                         .add_measurement("successor_misses_probe_time_ms", successor_misses_probe_time_ms)
                         .add_measurement("index_layer_time_ms", index_layer_time_ms)

@@ -8,3 +8,31 @@ tuning_results/
 **/paper_sweep_results/
 **/flix_lsm_paper_*/
 /scripts/__pycache__/
+
+# Local experiments and paper preparation.
+/experiments/
+/paper/
+
+# Local documents, data, and images at any directory depth.
+*.md
+*.csv
+*.png
+*.svg
+*.pdf
+
+# FliX local backups and build output.
+/FliX/**/comment_directory/
+/FliX/**/backup_long_versions_for_paper/
+/FliX/**/KeepOlderFiles/
+/FliX/**/KEEP_benchmarks_updates/
+/FliX/**/backup*/
+/FliX/build/*
+!/FliX/**/build/
+!/FliX/build/runscripts_experiments/
+!/FliX/build/runscripts_experiments/**
+!/FliX/build/sample_output/
+!/FliX/build/sample_output/**
+/FliX/**/bench_results/
+/FliX/**/build_gpulsmopt_*/
+/FliX/**/bench_b*/
+/FliX/**/updates.csv
