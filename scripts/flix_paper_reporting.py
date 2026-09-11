@@ -70,6 +70,8 @@ def load_runs(root, manifest):
             else:
                 rows = flix_rows(folder, case)
             frame = pd.DataFrame(rows)
+            if 'range_processing' not in frame:
+                frame['range_processing'] = 'aggregate_sum_unspecified'
             for key in ('family', 'backend', 'kind', 'batch_log'):
                 frame[key] = case[key]
             frame['repetition'] = rep
@@ -94,7 +96,7 @@ def summarize(root, no_plots=False):
     out = root / 'summary'; out.mkdir(exist_ok=True)
     raw.to_csv(out / 'measurements.csv', index=False)
     keys = ['family', 'kind', 'batch_log', 'system', 'operation', 'scenario',
-            'state', 'resident_elements', 'items']
+            'state', 'resident_elements', 'items', 'range_processing']
     states = raw.groupby(keys, dropna=False, sort=True).agg(
         repetitions=('time_ms', 'count'), mean_ms=('time_ms', 'mean'),
         median_ms=('time_ms', 'median'), stddev_ms=('time_ms', 'std'),
@@ -104,7 +106,8 @@ def summarize(root, no_plots=False):
     if not states['repetitions'].eq(manifest['settings']['repetitions']).all():
         raise RuntimeError('Unequal or duplicated repetition coverage')
     states.to_csv(out / 'states.csv', index=False)
-    trace_keys = ['family', 'kind', 'batch_log', 'system', 'operation', 'scenario']
+    trace_keys = ['family', 'kind', 'batch_log', 'system', 'operation', 'scenario',
+                  'range_processing']
     totals = raw.groupby(trace_keys + ['repetition'], sort=True).agg(
         total_ms=('time_ms', 'sum'), items=('items', 'sum'), states=('state', 'count'),
         first_resident=('resident_elements', 'min'), last_resident=('resident_elements', 'max')).reset_index()
@@ -128,9 +131,13 @@ def summarize(root, no_plots=False):
         'exclude reserved keys. All backends build the first batch; subsequent insertions grow '
         'the same prefixes. Deletes remove those batches in reverse order. Values retain their '
         'original insertion ordinals. Sorted array sorts and merges insertion batches, '
-        'and filters records against sorted deletion keys. Common ranges are sums, not '
-        'materialized range enumeration; GPULSMOpt, LSMu, GPU B-tree, FliX, and the '
-        'sorted array participate. Preparation and lazy range workspace allocation '
+        'and filters records against sorted deletion keys. Range rows tagged '
+        'enumerate_records_sum_v1 visit every visible match and reduce values instead '
+        'of writing the records. GPULSMOpt, LSMu, GPU B-tree, FliX, and sorted array '
+        'participate. Output-list allocation, offsets, ordering, and record writes are '
+        'not measured by this sum-output variant. Historical rows without that tag '
+        'have unspecified aggregation processing and must remain separate. '
+        'Preparation and lazy range workspace allocation '
         'are inside the timed calls. Dynamic ranges also run after deletions. '
         'Live-key overwrites and explicit LSM cleanup are outside this common matrix.\n\n'
         'Lookup starts with unsorted device inputs and ends with device answers in original '
@@ -169,8 +176,14 @@ def plot_states(frame, out):
                               points['maximum_ms']-points['median_ms']],
                         marker='o', markersize=3, capsize=2, color=COLORS[system], label=system)
         layout = f', public batch log {batch}' if family == 'paper' else ''
+        label = operation
+        if (operation.startswith('range_sum') and
+                group['range_processing'].eq('enumerate_records_sum_v1').all()):
+            label = 'range enumeration (sum output)'
+            if operation.endswith('_after_delete'):
+                label += ' after deletion'
         ax.set(xlabel='Workload state', ylabel='Complete operation time (ms)',
-               title=f'{family}: {kind}{layout}, {operation}, {scenario}')
+               title=f'{family}: {kind}{layout}, {label}, {scenario}')
         ax.set_yscale('log'); ax.grid(alpha=.2); ax.legend(fontsize=8)
         fig.tight_layout()
         fig.savefig(graphs / ('_'.join(map(str, identity)) + '.png'), dpi=160)

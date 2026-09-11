@@ -3,6 +3,7 @@
 
 #include "benchmark_lookup.cuh"
 #include "benchmark_inputs.cuh"
+#include "benchmark_range.cuh"
 #include <thrust/sort.h>
 #include <thrust/system/cuda/execution_policy.h>
 
@@ -58,6 +59,9 @@ constexpr bool paper_supports_ranges() {
         return Index::can_range_lookup != operation_support::none;
 }
 constexpr bool paper_range = paper_supports_ranges<selected_paper_backend>();
+static_assert(!paper_range ||
+              flix_benchmark::enumerates_range_records<selected_paper_backend>::value,
+              "Paper ranges must enumerate records before summing values");
 
 template <typename Index>
 void paper_build(Index &index, const key32 *keys, size_t size, size_t capacity,

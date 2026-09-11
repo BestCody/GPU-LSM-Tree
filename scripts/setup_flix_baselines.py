@@ -119,6 +119,9 @@ def verify_output(folder, backend, rounds, sanitized):
             rows.extend(csv.DictReader(stream, skipinitialspace=True))
     if not rows:
         raise RuntimeError("Harness produced no result rows")
+    if any(row.get("EXPERIMENT") == "range_query" and
+           row.get("range_processing") != "enumerate_records_sum_v1" for row in rows):
+        raise RuntimeError("Range row is missing the record-enumeration contract")
     update_rows = [row for row in rows if row.get("step", "").strip()]
     states = sorted({int(row["step"]) for row in update_rows})
     if states != list(range(2 * rounds + 1)):

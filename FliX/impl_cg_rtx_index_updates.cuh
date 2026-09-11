@@ -25,7 +25,7 @@
 // #include "coarse_granular_lookups.cuh"
 #include "coarse_granular_lookups_tile.cuh"
 #include "coarse_granular_lookups_tile_bulk.cuh"
-#include "coarse_granular_range_queries.cuh"
+#include "coarse_granular_range_enumeration.cuh"
 // #include "coarse_granular_lookups_tile.cuh"
 
 #include "coarse_granular_combined_updates.cuh"
@@ -1448,7 +1448,6 @@ private:
     cuda_buffer<smallsize> reuse_list_buffer;
 
     cuda_buffer<smallsize> bucket_values_buffer;
-    cuda_buffer<smallsize> range_query_sums_buffer;
 
     // add a buffer for static tree
     //  Meta data
@@ -1485,6 +1484,7 @@ public:
     static constexpr operation_support can_lookup = operation_support::async;
     static constexpr operation_support can_multi_lookup = operation_support::none;
     static constexpr operation_support can_range_lookup = operation_support::async;
+    static constexpr bool range_enumerates_records = true;
     static constexpr operation_support can_update = operation_support::async;
     static constexpr operation_support can_successor = operation_support::async;
 
@@ -1639,8 +1639,7 @@ public:
         const size_t nodes_bytes = static_cast<size_t>(total_nodes_used_from_AR) * node_stride;
 
         // Totals (preserve original: exclude AS buffer from returned total)
-        const size_t sum_all = pairs_sz + nodes_bytes + maxvals_sz + launch_params_sz
-                             + range_query_sums_buffer.size_in_bytes();
+        const size_t sum_all = pairs_sz + nodes_bytes + maxvals_sz + launch_params_sz;
         const size_t sum_with_as = sum_all + as_sz;
 
         //  snapshot
@@ -2662,20 +2661,10 @@ public:
             throw std::overflow_error("FliX range batch exceeds 32-bit query indices");
 
         const smallsize threads_per_block = MAXBLOCKSIZE / DIV_FACTOR;
-        const smallsize bucket_blocks = SDIV(
-            partition_count_with_overflow * TILE_SIZE, threads_per_block);
-        if (range_query_sums_buffer.num_elements != partition_count_with_overflow)
-            range_query_sums_buffer.resize(partition_count_with_overflow);
-
-        // Upstream FliX recomputes sums for every range call.
-        precompute_bucket_offset_sums_kernel<key_type>
-            <<<bucket_blocks, threads_per_block, 0, stream>>>(
-                launch_params_buffer.ptr(), range_query_sums_buffer.ptr());
-        C2EX
-        lookup_kernel_tile_ordered_rq_sums<key_type>
+        flix_range::enumerate_sum_kernel<key_type>
             <<<SDIV(size, threads_per_block), threads_per_block, 0, stream>>>(
-                launch_params_buffer.ptr(), lower, upper,
-                range_query_sums_buffer.ptr(), result, static_cast<smallsize>(size));
+                launch_params_buffer.ptr(), lower, upper, result,
+                static_cast<smallsize>(size));
         C2EX
     }
 
@@ -2723,7 +2712,6 @@ public:
         copy_buffer.free();
         tree_buffer.free();
         bucket_values_buffer.free();
-        range_query_sums_buffer.free();
         // copy_update_list.free();
         // copy_offset_list.free();
     }

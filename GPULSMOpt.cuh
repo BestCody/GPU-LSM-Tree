@@ -1229,10 +1229,11 @@ __global__ void materialize_range_hot_winners_kernel(
   rows[index] = transform(token);
 }
 
-struct SumRowsAggregate {
+// The enumeration visits records before this output sink.
+struct RangeSumSink {
   using State = unsigned long long;
   __device__ static State identity() { return 0ull; }
-  __device__ static State consume(State state, const Row &row) {
+  __device__ static State emit(State state, const Row &row) {
     return state + row.value;
   }
   __device__ State operator()(State a, State b) const { return a + b; }
@@ -1247,14 +1248,14 @@ __device__ __forceinline__ std::uint32_t section_range_row_count(
 }
 
 // Scan base rows against the resolved newer run.
-template <class Aggregate>
-__device__ __forceinline__ typename Aggregate::State
-cooperative_sum_visible_section(
+template <class Sink>
+__device__ __forceinline__ typename Sink::State
+enumerate_visible_section(
     std::uint32_t low, std::uint32_t high,
     const Row *current, std::uint32_t current_count,
     ResidentRows arena, Descriptor base,
     std::uint32_t group_lane, std::uint32_t group_size) {
-  typename Aggregate::State result = Aggregate::identity();
+  typename Sink::State result = Sink::identity();
   const std::uint32_t update_begin =
       lower_bound_rows(current, current_count, low);
   const std::uint32_t update_end =
@@ -1263,7 +1264,7 @@ cooperative_sum_visible_section(
        index < update_end; index += group_size) {
     const Row row = current[index];
     if ((row.flags & kTombstone) == 0u)
-      result = Aggregate::consume(result, row);
+      result = Sink::emit(result, row);
   }
 
   const ResidentRows rows = arena + base.offset();
@@ -1287,7 +1288,7 @@ cooperative_sum_visible_section(
     const bool covered =
         update < update_end && current[update].key == row.key;
     if (!covered && (row.flags & kTombstone) == 0u)
-      result = Aggregate::consume(result, row);
+      result = Sink::emit(result, row);
   }
   return result;
 }
@@ -1302,7 +1303,7 @@ struct RangeTileSource {
   }
 };
 
-template <class Aggregate>
+template <class Sink>
 __device__ __forceinline__ void enumerate_range_source_tiles(
     std::uint32_t fragment_count, RangeTileSource source,
     const Row *newer, std::uint32_t newer_count, bool hide_with_newer,
@@ -1314,7 +1315,7 @@ __device__ __forceinline__ void enumerate_range_source_tiles(
     std::uint32_t wave_count,
     std::uint32_t *union_begins, std::uint32_t *union_ends,
     std::uint32_t *union_count, Row *row_tile,
-    typename Aggregate::State *fragment_sums) {
+    typename Sink::State *fragment_sums) {
   if (threadIdx.x == 0u) {
     std::uint32_t count = 0u;
     for (std::uint32_t fragment = 0u; fragment < fragment_count;
@@ -1375,22 +1376,22 @@ __device__ __forceinline__ void enumerate_range_source_tiles(
               max(source_begins[fragment], tile_begin);
           const std::uint32_t consume_end =
               min(source_ends[fragment], tile_end);
-          typename Aggregate::State local = Aggregate::identity();
+          typename Sink::State local = Sink::identity();
           for (std::uint32_t position = consume_begin + group_lane;
                position < consume_end; position += width) {
             const Row row = row_tile[position - tile_begin];
             if ((row.flags & kTombstone) == 0u)
-              local = Aggregate::consume(local, row);
+              local = Sink::emit(local, row);
           }
           const std::uint32_t warp_slot = slot & 31u;
           const unsigned mask = width == 32u ? 0xffffffffu
               : ((1u << width) - 1u) << warp_slot;
           for (std::uint32_t offset = width >> 1u; offset;
                offset >>= 1u)
-            local = Aggregate{}(local, __shfl_down_sync(
+            local = Sink{}(local, __shfl_down_sync(
                 mask, local, offset, width));
           if (!group_lane)
-            fragment_sums[fragment] = Aggregate{}(
+            fragment_sums[fragment] = Sink{}(
                 fragment_sums[fragment], local);
         }
       }
@@ -1642,7 +1643,7 @@ __global__ void emit_section_range_tasks_kernel(
   }
 }
 
-template <class Aggregate>
+template <class Sink>
 __global__ void cooperative_section_owned_range_kernel(
     const SectionRangeFragment *fragments,
     const SectionRangeTask *tasks,
@@ -1652,7 +1653,7 @@ __global__ void cooperative_section_owned_range_kernel(
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches,
-    typename Aggregate::State *aggregate_partials,
+    typename Sink::State *aggregate_partials,
     const std::uint64_t *query_occupied_level_mask) {
   constexpr std::uint32_t kCapacity = kRangeOnChipNewerRows;
   using BlockScan = cub::BlockScan<std::uint32_t, kSectionRangeThreads>;
@@ -1668,7 +1669,7 @@ __global__ void cooperative_section_owned_range_kernel(
   __shared__ std::uint32_t foundation_cell_ranks[kFoundationCells + 1u];
   __shared__ RangeFragmentBounds fragment_bounds[kSectionTaskFragments];
   __shared__ std::uint32_t fragment_work[kSectionTaskFragments];
-  __shared__ typename Aggregate::State fragment_sums[kSectionTaskFragments];
+  __shared__ typename Sink::State fragment_sums[kSectionTaskFragments];
   __shared__ std::uint32_t source_begins[kSectionTaskFragments];
   __shared__ std::uint32_t source_ends[kSectionTaskFragments];
   __shared__ std::uint32_t union_begins[kSectionTaskFragments];
@@ -1938,7 +1939,7 @@ __global__ void cooperative_section_owned_range_kernel(
       }
       fragment_bounds[local] = bounds;
       fragment_work[local] = bounds.update_end - bounds.update_begin + base_work;
-      fragment_sums[local] = Aggregate::identity();
+      fragment_sums[local] = Sink::identity();
     }
     __syncthreads();
 
@@ -1973,7 +1974,7 @@ __global__ void cooperative_section_owned_range_kernel(
       source_ends[local] = fragment_bounds[local].update_end;
     }
     __syncthreads();
-    enumerate_range_source_tiles<Aggregate>(
+    enumerate_range_source_tiles<Sink>(
         fragment_count,
         RangeTileSource{newer, {}, true}, newer, newer_count, false,
         source_begins, source_ends, fragment_slots, fragment_widths,
@@ -1988,7 +1989,7 @@ __global__ void cooperative_section_owned_range_kernel(
         source_ends[local] = fragment_bounds[local].base_end;
       }
       __syncthreads();
-      enumerate_range_source_tiles<Aggregate>(
+      enumerate_range_source_tiles<Sink>(
           fragment_count,
           RangeTileSource{nullptr, rows, false}, newer, newer_count, true,
           source_begins, source_ends, fragment_slots, fragment_widths,
@@ -2005,7 +2006,7 @@ __global__ void cooperative_section_owned_range_kernel(
   }
 }
 
-template <class Aggregate>
+template <class Sink>
 __global__ void warp_range_fragment_kernel(
     const RangeFragment *fragments, std::uint32_t fragment_count,
     const std::uint32_t *device_fragment_count,
@@ -2017,7 +2018,7 @@ __global__ void warp_range_fragment_kernel(
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches,
-    typename Aggregate::State *aggregate_partials,
+    typename Sink::State *aggregate_partials,
     const std::uint64_t *query_occupied_level_mask) {
   constexpr std::uint32_t kWarps = 4u;
   constexpr std::uint32_t kUpdateCapacity = 128u;
@@ -2070,12 +2071,12 @@ __global__ void warp_range_fragment_kernel(
   if (hot_descriptor.count()) {
     const Descriptor foundation = foundation_level < active_levels
         ? descriptors[descriptor_index(q, foundation_level)] : Descriptor{};
-    unsigned long long value = cooperative_sum_visible_section<Aggregate>(
+    unsigned long long value = enumerate_visible_section<Sink>(
         low_suffix, high_suffix, hot_rows + hot_descriptor.offset(),
         hot_descriptor.count(), arena, foundation,
         lane, 32u);
     for (std::uint32_t offset = 16u; offset; offset >>= 1u)
-      value = Aggregate{}(value,
+      value = Sink{}(value,
           __shfl_down_sync(full_mask, value, offset));
     if (lane == 0u) aggregate_partials[fragment_index] = value;
     return;
@@ -2231,9 +2232,9 @@ __global__ void warp_range_fragment_kernel(
   const std::uint32_t worker_width = work <= kRangeThreadWork ? 1u
       : work <= kRangeSubgroupWork ? 8u : 32u;
   const unsigned worker_mask = __ballot_sync(full_mask, lane < worker_width);
-  typename Aggregate::State local = Aggregate::identity();
+  typename Sink::State local = Sink::identity();
   if (lane < worker_width) {
-    local = cooperative_sum_visible_section<Aggregate>(
+    local = enumerate_visible_section<Sink>(
         low_suffix, high_suffix, current, current_count, arena,
         foundation, lane, worker_width);
     for (std::uint32_t offset = worker_width / 2u; offset; offset >>= 1u)
@@ -12517,7 +12518,7 @@ inline std::uint32_t roster_capacity(
   return static_cast<std::uint32_t>(capacity);
 }
 
-__global__ void reduce_range_slices(
+__global__ void sum_enumerated_range_slices(
     OutputView output, const RangeSlice *slices,
     std::uint32_t query_count, std::uint32_t *sums) {
   using BlockReduce = cub::BlockReduce<std::uint32_t, kThreads>;
@@ -13885,7 +13886,7 @@ private:
           state.batch_counts.data(), resident_rows(), roots.data(), stream);
       if (result.errors || result.receipt.status)
         throw std::runtime_error("rank-roster range enumeration failed");
-      gpulsm_sparse::rank_range::reduce_range_slices<<<
+      gpulsm_sparse::rank_range::sum_enumerated_range_slices<<<
           queries.count, gpulsm_sparse::kThreads, 0, stream>>>(
           output.view(result.tasks), output.slices_.data(), queries.count,
           sums);
@@ -14473,7 +14474,7 @@ private:
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
         gpulsmopt2_detail::cooperative_section_owned_range_kernel<
-            gpulsmopt2_detail::SumRowsAggregate>,
+            gpulsmopt2_detail::RangeSumSink>,
         gpulsmopt2_detail::kSectionRangeThreads, 0u));
     range_section_blocks_ = static_cast<std::uint32_t>(
         std::max(1, blocks_per_sm) * capabilities.multiprocessors);
@@ -16145,7 +16146,7 @@ private:
           std::size_t{foundation} *
               gpulsmopt2_detail::kLocalRankEntries;
     gpulsmopt2_detail::cooperative_section_owned_range_kernel<
-        gpulsmopt2_detail::SumRowsAggregate>
+        gpulsmopt2_detail::RangeSumSink>
         <<<range_section_blocks_, gpulsmopt2_detail::kSectionRangeThreads,
            0, stream>>>(
             range_section_fragments_out_.data(),
@@ -16166,7 +16167,7 @@ private:
                               const DeviceRangeOutputBatch &batch,
                               cudaStream_t stream, bool hot_ready) {
     gpulsmopt2_detail::warp_range_fragment_kernel<
-        gpulsmopt2_detail::SumRowsAggregate>
+        gpulsmopt2_detail::RangeSumSink>
         <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
             range_fragments_.data(), fragment_count,
             range_fragment_offsets_.data() + query_count,

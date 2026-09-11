@@ -17,7 +17,8 @@ struct common_rows {
         : output(directory / "measurements.csv") {
         output << "system,protocol,operation,batch_log,state,resident_elements,"
                   "items,scenario,time_ms,wall_ms,prepare_ms,search_ms,restore_ms,"
-                  "index_bytes,input_sum,input_xor,checksum_sum,checksum_xor\n";
+                  "index_bytes,input_sum,input_xor,checksum_sum,checksum_xor,"
+                  "range_processing\n";
         output << std::setprecision(12);
     }
     void add(const char *operation, uint32_t state, uint32_t resident,
@@ -30,7 +31,8 @@ struct common_rows {
                << ',' << scenario << ',' << times.total_ms << ',' << times.wall_ms
                << ',' << times.prepare_ms << ',' << times.search_ms << ','
                << times.restore_ms << ',' << bytes << ',' << input[0] << ','
-               << input[1] << ',' << answer[0] << ',' << answer[1] << '\n';
+               << input[1] << ',' << answer[0] << ',' << answer[1] << ','
+               << flix_benchmark::range_processing<selected_paper_backend>() << '\n';
         output.flush();
         if (!output) throw std::runtime_error("Cannot write paper measurements");
     }
@@ -83,6 +85,8 @@ void run_common_impl(const options &configuration) {
                << ",\"live_overwrite\":false,\"explicit_cleanup\":false,"
                   "\"lookup_timing\":\"complete_unsorted_v1\","
                   "\"range_timing\":\"complete_unsorted_range_v1\","
+                  "\"range_processing\":\""
+               << flix_benchmark::range_processing<Index>() << "\","
                   "\"key_mapping\":\"paper_permutation_plus_2\","
                   "\"key_min\":2,\"key_max\":1073741825}\n";
     common_rows rows(configuration.output_directory);

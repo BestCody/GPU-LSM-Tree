@@ -178,11 +178,23 @@ insertion ordinals. Every point-lookup answer is checked against that mapping.
 Deletes remove growth batches in reverse order, followed by checks of both
 deleted keys and surviving keys. Live-key overwrite semantics are not assumed.
 
-Common range sums run for GPULSMOpt, LSMu, GPU B-tree, FliX,
-and sorted array; their input and result checksums must
-agree. Dynamic range results are also checked after deletions. These are
-inclusive sums with the adapters' 32-bit output arithmetic, distinct from the
-historical range-enumeration experiment. The paper family's
+Common ranges enumerate visible records and sum their values in place of
+writing an output list. GPULSMOpt, LSMu, GPU B-tree, FliX, and sorted array
+participate; their input and result checksums must agree, including after
+deletions. Each query must visit every visible matching record; bucket sums
+and value-prefix shortcuts do not satisfy this contract. Bounds are inclusive
+and output arithmetic is modulo 2^32. Results carry the processing tag
+`enumerate_records_sum_v1`; the CSV operation names remain `range_sum` and
+`range_sum_after_delete`. Historical untagged results remain separate.
+
+GPULSMOpt's native range traversal already resolves versions and visits
+individual records. Its output sink reduces their values. Returning records
+can reuse that traversal, but needs per-query output sizing and offsets,
+full-key reconstruction from the region and suffix, and writes to output
+storage. Producing key-ordered lists also needs output ordering. Those costs
+are omitted by the sum-output experiment, so its timings do not establish
+the performance of a materialized range API. The sparse-record path already
+enumerates into temporary output before summing. The paper family's
 `--skip-ranges`, `--skip-deletions`, and
 `--skip-bulk` select subsets. Explicit LSM cleanup stays in the legacy family.
 
@@ -210,15 +222,15 @@ supports 32- and 64-bit keys and at most INT_MAX resident records or requests.
 Historical static-only sorted-array results remain unchanged and must not be
 combined with the new dynamic update results.
 
-FliX range kernels are imported unchanged from `src/coarse_granular_range_queries.cuh`
-in FliX-Full commit `4acb4b5eab91851e6d29b0015752f23cd6af187b`; the source hash
-is recorded in `dependencies.json`. The local adapter connects the upstream
-precomputation and query launches, advertises range support, and owns the sum
-workspace. Each range API call recomputes bucket sums, including after updates.
-The complete call is timed from unsorted GPU bounds to answers in input order,
-including bucket-sum preparation and lazy workspace allocation. The workspace
-uses four bytes per bucket, appears in adapter memory snapshots, and is freed
-on destruction. SlabHash and WarpCore have no implemented range-sum method.
+The imported `coarse_granular_range_queries.cuh` remains unchanged from
+FliX-Full commit `4acb4b5eab91851e6d29b0015752f23cd6af187b`, with its source hash
+in `dependencies.json`. The active adapter uses the local
+`coarse_granular_range_enumeration.cuh`, which reuses the upstream node helpers
+and scans all matching records, including fully covered interior buckets.
+The visitor sends each key/value pair to an output sink; the measured sink
+sums values. It no longer precomputes bucket sums or allocates a sum buffer.
+The complete call is timed from unsorted GPU bounds to answers in input order.
+SlabHash and WarpCore have no implemented range method.
 
 Both families use the complete unsorted lookup wrapper. GPU inputs are ready
 before timing; required sorting, workspace growth, searching, and answer-order

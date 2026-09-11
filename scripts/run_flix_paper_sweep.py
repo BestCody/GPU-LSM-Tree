@@ -211,11 +211,15 @@ def validate_case(folder, case, args, sanitized=False):
         raise RuntimeError("Range capability differs between adapter and runner")
     if capabilities.get('range_timing') != 'complete_unsorted_range_v1':
         raise RuntimeError("Incorrect range timing contract")
+    if capabilities['range'] and capabilities.get('range_processing') != 'enumerate_records_sum_v1':
+        raise RuntimeError("Range processing must enumerate records before summing")
     if any(counts.get(op, 0) != count for op, count in expected_counts.items()):
         raise RuntimeError(f"Incomplete lookup/range states: {counts}; expected {expected_counts}")
     identities = set(); signature = []
     for row in rows:
         if row["protocol"] != "common_initialized_v1": raise RuntimeError("Incorrect protocol")
+        if row["operation"].startswith("range_sum") and row.get("range_processing") != 'enumerate_records_sum_v1':
+            raise RuntimeError("Range row is missing the record-enumeration contract")
         key = tuple(row[k] for k in ("operation", "state", "resident_elements", "items", "scenario"))
         if key in identities: raise RuntimeError("Duplicate operation row")
         identities.add(key)

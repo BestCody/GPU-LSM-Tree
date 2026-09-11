@@ -14,6 +14,7 @@
 #include "result_collector.h"
 #include "utilities.cuh"
 #include "benchmark_inputs.cuh"
+#include "benchmark_range.cuh"
 
 #if !defined(GPULSMOPT)
 #include <nvtx3/nvtx3.hpp>
@@ -610,6 +611,7 @@ void benchmark_range_query(
 
             rc::auto_commit_result(rc)
                 .add_parameter("EXPERIMENT", "range_query")
+                .add_parameter("range_processing", flix_benchmark::range_processing<index_type>())
                 .add_parameter("index_type", index_type::short_description())
                 .add_parameter("run", run)
                 .add_parameter("key_bits", sizeof(key_type) * 8)

@@ -154,6 +154,7 @@ public:
   static constexpr operation_support can_multi_lookup = operation_support::none;
   static constexpr operation_support can_range_lookup =
       operation_support::async;
+  static constexpr bool range_enumerates_records = true;
   static constexpr operation_support can_insert = operation_support::async;
   static constexpr operation_support can_delete = operation_support::async;
   static constexpr operation_support can_update = operation_support::async;

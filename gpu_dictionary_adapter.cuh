@@ -41,6 +41,7 @@ struct DeviceSuccessorBatch {
   std::uint32_t* out_keys = nullptr;
 };
 
+// Enumerate visible matches and sum their values.
 struct DeviceRangeOutputBatch {
   const std::uint32_t* lo = nullptr;
   const std::uint32_t* hi = nullptr;
