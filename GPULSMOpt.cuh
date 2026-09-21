@@ -72,6 +72,12 @@ constexpr std::uint32_t kLookupTileRows = kThreads * kLookupTileItems;
 constexpr std::uint32_t kLookupTileBins = 256u;
 constexpr std::uint32_t kLookupTileLanes = 8u;
 constexpr std::uint32_t kMaximumLookupWindowTiles = 4096u;
+constexpr std::uint32_t kSuccessorRegionChunk = kThreads;
+constexpr std::uint32_t kSuccessorRegionChunks =
+    kQuotients / kSuccessorRegionChunk;
+constexpr std::uint32_t kSuccessorSharedPendingQueries =
+    kQuotients * 4u;
+static_assert(kQuotients % kSuccessorRegionChunk == 0u);
 // Tile large batches over one run without pending rows.
 constexpr std::size_t kMinimumTileLookupQueries = std::size_t{1} << 24u;
 constexpr std::size_t kMinimumTileLookupResidentRows = std::size_t{1} << 24u;
@@ -2716,7 +2722,7 @@ __device__ __forceinline__ void resolve_canonical_epoch_active_job(
   std::uint32_t cell_prefix = 0u, ignored = 0u;
   ActiveEpochBlockScan(scan_storage).ExclusiveSum(
       cell_count, cell_prefix, ignored);
-  if (threadIdx.x < kFoundationCells)
+  if (cell_ranks && threadIdx.x < kFoundationCells)
     cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
         static_cast<std::uint16_t>(cell_prefix);
 }
@@ -2888,7 +2894,7 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
     std::uint32_t cell_prefix = 0u, ignored = 0u;
     BlockScan(scan_storage).ExclusiveSum(
         cell_count, cell_prefix, ignored);
-    if (threadIdx.x < kFoundationCells)
+    if (cell_ranks && threadIdx.x < kFoundationCells)
       cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
           static_cast<std::uint16_t>(cell_prefix);
     __syncthreads();
@@ -4985,105 +4991,222 @@ __global__ void tqrj_hash_lookup_kernel(
   work.run(access);
 }
 
-__device__ bool first_visible_in_quotient(
+__device__ __forceinline__ bool first_resident_at_or_after(
+    std::uint32_t q, std::uint32_t lower_suffix, std::uint32_t level,
+    ResidentRows arena, const Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, Row &candidate) {
+  const Descriptor rows = descriptors[descriptor_index(q, level)];
+  if (!rows.count()) return false;
+  const std::uint16_t *ranks = cell_ranks +
+      std::size_t{level} * kLocalRankEntries +
+      std::size_t{q} * kFoundationCells;
+  const std::uint32_t first_cell = lower_suffix / kFoundationCellKeys;
+  std::uint32_t begin = ranks[first_cell];
+  std::uint32_t end = first_cell + 1u < kFoundationCells
+      ? ranks[first_cell + 1u] : rows.count();
+  const std::uint32_t local = lower_bound_rows(
+      arena + rows.offset() + begin, end - begin, lower_suffix);
+  if (local < end - begin) {
+    candidate = arena[rows.offset() + begin + local];
+    return true;
+  }
+  if (end < rows.count()) {
+    candidate = arena[rows.offset() + end];
+    return true;
+  }
+  return false;
+}
+
+__device__ __forceinline__ bool find_resident_successor_version(
+    std::uint32_t q, std::uint32_t suffix, std::uint64_t occupied_levels,
+    ResidentRows arena, const Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, Row &winner) {
+  while (occupied_levels) {
+    const std::uint32_t level =
+        static_cast<std::uint32_t>(__ffsll(occupied_levels) - 1);
+    occupied_levels &= occupied_levels - 1u;
+    const Descriptor rows = descriptors[descriptor_index(q, level)];
+    if (!rows.count()) continue;
+    const std::uint32_t cell = suffix / kFoundationCellKeys;
+    const std::uint16_t *ranks = cell_ranks +
+        std::size_t{level} * kLocalRankEntries +
+        std::size_t{q} * kFoundationCells;
+    const std::uint32_t begin = ranks[cell];
+    const std::uint32_t end = cell + 1u < kFoundationCells
+        ? ranks[cell + 1u] : rows.count();
+    if (find_unique_point_row(
+            arena + rows.offset() + begin, end - begin, suffix, winner))
+      return true;
+  }
+  return false;
+}
+
+__device__ __forceinline__ bool find_raw_successor_version(
+    std::uint32_t q, std::uint32_t suffix,
+    const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
+    const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
+    std::uint32_t pending_batches, Row &winner) {
+  for (int batch = static_cast<int>(pending_batches) - 1;
+       batch >= 0; --batch) {
+    const std::uint32_t slot = static_cast<std::uint32_t>(batch);
+    const std::size_t offset =
+        std::size_t{slot} * (kQuotients + 1u) + q;
+    const std::uint32_t begin = raw_offsets[offset];
+    const std::uint32_t end = raw_offsets[offset + 1u];
+    bool found = false;
+    std::uint32_t newest = 0u;
+    for (std::uint32_t local = begin; local < end; ++local) {
+      const std::uint32_t record = slot * batch_stride + local;
+      if (key_suffix(raw_keys[record]) != suffix) continue;
+      const RawPayload payload = raw_payloads[record];
+      const std::uint32_t age = raw_position(payload);
+      if (!found || age > newest) {
+        winner = raw_row(raw_keys[record], payload);
+        newest = age;
+        found = true;
+      }
+    }
+    if (found) return true;
+  }
+  return false;
+}
+
+__device__ __forceinline__ bool first_visible_in_quotient(
     std::uint32_t q, std::uint32_t lower,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, ResidentRows arena,
-    const Descriptor *descriptors, std::uint32_t active_levels,
-    std::uint64_t occupied_levels,
+    std::uint32_t pending_batches, const Row *prepared_pending_rows,
+    const std::uint32_t *prepared_pending_offsets,
+    const std::uint32_t *prepared_pending_counts,
+    ResidentRows arena, const Descriptor *descriptors,
+    const std::uint16_t *cell_ranks, std::uint64_t occupied_levels,
     std::uint32_t &result) {
-  const std::uint32_t lower_suffix = key_suffix(lower);
-  std::uint32_t raw_begin[kBatchesPerEpoch]{}, raw_end[kBatchesPerEpoch]{};
-  for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
-    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
-    raw_begin[batch] = raw_offsets[oi];
-    raw_end[batch] = raw_offsets[oi + 1u];
-  }
-  std::uint32_t class_position[kMaximumLevels]{};
-  std::uint32_t class_end[kMaximumLevels]{};
-  for (std::uint32_t level = 0u; level < active_levels; ++level) {
-    if (!level_is_occupied(occupied_levels, level)) continue;
-    const Descriptor section = descriptors[descriptor_index(q, level)];
-    class_position[level] = lower_bound_rows(
-        arena + section.offset(), section.count(), lower_suffix);
-    class_end[level] = section.count();
-  }
-  std::uint32_t previous{};
-  bool have_previous = false;
-  while (true) {
+  std::uint32_t lower_suffix = key_suffix(lower);
+  for (;;) {
     std::uint32_t minimum = kInvalid;
     bool found = false;
-    for (std::uint32_t batch = 0u; batch < pending_batches; ++batch)
-      for (std::uint32_t position = raw_begin[batch]; position < raw_end[batch];
-           ++position) {
-        const std::uint32_t key =
-            key_suffix(raw_keys[batch * batch_stride + position]);
-        if (key >= lower_suffix && (!have_previous || key > previous) &&
-            (!found || key < minimum)) {
-          minimum = key;
-          found = true;
+
+    if (prepared_pending_rows) {
+      const std::uint32_t begin = prepared_pending_offsets[q];
+      const std::uint32_t count = prepared_pending_counts[q];
+      const std::uint32_t local = lower_bound_rows(
+          prepared_pending_rows + begin, count, lower_suffix);
+      if (local < count) {
+        minimum = prepared_pending_rows[begin + local].key;
+        found = true;
+      }
+    } else {
+      for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
+        const std::size_t offset =
+            std::size_t{batch} * (kQuotients + 1u) + q;
+        const std::uint32_t begin = raw_offsets[offset];
+        const std::uint32_t end = raw_offsets[offset + 1u];
+        for (std::uint32_t local = begin; local < end; ++local) {
+          const std::uint32_t suffix = key_suffix(
+              raw_keys[batch * batch_stride + local]);
+          if (suffix >= lower_suffix && (!found || suffix < minimum)) {
+            minimum = suffix;
+            found = true;
+          }
         }
       }
-    for (std::uint32_t level = 0u; level < active_levels; ++level)
-      if (level_is_occupied(occupied_levels, level))
-      if (class_position[level] < class_end[level]) {
-        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-        const std::uint32_t key =
-            arena[descriptor.offset() + class_position[level]].key;
-        if (!found || key < minimum) {
-          minimum = key;
-          found = true;
-        }
+    }
+
+    std::uint64_t levels = occupied_levels;
+    while (levels) {
+      const std::uint32_t level =
+          static_cast<std::uint32_t>(__ffsll(levels) - 1);
+      levels &= levels - 1u;
+      Row candidate{};
+      if (first_resident_at_or_after(
+              q, lower_suffix, level, arena, descriptors,
+              cell_ranks, candidate) &&
+          (!found || candidate.key < minimum)) {
+        minimum = candidate.key;
+        found = true;
       }
+    }
     if (!found) return false;
 
     Row winner{};
     bool have_winner = false;
-    for (int batch = int(pending_batches) - 1; batch >= 0; --batch) {
-      const std::uint32_t batch_index = static_cast<std::uint32_t>(batch);
-      Row candidate{};
-      std::uint32_t newest_position{};
-      bool matched = false;
-      for (std::uint32_t position = raw_begin[batch_index];
-           position < raw_end[batch_index]; ++position) {
-        const RawAssignment item = load_raw_assignment(
-            raw_keys, raw_payloads,
-            batch_index * batch_stride + position);
-        const std::uint32_t item_position = raw_position(item);
-        if (key_suffix(item.key) == minimum &&
-            (!matched || item_position > newest_position)) {
-          candidate = raw_row(item);
-          newest_position = item_position;
-          matched = true;
-        }
+    if (prepared_pending_rows) {
+      const std::uint32_t begin = prepared_pending_offsets[q];
+      const std::uint32_t count = prepared_pending_counts[q];
+      const std::uint32_t local = lower_bound_rows(
+          prepared_pending_rows + begin, count, minimum);
+      if (local < count && prepared_pending_rows[begin + local].key == minimum) {
+        winner = prepared_pending_rows[begin + local];
+        have_winner = true;
       }
-      if (!have_winner && matched) { winner = candidate; have_winner = true; }
+    } else {
+      have_winner = find_raw_successor_version(
+          q, minimum, raw_keys, raw_payloads, raw_offsets,
+          batch_stride, pending_batches, winner);
     }
     if (!have_winner)
-      for (std::uint32_t level = 0u; level < active_levels; ++level) {
-        if (!level_is_occupied(occupied_levels, level)) continue;
-        if (class_position[level] >= class_end[level]) continue;
-        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-        const Row row = arena[descriptor.offset() + class_position[level]];
-        if (!have_winner && row.key == minimum) {
-          winner = row; have_winner = true;
-        }
-      }
+      have_winner = find_resident_successor_version(
+          q, minimum, occupied_levels, arena, descriptors,
+          cell_ranks, winner);
     if (have_winner && (winner.flags & kTombstone) == 0u) {
-      result = full_key(q, winner.key);
+      result = full_key(q, minimum);
       return true;
     }
-    for (std::uint32_t level = 0u; level < active_levels; ++level)
-      if (level_is_occupied(occupied_levels, level))
-      if (class_position[level] < class_end[level]) {
-        const Descriptor descriptor = descriptors[descriptor_index(q, level)];
-        if (arena[descriptor.offset() + class_position[level]].key == minimum)
-          ++class_position[level];
-      }
-    previous = minimum;
-    have_previous = true;
+    if (minimum == std::numeric_limits<std::uint16_t>::max()) return false;
+    lower_suffix = minimum + 1u;
   }
+}
+
+__global__ void build_successor_region_index_kernel(
+    const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
+    const Descriptor *descriptors, const std::uint64_t *occupied_mask,
+    std::uint32_t *next_regions, std::uint32_t *chunk_first) {
+  __shared__ std::uint32_t occupied[kSuccessorRegionChunk];
+  const std::uint32_t q =
+      blockIdx.x * kSuccessorRegionChunk + threadIdx.x;
+  bool present = false;
+  for (std::uint32_t batch = 0u; batch < pending_batches && !present; ++batch) {
+    const std::size_t offset =
+        std::size_t{batch} * (kQuotients + 1u) + q;
+    present = raw_offsets[offset] != raw_offsets[offset + 1u];
+  }
+  std::uint64_t levels = __ldg(occupied_mask);
+  while (levels && !present) {
+    const std::uint32_t level =
+        static_cast<std::uint32_t>(__ffsll(levels) - 1);
+    levels &= levels - 1u;
+    present = descriptors[descriptor_index(q, level)].count() != 0u;
+  }
+  occupied[threadIdx.x] = present ? q : kInvalid;
+  __syncthreads();
+  if (threadIdx.x == 0u) {
+    std::uint32_t next = kInvalid;
+    for (std::uint32_t local = kSuccessorRegionChunk; local-- > 0u;) {
+      if (occupied[local] != kInvalid) next = occupied[local];
+      next_regions[blockIdx.x * kSuccessorRegionChunk + local] = next;
+    }
+    chunk_first[blockIdx.x] = next;
+  }
+}
+
+__global__ void build_successor_chunk_carry_kernel(
+    const std::uint32_t *chunk_first, std::uint32_t *chunk_carry,
+    std::uint32_t *next_regions) {
+  if (blockIdx.x || threadIdx.x) return;
+  std::uint32_t next = kInvalid;
+  for (std::uint32_t chunk = kSuccessorRegionChunks; chunk-- > 0u;) {
+    chunk_carry[chunk] = next;
+    if (chunk_first[chunk] != kInvalid) next = chunk_first[chunk];
+  }
+  next_regions[kQuotients] = kInvalid;
+}
+
+__global__ void finish_successor_region_index_kernel(
+    std::uint32_t *next_regions, const std::uint32_t *chunk_carry) {
+  const std::uint32_t q =
+      blockIdx.x * kSuccessorRegionChunk + threadIdx.x;
+  if (next_regions[q] == kInvalid)
+    next_regions[q] = chunk_carry[blockIdx.x];
 }
 
 __global__ void successor_with_pending_kernel(
@@ -5091,25 +5214,32 @@ __global__ void successor_with_pending_kernel(
     std::uint32_t *out_keys, const std::uint32_t *raw_keys,
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, ResidentRows arena,
-    const Descriptor *descriptors,
+    std::uint32_t pending_batches, const Row *prepared_pending_rows,
+    const std::uint32_t *prepared_pending_offsets,
+    const std::uint32_t *prepared_pending_counts,
+    ResidentRows arena, const Descriptor *descriptors,
+    const std::uint16_t *cell_ranks,
+    const std::uint32_t *next_regions,
     const std::uint64_t *query_occupied_level_mask) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  const DeviceManifestSnapshot manifest =
-      load_query_manifest(query_occupied_level_mask);
-  const std::uint32_t active_levels = manifest.active_levels;
-  const std::uint64_t occupied_levels = manifest.occupied_level_mask;
+  const std::uint64_t occupied_levels =
+      __ldg(query_occupied_level_mask);
   const std::uint32_t query = queries[i];
-  for (std::uint32_t q = query >> 16u; q < kQuotients; ++q) {
-    const std::uint32_t lower = q == (query >> 16u) ? query : q << 16u;
+  const std::uint32_t first_q = query >> 16u;
+  std::uint32_t q = next_regions[first_q];
+  while (q != kInvalid) {
+    const std::uint32_t lower = q == first_q ? query : q << 16u;
     std::uint32_t result{};
     if (first_visible_in_quotient(
             q, lower, raw_keys, raw_payloads, raw_offsets, batch_stride,
-            pending_batches, arena, descriptors, active_levels, occupied_levels, result)) {
+            pending_batches, prepared_pending_rows, prepared_pending_offsets,
+            prepared_pending_counts, arena, descriptors, cell_ranks,
+            occupied_levels, result)) {
       out_keys[i] = result;
       return;
     }
+    q = q + 1u < kQuotients ? next_regions[q + 1u] : kInvalid;
   }
   out_keys[i] = kInvalid;
 }
@@ -10330,7 +10460,7 @@ __device__ __forceinline__ bool first_original_successor_head(
     std::uint32_t lower, PendingReadView pending,
     gpulsmopt2_detail::ResidentRows arena,
     const gpulsmopt2_detail::Descriptor *descriptors,
-    std::uint32_t active_levels, std::uint64_t occupied_levels,
+    const std::uint16_t *cell_ranks, std::uint64_t occupied_levels,
     std::uint32_t &result) {
   const std::uint32_t first_section = lower >> 16u;
   for (std::uint32_t section = first_section;
@@ -10340,7 +10470,7 @@ __device__ __forceinline__ bool first_original_successor_head(
     if (gpulsmopt2_detail::first_visible_in_quotient(
             section, section_lower, pending.keys, pending.payloads,
             pending.offsets, pending.batch_capacity, pending.batch_count,
-            arena, descriptors, active_levels,
+            nullptr, nullptr, nullptr, arena, descriptors, cell_ranks,
             occupied_levels, result))
       return true;
   }
@@ -10595,15 +10725,13 @@ __global__ void sparse_successor_kernel(
   const std::uint32_t active = __ldg(active_manifest) & 1u;
   const DeviceSparseManifest &sparse = sparse_manifests[active];
   const std::uint64_t occupied_levels = __ldg(occupied_mask);
-  const std::uint32_t active_levels = occupied_levels
-      ? 64u - static_cast<std::uint32_t>(__clzll(occupied_levels)) : 0u;
   std::uint32_t lower = query.head4();
 
   for (;;) {
     std::uint32_t ordinary_head = 0u;
     const bool have_ordinary = first_original_successor_head(
         lower, pending, arena, descriptors,
-        active_levels, occupied_levels, ordinary_head);
+        cell_ranks, occupied_levels, ordinary_head);
     std::uint32_t exact_head = 0u;
     const bool have_exact =
         next_sparse_exact_head(lower, pending, sparse, exact_head);
@@ -12563,6 +12691,11 @@ public:
       return manifest_bytes + overlay_metadata_bytes + workspace_bytes +
           capsule_mapped_bytes;
     }
+
+    std::uint64_t physical_bytes_outside_static_workspace() const {
+      return overlay_metadata_bytes + workspace_bytes +
+          capsule_mapped_bytes;
+    }
   };
 
   explicit GPULSMOpt(const DictionaryConfig &config)
@@ -14102,24 +14235,54 @@ private:
     if (!batch.count) return;
     if (!batch.queries || !batch.out_keys)
       throw std::invalid_argument("invalid GPULSMOpt successor input");
-    if (batch.count > gpulsmopt2_detail::kMaximumOperationTile) {
-      for (std::size_t begin = 0u; begin < batch.count;
-           begin += gpulsmopt2_detail::kMaximumOperationTile) {
-        const std::size_t count = std::min(
-            batch.count - begin,
-            gpulsmopt2_detail::kMaximumOperationTile);
-        successor_locked(DeviceSuccessorBatch{
-            batch.queries + begin, count, batch.out_keys + begin}, stream);
-      }
-      return;
-    }
+    if (batch.count > std::numeric_limits<std::uint32_t>::max())
+      throw std::length_error("GPULSMOpt successor batch is too large");
     begin_operation(stream);
+
+    const bool prepare_pending = pending_records_ &&
+        batch.count >= gpulsmopt2_detail::kSuccessorSharedPendingQueries;
+    const gpulsmopt2_detail::Row *prepared_pending_rows = nullptr;
+    const std::uint32_t *prepared_pending_offsets = nullptr;
+    const std::uint32_t *prepared_pending_counts = nullptr;
+    if (prepare_pending) {
+      ensure_publication_capacity(pending_records_, stream);
+      launch_canonical_epoch_resolution(
+          stream, false, 0u, nullptr, false);
+      prepared_pending_rows = publication_rows_a_.data();
+      prepared_pending_offsets = foundation_source_offsets_.data();
+      prepared_pending_counts = foundation_section_output_counts_.data();
+    }
+
+    constexpr std::size_t region_words =
+        gpulsmopt2_detail::kQuotients + 1u;
+    constexpr std::size_t chunk_words =
+        gpulsmopt2_detail::kSuccessorRegionChunks;
+    constexpr std::size_t required_words = region_words + 2u * chunk_words;
+    if (operation_workspace_.size() < required_words * sizeof(std::uint32_t))
+      throw std::length_error("insufficient GPULSMOpt successor workspace");
+    auto *next_regions = reinterpret_cast<std::uint32_t *>(
+        operation_workspace_.data());
+    auto *chunk_first = next_regions + region_words;
+    auto *chunk_carry = chunk_first + chunk_words;
+    gpulsmopt2_detail::build_successor_region_index_kernel<<<
+        gpulsmopt2_detail::kSuccessorRegionChunks,
+        gpulsmopt2_detail::kSuccessorRegionChunk, 0, stream>>>(
+            raw_offsets_.data(), pending_batches_, descriptors_.data(),
+            query_occupied_level_mask_.data(), next_regions, chunk_first);
+    gpulsmopt2_detail::build_successor_chunk_carry_kernel<<<1, 1, 0, stream>>>(
+        chunk_first, chunk_carry, next_regions);
+    gpulsmopt2_detail::finish_successor_region_index_kernel<<<
+        gpulsmopt2_detail::kSuccessorRegionChunks,
+        gpulsmopt2_detail::kSuccessorRegionChunk, 0, stream>>>(
+            next_regions, chunk_carry);
     gpulsmopt2_detail::successor_with_pending_kernel<<<
         blocks(batch.count), gpulsmopt2_detail::kThreads, 0, stream>>>(
         batch.queries, static_cast<std::uint32_t>(batch.count), batch.out_keys,
         raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
-        static_cast<std::uint32_t>(batch_capacity_),
-        pending_batches_, resident_rows(), descriptors_.data(),
+        static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
+        prepared_pending_rows, prepared_pending_offsets,
+        prepared_pending_counts, resident_rows(), descriptors_.data(),
+        canonical_cell_ranks_.data(), next_regions,
         query_occupied_level_mask_.data());
     CUDA_CHECK(cudaGetLastError());
     end_operation(stream);
@@ -14173,61 +14336,24 @@ public:
     const std::size_t rollover_rank_bytes = canonical_rollover_epoch_ranks_
         ? canonical_rollover_epoch_ranks_->size() * sizeof(std::uint16_t)
         : 0u;
-    const std::size_t phase_backed_bytes = phase_workspace_.size();
-    const std::uint64_t restored = rollover_rank_bytes +
+    const std::uint64_t retained = rollover_rank_bytes +
         arena_key_flags_.size() * sizeof(std::uint32_t) +
         arena_values_.size() * sizeof(std::uint32_t) +
-        descriptors_.size() * sizeof(gpulsmopt2_detail::Descriptor) +
-        device_manifests_.size() *
-            sizeof(gpulsmopt2_detail::DeviceManifest) +
-        active_device_manifest_.size() * sizeof(std::uint32_t) +
-        query_occupied_level_mask_.size() * sizeof(std::uint64_t) +
-        sealed_device_command_.bytes() + sealed_device_receipt_.bytes() +
-        resident_plan_.size() *
-            sizeof(gpulsmopt2_detail::ResidentPublicationPlan) +
-        level_storage_spans_.size() *
-            sizeof(gpulsmopt2_detail::LevelStorageSpan) +
-        canonical_cell_ranks_.size() * sizeof(std::uint16_t) +
-        phase_backed_bytes + (sealed_workspace_ ? sealed_workspace_->bytes() : 0u) +
-        canonical_job_prefixes_.size() *
-            sizeof(gpulsmopt2_detail::CanonicalJobPrefix) +
-        canonical_next_job_.size() * sizeof(std::uint32_t) +
-        raw_payloads_.size() * sizeof(gpulsmopt2_detail::RawPayload) +
-        raw_offsets_.size() * sizeof(std::uint32_t) +
-        raw_signatures_.size() * sizeof(std::uint64_t) +
-        raw_epoch_signatures_.size() * sizeof(std::uint64_t) +
+        static_workspace_.size() + phase_workspace_.size() +
+        (sealed_workspace_ ? sealed_workspace_->bytes() : 0u) +
         publication_rows_a_.size() * sizeof(gpulsmopt2_detail::Row) +
-        (publication_keys_a_.size() +
-         publication_selected_count_.size()) * sizeof(std::uint32_t) +
-        (foundation_source_offsets_.size() +
-         foundation_section_output_counts_.size() +
-         local_epoch_overflow_flag_.size()) * sizeof(std::uint32_t) +
-        balanced_merge_raw_counts_.size() * sizeof(std::uint64_t) +
-        (resident_tile_job_counts_.size() +
-         resident_tile_job_offsets_.size()) * sizeof(std::uint32_t) +
-        resident_job_raw_reservations_.size() * sizeof(std::uint64_t) +
-        balanced_merge_jobs_.size() *
-            sizeof(gpulsmopt2_detail::BalancedMergeJob) +
+        publication_keys_a_.size() * sizeof(std::uint32_t) +
         resident_scan_temp_.size() * sizeof(std::uint8_t) +
-        admission_counts_.size() * sizeof(std::uint32_t) +
         admission_temp_.size() * sizeof(std::uint8_t) +
-        range_partials_.size() * sizeof(unsigned long long) +
-        range_reduction_completion_.size() * sizeof(std::uint32_t) +
-        range_fragment_total_.size() * sizeof(std::uint64_t) +
-        (range_hot_counts_.size() + range_hot_offsets_.size() +
-         range_hot_tokens_a_.size() + range_hot_tokens_b_.size()) *
+        (range_hot_tokens_a_.size() + range_hot_tokens_b_.size()) *
             sizeof(std::uint64_t) +
-        (range_hot_window_offsets_.size() +
-         range_hot_selected_count_.size()) * sizeof(std::uint32_t) +
-        range_hot_descriptors_.size() *
-            sizeof(gpulsmopt2_detail::Descriptor) +
         range_hot_temp_.size() * sizeof(std::uint8_t) +
         range_query_storage_.size() + range_fragment_storage_.size() +
-        range_section_storage_.size();
-    if (sparse.physical_bytes() >
-        std::numeric_limits<std::size_t>::max() - restored)
+        range_section_storage_.size() +
+        sparse.physical_bytes_outside_static_workspace();
+    if (retained > std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("GPULSMOpt memory accounting overflow");
-    return static_cast<std::size_t>(restored + sparse.physical_bytes());
+    return static_cast<std::size_t>(retained);
   }
 
 private:
@@ -15597,7 +15723,8 @@ private:
   void launch_canonical_epoch_resolution(
       cudaStream_t stream, bool materialize_resident,
       std::uint32_t destination_level,
-      std::uint16_t *rank_output = nullptr) {
+      std::uint16_t *rank_output = nullptr,
+      bool build_cell_ranks = true) {
     CUDA_CHECK(cudaMemsetAsync(
         publication_selected_count_.data(), 0, sizeof(std::uint32_t),
         stream));
@@ -15625,11 +15752,13 @@ private:
         foundation_section_output_counts_.data(),
         foundation_source_offsets_.data(),
         gpulsmopt2_detail::kQuotients + 1u, stream));
-    std::uint16_t *epoch_ranks = rank_output
+    std::uint16_t *epoch_ranks = build_cell_ranks
         ? rank_output
-        : canonical_cell_ranks_.data() +
-              std::size_t{destination_level} *
-                  gpulsmopt2_detail::kLocalRankEntries;
+            ? rank_output
+            : canonical_cell_ranks_.data() +
+                  std::size_t{destination_level} *
+                      gpulsmopt2_detail::kLocalRankEntries
+        : nullptr;
     const std::uint64_t resident_destination =
         level_begin(destination_level);
 

@@ -185,7 +185,7 @@ void hashtable_slab_count_kernel(
 }
 
 
-template <typename key_type_, uint8_t initial_load_percent = 100>
+template <typename key_type_, uint8_t initial_load_percent = 80>
 class hashtable_slab {
     static_assert(std::is_same<key_type_, key32>::value, "key must be 32 bits wide");
 
@@ -211,6 +211,7 @@ private:
     std::optional<table_type> wrapped_table;
 
     size_t num_buckets = 0;
+    size_t reserved_superblocks = 0;
 
 public:
     static constexpr const char* name = "hashtable_slab";
@@ -234,14 +235,14 @@ public:
     }
 
     size_t gpu_resident_bytes() {
-        cuda_buffer<bigsize> allocated_slab_count_buffer;
-        allocated_slab_count_buffer.alloc(1);
-        allocated_slab_count_buffer.zero();
-        hashtable_slab_count_kernel<<<SDIV(num_buckets * 32, threads_per_block), threads_per_block>>>(
-            allocated_slab_count_buffer.ptr(),
-            num_buckets,
-            wrapped_table->gpu_context_);
-        return 32 * sizeof(uint32_t) * allocated_slab_count_buffer.download_first_item();
+        const size_t table_bytes = wrapped_table
+            ? num_buckets * table_context_type::getSlabUnitSize() : 0;
+        const size_t allocator_bytes = wrapped_allocator
+            ? reserved_superblocks *
+                size_t(allocator_context_type::SUPER_BLOCK_SIZE_) *
+                sizeof(uint32_t)
+            : 0;
+        return table_bytes + allocator_bytes;
     }
 
     void build(const key_type* keys, size_t size, size_t max_size, size_t available_memory_bytes, double* build_time_ms, size_t* build_bytes) {
@@ -264,13 +265,17 @@ public:
         size_t required_superblocks = 1 + (1 + required_key_capacity * 32 / (slots_per_superblock * 15));
 
         // SUPER_BLOCK_SIZE_ includes the per-block bitmaps
-        size_t expected_size_bytes = (num_buckets + required_superblocks * allocator_context_type::SUPER_BLOCK_SIZE_) * sizeof(key_type);
+        const size_t expected_size_bytes =
+            num_buckets * table_context_type::getSlabUnitSize() +
+            required_superblocks * size_t(allocator_context_type::SUPER_BLOCK_SIZE_) *
+                sizeof(uint32_t);
         if (expected_size_bytes > available_memory_bytes) {
             throw std::runtime_error("not enough memory to build");
         }
 
         wrapped_allocator.emplace(required_superblocks);
         wrapped_table.emplace(num_buckets, &wrapped_allocator.value(), device_id);
+        reserved_superblocks = required_superblocks;
 
         {
             scoped_cuda_timer timer(0, build_time_ms);
@@ -284,8 +289,9 @@ public:
     }
 
     void destroy() {
-        wrapped_allocator.reset();
         wrapped_table.reset();
+        wrapped_allocator.reset();
+        reserved_superblocks = 0;
     }
 
     void lookup(const key_type* keys, smallsize* result, size_t size, cudaStream_t stream) {

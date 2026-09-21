@@ -38,14 +38,14 @@ def source_signature():
         cwd=ROOT).decode().split("\0")
     files = {name: sha(ROOT / name) for name in sorted(set(names))
              if (ROOT / name).is_file() and
-             (Path(name).suffix in {".cu", ".cuh", ".h", ".hpp", ".cpp", ".cmake", ".sh", ".py", ".json"}
+             (Path(name).suffix in {".cu", ".cuh", ".h", ".hpp", ".hxx", ".cpp", ".cmake", ".sh", ".py", ".json"}
               or Path(name).name == "CMakeLists.txt")}
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--family", choices=["paper", "flix", "both", "legacy"], default="paper")
+    parser.add_argument("--family", choices=["paper", "flix", "both"], default="paper")
     parser.add_argument("--systems", nargs="+", default=["all"],
                         help="all, both (GPULSMOpt/LSMu), or backend names")
     parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
@@ -54,15 +54,22 @@ def parse_args():
     parser.add_argument("--batch-logs", nargs="+", help="space-separated public batch logs")
     parser.add_argument("--insert-limit-log", type=int)
     parser.add_argument("--query-limit-log", type=int)
-    parser.add_argument("--range-chunk-log", type=int)
+    parser.add_argument("--range-chunk-log", type=int, default=0,
+                        help="0 submits the full range-query batch (default); N limits each call to 2^N queries")
     parser.add_argument("--stop-after-r", type=int, default=0)
     parser.add_argument("--repetitions", type=int)
     parser.add_argument("--warmups", type=int)
+    parser.add_argument("--adopt-warmups-from", type=Path,
+                        help="use completed warmup_00 cases from an earlier suite as one timing sample")
+    parser.add_argument("--adopt-warmup-batch-logs", nargs="+", type=int, default=[],
+                        help="paper batch logs whose completed warmups should replace new repetitions")
+    parser.add_argument("--adopt-warmup-cases", nargs="+", default=[],
+                        help="additional case IDs whose completed warmups should replace new repetitions")
+    parser.add_argument("--skip-completed-from", type=Path,
+                        help="skip cases with all required, validated runs in an earlier suite")
     parser.add_argument("--skip-bulk", action="store_true")
     parser.add_argument("--skip-ranges", action="store_true")
     parser.add_argument("--skip-deletions", action="store_true")
-    parser.add_argument("--skip-cleanup", action="store_true",
-                        help="accepted for compatibility; cleanup is only in --family legacy")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--memcheck", action="store_true",
                         help="one separate sanitizer replay per case; excluded from results")
@@ -78,13 +85,10 @@ def parse_args():
     parser.add_argument("--flix-rounds", type=int, default=5)
     parser.add_argument("--xy", nargs="+", default=["25:25", "25:90"], help="FliX X:Y pairs")
     args = parser.parse_args()
-    if args.family == "legacy":
-        parser.error("legacy dispatch must use run_flix_lsm_paper_comparison.sh")
     full = args.mode == "full"
     args.insert_limit_log = args.insert_limit_log if args.insert_limit_log is not None else (27 if full else 18)
     args.query_limit_log = args.query_limit_log if args.query_limit_log is not None else (24 if full else 18)
-    args.range_chunk_log = args.range_chunk_log if args.range_chunk_log is not None else min(16, args.query_limit_log)
-    args.repetitions = args.repetitions if args.repetitions is not None else (5 if full else 2)
+    args.repetitions = args.repetitions if args.repetitions is not None else (3 if full else 2)
     args.warmups = args.warmups if args.warmups is not None else (1 if full else 0)
     args.flix_build_log = args.flix_build_log if args.flix_build_log is not None else (26 if full else 15)
     args.flix_probe_log = args.flix_probe_log if args.flix_probe_log is not None else (27 if full else 16)
@@ -105,8 +109,8 @@ def parse_args():
         parser.error("xy must contain X:Y pairs with X in [1,99], Y in [0,100]")
     if not (1 <= args.query_limit_log <= args.insert_limit_log <= 27):
         parser.error("require 1 <= query-limit-log <= insert-limit-log <= 27")
-    if not (1 <= args.range_chunk_log <= args.query_limit_log):
-        parser.error("range-chunk-log must be positive and no larger than query-limit-log")
+    if not (0 <= args.range_chunk_log <= args.query_limit_log):
+        parser.error("range-chunk-log must be 0 (full batch) or positive and no larger than query-limit-log")
     if any(not 1 <= b <= args.insert_limit_log for b in args.batch_logs):
         parser.error("batch logs must be positive and at most insert-limit-log")
     if min(args.repetitions, args.jobs, args.parallel_builds, args.timeout, args.flix_rounds) < 1 or min(args.warmups, args.stop_after_r) < 0:
@@ -116,6 +120,12 @@ def parse_args():
     if (1 << args.flix_build_log) // (4 * args.flix_rounds) == 0:
         parser.error("FliX configuration produces empty update batches")
     args.output = args.output.resolve(); args.build_root = args.build_root.resolve()
+    if args.skip_completed_from is not None:
+        args.skip_completed_from = args.skip_completed_from.resolve()
+    if args.adopt_warmups_from is not None:
+        args.adopt_warmups_from = args.adopt_warmups_from.resolve()
+    if bool(args.adopt_warmups_from) != bool(args.adopt_warmup_batch_logs or args.adopt_warmup_cases):
+        parser.error("--adopt-warmups-from requires batch logs or case IDs to adopt")
     return args
 
 
@@ -136,6 +146,104 @@ def cases_for(args):
     for case in cases:
         case["id"] = f"{case['family']}/{case['kind']}_b{case['batch_log']}/{case['backend']}"
     return cases
+
+
+def skip_completed_cases(cases, args):
+    if args.skip_completed_from is None:
+        return cases, []
+    previous = args.skip_completed_from
+    previous_manifest = previous / "run_manifest.json"
+    if not previous_manifest.is_file():
+        raise RuntimeError(f"Missing previous suite manifest: {previous_manifest}")
+    old_manifest = json.loads(previous_manifest.read_text())
+    if old_manifest.get("protocol") != PROTOCOL:
+        raise RuntimeError("Previous suite uses a different protocol")
+    old_settings = old_manifest["settings"]
+    ignored = {"output", "build_root", "plan", "no_plots", "build_only",
+               "jobs", "parallel_builds", "timeout", "skip_completed_from",
+               "adopt_warmups_from", "adopt_warmup_batch_logs", "adopt_warmup_cases"}
+    current_settings = json.loads(json.dumps(
+        {k: v for k, v in vars(args).items() if k not in ignored}))
+    # Changing the number of repetitions only drops later runs. The old range
+    # chunk size is allowed to differ because range cases must be rerun below.
+    for key, value in current_settings.items():
+        if key in {"repetitions", "warmups", "range_chunk_log"}:
+            continue
+        if old_settings.get(key) != value:
+            raise RuntimeError(f"Previous suite has a different {key} setting")
+    if old_settings["repetitions"] < args.repetitions or old_settings["warmups"] < args.warmups:
+        raise RuntimeError("Previous suite has too few runs to skip completed cases")
+    old_cases = {case["id"]: case for case in old_manifest["cases"]}
+    labels = [f"warmup_{r:02}" for r in range(args.warmups)]
+    labels += [f"rep_{r:02}" for r in range(args.repetitions)]
+    if args.memcheck:
+        labels.append("memcheck")
+    remaining, skipped = [], []
+    for case in cases:
+        if old_cases.get(case["id"]) != case:
+            raise RuntimeError(f"Previous suite has a different case: {case['id']}")
+        completions = []
+        for label in labels:
+            folder = previous / case["id"] / label
+            marker = folder / "completion.json"
+            if not marker.is_file():
+                break
+            try:
+                record = json.loads(marker.read_text())
+                for artifact, expected in record["artifacts"].items():
+                    if sha(folder / artifact) != expected:
+                        raise RuntimeError(f"Changed artifact: {folder / artifact}")
+                validate_case(folder, case, args, label == "memcheck")
+            except (KeyError, ValueError, OSError, RuntimeError) as error:
+                print(f"Rerun {case['id']}: {error}", flush=True)
+                break
+            completions.append({"label": label, "sha256": sha(marker)})
+        if len(completions) == len(labels):
+            skipped.append({"case": case, "completions": completions})
+        else:
+            remaining.append(case)
+    return remaining, skipped
+
+
+def adopt_warmup_cases(cases, args):
+    if args.adopt_warmups_from is None:
+        return cases, [], []
+    source = args.adopt_warmups_from
+    previous = json.loads((source / "run_manifest.json").read_text())
+    if previous.get("protocol") != PROTOCOL:
+        raise RuntimeError("Adopted warmups use a different protocol")
+    for key in ("family", "mode", "insert_limit_log", "query_limit_log",
+                "range_chunk_log", "skip_ranges", "skip_deletions", "stop_after_r"):
+        if previous["settings"].get(key) != getattr(args, key):
+            raise RuntimeError(f"Adopted warmups use a different {key} setting")
+    available = {case["id"] for case in previous["cases"]}
+    if set(args.adopt_warmup_cases) - available:
+        raise RuntimeError("Requested adopted warmup case is absent from the source suite")
+    remaining, adopted, records = [], [], []
+    for case in cases:
+        selected_by_log = (case["family"] == "paper" and case["kind"] == "main" and
+                           case["batch_log"] in args.adopt_warmup_batch_logs)
+        if ((not selected_by_log and case["id"] not in args.adopt_warmup_cases) or
+                case["id"] not in available):
+            remaining.append(case)
+            continue
+        folder = source / case["id"] / "warmup_00"
+        completion = folder / "completion.json"
+        if not completion.is_file():
+            raise RuntimeError(f"Missing completed warmup: {completion}")
+        record = json.loads(completion.read_text())
+        for artifact, expected in record["artifacts"].items():
+            if sha(folder / artifact) != expected:
+                raise RuntimeError(f"Changed adopted warmup artifact: {folder / artifact}")
+        validation = validate_case(folder, case, args)
+        if validation != record["validation"]:
+            raise RuntimeError(f"Changed adopted warmup validation: {folder}")
+        adopted.append({"case": case, "completion_sha256": sha(completion)})
+        records.append(("warmup_00", case, record))
+    if not adopted:
+        raise RuntimeError("No completed warmups match the requested batch logs")
+    validate_cohort(records)
+    return remaining, adopted, records
 
 
 def build_case(case, args, toolkit, arch):
@@ -218,8 +326,15 @@ def validate_case(folder, case, args, sanitized=False):
     identities = set(); signature = []
     for row in rows:
         if row["protocol"] != "common_initialized_v1": raise RuntimeError("Incorrect protocol")
-        if row["operation"].startswith("range_sum") and row.get("range_processing") != 'enumerate_records_sum_v1':
-            raise RuntimeError("Range row is missing the record-enumeration contract")
+        if row["operation"].startswith("range_sum"):
+            if row.get("range_processing") != 'enumerate_records_sum_v1':
+                raise RuntimeError("Range row is missing the record-enumeration contract")
+            items = int(row["items"])
+            call_items = min(items, 1 << args.range_chunk_log) if args.range_chunk_log else items
+            calls = (items + call_items - 1) // call_items
+            if (int(row.get("range_api_calls", -1)) != calls or
+                    int(row.get("range_max_call_items", -1)) != call_items):
+                raise RuntimeError("Range calls do not match the configured public batch size")
         key = tuple(row[k] for k in ("operation", "state", "resident_elements", "items", "scenario"))
         if key in identities: raise RuntimeError("Duplicate operation row")
         identities.add(key)
@@ -254,8 +369,8 @@ def run_case(case, build, args, toolkit, label, sanitized=False):
     if case['family'] == 'paper':
         command += ['--output', str(folder), '--insert-limit-log', str(args.insert_limit_log),
                     '--query-limit-log', str(args.query_limit_log), '--range-chunk-log', str(args.range_chunk_log),
-                    '--stop-after-r', str(args.stop_after_r), '--range-only',
-                    '--bulk-only' if case['kind']=='bulk' else '--main-only']
+                    '--stop-after-r', str(args.stop_after_r)]
+        if case['kind'] == 'bulk': command += ['--bulk-only']
         if args.skip_ranges: command += ['--skip-ranges']
         if args.skip_deletions: command += ['--skip-deletions']
     if sanitized:
@@ -290,10 +405,16 @@ def validate_cohort(records):
 
 
 def main():
-    args = parse_args(); cases = cases_for(args)
+    args = parse_args(); all_cases = cases_for(args)
+    all_cases, adopted, adopted_records = adopt_warmup_cases(all_cases, args)
+    cases, skipped = skip_completed_cases(all_cases, args)
     if not cases: raise RuntimeError("No supported cases selected")
     if args.plan:
-        print(json.dumps({'protocol':PROTOCOL, 'cases':cases, 'repetitions':args.repetitions,
+        print(json.dumps({'protocol':PROTOCOL, 'cases':cases,
+                          'skipped_cases':[item['case']['id'] for item in skipped],
+                          'adopted_warmups':[item['case']['id'] for item in adopted],
+                          'repetitions':args.repetitions,
+                          'range_chunk_log':args.range_chunk_log,
                           'warmups':args.warmups, 'memcheck':args.memcheck},indent=2)); return
     setup.verify_dependencies()
     toolkit = setup.cuda_root(args.cuda_root)
@@ -302,10 +423,22 @@ def main():
     if not re.fullmatch(r'\d+',arch): raise RuntimeError('Invalid architecture')
     gpu = subprocess.check_output(['nvidia-smi','--id=0','--query-gpu=name,uuid,driver_version',
                                   '--format=csv,noheader'],text=True).strip()
+    if adopted:
+        old_gpu = json.loads((args.adopt_warmups_from / 'run_manifest.json').read_text())['gpu']
+        if old_gpu != gpu:
+            raise RuntimeError("Adopted warmups were measured on a different GPU or driver")
     manifest = {'protocol':PROTOCOL, 'source_sha256':source_signature(), 'cases':cases,
+                'skipped_from':str(args.skip_completed_from) if skipped else None,
+                'previous_manifest_sha256':sha(args.skip_completed_from / 'run_manifest.json') if skipped else None,
+                'skipped_cases':skipped,
+                'adopted_warmups':adopted,
+                'adopted_from':str(args.adopt_warmups_from) if adopted else None,
+                'adopted_manifest_sha256':sha(args.adopt_warmups_from / 'run_manifest.json') if adopted else None,
                 'toolkit':str(toolkit), 'arch':arch, 'gpu':gpu,
                 'settings':{k:v for k,v in vars(args).items() if k not in
-                    {'output','build_root','plan','no_plots','build_only','jobs','parallel_builds','timeout'}}}
+                    {'output','build_root','plan','no_plots','build_only','jobs','parallel_builds','timeout',
+                     'skip_completed_from','adopt_warmups_from','adopt_warmup_batch_logs',
+                     'adopt_warmup_cases'}}}
     manifest = json.loads(json.dumps(manifest))
     args.output.mkdir(parents=True,exist_ok=True)
     path = args.output / 'run_manifest.json'
@@ -328,6 +461,12 @@ def main():
     save(args.output / 'builds.json',builds)
     if args.build_only: return
     records = []
+    previous_records = []
+    for item in skipped:
+        for completion in item['completions']:
+            folder = args.skip_completed_from / item['case']['id'] / completion['label']
+            previous_records.append((completion['label'], item['case'],
+                                     json.loads((folder / 'completion.json').read_text())))
     labels = [(f'warmup_{r:02}',False) for r in range(args.warmups)]
     labels += [(f'rep_{r:02}',False) for r in range(args.repetitions)]
     if args.memcheck: labels.append(('memcheck',True))
@@ -337,17 +476,20 @@ def main():
             record = run_case(case, builds[case['id']], args, toolkit, label, sanitized)
             records.append((label,case,record))
         compared = validate_cohort(records)
-        save(args.output / 'validation.json', {'state':'passed','completed_runs':len(records),
+        save(args.output / 'validation.json', {'state':'partial','completed_runs':len(records),
                                               'matching_backend_and_repetition_rows':compared})
-    subprocess.run([sys.executable, ROOT/'scripts/summarize_flix_lsm_paper_comparison.py',
-                    args.output, '--suite'] + (['--no-plots'] if args.no_plots else []),check=True)
+    compared = validate_cohort(records + previous_records + adopted_records)
+    save(args.output / 'validation.json', {'state':'passed',
+                                          'completed_runs':len(records) + len(previous_records) + len(adopted_records),
+                                          'reused_runs':len(previous_records),
+                                          'adopted_single_samples':len(adopted_records),
+                                          'matching_backend_and_repetition_rows':compared})
+    from flix_paper_reporting import summarize
+    summarize(args.output, no_plots=args.no_plots)
     print('Paper suite complete: ' + str(args.output),flush=True)
 
 
 if __name__=='__main__':
-    if '--family' in sys.argv and sys.argv[sys.argv.index('--family')+1:sys.argv.index('--family')+2]==['legacy']:
-        forwarded=sys.argv[1:]; i=forwarded.index('--family'); del forwarded[i:i+2]
-        raise SystemExit(subprocess.call(['bash',ROOT/'scripts/run_legacy_flix_lsm_paper_comparison.sh']+forwarded))
     try: main()
     except (RuntimeError,ValueError,OSError,subprocess.SubprocessError) as error:
         print('ERROR: '+str(error),file=sys.stderr); raise SystemExit(1)

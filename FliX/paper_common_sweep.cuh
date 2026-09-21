@@ -18,21 +18,23 @@ struct common_rows {
         output << "system,protocol,operation,batch_log,state,resident_elements,"
                   "items,scenario,time_ms,wall_ms,prepare_ms,search_ms,restore_ms,"
                   "index_bytes,input_sum,input_xor,checksum_sum,checksum_xor,"
-                  "range_processing\n";
+                  "range_processing,range_api_calls,range_max_call_items\n";
         output << std::setprecision(12);
     }
     void add(const char *operation, uint32_t state, uint32_t resident,
              uint32_t items, const std::string &scenario,
              const flix_benchmark::lookup_times &times, size_t bytes,
              const std::vector<unsigned long long> &input = {0, 0},
-             const std::vector<unsigned long long> &answer = {0, 0}) {
+             const std::vector<unsigned long long> &answer = {0, 0},
+             uint32_t range_api_calls = 0, uint32_t range_max_call_items = 0) {
         output << index_name << ",common_initialized_v1," << operation << ','
                << batch_log << ',' << state << ',' << resident << ',' << items
                << ',' << scenario << ',' << times.total_ms << ',' << times.wall_ms
                << ',' << times.prepare_ms << ',' << times.search_ms << ','
                << times.restore_ms << ',' << bytes << ',' << input[0] << ','
                << input[1] << ',' << answer[0] << ',' << answer[1] << ','
-               << flix_benchmark::range_processing<selected_paper_backend>() << '\n';
+               << flix_benchmark::range_processing<selected_paper_backend>() << ','
+               << range_api_calls << ',' << range_max_call_items << '\n';
         output.flush();
         if (!output) throw std::runtime_error("Cannot write paper measurements");
     }
@@ -62,7 +64,6 @@ void run_common_impl(const options &configuration) {
     if (batch_log == 0 || batch_log > configuration.insert_limit_log ||
         configuration.insert_limit_log > 27 || configuration.query_limit_log == 0 ||
         configuration.query_limit_log > configuration.insert_limit_log ||
-        configuration.range_chunk_log == 0 ||
         configuration.range_chunk_log > configuration.query_limit_log)
         throw std::invalid_argument("Invalid common paper size limits");
     constexpr uint32_t batch = uint32_t{1} << batch_log;
@@ -73,11 +74,6 @@ void run_common_impl(const options &configuration) {
     if (!paper_dynamic && !configuration.bulk_sweep)
         states = std::min(states, query_max / batch);
     if (states == 0) throw std::invalid_argument("No states fit the configured limits");
-    if (configuration.cleanup_sweep || configuration.forced_unified_validation ||
-        configuration.construction_only || configuration.profile_all_inserts ||
-        configuration.profile_insert_r)
-        throw std::invalid_argument("LSM-specific modes require the legacy experiment family");
-
     std::ofstream capability(configuration.output_directory / "capabilities.json");
     capability << "{\"protocol\":\"common_initialized_v1\",\"dynamic\":"
                << (paper_dynamic ? "true" : "false") << ",\"range\":"
@@ -108,6 +104,13 @@ void run_common_impl(const options &configuration) {
     std::unique_ptr<Index> index;
     flix_benchmark::lookup_workspace<key_type> lookup;
 
+    // Count retained allocations required by the backend's completed lookup
+    // path. Common query, answer, and input buffers remain excluded.
+    auto retained_bytes = [&] {
+        return (index ? index->gpu_resident_bytes() : size_t{0}) +
+               lookup.gpu_resident_bytes();
+    };
+
     auto validate = [&] {
         PAPER_CUDA(cudaDeviceSynchronize());
         if (errors.download_first_item() != 0)
@@ -126,7 +129,7 @@ void run_common_impl(const options &configuration) {
                 answers.ptr(), count, resident, hits, seed, errors.ptr());
             validate();
             rows.add(phase, state, resident, count, hits ? "all_existing" : "none_existing",
-                     times, index->gpu_resident_bytes(), input);
+                     times, retained_bytes(), input);
         }
     };
     auto range_state = [&](uint32_t state, uint32_t resident, const char *phase) {
@@ -134,11 +137,14 @@ void run_common_impl(const options &configuration) {
             if (configuration.skip_ranges || resident > query_max || batch_log > 20) return;
             for (uint32_t expected : {8u, 1024u}) {
                 uint32_t remaining = resident, offset = 0;
+                const uint32_t call_limit = configuration.range_chunk_log
+                    ? std::min(resident, uint32_t{1} << configuration.range_chunk_log)
+                    : resident;
+                uint32_t calls = 0;
                 flix_benchmark::lookup_times times;
                 std::vector<unsigned long long> input(2, 0), output(2, 0);
                 while (remaining) {
-                    const uint32_t count = std::min(remaining,
-                        uint32_t{1} << configuration.range_chunk_log);
+                    const uint32_t count = std::min(remaining, call_limit);
                     fill_range_queries<<<(count + threads - 1) / threads, threads>>>(
                         queries.ptr(), upper.ptr(), count, resident, expected,
                         0x30000u + state + expected + offset);
@@ -149,6 +155,7 @@ void run_common_impl(const options &configuration) {
                     const auto measured = measure_common(timer, [&] {
                         index->range_lookup_sum(queries.ptr(), upper.ptr(), answers.ptr(), count, 0);
                     });
+                    ++calls;
                     times.total_ms += measured.total_ms; times.wall_ms += measured.wall_ms;
                     part = common_digest(answers.ptr(), count, digest, offset);
                     output[0] += part[0]; output[1] ^= part[1];
@@ -156,7 +163,7 @@ void run_common_impl(const options &configuration) {
                 }
                 times.search_ms = times.total_ms;
                 rows.add(phase, state, resident, resident, std::to_string(expected),
-                         times, index->gpu_resident_bytes(), input, output);
+                         times, retained_bytes(), input, output, calls, call_limit);
             }
         }
     };
@@ -182,14 +189,14 @@ void run_common_impl(const options &configuration) {
                 paper_build(*index, keys.ptr(), n, capacity, free_bytes);
             });
             rows.add(configuration.bulk_sweep ? "bulk_build" : "build", r,
-                     resident, n, "initial_keys", times, index->gpu_resident_bytes(), input);
+                     resident, n, "initial_keys", times, retained_bytes(), input);
         } else if constexpr (paper_dynamic) {
             const auto times = measure_common(timer, [&] {
                 paper_prepare_updates<Index>(keys.ptr(), values.ptr(), n);
                 index->insert(keys.ptr(), values.ptr(), n, 0);
             });
             rows.add("insert", r, resident, n, "distinct_growth", times,
-                     index->gpu_resident_bytes(), input);
+                     retained_bytes(), input);
         }
         if (resident <= query_max || r == states || configuration.bulk_sweep)
             query_state(r, resident, "lookup");
@@ -210,14 +217,14 @@ void run_common_impl(const options &configuration) {
                     index->remove(keys.ptr(), batch, 0);
                 });
                 rows.add("delete", r, resident, batch, "reverse_growth", times,
-                         index->gpu_resident_bytes(), input);
+                         retained_bytes(), input);
                 const auto checked = lookup.lookup(*index, queries.ptr(), answers.ptr(), batch);
                 errors.zero();
                 validate_common_lookup<<<(batch + threads - 1) / threads, threads>>>(
                     answers.ptr(), batch, resident, false, 0, errors.ptr());
                 validate();
                 rows.add("lookup_deleted", r, resident, batch, "all_deleted", checked,
-                         index->gpu_resident_bytes(), input);
+                         retained_bytes(), input);
                 if (resident <= query_max || r == 2) query_state(r, resident, "lookup_after_delete");
                 range_state(r, resident, "range_sum_after_delete");
             }

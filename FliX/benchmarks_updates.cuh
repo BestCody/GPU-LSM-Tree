@@ -154,18 +154,11 @@ void assert_ceiling_results(const std::vector<key_type> &a_keys,
                                    sorted_live_keys.end(),
                                    query);
 
-        if (it == sorted_live_keys.end())
-        {
-            continue;
-        }
-
-        const key_type expected = *it;
+        const key_type expected = it == sorted_live_keys.end()
+            ? static_cast<key_type>(not_found) : *it;
         const key_type got = b_results[i];
-        bool skip = false;
-        if (got == 0)
-            skip = true;
 
-        if (got != expected && !skip)
+        if (got != expected)
         {
             std::cerr << "ASSERT FAIL: ceiling mismatch at i=" << i
                       << " " << a_name << "=" << query
@@ -1544,6 +1537,7 @@ void benchmark_updates(
             // initial build (untimed)
             index_type index;
             flix_benchmark::lookup_workspace<key_type> lookup_workspace;
+            flix_benchmark::successor_workspace<key_type> successor_workspace;
             // index.build(insert_delete_keys_buffer.ptr(), active_range_end - active_range_start, nullptr, nullptr);
 #ifdef DEBUG_BENCHMARK_OUTPUT
             next_free = index.allocation_buffer_next_free();
@@ -1613,6 +1607,7 @@ void benchmark_updates(
                 double probe_time_ms = 0;
                 double successor_hits_probe_time_ms = 0;
                 double successor_misses_probe_time_ms = 0;
+                double successor_deleted_probe_time_ms = 0;
 
                 double rebuild_time_ms = 0;
                 double probe_miss_time_ms = 0;
@@ -1668,7 +1663,8 @@ void benchmark_updates(
                     goto end_run;
                 }
 
-                before_update_bytes = index.gpu_resident_bytes();
+                before_update_bytes = index.gpu_resident_bytes() +
+                                      lookup_workspace.gpu_resident_bytes();
 
                 if constexpr (supports_updates)
                 {
@@ -1854,6 +1850,17 @@ void benchmark_updates(
                             break;
                         }
 
+                        if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
+                        {
+                            cuda_buffer<key_type> successor_results;
+                            successor_results.alloc(del_probe_size);
+                            const auto successor_times = successor_workspace.lookup(
+                                index, del_probe_keys_buffer.ptr(),
+                                successor_results.ptr(), del_probe_size);
+                            successor_deleted_probe_time_ms =
+                                successor_times.total_ms;
+                        }
+
                     }
                 }
 
@@ -1959,17 +1966,13 @@ void benchmark_updates(
 
                     if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
                     {
-                        lookup_workspace.prepare_ordered(probe_keys_buffer.ptr(), hit_count, 0);
                         cuda_buffer<key_type> successor_results;
                         successor_results.alloc(hit_count);
-                        timer.start();
-                        index.lookups_successor(lookup_workspace.sorted_keys.ptr(),
-                            successor_results.ptr(), hit_count, 0);
-                        timer.stop();
-                        successor_hits_probe_time_ms = timer.time_ms();
-                        auto sorted_keys = lookup_workspace.sorted_keys.download(hit_count);
-                        auto results = successor_results.download(hit_count);
-                        assert_vectors_equal(sorted_keys, results);
+                        const auto successor_times = successor_workspace.lookup(
+                            index, probe_keys_buffer.ptr(),
+                            successor_results.ptr(), hit_count);
+                        successor_hits_probe_time_ms =
+                            successor_times.total_ms;
                     }
                 }
 
@@ -2004,17 +2007,13 @@ void benchmark_updates(
 
                         if constexpr (supports_successor && PERFORM_SUCCESSOR_PROBES)
                         {
-                            lookup_workspace.prepare_ordered(probe_keys_buffer.ptr(), miss_count, 0);
                             cuda_buffer<key_type> successor_results;
                             successor_results.alloc(miss_count);
-                            timer.start();
-                            index.lookups_successor(lookup_workspace.sorted_keys.ptr(),
-                                successor_results.ptr(), miss_count, 0);
-                            timer.stop();
-                            successor_misses_probe_time_ms = timer.time_ms();
-                            auto sorted_keys = lookup_workspace.sorted_keys.download(miss_count);
-                            auto results = successor_results.download(miss_count);
-                            assert_ceiling_results(sorted_keys, results, live_keys);
+                            const auto successor_times = successor_workspace.lookup(
+                                index, probe_keys_buffer.ptr(),
+                                successor_results.ptr(), miss_count);
+                            successor_misses_probe_time_ms =
+                                successor_times.total_ms;
                         }
                     }
                 }
@@ -2024,7 +2023,8 @@ void benchmark_updates(
                 std::cerr << "    --Probe Miss Time: -> " << probe_miss_time_ms << " ms" << std::endl;
                 std::cerr << "    ---------------------- " << std::endl;
 
-                after_update_bytes = index.gpu_resident_bytes();
+                after_update_bytes = index.gpu_resident_bytes() +
+                                     lookup_workspace.gpu_resident_bytes();
 
 #ifdef COMPUTE_TOTALKEYS
 #pragma message "COMPUTE_TOTALKEYS=YES"
@@ -2052,6 +2052,7 @@ void benchmark_updates(
                         .add_parameter("request_checksum", request_checksum.str())
                         .add_parameter("checksum_format", "fnv1a64_u64le_v1")
                         .add_parameter("lookup_timing", "complete_unsorted_v1")
+                        .add_parameter("successor_timing", "complete_unsorted_v1")
                         .add_parameter("probe_input_order", "unsorted")
                         .add_parameter("external_lookup_sort", flix_benchmark::requires_ordered_lookup<index_type>::value)
                         .add_parameter("hit_query_count", hit_count)
@@ -2093,6 +2094,7 @@ void benchmark_updates(
                         .add_measurement("deleted_keys_probe_restore_time_ms", deleted_times.restore_ms)
                         .add_measurement("successor_hits_probe_time_ms", successor_hits_probe_time_ms)
                         .add_measurement("successor_misses_probe_time_ms", successor_misses_probe_time_ms)
+                        .add_measurement("successor_deleted_probe_time_ms", successor_deleted_probe_time_ms)
                         .add_measurement("index_layer_time_ms", index_layer_time_ms)
                         .add_measurement("bucket_layer_time_ms", bucket_layer_time_ms)
                         .add_measurement("rebuild_time_ms", rebuild_time_ms)

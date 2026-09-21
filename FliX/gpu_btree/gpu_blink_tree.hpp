@@ -1191,10 +1191,8 @@ struct gpu_blink_tree {
   }
 
   // MODIFIED jh: get the size of the tree, copied from above
-  std::size_t compute_memory_usage_bytes() {
-    auto num_nodes         = get_num_tree_node();
-    double tree_size_bytes = num_nodes * sizeof(node_type<Key, Value, B>);
-    return tree_size_bytes;
+  std::size_t compute_memory_usage_bytes() const {
+    return allocator_.allocated_bytes();
   }
 
  private:

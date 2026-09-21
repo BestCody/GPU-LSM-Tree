@@ -9,11 +9,13 @@
 
 #include "definitions_coarse_granular.cuh"
 #include "utilities.cuh"
+#include "lsm_sort_context.cuh"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -223,7 +225,7 @@ GLOBALQUALIFIER void lsm_query_bounds_kernel_paper(
     const Key *upper_bounds,
     smallsize *lower_indices,
     smallsize *upper_indices,
-    smallsize *candidate_counts,
+    std::uint64_t *candidate_counts,
     smallsize query_count,
     smallsize level_count,
     std::uint64_t num_batches,
@@ -262,7 +264,7 @@ GLOBALQUALIFIER void lsm_gather_query_candidates_kernel_paper(
     const Key *level_keys,
     const smallsize *level_values,
     const smallsize *lower_indices,
-    const smallsize *candidate_offsets,
+    const std::uint64_t *candidate_offsets,
     Key *candidate_keys,
     smallsize *candidate_values,
     smallsize query_count,
@@ -314,7 +316,7 @@ GLOBALQUALIFIER void lsm_gather_query_candidates_kernel_paper(
 }
 
 GLOBALQUALIFIER void lsm_make_query_segment_offsets_kernel(
-    const smallsize *candidate_offsets,
+    const std::uint64_t *candidate_offsets,
     smallsize *query_offsets,
     smallsize query_count,
     smallsize level_count)
@@ -408,34 +410,12 @@ GLOBALQUALIFIER void lsm_sum_sorted_candidates_kernel_paper(
         results[query] = sum;
 }
 
-// Successor is the paper's suggested adapter extension.
+// Successor is the paper's suggested adapter extension. One warp merges the
+// lower-bound positions from the occupied levels. Lane numbers are level
+// numbers, so the first lane containing a key also contains its newest
+// version. A tombstone removes that key but does not end the successor search.
 template <typename Key>
-DEVICEQUALIFIER INLINEQUALIFIER
-bool lsm_key_occurs_in_newer_level(
-    const Key *level_keys,
-    smallsize candidate_level,
-    std::uint64_t num_batches,
-    smallsize batch_size,
-    Key original_key)
-{
-    for (smallsize level = 0; level < candidate_level; ++level)
-    {
-        if ((num_batches & (std::uint64_t{1} << level)) == 0)
-            continue;
-        const smallsize level_size = batch_size << level;
-        const smallsize level_offset = level_size - batch_size;
-        const Key *keys = level_keys + level_offset;
-        const smallsize index =
-            lsm_lower_bound_original(keys, level_size, original_key);
-        if (index != level_size &&
-            lsm_paper_key<Key>::original(keys[index]) == original_key)
-            return true;
-    }
-    return false;
-}
-
-template <typename Key>
-GLOBALQUALIFIER void lsm_successor_kernel_paper(
+GLOBALQUALIFIER void lsm_successor_merge_kernel(
     const Key *level_keys,
     const Key *queries,
     Key *results,
@@ -444,41 +424,67 @@ GLOBALQUALIFIER void lsm_successor_kernel_paper(
     std::uint64_t num_batches,
     smallsize batch_size)
 {
-    const smallsize tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= query_count)
+    constexpr unsigned warp_mask = 0xffffffffu;
+    const size_t global_thread =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const smallsize query_index = static_cast<smallsize>(global_thread >> 5);
+    const unsigned lane = threadIdx.x & 31u;
+    if (query_index >= query_count)
         return;
 
-    const Key query = queries[tid];
-    Key result = static_cast<Key>(not_found);
+    const Key query = queries[query_index];
+    const bool occupied =
+        lane < level_count &&
+        (num_batches & (std::uint64_t{1} << lane)) != 0;
+    const smallsize level_size = occupied ? batch_size << lane : 0;
+    const smallsize level_offset = occupied ? level_size - batch_size : 0;
+    const Key *keys = occupied ? level_keys + level_offset : nullptr;
+    smallsize position =
+        occupied ? lsm_lower_bound_original(keys, level_size, query) : 0;
+    bool active = occupied && position != level_size;
+    Key encoded = active ? keys[position] : Key{};
 
-    for (smallsize level = 0; level < level_count; ++level)
+    while (__any_sync(warp_mask, active))
     {
-        if ((num_batches & (std::uint64_t{1} << level)) == 0)
-            continue;
-        const smallsize level_size = batch_size << level;
-        const smallsize level_offset = level_size - batch_size;
-        const Key *keys = level_keys + level_offset;
-        smallsize index = lsm_lower_bound_original(keys, level_size, query);
-
-        for (; index < level_size; ++index)
+        Key smallest = active
+                           ? lsm_paper_key<Key>::original(encoded)
+                           : std::numeric_limits<Key>::max();
+        for (unsigned distance = 16; distance != 0; distance >>= 1)
         {
-            const Key key = lsm_paper_key<Key>::original(keys[index]);
-            if (key >= result)
-                break;
-            if (!lsm_paper_key<Key>::is_regular(keys[index]))
-                continue;
-            if (index != 0 &&
-                lsm_paper_key<Key>::original(keys[index - 1]) == key)
-                continue;
-            if (lsm_key_occurs_in_newer_level(
-                    level_keys, level, num_batches, batch_size, key))
-                continue;
-            result = key;
-            break;
+            const Key other =
+                __shfl_down_sync(warp_mask, smallest, distance);
+            smallest = min(smallest, other);
+        }
+        smallest = __shfl_sync(warp_mask, smallest, 0);
+
+        const bool owns_smallest =
+            active && lsm_paper_key<Key>::original(encoded) == smallest;
+        const unsigned owners = __ballot_sync(warp_mask, owns_smallest);
+        const unsigned newest_level = __ffs(owners) - 1;
+        const Key newest =
+            __shfl_sync(warp_mask, encoded, newest_level);
+        if (lsm_paper_key<Key>::is_regular(newest))
+        {
+            if (lane == 0)
+                results[query_index] = smallest;
+            return;
+        }
+
+        if (owns_smallest)
+        {
+            do
+            {
+                ++position;
+            } while (position != level_size &&
+                     lsm_paper_key<Key>::original(keys[position]) == smallest);
+            active = position != level_size;
+            if (active)
+                encoded = keys[position];
         }
     }
 
-    results[tid] = result;
+    if (lane == 0)
+        results[query_index] = static_cast<Key>(not_found);
 }
 
 template <typename Key>
@@ -583,14 +589,13 @@ private:
     // Persistent COUNT/RANGE workspace grows on demand.
     cuda_buffer<smallsize> query_lower_indices_buffer;
     cuda_buffer<smallsize> query_upper_indices_buffer;
-    cuda_buffer<smallsize> query_candidate_counts_buffer;
-    cuda_buffer<smallsize> query_candidate_offsets_buffer;
+    cuda_buffer<std::uint64_t> query_candidate_counts_buffer;
+    cuda_buffer<std::uint64_t> query_candidate_offsets_buffer;
     cuda_buffer<smallsize> query_segment_offsets_buffer;
     cuda_buffer<key_type> query_candidate_keys_buffer;
     cuda_buffer<smallsize> query_candidate_values_buffer;
-    cuda_buffer<key_type> query_sorted_keys_buffer;
-    cuda_buffer<smallsize> query_sorted_values_buffer;
     cuda_buffer<std::uint8_t> query_temp_buffer;
+    std::unique_ptr<lsm_sort_context> query_sort_context;
 
     size_t total_available_slots = 0;
     size_t max_level_size = 0;
@@ -797,9 +802,10 @@ private:
                 static_cast<smallsize>(size), level_count, num_batches,
                 static_cast<smallsize>(batch_size));
         cudaMemsetAsync(query_candidate_counts_buffer.ptr() + slot_count, 0,
-                        sizeof(smallsize), stream);
+                        sizeof(std::uint64_t), stream);
 
-        // Stage 2 scans candidate range sizes.
+        // Stage 2 uses a 64-bit scan: overlapping queries repeat physical
+        // records, so their total can exceed both INT_MAX and UINT32_MAX.
         size_t scan_bytes = 0;
         cub::DeviceScan::ExclusiveSum(
             nullptr, scan_bytes,
@@ -813,14 +819,7 @@ private:
             query_candidate_offsets_buffer.ptr(),
             static_cast<int>(slot_count + 1), stream);
 
-        lsm_make_query_segment_offsets_kernel<<<
-            SDIV(size + 1, threads_per_block),
-            threads_per_block, 0, stream>>>(
-                query_candidate_offsets_buffer.ptr(),
-                query_segment_offsets_buffer.ptr(),
-                static_cast<smallsize>(size), level_count);
-
-        smallsize candidate_count = 0;
+        std::uint64_t candidate_count = 0;
         cudaMemcpyAsync(&candidate_count,
                         query_candidate_offsets_buffer.ptr() + slot_count,
                         sizeof(candidate_count), cudaMemcpyDeviceToHost, stream);
@@ -832,16 +831,41 @@ private:
             cudaMemsetAsync(results, 0, size * sizeof(value_type), stream);
             return;
         }
-        if (candidate_count > static_cast<smallsize>(
-                                  std::numeric_limits<int>::max()))
-            throw std::overflow_error("LSMu candidate array exceeds CUB limits");
+        if (!query_sort_context)
+            query_sort_context = std::make_unique<lsm_sort_context>(stream);
+        query_sort_context->set_stream(stream);
+        const size_t sort_limit = query_sort_context->max_sort_items<
+            key_type, value_type, lsm_original_key_less<key_type>>();
+        if (candidate_count > sort_limit)
+        {
+            if (size == 1)
+                throw std::overflow_error(
+                    "LSMu single-query candidate array exceeds ModernGPU limits");
+
+            // Keep each query's versions together for stable deduplication.
+            // Recompute bounds in each half using the same workspace/stream.
+            const size_t first_size = size / 2;
+            run_paper_range_pipeline<CountOnly>(
+                lower, upper, results, first_size, stream);
+            run_paper_range_pipeline<CountOnly>(
+                lower + first_size, upper + first_size, results + first_size,
+                size - first_size, stream);
+            return;
+        }
+
+        // Narrow offsets only after the candidate array and ModernGPU's merge
+        // frames fit signed 32-bit indices.
+        lsm_make_query_segment_offsets_kernel<<<
+            SDIV(size + 1, threads_per_block),
+            threads_per_block, 0, stream>>>(
+                query_candidate_offsets_buffer.ptr(),
+                query_segment_offsets_buffer.ptr(),
+                static_cast<smallsize>(size), level_count);
 
         ensure_capacity(query_candidate_keys_buffer, candidate_count);
-        ensure_capacity(query_sorted_keys_buffer, candidate_count);
         if constexpr (!CountOnly)
         {
             ensure_capacity(query_candidate_values_buffer, candidate_count);
-            ensure_capacity(query_sorted_values_buffer, candidate_count);
         }
 
         // Stage 3 gathers keys and optional values.
@@ -857,58 +881,30 @@ private:
                 static_cast<smallsize>(size), level_count,
                 static_cast<smallsize>(batch_size));
 
-        // Stage 4 stably sorts by bits [31:1].
-        size_t segmented_sort_bytes = 0;
+        // Stage 4 follows the paper's ModernGPU segmented sort. The comparator
+        // ignores the status bit; stable ordering keeps newer versions first.
+        // Query starts include repeats for empty queries, but not the final
+        // end offset. ModernGPU sorts in place and preserves these boundaries.
         if constexpr (CountOnly)
         {
-            cub::DeviceSegmentedRadixSort::SortKeys(
-                nullptr, segmented_sort_bytes,
+            mgpu::segmented_sort(
                 query_candidate_keys_buffer.ptr(),
-                query_sorted_keys_buffer.ptr(),
-                static_cast<int>(candidate_count), static_cast<int>(size),
+                static_cast<int>(candidate_count),
                 query_segment_offsets_buffer.ptr(),
-                query_segment_offsets_buffer.ptr() + 1,
-                1, sizeof(key_type) * 8, stream);
+                static_cast<int>(size), lsm_original_key_less<key_type>{},
+                *query_sort_context);
         }
         else
         {
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                nullptr, segmented_sort_bytes,
+            mgpu::segmented_sort(
                 query_candidate_keys_buffer.ptr(),
-                query_sorted_keys_buffer.ptr(),
                 query_candidate_values_buffer.ptr(),
-                query_sorted_values_buffer.ptr(),
-                static_cast<int>(candidate_count), static_cast<int>(size),
+                static_cast<int>(candidate_count),
                 query_segment_offsets_buffer.ptr(),
-                query_segment_offsets_buffer.ptr() + 1,
-                1, sizeof(key_type) * 8, stream);
+                static_cast<int>(size), lsm_original_key_less<key_type>{},
+                *query_sort_context);
         }
-        ensure_capacity(query_temp_buffer,
-                        std::max(scan_bytes, segmented_sort_bytes));
-        if constexpr (CountOnly)
-        {
-            cub::DeviceSegmentedRadixSort::SortKeys(
-                query_temp_buffer.raw_ptr, segmented_sort_bytes,
-                query_candidate_keys_buffer.ptr(),
-                query_sorted_keys_buffer.ptr(),
-                static_cast<int>(candidate_count), static_cast<int>(size),
-                query_segment_offsets_buffer.ptr(),
-                query_segment_offsets_buffer.ptr() + 1,
-                1, sizeof(key_type) * 8, stream);
-        }
-        else
-        {
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                query_temp_buffer.raw_ptr, segmented_sort_bytes,
-                query_candidate_keys_buffer.ptr(),
-                query_sorted_keys_buffer.ptr(),
-                query_candidate_values_buffer.ptr(),
-                query_sorted_values_buffer.ptr(),
-                static_cast<int>(candidate_count), static_cast<int>(size),
-                query_segment_offsets_buffer.ptr(),
-                query_segment_offsets_buffer.ptr() + 1,
-                1, sizeof(key_type) * 8, stream);
-        }
+        C2EX
 
         // Stage 5 validates or aggregates newest entries.
         if constexpr (CountOnly)
@@ -916,7 +912,7 @@ private:
             lsm_count_sorted_candidates_kernel_paper<<<
                 SDIV(size, threads_per_block),
                 threads_per_block, 0, stream>>>(
-                    query_sorted_keys_buffer.ptr(),
+                    query_candidate_keys_buffer.ptr(),
                     query_segment_offsets_buffer.ptr(), results,
                     static_cast<smallsize>(size));
         }
@@ -925,8 +921,8 @@ private:
             lsm_sum_sorted_candidates_kernel_paper<<<
                 SDIV(size, threads_per_block),
                 threads_per_block, 0, stream>>>(
-                    query_sorted_keys_buffer.ptr(),
-                    query_sorted_values_buffer.ptr(),
+                    query_candidate_keys_buffer.ptr(),
+                    query_candidate_values_buffer.ptr(),
                     query_segment_offsets_buffer.ptr(), results,
                     static_cast<smallsize>(size));
         }
@@ -956,6 +952,7 @@ public:
             {"threads_per_block", std::to_string(threads_per_block)},
             {"status_bit", "key_lsb"},
             {"stable_original_key_merge", "1"},
+            {"range_sort", "moderngpu_segmented_sort"},
             {"cg_size", std::to_string(size_t{1} << cg_size_log)},
         };
     }
@@ -996,9 +993,8 @@ public:
                query_segment_offsets_buffer.size_in_bytes() +
                query_candidate_keys_buffer.size_in_bytes() +
                query_candidate_values_buffer.size_in_bytes() +
-               query_sorted_keys_buffer.size_in_bytes() +
-               query_sorted_values_buffer.size_in_bytes() +
-               query_temp_buffer.size_in_bytes();
+               query_temp_buffer.size_in_bytes() +
+               (query_sort_context ? query_sort_context->size_in_bytes() : 0);
     }
 
     size_t gpu_resident_bytes_previous()
@@ -1120,12 +1116,9 @@ public:
             query_candidate_keys_buffer.free();
         if (query_candidate_values_buffer.raw_ptr)
             query_candidate_values_buffer.free();
-        if (query_sorted_keys_buffer.raw_ptr)
-            query_sorted_keys_buffer.free();
-        if (query_sorted_values_buffer.raw_ptr)
-            query_sorted_values_buffer.free();
         if (query_temp_buffer.raw_ptr)
             query_temp_buffer.free();
+        query_sort_context.reset();
         total_available_slots = 0;
         max_level_size = 0;
         level_count = 0;
@@ -1145,21 +1138,35 @@ public:
         const size_t total = insert_size + delete_size;
         if (total == 0)
             return;
-        if (total > batch_size)
-            throw std::invalid_argument(
-                "GPU LSM updates must contain at most the fixed batch size b");
+        if (batches_for_elements(total) > capacity_batches() - num_batches)
+            throw std::overflow_error(
+                "LSMu capacity exhausted: max_size must include tombstones");
 
-        // Pad one short mixed batch with its last member.
-        lsm_encode_update_batch_kernel<<<
-            SDIV(batch_size, threads_per_block),
-            threads_per_block, 0, stream>>>(
-                insert_keys, insert_values,
-                static_cast<smallsize>(insert_size),
-                delete_keys, static_cast<smallsize>(delete_size),
-                static_cast<smallsize>(total),
-                batch_keys_buffer.ptr(), batch_values_buffer.ptr(),
-                static_cast<smallsize>(batch_size));
-        sort_and_merge_current_batch(stream);
+        // Preserve insertion order, followed by all deletions.
+        size_t inserted = 0;
+        size_t deleted = 0;
+        while (inserted < insert_size || deleted < delete_size)
+        {
+            const size_t inserts = std::min(batch_size, insert_size - inserted);
+            const size_t deletes =
+                std::min(batch_size - inserts, delete_size - deleted);
+
+            // Only the final short batch repeats its last member.
+            lsm_encode_update_batch_kernel<<<
+                SDIV(batch_size, threads_per_block),
+                threads_per_block, 0, stream>>>(
+                    inserts ? insert_keys + inserted : nullptr,
+                    inserts ? insert_values + inserted : nullptr,
+                    static_cast<smallsize>(inserts),
+                    deletes ? delete_keys + deleted : nullptr,
+                    static_cast<smallsize>(deletes),
+                    static_cast<smallsize>(inserts + deletes),
+                    batch_keys_buffer.ptr(), batch_values_buffer.ptr(),
+                    static_cast<smallsize>(batch_size));
+            sort_and_merge_current_batch(stream);
+            inserted += inserts;
+            deleted += deletes;
+        }
     }
 
     void insert(
@@ -1246,8 +1253,9 @@ public:
     {
         if (size == 0)
             return;
-        lsm_successor_kernel_paper<<<
-            SDIV(size, threads_per_block),
+        const size_t successor_threads = size * 32;
+        lsm_successor_merge_kernel<<<
+            SDIV(successor_threads, threads_per_block),
             threads_per_block, 0, stream>>>(
                 level_keys_buffer.ptr(), keys, results,
                 static_cast<smallsize>(size), level_count, num_batches,

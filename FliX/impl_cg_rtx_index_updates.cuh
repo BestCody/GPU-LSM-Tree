@@ -759,7 +759,7 @@ void build_structures_bucket_layer(
     // CUERR
     copy_buffer.zero();
 
-    reuse_list_buffer.alloc(partition_count_with_overflow);
+    reuse_list_buffer.alloc(extra_allocated_nodes);
     CUERR
     reuse_list_buffer.zero();
     CUERR
@@ -906,7 +906,7 @@ void rebuild_structures_bucket_layer(
         partition_count_with_overflow = new_bucket_count_with_overflow; // total_nodes_used_from_AR + partition_count_with_overflow;
     partition_count = partition_count_with_overflow - 1;
 
-    reuse_list_buffer.resize(partition_count_with_overflow);
+    reuse_list_buffer.resize(allocation_buffer.size_in_bytes() / node_stride);
     CUERR
     reuse_list_buffer.zero();
     CUERR
@@ -1610,59 +1610,24 @@ public:
 
     inline size_t gpu_resident_bytes()
     {
-        // why: snapshot launch params once for consistency with the debug output
-        const updatable_cg_params params = launch_params_buffer.download_first_item();
-        total_nodes_used_from_AR = params.free_node;
-
-        smallsize total_reuse_list_nodes = params.reuse_list_count;
-
-        if (total_nodes_used_from_AR > total_reuse_list_nodes)
-        {
-
-            total_nodes_used_from_AR = total_nodes_used_from_AR - total_reuse_list_nodes;
+        size_t total = as_buffer.size_in_bytes() +
+                       ordered_node_pairs_buffer.size_in_bytes() +
+                       allocation_buffer.size_in_bytes() +
+                       copy_buffer.size_in_bytes() +
+                       maxvalues_buffer.size_in_bytes() +
+                       reuse_list_buffer.size_in_bytes() +
+                       bucket_values_buffer.size_in_bytes() +
+                       launch_params_buffer.size_in_bytes() +
+                       sorted_keys_buffer.size_in_bytes() +
+                       sorted_offsets_buffer.size_in_bytes() +
+                       sorted_key_offset_pairs_buffer.size_in_bytes() +
+                       tree_buffer.size_in_bytes();
+        if (pipeline) {
+            total += pipeline->raygen_records_buffer.size_in_bytes() +
+                     pipeline->miss_records_buffer.size_in_bytes() +
+                     pipeline->hitgroup_records_buffer.size_in_bytes();
         }
-        else
-        {
-
-            total_nodes_used_from_AR = 0;
-        }
-        DEBUG_GPU_RESIDENT_BYTES("Reuse List Nodes, Total Used from AR", 2, total_reuse_list_nodes, total_nodes_used_from_AR);
-
-        // total_nodes_used_from_AR = total_nodes_used_from_AR - total_reuse_list_nodes;
-        // total_nodes_used_from_AR = total_nodes_used_from_AR - total_reuse_list_nodes;
-
-        // Component sizes
-        const size_t as_sz = as_buffer.size_in_bytes();
-        const size_t pairs_sz = ordered_node_pairs_buffer.size_in_bytes();
-        const size_t maxvals_sz = maxvalues_buffer.size_in_bytes();
-        const size_t launch_params_sz = launch_params_buffer.size_in_bytes();
-        const size_t nodes_bytes = static_cast<size_t>(total_nodes_used_from_AR) * node_stride;
-
-        // Totals (preserve original: exclude AS buffer from returned total)
-        const size_t sum_all = pairs_sz + nodes_bytes + maxvals_sz + launch_params_sz;
-        const size_t sum_with_as = sum_all + as_sz;
-
-        //  snapshot
-      /* 
-        DEBUG_GPU_RESIDENT_BYTES("GPU Resident Byte Components", 7,
-                                 as_sz,                                         // AS BUFFER SIZE
-                                 pairs_sz,                                      // ORDERED NODE PAIRS BUFFER SIZE
-                                 static_cast<size_t>(total_nodes_used_from_AR), // TOTAL NODES USED FROM AR
-                                 node_stride,                                   // NODE STRIDE
-                                 maxvals_sz,                                    // MAXVALUES BUFFER SIZE
-                                 total_reuse_list_nodes,                        // TOTAL REUSE LIST NODES
-                                 // ---------total_reuse_list_nodes, // TOTAL REUSE LIST NODES
-                                 launch_params_sz // LAUNCH PARAMS BUFFER SIZE
-        );
-        */
-
-        //  (excl/with AS buffer)
-        DEBUG_GPU_RESIDENT_BYTES("GPU Resident Byte Totals (excl AS, incl AS)", 2,
-                                 sum_all,    // TOTAL GPU RESIDENT BYTES (original behavior)
-                                 sum_with_as // TOTAL incl. AS buffer (for visibility)
-        );
-
-        return sum_all;
+        return total;
     }
 
     size_t compute_total_size(cudaStream_t stream)

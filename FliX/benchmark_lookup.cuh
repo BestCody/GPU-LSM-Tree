@@ -45,6 +45,13 @@ static __global__ void restore_lookup_answers(const smallsize *sorted,
 }
 
 template <typename Key>
+static __global__ void restore_successor_answers(const Key *sorted,
+    const uint32_t *permutation, Key *output, size_t n) {
+    const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    if (i < n) output[permutation[i]] = sorted[i];
+}
+
+template <typename Key>
 class lookup_workspace {
     cuda_buffer<uint32_t> permutation_in_, permutation_sorted_;
     cuda_buffer<uint8_t> scratch_;
@@ -67,6 +74,12 @@ class lookup_workspace {
 public:
     cuda_buffer<Key> sorted_keys;
     cuda_buffer<smallsize> sorted_answers;
+
+    size_t gpu_resident_bytes() {
+        return sorted_keys.size_in_bytes() + sorted_answers.size_in_bytes() +
+               permutation_in_.size_in_bytes() +
+               permutation_sorted_.size_in_bytes() + scratch_.size_in_bytes();
+    }
 
     lookup_workspace() {
         try {
@@ -128,6 +141,95 @@ public:
         if constexpr (requires_ordered_lookup<Index>::value) {
             restore_lookup_answers<<<(n + 255) / 256, 256, 0, stream>>>(
                 sorted_answers.ptr(), permutation_sorted_.ptr(), output, n);
+            check(cudaGetLastError());
+        }
+        check(cudaEventRecord(events_[3], stream));
+        check(cudaEventSynchronize(events_[3]));
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return {elapsed(0, 3), wall_ms, elapsed(0, 1),
+                elapsed(1, 2), elapsed(2, 3)};
+    }
+};
+
+template <typename Key>
+class successor_workspace {
+    cuda_buffer<Key> sorted_keys_, sorted_results_;
+    cuda_buffer<uint32_t> permutation_in_, permutation_sorted_;
+    cuda_buffer<uint8_t> scratch_;
+    std::array<cudaEvent_t, 4> events_{};
+
+    template <typename T>
+    static void ensure(cuda_buffer<T> &buffer, size_t n) {
+        if (buffer.num_elements < n) {
+            buffer.resize(n);
+            check(cudaGetLastError());
+        }
+    }
+
+    double elapsed(unsigned begin, unsigned end) const {
+        float ms = 0;
+        check(cudaEventElapsedTime(&ms, events_[begin], events_[end]));
+        return ms;
+    }
+
+public:
+    successor_workspace() {
+        try {
+            for (auto &event : events_) check(cudaEventCreate(&event));
+        } catch (...) {
+            for (auto event : events_) if (event) cudaEventDestroy(event);
+            throw;
+        }
+    }
+    successor_workspace(const successor_workspace &) = delete;
+    successor_workspace &operator=(const successor_workspace &) = delete;
+    ~successor_workspace() {
+        for (auto event : events_) cudaEventDestroy(event);
+    }
+
+    template <typename Index>
+    lookup_times lookup(Index &index, const Key *keys, Key *output,
+                        size_t n, cudaStream_t stream = 0) {
+        if (n == 0) return {};
+        if (n > std::numeric_limits<uint32_t>::max())
+            throw std::overflow_error(
+                "Successor permutation exceeds 32-bit indices");
+        check(cudaStreamSynchronize(stream));
+        const auto wall_start = std::chrono::steady_clock::now();
+        check(cudaEventRecord(events_[0], stream));
+        if constexpr (requires_ordered_lookup<Index>::value) {
+            ensure(sorted_keys_, n);
+            ensure(sorted_results_, n);
+            ensure(permutation_in_, n);
+            ensure(permutation_sorted_, n);
+            make_lookup_permutation<<<(n + 255) / 256, 256, 0, stream>>>(
+                permutation_in_.ptr(), n);
+            check(cudaGetLastError());
+            size_t scratch_bytes = 0;
+            check(cub::DeviceRadixSort::SortPairs(nullptr, scratch_bytes,
+                keys, sorted_keys_.ptr(), permutation_in_.ptr(),
+                permutation_sorted_.ptr(), n, 0, sizeof(Key) * 8, stream));
+            ensure(scratch_, scratch_bytes);
+            check(cub::DeviceRadixSort::SortPairs(scratch_.ptr(), scratch_bytes,
+                keys, sorted_keys_.ptr(), permutation_in_.ptr(),
+                permutation_sorted_.ptr(), n, 0, sizeof(Key) * 8, stream));
+            check(cudaMemsetAsync(sorted_results_.ptr(), 0,
+                                  n * sizeof(Key), stream));
+        } else {
+            check(cudaMemsetAsync(output, 0, n * sizeof(Key), stream));
+        }
+        check(cudaEventRecord(events_[1], stream));
+        if constexpr (requires_ordered_lookup<Index>::value)
+            index.lookups_successor(
+                sorted_keys_.ptr(), sorted_results_.ptr(), n, stream);
+        else
+            index.lookups_successor(keys, output, n, stream);
+        check(cudaGetLastError());
+        check(cudaEventRecord(events_[2], stream));
+        if constexpr (requires_ordered_lookup<Index>::value) {
+            restore_successor_answers<<<(n + 255) / 256, 256, 0, stream>>>(
+                sorted_results_.ptr(), permutation_sorted_.ptr(), output, n);
             check(cudaGetLastError());
         }
         check(cudaEventRecord(events_[3], stream));

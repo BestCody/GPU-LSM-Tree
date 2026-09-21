@@ -1,0 +1,27 @@
+{
+  "repository": "https://github.com/moderngpu/moderngpu",
+  "revision": "267cc8d02c03f00f1656f1205c61c946a1e530b0",
+  "description": "Unmodified headers required by stable segmented_sort; upstream LICENSE.md retained as LICENSE.txt.",
+  "sha256": {
+    "src/moderngpu/context.hxx": "d07665a576f839a2e426b74c0dd3105395390f3809b451831fa9bf78b5973c69",
+    "src/moderngpu/cta_merge.hxx": "c1f429292686f619593ebaa58d2ed22c233438289973cdb97dd80de7f89be382",
+    "src/moderngpu/cta_mergesort.hxx": "d8a62acb0ad175d627601a9656d39658cee59a310e724d0ab29db353bcd45385",
+    "src/moderngpu/cta_scan.hxx": "7acc1d100c8f213123dfcb1dcb81912d729c9a06e40896d3a34844b050015000",
+    "src/moderngpu/cta_search.hxx": "f822b5789d3e1ad061eadd3927a7f824021155770073ecb7ff2be068b3efd2d2",
+    "src/moderngpu/cta_segsort.hxx": "3c23d1f50e850aa53b3d7388ae63e94eb8c5515d0b4eb9b90cf1b0250bc892c2",
+    "src/moderngpu/intrinsics.hxx": "0cb927593bc8960fd7bbefb9790c6887495a0cfb5f57c87cf518be22c9765aac",
+    "src/moderngpu/kernel_segsort.hxx": "c2d6ed6d7ee379e48306b4142abb42e6c0c8743235ec1ffab460656971967141",
+    "src/moderngpu/launch_box.hxx": "5005889b6fd8a9bb5d57eef86f63e66c09a8925285835a5c3ed5eb4475ebf1d9",
+    "src/moderngpu/launch_params.hxx": "6f0ce847ec1cb9b6c9f2e46dade65c582915207cfe19f600909016b9f469b0c2",
+    "src/moderngpu/loadstore.hxx": "12ef8bae4d815bb75be5f91653d328db7952247aff7145ccfe14df19fe35eb1b",
+    "src/moderngpu/memory.hxx": "0f0c94e94f44771eac1eb0f17a281a10c523f3b33c373a1b723e423e60240fa5",
+    "src/moderngpu/meta.hxx": "e69df0834cfc11610f96fe65018f8f11d91668dec1ca81001d57aa8a13792f80",
+    "src/moderngpu/operators.hxx": "16ea33b70ac52eff925d757c56c717490a24f62b8d661365315681a9887781ff",
+    "src/moderngpu/search.hxx": "deb606d5bac985a682328b507f7fec8430ab8b59caf54ee9d2338da4c800223d",
+    "src/moderngpu/sort_networks.hxx": "ae4ec6e82cc18925a19c0358299dc40b157ad23bb02b0788ac18922874762cd1",
+    "src/moderngpu/transform.hxx": "63a1981875defb5829d103ddd9700b27a99a2694200047378e16afd0224eb1c9",
+    "src/moderngpu/tuple.hxx": "f05b0b63cebf13723ddc2cd81a3e42d85afe0eb0e1d5e88b4ffedf15b28413dd",
+    "src/moderngpu/types.hxx": "b605ad5121494c628fcd1092ee89c961d60f68a833d6e0a7f4b12f14eeb3413a",
+    "src/moderngpu/util.hxx": "9e96b73d32c54f331a0e81790ec2095f34f7f466bb0a132375e1ba66e07562dd"
+  }
+}

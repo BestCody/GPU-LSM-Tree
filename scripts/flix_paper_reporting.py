@@ -1,4 +1,4 @@
-"""Reports for the common suite; legacy reports remain unchanged."""
+"""Generate reports for the common paper suite."""
 import csv
 import hashlib
 import json
@@ -54,12 +54,27 @@ def flix_rows(folder, case):
 
 def load_runs(root, manifest):
     frames = []
-    for case in manifest['cases']:
-        for rep in range(manifest['settings']['repetitions']):
-            folder = root / case['id'] / f'rep_{rep:02}'
+    sources = [(case, root, None, False) for case in manifest['cases']]
+    for skipped in manifest.get('skipped_cases', []):
+        sources.append((skipped['case'], Path(manifest['skipped_from']), skipped, False))
+    for adopted in manifest.get('adopted_warmups', []):
+        sources.append((adopted['case'], Path(manifest['adopted_from']), adopted, True))
+    for case, source, prior, is_adopted in sources:
+        repetitions = 1 if is_adopted else manifest['settings']['repetitions']
+        for rep in range(repetitions):
+            label = 'warmup_00' if is_adopted else f'rep_{rep:02}'
+            folder = source / case['id'] / label
             completion = folder / 'completion.json'
             if not completion.exists():
                 raise RuntimeError(f'Missing completed repetition: {folder}')
+            if is_adopted:
+                expected = prior['completion_sha256']
+                if hashlib.sha256(completion.read_bytes()).hexdigest() != expected:
+                    raise RuntimeError(f'Changed adopted warmup: {completion}')
+            elif prior is not None:
+                expected = {item['label']: item['sha256'] for item in prior['completions']}
+                if hashlib.sha256(completion.read_bytes()).hexdigest() != expected[label]:
+                    raise RuntimeError(f'Changed reused completion: {completion}')
             record = json.loads(completion.read_text())
             for name, digest in record['artifacts'].items():
                 if hashlib.sha256((folder / name).read_bytes()).hexdigest() != digest:
@@ -75,6 +90,11 @@ def load_runs(root, manifest):
             for key in ('family', 'backend', 'kind', 'batch_log'):
                 frame[key] = case[key]
             frame['repetition'] = rep
+            frame['expected_repetitions'] = repetitions
+            frame['sample_origin'] = 'adopted_warmup' if is_adopted else 'measured_repetition'
+            if is_adopted:
+                # These binaries precede the retained-memory accounting fix.
+                frame['index_bytes'] = np.nan
             frames.append(frame)
     frame = pd.concat(frames, ignore_index=True)
     for name in ('state', 'resident_elements', 'items', 'time_ms', 'wall_ms', 'prepare_ms',
@@ -102,8 +122,10 @@ def summarize(root, no_plots=False):
         median_ms=('time_ms', 'median'), stddev_ms=('time_ms', 'std'),
         minimum_ms=('time_ms', 'min'), maximum_ms=('time_ms', 'max'),
         mean_wall_ms=('wall_ms', 'mean'), median_rate_mops=('rate_mops', 'median'),
-        maximum_index_bytes=('index_bytes', 'max')).reset_index()
-    if not states['repetitions'].eq(manifest['settings']['repetitions']).all():
+        maximum_index_bytes=('index_bytes', 'max'),
+        expected_repetitions=('expected_repetitions', 'first'),
+        sample_origin=('sample_origin', 'first')).reset_index()
+    if not states['repetitions'].eq(states['expected_repetitions']).all():
         raise RuntimeError('Unequal or duplicated repetition coverage')
     states.to_csv(out / 'states.csv', index=False)
     trace_keys = ['family', 'kind', 'batch_log', 'system', 'operation', 'scenario',
@@ -123,7 +145,10 @@ def summarize(root, no_plots=False):
         plot_states(states, out)
     (out / 'README.md').write_text(
         '# Common FliX paper suite\n\n'
-        'Only completed timed repetitions appear here. Warmups and sanitizer runs are excluded. '
+        'Only completed timed repetitions appear here, except the explicitly adopted '
+        'warmup cases marked sample_origin=adopted_warmup. '
+        'Those cases have one sample and no variation estimate; their old memory '
+        'counters are excluded. Other warmups and sanitizer runs are excluded. '
         'states.csv reports variability across repetitions of the same state; traces.csv sums '
         'time and work within each repetition before aggregation. Compare trace throughput only '
         'when the state coverage and item counts match.\n\n'
@@ -152,7 +177,7 @@ def summarize(root, no_plots=False):
         'snapshot, excludes harness buffers, and is not a measured allocation peak. Input '
         'generation, checksum collection, and correctness checking are outside operation timers. '
         'Validation between operations may affect cache state. No forced final publication is '
-        'required for visible results; explicit cleanup is available in the legacy family.\n\n'
+        'required for visible results.\n\n'
         'The common_initialized_v1 protocol changes initialization, values, and lookup timing '
         'relative to historical results. Do not merge the two datasets. The manifest records '
         'source, GPU, build, workload, and repetition settings.\n')

@@ -140,7 +140,11 @@ public:
     }
 
     size_t gpu_resident_bytes() {
-        return wrapped_table.value().bytes_total();
+        if (!wrapped_table) return 0;
+        return size_t(wrapped_table->bytes_total()) +
+               warpcore::defaults::temp_memory_bytes() +
+               sizeof(typename table_type::status_type) +
+               sizeof(typename table_type::index_type);
     }
 
     void build(const key_type* keys, size_t size, size_t max_size, size_t available_memory_bytes, double* build_time_ms, size_t* build_bytes) {

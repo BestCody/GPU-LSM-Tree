@@ -113,6 +113,12 @@ pairs or deletion keys on the GPU inside the update timer. LSMu capacity include
 tombstones and the padding consumed by each public update call. The hash checks
 cover distinct-key growth and deletion, not overwriting live keys.
 
+FliX's bulk insertion and deletion kernels use 128 threads per block: the
+imported CUDA helper defines `MAXBLOCKSIZE=1024`, and the runner sets `DIV=8`.
+SlabHash defaults to an 80% initial load, matching the FliX paper's hash-table
+setting. The load remains configurable through its `initial_load_percent`
+template parameter. Its bucket count is still based on the initial build size.
+
 Update-benchmark lookup rows use `lookup_timing=complete_unsorted_v1`.
 `probe_time_ms`, `probe_miss_time_ms`, and `deleted_keys_probe_time_ms` now cover
 the complete resident lookup: unsorted GPU inputs through answers in their
@@ -186,6 +192,19 @@ and value-prefix shortcuts do not satisfy this contract. Bounds are inclusive
 and output arithmetic is modulo 2^32. Results carry the processing tag
 `enumerate_records_sum_v1`; the CSV operation names remain `range_sum` and
 `range_sum_after_delete`. Historical untagged results remain separate.
+
+The common paper driver submits each state's full range-query batch in one
+public call by default, for every supporting backend. The complete call,
+including any internal workspace allocation or splitting, is timed. For a
+memory-limited experiment, `--range-chunk-log N` explicitly limits each public
+call to at most `2^N` queries; `0` restores the full-batch default. Use the same
+setting for every backend in a comparison. Larger batches can require more
+temporary memory, especially when LSMu gathers many matching elements.
+The CSV records `range_api_calls` and `range_max_call_items`, and the runner
+checks them against the requested setting. The previous runner default was
+`--range-chunk-log 16`; those timings used separate calls of 65,536 queries
+and must not be combined with full-batch timings. Use a new output directory
+for the changed configuration. The legacy experiment family is unchanged.
 
 GPULSMOpt's native range traversal already resolves versions and visits
 individual records. Its output sink reduces their values. Returning records

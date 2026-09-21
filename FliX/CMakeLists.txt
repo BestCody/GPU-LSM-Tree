@@ -10,21 +10,16 @@ option(FLIX_USE_KEY_CACHE "Reuse generated benchmark key caches" OFF)
 set(FLIX_BENCHMARK_KEY_BITS 31 CACHE STRING "Common FliX benchmark key domain width")
 option(FLIX_ENABLE_PROFILING "Enable host profiling instrumentation" OFF)
 option(FLIX_BUILD_COMMON_PAPER_SWEEP "Build the selected backend's common paper sweep" OFF)
-option(FLIX_BUILD_LSMU_PAPER_SWEEP
-       "Build the standalone GPU LSM paper sweep" OFF)
-option(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP
-       "Build the GPULSMOpt GPU LSM paper sweep" OFF)
-option(FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST
-       "Build the GPULSMOpt RootSink correctness test" OFF)
-option(FLIX_BUILD_GPULSMOPT_TILE_TEST
-       "Build the GPULSMOpt tile lookup correctness test" OFF)
-option(FLIX_BUILD_GPULSMOPT_SIMPLIFICATION_TEST
-       "Build GPULSMOpt admission and lookup regression checks" OFF)
+option(FLIX_BUILD_GPULSMOPT_SUCCESSOR_TEST
+       "Build the GPULSMOpt successor correctness test" OFF)
+option(FLIX_BUILD_LSMU_SUCCESSOR_TEST
+       "Build the LSMu successor correctness and focused timing test" OFF)
+option(FLIX_BUILD_LSMU_CLEANUP_RANGE_EXPERIMENT
+       "Build the focused LSMu cleanup and range-sum experiment" OFF)
 
 set(FLIX_NEEDS_OPTIX ON)
-if(FLIX_BUILD_LSMU_PAPER_SWEEP OR FLIX_BUILD_GPULSMOPT_PAPER_SWEEP OR
-   FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST OR FLIX_BUILD_GPULSMOPT_TILE_TEST OR
-   FLIX_BUILD_GPULSMOPT_SIMPLIFICATION_TEST)
+if(FLIX_BUILD_GPULSMOPT_SUCCESSOR_TEST OR FLIX_BUILD_LSMU_SUCCESSOR_TEST OR
+   FLIX_BUILD_LSMU_CLEANUP_RANGE_EXPERIMENT)
   set(FLIX_NEEDS_OPTIX OFF)
 elseif(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
    IFDEFS MATCHES "(GPULSMOPT|LSM_TREE|GPU_BTREE|HASHTABLE_WARPCORE|HASHTABLE_SLAB|SORTED_ARRAY)")
@@ -149,73 +144,34 @@ if(FLIX_BUILD_COMMON_PAPER_SWEEP)
   endif()
 endif()
 
-if(FLIX_BUILD_LSMU_PAPER_SWEEP)
-  add_executable(lsmu_paper_sweep paper_lsmu_sweep.cu)
-  target_compile_definitions(lsmu_paper_sweep PRIVATE LSM_TREE)
-  configure_paper_sweep_target(lsmu_paper_sweep)
-endif()
-
-if(FLIX_BUILD_GPULSMOPT_PAPER_SWEEP)
-  add_executable(gpulsmopt_paper_sweep paper_lsmu_sweep.cu)
-  target_compile_definitions(gpulsmopt_paper_sweep PRIVATE
-          GPULSMOPT PAPER_SWEEP_GPULSMOPT UNSORTED_PROBES_CHECKS
-          GPULSMOPT_BATCH_CAPACITY=1048576)
-  configure_paper_sweep_target(gpulsmopt_paper_sweep)
-endif()
-
-if(FLIX_BUILD_GPULSMOPT_ROOTSINK_TEST)
+if(FLIX_BUILD_GPULSMOPT_SUCCESSOR_TEST)
   enable_testing()
-  add_executable(gpulsmopt_rootsink_test gpulsmopt_rootsink_test.cu)
-  target_include_directories(gpulsmopt_rootsink_test PRIVATE
+  add_executable(gpulsmopt_successor_test
+          ../tests/gpulsmopt_successor_test.cu)
+  target_include_directories(gpulsmopt_successor_test PRIVATE
           "${CMAKE_CURRENT_SOURCE_DIR}/..")
-  configure_paper_sweep_target(gpulsmopt_rootsink_test)
-  add_test(NAME gpulsmopt_rootsink_correctness
-           COMMAND gpulsmopt_rootsink_test)
+  configure_paper_sweep_target(gpulsmopt_successor_test)
+  add_test(NAME gpulsmopt_successor_correctness
+           COMMAND gpulsmopt_successor_test)
 endif()
 
-if(FLIX_BUILD_GPULSMOPT_TILE_TEST)
+if(FLIX_BUILD_LSMU_SUCCESSOR_TEST)
   enable_testing()
-  add_executable(gpulsmopt_tile_lookup_test ../tests/gpulsmopt_tile_lookup_test.cu)
-  target_include_directories(gpulsmopt_tile_lookup_test PRIVATE
-          "${CMAKE_CURRENT_SOURCE_DIR}/..")
-  configure_paper_sweep_target(gpulsmopt_tile_lookup_test)
-  add_test(NAME gpulsmopt_tile_lookup_correctness
-           COMMAND gpulsmopt_tile_lookup_test)
+  add_executable(lsmu_successor_test
+          ../tests/lsmu_successor_test.cu)
+  target_include_directories(lsmu_successor_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}")
+  configure_paper_sweep_target(lsmu_successor_test)
+  add_test(NAME lsmu_successor_correctness
+           COMMAND lsmu_successor_test)
 endif()
 
-if(FLIX_BUILD_GPULSMOPT_SIMPLIFICATION_TEST)
-  enable_testing()
-  add_executable(gpulsmopt_simplification_test
-          ../tests/gpulsmopt_simplification_test.cu)
-  target_include_directories(gpulsmopt_simplification_test PRIVATE
-          "${CMAKE_CURRENT_SOURCE_DIR}/..")
-  configure_paper_sweep_target(gpulsmopt_simplification_test)
-  add_test(NAME gpulsmopt_simplification_correctness
-           COMMAND gpulsmopt_simplification_test)
-  add_executable(gpulsmopt_sealed_consolidation_test
-          ../tests/gpulsmopt_sealed_consolidation_test.cu)
-  target_include_directories(gpulsmopt_sealed_consolidation_test PRIVATE
-          "${CMAKE_CURRENT_SOURCE_DIR}/..")
-  configure_paper_sweep_target(gpulsmopt_sealed_consolidation_test)
-  add_test(NAME gpulsmopt_sealed_consolidation_correctness
-           COMMAND gpulsmopt_sealed_consolidation_test)
-  add_executable(gpulsmopt_state_cleanup_test
-          ../tests/gpulsmopt_state_cleanup_test.cu)
-  target_include_directories(gpulsmopt_state_cleanup_test PRIVATE
-          "${CMAKE_CURRENT_SOURCE_DIR}/..")
-  configure_paper_sweep_target(gpulsmopt_state_cleanup_test)
-  add_test(NAME gpulsmopt_state_cleanup_correctness
-           COMMAND gpulsmopt_state_cleanup_test)
-  add_executable(gpulsmopt_memory_test ../tests/gpulsmopt_memory_test.cu)
-  target_include_directories(gpulsmopt_memory_test PRIVATE
-          "${CMAKE_CURRENT_SOURCE_DIR}/..")
-  configure_paper_sweep_target(gpulsmopt_memory_test)
-  add_test(NAME gpulsmopt_memory_correctness COMMAND gpulsmopt_memory_test)
-  add_executable(gpulsmopt_dead_code_test ../tests/gpulsmopt_dead_code_test.cu)
-  target_include_directories(gpulsmopt_dead_code_test PRIVATE
-          "${CMAKE_CURRENT_SOURCE_DIR}/..")
-  configure_paper_sweep_target(gpulsmopt_dead_code_test)
-  add_test(NAME gpulsmopt_dead_code_correctness COMMAND gpulsmopt_dead_code_test)
+if(FLIX_BUILD_LSMU_CLEANUP_RANGE_EXPERIMENT)
+  add_executable(lsmu_cleanup_range_experiment
+          ../tests/lsmu_cleanup_range_experiment.cu)
+  target_include_directories(lsmu_cleanup_range_experiment PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}")
+  configure_paper_sweep_target(lsmu_cleanup_range_experiment)
 endif()
 
 set_target_properties(index_prototype PROPERTIES

@@ -94,7 +94,7 @@ DEVICEQUALIFIER int binarySearchIndex_leftmost_ge(
     // NOTE: cannot clamp 'right' to allocation size here because we don't know it.
 
     int lo = left;
-    int hi = right -1;
+    int hi = right;
 
    // printf(" 0 Binary Search Leftmost GE: Initial lo=%d hi=%d \n", lo, hi);
 

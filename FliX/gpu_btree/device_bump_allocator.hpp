@@ -28,7 +28,7 @@ struct device_bump_allocator {
   using pointer_type = uint32_t;
 
   // EDIT jh: passed allocation size in constructor
-  device_bump_allocator(std::size_t num_items) {
+  explicit device_bump_allocator(std::size_t num_items) : capacity_(num_items) {
     d_buffer_     = cuda_allocator<T>().allocate(num_items);
     d_slab_count_ = cuda_allocator<uint32_t>().allocate(1);
     cuda_try(cudaMemset(d_slab_count_, 0x00, sizeof(uint32_t)));
@@ -43,7 +43,8 @@ struct device_bump_allocator {
       : d_buffer_(other.d_buffer_)
       , buffer_(other.buffer_)
       , d_slab_count_(other.d_slab_count_)
-      , slab_count_(other.slab_count_) {}
+      , slab_count_(other.slab_count_)
+      , capacity_(other.capacity_) {}
   template <typename tile_type>
   DEVICE_QUALIFIER pointer_type allocate(std::size_t n, const tile_type& tile) {
     static constexpr int elected_lane = 0;
@@ -67,6 +68,10 @@ struct device_bump_allocator {
   __device__ void set_allocated_count(size_type count) { *d_slab_count_ = count; }
   uint32_t get_total_allocated_count() const { return get_allocated_count(); }
 
+  std::size_t allocated_bytes() const {
+    return capacity_ * sizeof(T) + sizeof(uint32_t);
+  }
+
   void copy_buffer(T* buffer, std::size_t bytes_count) const {
     cuda_try(cudaMemcpy(buffer, d_buffer_, bytes_count, cudaMemcpyDeviceToHost));
   }
@@ -77,6 +82,10 @@ private:
   std::shared_ptr<T> buffer_;
   uint32_t* d_slab_count_;
   std::shared_ptr<uint32_t> slab_count_;
+  std::size_t capacity_;
+
+  template <class>
+  friend struct device_bump_allocator;
 };
 
 template <class T>
