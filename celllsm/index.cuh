@@ -271,34 +271,6 @@ private:
         batch_capacity_ * celllsm::kBatchesPerEpoch);
   }
 
-  template <class AdmitTile, class AdmitLargeBatch>
-  void admit_batches(std::uint64_t count, cudaStream_t stream,
-                     AdmitTile admit_one, AdmitLargeBatch admit_large_batch) {
-    begin_operation(stream);
-    std::uint64_t consumed = 0u;
-    while (consumed < count) {
-      if (!pending_batches_) {
-        consumed += admit_large_batch(consumed, count - consumed);
-        if (consumed == count) break;
-      }
-      // Fit each epoch in its smallest destination.
-      const std::uint32_t tile_count = static_cast<std::uint32_t>(
-          std::min<std::uint64_t>(count - consumed,
-              std::min(batch_capacity_, epoch_row_capacity() - pending_records_)));
-      admit_one(consumed, tile_count);
-      consumed += tile_count;
-      if (consumed < count && publication_.receipt_pending())
-        resolve_publication_receipt_on_stream(stream);
-      if (consumed < count && publication_.failed()) {
-        end_operation(stream);
-        throw std::runtime_error(
-            "GPULSMOpt publication failed while tiling an update; "
-            "accepted pending records were preserved");
-      }
-    }
-    end_operation(stream);
-  }
-
   struct AdmissionTile {
     std::uint32_t slot, count;
     std::uint32_t *keys;
@@ -1883,21 +1855,39 @@ private:
     return static_cast<std::size_t>(admission->accepted_rows);
   }
 
+  // Split an update into pending-batch tiles. Whenever nothing is pending,
+  // the large-batch path may first take whole epochs as direct runs.
   void admit(const std::uint32_t *keys, const std::uint32_t *values,
              std::size_t count, bool tombstone, cudaStream_t stream) {
     if (!count) return;
     if (!keys || (!tombstone && !values))
       throw std::invalid_argument("invalid GPULSMOpt update batch");
-    admit_batches(count, stream,
-        [&](std::uint64_t first, std::uint32_t count) {
-          admit_tile(keys + first, tombstone ? nullptr : values + first,
-                     count, tombstone, stream);
-        },
-        [&](std::uint64_t first, std::uint64_t count) -> std::uint64_t {
-          return try_admit_large_batch(
-              keys + first, tombstone ? nullptr : values + first,
-              count, tombstone, stream);
-        });
+    begin_operation(stream);
+    std::uint64_t consumed = 0u;
+    while (consumed < count) {
+      if (!pending_batches_) {
+        consumed += try_admit_large_batch(
+            keys + consumed, tombstone ? nullptr : values + consumed,
+            count - consumed, tombstone, stream);
+        if (consumed == count) break;
+      }
+      // Fit each epoch in its smallest destination.
+      const std::uint32_t tile_count = static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(count - consumed,
+              std::min(batch_capacity_, epoch_row_capacity() - pending_records_)));
+      admit_tile(keys + consumed, tombstone ? nullptr : values + consumed,
+                 tile_count, tombstone, stream);
+      consumed += tile_count;
+      if (consumed < count && publication_.receipt_pending())
+        resolve_publication_receipt_on_stream(stream);
+      if (consumed < count && publication_.failed()) {
+        end_operation(stream);
+        throw std::runtime_error(
+            "GPULSMOpt publication failed while tiling an update; "
+            "accepted pending records were preserved");
+      }
+    }
+    end_operation(stream);
   }
 
   void admit_tile(const std::uint32_t *keys, const std::uint32_t *values,
