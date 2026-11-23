@@ -2478,7 +2478,7 @@ __global__ void deposit_bulk_root_sink_kernel(
     const std::uint32_t *tile_offsets,
     std::uint32_t *quotient_end_markers,
     Output output_rows,
-    std::uint64_t destination) {
+    std::uint64_t destination, bool tombstone) {
   constexpr std::uint32_t kWarpSize = 32u;
   constexpr std::uint32_t kWarps = kThreads / kWarpSize;
   constexpr std::uint32_t kGroups =
@@ -2537,7 +2537,8 @@ __global__ void deposit_bulk_root_sink_kernel(
         __popc(mask & lower_lanes);
     const std::uint64_t output = destination + output_rank;
     output_rows.store(output, make_row(
-        keys[item], sorted_values[position], 0u));
+        keys[item], tombstone ? 0u : sorted_values[position],
+        tombstone ? kTombstone : 0u));
     if (quotient_terminal[item]) {
       const std::uint32_t quotient = keys[item] >> 16u;
       quotient_end_markers[quotient + 1u] = output_rank + 1u;
@@ -5613,12 +5614,18 @@ __host__ __device__ inline int compare_keys(
 inline RecordBatchView inline_u32_batch(
     const std::uint32_t *keys, const std::uint32_t *values,
     std::uint64_t count, Mutation operation = Mutation::put) {
-  return {
-      {reinterpret_cast<const std::uint8_t *>(keys), nullptr,
-       sizeof(std::uint32_t)},
-      {reinterpret_cast<const std::uint8_t *>(values), nullptr,
-       sizeof(std::uint32_t)},
-      nullptr, values, count, true, operation};
+  RecordBatchView source{};
+  source.keys = {reinterpret_cast<const std::uint8_t *>(keys), nullptr,
+                 sizeof(std::uint32_t)};
+  if (operation != Mutation::erase) {
+    source.values = {reinterpret_cast<const std::uint8_t *>(values), nullptr,
+                     sizeof(std::uint32_t)};
+    source.range_contributions = values;
+  }
+  source.count = count;
+  source.head4_words = true;
+  source.uniform_operation = operation;
+  return source;
 }
 
 
@@ -9276,7 +9283,7 @@ class DirectRootWorkspace {
   const std::uint32_t *sparse_heads() const {
     return sparse_heads_.data();
   }
-  const gpulsmopt2_detail::Row *projection_rows() const {
+  gpulsmopt2_detail::Row *projection_rows() {
     return projection_rows_.data();
   }
   const std::uint32_t *section_offsets() const {
@@ -9364,16 +9371,24 @@ template <bool WithEpoch> class NativeRootWorkspace {
   std::uint16_t *epoch_ranks() const { return view<std::uint16_t>(layout_.epoch_ranks); }
 
   std::uint32_t prepare(const std::uint32_t *keys, const std::uint32_t *values,
-                        std::uint32_t count, bool materialize_epoch,
+                        std::uint32_t count, Mutation operation,
+                        bool materialize_epoch,
                         cudaStream_t stream) {
     if (!count || count > capacity_ || (materialize_epoch && !WithEpoch))
       throw std::length_error("native root workspace capacity");
     count_ = count;
+    tombstone_ = operation == Mutation::erase;
     const std::uint32_t tiles = tile_count(count);
     std::size_t bytes = layout_.sort_bytes;
-    check(cub::DeviceRadixSort::SortPairs(
-        view<std::uint8_t>(layout_.temporary), bytes, keys, sorted_keys(),
-        values, sorted_values(), count, 0, 32, stream), "sort native root");
+    if (tombstone_) {
+      check(cub::DeviceRadixSort::SortKeys(
+          view<std::uint8_t>(layout_.temporary), bytes, keys, sorted_keys(),
+          count, 0, 32, stream), "sort native deletion keys");
+    } else {
+      check(cub::DeviceRadixSort::SortPairs(
+          view<std::uint8_t>(layout_.temporary), bytes, keys, sorted_keys(),
+          values, sorted_values(), count, 0, 32, stream), "sort native root");
+    }
     gpulsmopt2_detail::count_bulk_root_sink_tiles_kernel<<<
         tiles, gpulsmopt2_detail::kThreads, 0, stream>>>(
         sorted_keys(), count, view<std::uint32_t>(layout_.tile_counts));
@@ -9410,7 +9425,8 @@ template <bool WithEpoch> class NativeRootWorkspace {
     gpulsmopt2_detail::deposit_bulk_root_sink_kernel<<<
         tile_count(count_), gpulsmopt2_detail::kThreads, 0, stream>>>(
         sorted_keys(), sorted_values(), count_,
-        view<std::uint32_t>(layout_.tile_offsets), markers, output, destination);
+        view<std::uint32_t>(layout_.tile_offsets), markers, output, destination,
+        tombstone_);
     std::size_t bytes = layout_.quotient_scan_bytes;
     check(cub::DeviceScan::InclusiveScan(
         view<std::uint8_t>(layout_.quotient_scan_temporary), bytes,
@@ -9450,6 +9466,11 @@ template <bool WithEpoch> class NativeRootWorkspace {
     check(cub::DeviceRadixSort::SortPairs(
         nullptr, layout.sort_bytes, rows, rows, rows, rows,
         static_cast<std::uint32_t>(capacity), 0, 32), "size native root sort");
+    std::size_t key_sort_bytes = 0u;
+    check(cub::DeviceRadixSort::SortKeys(
+        nullptr, key_sort_bytes, rows, rows,
+        static_cast<std::uint32_t>(capacity), 0, 32), "size native deletion sort");
+    layout.sort_bytes = std::max(layout.sort_bytes, key_sort_bytes);
     check(cub::DeviceScan::ExclusiveSum(
         nullptr, layout.scan_bytes, rows, rows, tile_count(capacity) + 1u),
         "size native root scan");
@@ -9485,6 +9506,7 @@ template <bool WithEpoch> class NativeRootWorkspace {
   }
   Buffer<std::uint8_t> owned_storage_;
   std::uint32_t capacity_{}, count_{};
+  bool tombstone_{};
   StorageLayout layout_;
   std::uint8_t *storage_{};
 };
@@ -12800,7 +12822,8 @@ public:
     phase_workspace_.grow(bulk_bytes);
     gpulsm_sparse::NativeRootWorkspace<false> workspace(
         n, phase_workspace_.data(), phase_workspace_.size());
-    const std::uint32_t base_count = workspace.prepare(keys, values, n, false, stream);
+    const std::uint32_t base_count = workspace.prepare(
+        keys, values, n, gpulsm_sparse::Mutation::put, false, stream);
 
     const std::uint32_t level = initial_level_for_records(base_count);
     ensure_level_storage_mapped(level, stream);
@@ -12822,6 +12845,17 @@ public:
         device_manifests_.data(), active_device_manifest_.data(),
         query_occupied_level_mask_.data(), level, base_count, 0u);
     CUDA_CHECK(cudaGetLastError());
+    // The large-deletion shortcut sorts keys without values. Initialize its
+    // separate sorting kernels during bulk build, after the initial run has
+    // been copied. Reuse the build workspace; this does not change the index.
+    if (count >= epoch_row_capacity() &&
+        sealed_workspace_capacity(publication_capacity_, level_zero_capacity_) >
+            level_zero_capacity_) {
+      const auto warm_rows = static_cast<std::uint32_t>(std::min<std::size_t>(
+          {count, epoch_row_capacity(), std::size_t{1u} << 20u}));
+      workspace.prepare(keys, nullptr, warm_rows,
+                        gpulsm_sparse::Mutation::erase, false, stream);
+    }
     end_operation(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     phase_workspace_.shrink(phase_restore_bytes);
@@ -13164,6 +13198,8 @@ public:
   }
 
 private:
+
+  friend struct GPULSMOptDeletionTestAccess;
 
   class PublicationLifecycle {
    public:
@@ -15286,25 +15322,28 @@ private:
   std::uint32_t build_sealed_root(Workspace &workspace,
       std::uint32_t selected, std::uint64_t resident_sources,
       std::uint32_t level, std::uint32_t generation,
+      bool merge, bool keep_tombstones,
       cudaStream_t stream) {
     gpulsmopt2_detail::ResidentPublicationPlan plan{};
     plan.selected_count = selected;
     plan.destination_level = level;
     plan.output_generation = generation;
-    if (resident_sources) {
+    plan.keep_tombstones = keep_tombstones;
+    if (merge) {
       plan.source_count = 1u + static_cast<std::uint32_t>(
           __builtin_popcountll(resident_sources));
       if (plan.source_count > gpulsmopt2_detail::kMaximumMergeSources)
         throw std::invalid_argument("invalid sealed carry sources");
       validate_publication_sources(plan.source_count);
-      plan.source_level_limit = 63u -
-          static_cast<std::uint32_t>(__builtin_clzll(resident_sources));
-      const std::uint64_t source_prefix = plan.source_level_limit == 63u
-          ? ~std::uint64_t{0}
-          : (std::uint64_t{1u} << (plan.source_level_limit + 1u)) - 1u;
-      if ((host_occupied_level_mask_ & source_prefix) != resident_sources)
-        throw std::invalid_argument("non-prefix sealed carry sources");
-      plan.keep_tombstones = 1u;
+      if (resident_sources) {
+        plan.source_level_limit = 63u -
+            static_cast<std::uint32_t>(__builtin_clzll(resident_sources));
+        const std::uint64_t source_prefix = plan.source_level_limit == 63u
+            ? ~std::uint64_t{0}
+            : (std::uint64_t{1u} << (plan.source_level_limit + 1u)) - 1u;
+        if ((host_occupied_level_mask_ & source_prefix) != resident_sources)
+          throw std::invalid_argument("non-prefix sealed carry sources");
+      }
       plan.job_capacity = canonical_job_capacities_[plan.source_count];
       plan.tournament_workspace_bytes = static_cast<std::uint32_t>(
           canonical_tournament_shared_bytes_[plan.source_count]);
@@ -15317,7 +15356,7 @@ private:
         ? gpulsmopt2_detail::kPublicationOutputOverflow
         : gpulsmopt2_detail::kPublicationSuccess;
 
-    if (!resident_sources) {
+    if (!merge) {
       if (plan.status) throw std::length_error("sealed direct root capacity");
       if constexpr (Mixed) {
         gpulsmopt2_detail::copy_canonical_epoch_kernel<<<
@@ -15526,6 +15565,13 @@ private:
           plan, root, manifests[active], command, stream);
       const gpulsm_sparse::RecordBatchView root_source =
           slice_record_batch(source, raw_begin, raw_count);
+      // Higher slots are older. Include other outputs of this operation,
+      // not only runs that were present before it, in the retention decision.
+      const bool keep_tombstones = root.destination < 63u &&
+          (plan.final_mask >> (root.destination + 1u)) != 0u;
+      const bool merge = root.resident_sources ||
+          (!keep_tombstones &&
+           (Mixed || root_source.uniform_operation == gpulsm_sparse::Mutation::erase));
       gpulsm_sparse::CompletionSourceView completion{};
       const std::uint32_t *sparse_heads = nullptr;
       std::uint32_t sparse_head_count = 0u, logical_rows = 0u;
@@ -15549,31 +15595,46 @@ private:
             reinterpret_cast<const std::uint32_t *>(root_source.values.bytes);
         selected = workspace.prepare(
             root_keys, root_values, static_cast<std::uint32_t>(raw_count),
-            root.resident_sources != 0u, stream);
+            root_source.uniform_operation, merge, stream);
         completion.incoming = gpulsm_sparse::inline_u32_batch(
-            workspace.sorted_keys(), workspace.sorted_values(), raw_count);
+            workspace.sorted_keys(), workspace.sorted_values(), raw_count,
+            root_source.uniform_operation);
         completion.incoming_sorted_heads = workspace.sorted_keys();
         completion.incoming_sorted_refs = nullptr;
       }
       completion.incoming_records = static_cast<std::uint32_t>(raw_count);
-      output_counts[root.destination] = build_sealed_root<Mixed>(
-          workspace, selected, root.resident_sources,
-          root.destination, generation, stream);
-
       const std::uint64_t sparse_sources = root.resident_sources &
           (sparse_exact_level_mask_ | sparse_capsule_level_mask_);
-      if (!sparse_head_count && !sparse_sources) continue;
-      if (!sparse_refinement_workspace_)
-        sparse_refinement_workspace_ = std::make_unique<
-            gpulsm_sparse::SparseRefinementWorkspace>();
-      const auto roster = sparse_refinement_workspace_->prepare_roster(
-          sparse_pending_slots_, 0u, sparse_roots_,
-          root.resident_sources, stream, sparse_heads, sparse_head_count);
-      if (!roster.count)
-        throw std::logic_error(
-            Mixed ? "sealed mixed carry has no exceptional roster"
-                  : "sealed sparse carry has no exceptional roster");
-      const auto expected_logical = Mixed && !root.resident_sources
+      const bool sparse = sparse_head_count || sparse_sources;
+      if (sparse) {
+        if (!sparse_refinement_workspace_)
+          sparse_refinement_workspace_ = std::make_unique<
+              gpulsm_sparse::SparseRefinementWorkspace>();
+        const auto roster = sparse_refinement_workspace_->prepare_roster(
+            sparse_pending_slots_, 0u, sparse_roots_,
+            root.resident_sources, stream, sparse_heads, sparse_head_count);
+        if (!roster.count)
+          throw std::logic_error("sealed carry has no exceptional roster");
+        if (merge) {
+          gpulsmopt2_detail::Row *rows;
+          if constexpr (Mixed) rows = workspace.projection_rows();
+          else rows = workspace.epoch_rows();
+          // A four-byte deletion may share its head with a longer key.
+          // Preserve that head until exact-key refinement, as in ordinary
+          // publication; dropping it here would also hide the longer key.
+          gpulsm_sparse::patch_epoch_sparse_placeholders<<<
+              blocks(roster.count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+              roster.heads, roster.count, workspace.section_offsets(),
+              workspace.section_counts(), rows, resident_rows(), 0u, false);
+        }
+      }
+      output_counts[root.destination] = build_sealed_root<Mixed>(
+          workspace, selected, root.resident_sources,
+          root.destination, generation, merge, keep_tombstones, stream);
+      // Empty outputs keep their planned slot to preserve the radix-4 slot
+      // order. Their region counts are zero, so searches skip them.
+      if (!sparse) continue;
+      const auto expected_logical = Mixed && !root.resident_sources && !merge
           ? std::optional<std::uint32_t>{logical_rows} : std::nullopt;
       auto completed = complete_sparse_root(
           completion, 0u, root.destination,
@@ -15594,7 +15655,7 @@ private:
 
   std::size_t try_admit_sealed_inline(
       const std::uint32_t *keys, const std::uint32_t *values,
-      std::size_t count, cudaStream_t stream) {
+      std::size_t count, bool tombstone, cudaStream_t stream) {
     const auto admission = plan_sealed_admission(count);
     if (!admission) return 0u;
     const std::uint64_t maximum_interval = admission->maximum_interval;
@@ -15614,7 +15675,9 @@ private:
     }
     const auto snapshot = read_sealed_manifest();
     execute_sealed_admission<false>(
-        gpulsm_sparse::inline_u32_batch(keys, values, count), *admission,
+        gpulsm_sparse::inline_u32_batch(keys, values, count,
+            tombstone ? gpulsm_sparse::Mutation::erase : gpulsm_sparse::Mutation::put),
+        *admission,
         snapshot, *sealed_workspace_, stream);
     return static_cast<std::size_t>(admission->accepted_rows);
   }
@@ -15646,8 +15709,9 @@ private:
                      count, tombstone, stream);
         },
         [&](std::uint64_t first, std::uint64_t count) -> std::uint64_t {
-          return tombstone ? 0u : try_admit_sealed_inline(
-              keys + first, values + first, count, stream);
+          return try_admit_sealed_inline(
+              keys + first, tombstone ? nullptr : values + first,
+              count, tombstone, stream);
         });
   }
 

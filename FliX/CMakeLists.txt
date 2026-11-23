@@ -12,13 +12,16 @@ option(FLIX_ENABLE_PROFILING "Enable host profiling instrumentation" OFF)
 option(FLIX_BUILD_COMMON_PAPER_SWEEP "Build the selected backend's common paper sweep" OFF)
 option(FLIX_BUILD_GPULSMOPT_SUCCESSOR_TEST
        "Build the GPULSMOpt successor correctness test" OFF)
+option(FLIX_BUILD_GPULSMOPT_DELETION_TEST
+       "Build the GPULSMOpt deletion correctness and single-case timing test" OFF)
 option(FLIX_BUILD_LSMU_SUCCESSOR_TEST
        "Build the LSMu successor correctness and focused timing test" OFF)
 option(FLIX_BUILD_LSMU_CLEANUP_RANGE_EXPERIMENT
        "Build the focused LSMu cleanup and range-sum experiment" OFF)
 
 set(FLIX_NEEDS_OPTIX ON)
-if(FLIX_BUILD_GPULSMOPT_SUCCESSOR_TEST OR FLIX_BUILD_LSMU_SUCCESSOR_TEST OR
+if(FLIX_BUILD_GPULSMOPT_SUCCESSOR_TEST OR FLIX_BUILD_GPULSMOPT_DELETION_TEST OR
+   FLIX_BUILD_LSMU_SUCCESSOR_TEST OR
    FLIX_BUILD_LSMU_CLEANUP_RANGE_EXPERIMENT)
   set(FLIX_NEEDS_OPTIX OFF)
 elseif(DEFINED IFDEFS AND IFDEFS MATCHES "BASELINES" AND
@@ -153,6 +156,16 @@ if(FLIX_BUILD_GPULSMOPT_SUCCESSOR_TEST)
   configure_paper_sweep_target(gpulsmopt_successor_test)
   add_test(NAME gpulsmopt_successor_correctness
            COMMAND gpulsmopt_successor_test)
+endif()
+
+if(FLIX_BUILD_GPULSMOPT_DELETION_TEST)
+  enable_testing()
+  add_executable(gpulsmopt_deletion_test ../tests/gpulsmopt_deletion_test.cu)
+  target_include_directories(gpulsmopt_deletion_test PRIVATE
+          "${CMAKE_CURRENT_SOURCE_DIR}/..")
+  configure_paper_sweep_target(gpulsmopt_deletion_test)
+  target_link_libraries(gpulsmopt_deletion_test PRIVATE CUDA::cuda_driver)
+  add_test(NAME gpulsmopt_deletion_correctness COMMAND gpulsmopt_deletion_test)
 endif()
 
 if(FLIX_BUILD_LSMU_SUCCESSOR_TEST)
