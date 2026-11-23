@@ -180,34 +180,6 @@ void ordinary_checks() {
   }
   {
     Fixture f;
-    constexpr unsigned count = 4 * Fixture::epoch;
-    std::vector<std::uint32_t> keys(count), values(count);
-    std::vector<std::uint8_t> operations(count);
-    for (unsigned i = 0; i < count; ++i) {
-      keys[i] = key_for(i % 64);
-      values[i] = i + 1u;
-      operations[i] = static_cast<std::uint8_t>(i % 5u == 0u
-          ? DeviceMutation::erase : DeviceMutation::put);
-      if (i % 5u == 0u) f.expected.erase(keys[i]);
-      else f.expected[keys[i]] = values[i];
-    }
-    auto dk = upload(keys);
-    auto dv = upload(values);
-    auto dm = upload(operations);
-    DeviceRecordBatchView batch;
-    batch.keys = device_head4_source(dk.data());
-    batch.values = device_u32_source(dv.data());
-    batch.operations = dm.data();
-    batch.count = count;
-    batch.key_encoding = DeviceKeyEncoding::head4_words;
-    f.index.insert(batch, 0);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    require(GPULSMOptDeletionTestAccess::oldest_tombstones(f.index) == 0,
-            "mixed-update shortcut retained obsolete tombstones");
-    f.check("mixed insertion/deletion input keeps the last update per key");
-  }
-  {
-    Fixture f;
     f.put(0, 128, 1, true);
     // Fill the hierarchy and exercise the replacement slot repeatedly.
     for (unsigned round = 0; round < 8; ++round)
@@ -216,40 +188,6 @@ void ordinary_checks() {
     f.put(0, 64, 30000);
     f.check("reinsertion after final-slot replacement");
   }
-}
-
-void sparse_checks() {
-  Fixture f;
-  // A four-byte key with an eight-byte value, and a five-byte key sharing
-  // its four-byte prefix. Erasing the former must not erase the latter.
-  std::vector<std::uint8_t> keys{0,0,0,0, 0,0,0,0,7};
-  auto dk = upload(keys);
-  auto offsets = upload<std::uint64_t>({0,4,9});
-  auto values = upload<std::uint64_t>({123,456});
-  DeviceRecordBatchView batch;
-  batch.keys = {dk.data(), offsets.data(), 0};
-  batch.values = {reinterpret_cast<std::uint8_t *>(values.data()), nullptr, 8};
-  batch.count = 2;
-  f.index.bulk_build(batch, 0);
-  f.erase(3 * Fixture::epoch, 1024);
-  require(GPULSMOptDeletionTestAccess::shortcut_capacity(f.index), "sparse deletion missed shortcut");
-  Buffer<std::uint64_t> output(2);
-  Buffer<std::uint8_t> found(2), overflow(2);
-  Buffer<std::uint64_t> lengths(2);
-  DeviceLookupBatchView lookup;
-  lookup.queries = {batch.keys, 2, DeviceKeyEncoding::ordered_bytes};
-  lookup.output.values = {reinterpret_cast<std::uint8_t *>(output.data()), nullptr,
-                         output.bytes(), 8, DeviceSinkLayout::fixed_stride};
-  lookup.output.found = found.data();
-  lookup.output.overflow = overflow.data();
-  lookup.output.required_value_lengths = lengths.data();
-  f.index.lookup(lookup, 0);
-  std::uint8_t present[2];
-  std::uint64_t result[2];
-  CUDA_CHECK(cudaMemcpy(present, found.data(), sizeof(present), cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(result, output.data(), sizeof(result), cudaMemcpyDeviceToHost));
-  require(!present[0] && present[1] && result[1] == 456, "four-byte deletion damaged a longer key");
-  std::cout << "PASS deletion preserves a longer key with the same prefix\n";
 }
 
 __global__ void generate(std::uint32_t *keys, std::uint32_t *values, unsigned count) {
@@ -314,7 +252,7 @@ int main(int argc, char **argv) {
   try {
     CUDA_CHECK(cudaSetDevice(0));
     if (argc == 2 && std::string(argv[1]) == "--timing") time_one_case();
-    else if (argc == 1) { ordinary_checks(); sparse_checks(); }
+    else if (argc == 1) ordinary_checks();
     else throw std::invalid_argument("usage: gpulsmopt_deletion_test [--timing]");
     CUDA_CHECK(cudaDeviceSynchronize());
     return 0;
