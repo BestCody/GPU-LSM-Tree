@@ -139,7 +139,7 @@ accounting remain separate evaluation work; these totals are not those metrics.
 
 The main executable uses release optimization without host profiling by default.
 `FLIX_ENABLE_PROFILING=ON` enables the previous instrumentation. The common paper
-driver uses this wrapper too; the legacy paper protocol keeps its original timers.
+driver uses this wrapper too.
 
 The imported SlabHash, modified WarpCore, and helper libraries come from
 [FliX-Full](https://github.com/rkharal/FliX-Full/tree/4acb4b5eab91851e6d29b0015752f23cd6af187b).
@@ -204,7 +204,7 @@ The CSV records `range_api_calls` and `range_max_call_items`, and the runner
 checks them against the requested setting. The previous runner default was
 `--range-chunk-log 16`; those timings used separate calls of 65,536 queries
 and must not be combined with full-batch timings. Use a new output directory
-for the changed configuration. The legacy experiment family is unchanged.
+for the changed configuration.
 
 GPULSMOpt's native range traversal already resolves versions and visits
 individual records. Its output sink reduces their values. Returning records
@@ -212,10 +212,8 @@ can reuse that traversal, but needs per-query output sizing and offsets,
 full-key reconstruction from the region and suffix, and writes to output
 storage. Producing key-ordered lists also needs output ordering. Those costs
 are omitted by the sum-output experiment, so its timings do not establish
-the performance of a materialized range API. The sparse-record path already
-enumerates into temporary output before summing. The paper family's
-`--skip-ranges`, `--skip-deletions`, and
-`--skip-bulk` select subsets. Explicit LSM cleanup stays in the legacy family.
+the performance of a materialized range API. The paper family's
+`--skip-ranges`, `--skip-deletions`, and `--skip-bulk` select subsets.
 
 The local sorted-array update implementation uses CUB radix sorting and parallel
 merging for insertion. Deletion sorts the request keys, binary-searches that
@@ -262,7 +260,7 @@ exclude harness buffers and are not interchangeable with peak memory.
 
 Each repetition uses a fresh process and index. Backends execute serially;
 compilation may run in parallel. `--warmups` controls excluded warmup traces.
-`--mode full` selects the larger historical size matrix with five repetitions
+`--mode full` selects the larger historical size matrix with three repetitions
 and one warmup; it is never selected by default. All build settings are recorded.
 
 Resume by repeating the same command. Completed runs are reused only if source,
@@ -279,10 +277,7 @@ update sizes come from the X/Y harness and appear in `current_batch_size` and th
 normalized report's `items` column. They are identical across backends and need
 not be powers of two.
 
-The original two-backend driver and reporting remain accessible through
-`--family legacy`, with their original options and timing semantics. Do not
-merge those results with the new protocol. No backend algorithm is changed by
-the common sweep.
+No backend algorithm is changed by the common sweep.
 
 ### Original experiment scripts
 
@@ -290,7 +285,8 @@ To reproduce the experimental results from the paper:
 
 1. Navigate to the `runscripts_experiments` directory.
 2. Run the desired benchmark scripts
-3. Results will be saved to the `results/` directory for visualization.
+3. Each script copies `updates.csv` into a folder under `FliX/build/`, for
+   example `Baseline_Experiments/VaryBuildandProbeSizes/`.
 
 > **Note:** Plotting scripts and additional run configurations are currently being integrated into the repository. Please check back for updates as we finalize the repo.
 
