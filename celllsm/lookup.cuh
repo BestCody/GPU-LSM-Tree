@@ -5,11 +5,11 @@
 
 #include "pending.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
-constexpr std::uint32_t kTqrjHashThreads = 1024u;
-static_assert(kTqrjHashThreads <= 1024u &&
-              (kTqrjHashThreads & 31u) == 0u);
+constexpr std::uint32_t kSharedLookupHashThreads = 1024u;
+static_assert(kSharedLookupHashThreads <= 1024u &&
+              (kSharedLookupHashThreads & 31u) == 0u);
 
 // Bound scratch with fixed tiles and 8-bit key bins.
 constexpr std::uint32_t kLookupTileItems = 16u;
@@ -23,48 +23,48 @@ constexpr std::size_t kMinimumTileLookupQueries = std::size_t{1} << 24u;
 constexpr std::size_t kMinimumTileLookupResidentRows = std::size_t{1} << 24u;
 static_assert(kLookupTileRows < std::numeric_limits<std::uint16_t>::max());
 
-// TQRJ scans each owned pending section once.
-constexpr std::uint32_t kTqrjDenseRowsPerSection = 8u;
-constexpr std::uint32_t kTqrjMinimumBatches = 5u;
-constexpr std::uint32_t kTqrjDirectCapacity = 1280u;
-constexpr std::uint32_t kTqrjDirectoryBins = 256u;
-constexpr std::uint32_t kTqrjDirectIntervalLimit = 64u;
-constexpr std::uint32_t kTqrjDirectPendingRows = 1u << 16u;
-constexpr std::uint32_t kTqrjHashTileRows = 2048u;
+// The shared lookup scans each owned pending region once.
+constexpr std::uint32_t kSharedLookupDenseRowsPerRegion = 8u;
+constexpr std::uint32_t kSharedLookupMinimumBatches = 5u;
+constexpr std::uint32_t kSharedLookupDirectCapacity = 1280u;
+constexpr std::uint32_t kSharedLookupDirectoryBins = 256u;
+constexpr std::uint32_t kSharedLookupDirectIntervalLimit = 64u;
+constexpr std::uint32_t kSharedLookupDirectPendingRows = 1u << 16u;
+constexpr std::uint32_t kSharedLookupHashTileRows = 2048u;
 // Fingerprints reject; complete keys confirm matches.
-constexpr std::uint32_t kTqrjHashOwnerBits = 25u;
-constexpr std::uint32_t kTqrjHashOwnerMask =
-    (1u << kTqrjHashOwnerBits) - 1u;
-constexpr std::uint32_t kTqrjHashFingerprintBits =
-    32u - kTqrjHashOwnerBits;
-constexpr std::uint32_t kTqrjHashAttempts = 3u;
-constexpr std::uint32_t kTqrjHashProbeLimit = 64u;
-constexpr std::uint32_t kTqrjHashCapacityAlignment = 256u;
-static_assert(kTqrjDirectCapacity == 1280u);
-static_assert(kTqrjDirectCapacity <=
+constexpr std::uint32_t kSharedLookupHashOwnerBits = 25u;
+constexpr std::uint32_t kSharedLookupHashOwnerMask =
+    (1u << kSharedLookupHashOwnerBits) - 1u;
+constexpr std::uint32_t kSharedLookupHashFingerprintBits =
+    32u - kSharedLookupHashOwnerBits;
+constexpr std::uint32_t kSharedLookupHashAttempts = 3u;
+constexpr std::uint32_t kSharedLookupHashProbeLimit = 64u;
+constexpr std::uint32_t kSharedLookupHashCapacityAlignment = 256u;
+static_assert(kSharedLookupDirectCapacity == 1280u);
+static_assert(kSharedLookupDirectCapacity <=
               std::numeric_limits<std::uint16_t>::max());
-static_assert(kTqrjDirectoryBins == kThreads);
-static_assert(kTqrjDirectPendingRows > kTqrjDirectCapacity);
-static_assert(kTqrjHashTileRows >= kTqrjHashThreads &&
-              (kTqrjHashTileRows & (kTqrjHashTileRows - 1u)) == 0u);
+static_assert(kSharedLookupDirectoryBins == kThreads);
+static_assert(kSharedLookupDirectPendingRows > kSharedLookupDirectCapacity);
+static_assert(kSharedLookupHashTileRows >= kSharedLookupHashThreads &&
+              (kSharedLookupHashTileRows & (kSharedLookupHashTileRows - 1u)) == 0u);
 static_assert(kMaximumOperationTile * kBatchesPerEpoch <=
-              kTqrjHashOwnerMask);
+              kSharedLookupHashOwnerMask);
 
 __global__ void materialize_lookup_active_counts_kernel(
-    const std::uint32_t *active_quotients,
+    const std::uint32_t *active_regions,
     const std::uint32_t *active_count,
-    const std::uint32_t *quotient_counts,
+    const std::uint32_t *region_counts,
     std::uint32_t active_capacity,
     std::uint32_t *active_counts) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i > active_capacity) return;
   const std::uint32_t count = *active_count;
   active_counts[i] = i < count
-      ? quotient_counts[active_quotients[i]] : 0u;
+      ? region_counts[active_regions[i]] : 0u;
 }
 
 __global__ void publish_lookup_active_bases_kernel(
-    const std::uint32_t *active_quotients,
+    const std::uint32_t *active_regions,
     const std::uint32_t *active_count,
     const std::uint32_t *active_offsets,
     std::uint32_t active_capacity,
@@ -72,19 +72,19 @@ __global__ void publish_lookup_active_bases_kernel(
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t count = *active_count;
   if (i >= active_capacity || i >= count) return;
-  const std::uint32_t q = active_quotients[i];
+  const std::uint32_t q = active_regions[i];
   query_bases[q] = active_offsets[i];
 }
 
-__global__ void reset_lookup_quotient_counts_kernel(
-    const std::uint32_t *active_quotients,
+__global__ void reset_lookup_region_counts_kernel(
+    const std::uint32_t *active_regions,
     const std::uint32_t *active_count,
     std::uint32_t active_capacity,
-    std::uint32_t *quotient_counts) {
+    std::uint32_t *region_counts) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t count = *active_count;
   if (i >= active_capacity || i >= count) return;
-  quotient_counts[active_quotients[i]] = 0u;
+  region_counts[active_regions[i]] = 0u;
 }
 
 __global__ void scatter_query_records_kernel(
@@ -125,12 +125,12 @@ __device__ __forceinline__ void canonical_lookup_resident_only(
     levels &= levels - 1u;
     const Descriptor rows = descriptors[descriptor_index(q, level)];
     if (!rows.count()) continue;
-    const std::uint32_t cell = suffix / kFoundationCellKeys;
+    const std::uint32_t cell = suffix / kKeysPerCell;
     const std::uint16_t *ranks = cell_ranks +
         std::size_t{level} * kLocalRankEntries +
-        std::size_t{q} * kFoundationCells;
+        std::size_t{q} * kCellsPerRegion;
     const std::uint32_t begin = ranks[cell];
-    const std::uint32_t end = cell + 1u < kFoundationCells
+    const std::uint32_t end = cell + 1u < kCellsPerRegion
         ? ranks[cell + 1u] : rows.count();
     Row winner{};
     if (!find_unique_point_row(
@@ -153,21 +153,21 @@ __device__ __forceinline__ bool find_pending_lookup_winner(
     std::uint32_t batch_count, Match match, RawPayload &winner,
     const std::uint64_t *batch_signatures = nullptr,
     const std::uint64_t *epoch_signatures = nullptr) {
-  const std::uint32_t section = head >> 16u;
+  const std::uint32_t region = head >> 16u;
   const std::uint64_t signature_bits = pending_signature_bits(head);
   if constexpr (FilterSignatures) {
     if (!batch_count ||
-        (epoch_signatures[section] & signature_bits) != signature_bits)
+        (epoch_signatures[region] & signature_bits) != signature_bits)
       return false;
   }
   for (int batch = static_cast<int>(batch_count) - 1; batch >= 0; --batch) {
     const std::uint32_t slot = static_cast<std::uint32_t>(batch);
     if constexpr (FilterSignatures) {
       const std::uint64_t signature =
-          batch_signatures[std::size_t{slot} * kQuotients + section];
+          batch_signatures[std::size_t{slot} * kRegions + region];
       if ((signature & signature_bits) != signature_bits) continue;
     }
-    const std::size_t offset = std::size_t{slot} * (kQuotients + 1u) + section;
+    const std::size_t offset = std::size_t{slot} * (kRegions + 1u) + region;
     const std::uint32_t begin = offsets[offset], end = offsets[offset + 1u];
     bool found = false;
     std::uint32_t newest = 0u;
@@ -187,7 +187,7 @@ __device__ __forceinline__ bool find_pending_lookup_winner(
   return false;
 }
 
-struct NativePendingKeyMatch {
+struct PendingKeyMatch {
   static constexpr std::uint32_t kAgeMask = ~kRawTombstone;
   const std::uint32_t *keys;
   std::uint32_t suffix;
@@ -210,7 +210,7 @@ __device__ __forceinline__ void canonical_lookup_point_with_pending(
   RawPayload winner{};
   if (find_pending_lookup_winner<true>(
           key, raw_offsets, raw_payloads, batch_stride, pending_batches,
-          NativePendingKeyMatch{raw_keys, key_suffix(key)}, winner,
+          PendingKeyMatch{raw_keys, key_suffix(key)}, winner,
           batch_signatures, epoch_signatures)) {
     const bool live = (winner.metadata & kRawTombstone) == 0u;
     emit_lookup_result(i, live, winner.value, out_values, out_found, query_ids);
@@ -353,7 +353,7 @@ __global__ void unpack_lookup_tiles_kernel(
   }
 }
 
-__device__ __forceinline__ std::uint32_t tqrj_directory_find(
+__device__ __forceinline__ std::uint32_t shared_lookup_directory_find(
     const std::uint16_t *directory_offsets,
     const std::uint16_t *directory_suffixes,
     std::uint32_t target) {
@@ -364,7 +364,7 @@ __device__ __forceinline__ std::uint32_t tqrj_directory_find(
   return kInvalid;
 }
 
-__device__ __forceinline__ unsigned long long tqrj_pending_token(
+__device__ __forceinline__ unsigned long long shared_lookup_pending_token(
     const RawPayload &payload) {
   const std::uint64_t order =
       static_cast<std::uint64_t>(raw_position(payload)) + 1u;
@@ -375,7 +375,7 @@ __device__ __forceinline__ unsigned long long tqrj_pending_token(
 }
 
 // Aggregate matching lanes by exact owner.
-__device__ __forceinline__ void tqrj_warp_atomic_max(
+__device__ __forceinline__ void shared_lookup_warp_atomic_max(
     bool matched, std::uint32_t owner, unsigned long long token,
     unsigned long long *winners) {
   const unsigned matched_mask = __ballot_sync(0xffffffffu, matched);
@@ -394,66 +394,66 @@ __device__ __forceinline__ void tqrj_warp_atomic_max(
     atomicMax(winners + owner, aggregate);
 }
 
-struct TqrjHashTask {
-  std::uint32_t quotient;
+struct SharedLookupHashTask {
+  std::uint32_t region;
   std::uint32_t pending_rows;
   std::uint32_t query_tile_base;
   std::uint32_t pending_tile_base;
 };
 
-struct TqrjHashTile {
+struct SharedLookupHashTile {
   std::uint32_t task;
   std::uint32_t begin;
 };
 
-// TQRJ aliases reuse operation-locked storage.
-struct TqrjLookupWorkspace {
+// Shared-lookup scratch reuses operation-locked storage.
+struct SharedLookupWorkspace {
   std::uint32_t *grouped_queries;
   std::uint32_t *query_ids;
   std::uint32_t *reservation_ranks;
-  std::uint32_t *active_quotients;
+  std::uint32_t *active_regions;
   std::uint32_t *active_query_counts;
   std::uint32_t *active_query_offsets;
-  std::uint32_t *active_quotient_count;
+  std::uint32_t *active_region_count;
   std::uint32_t *query_bases;
 
-  TqrjHashTask *hash_tasks;
+  SharedLookupHashTask *hash_tasks;
   std::uint32_t *hash_counters;
   std::uint32_t *hash_task_count;
   unsigned long long *hash_winners;
-  TqrjHashTile *hash_query_tiles;
-  TqrjHashTile *hash_pending_tiles;
+  SharedLookupHashTile *hash_query_tiles;
+  SharedLookupHashTile *hash_pending_tiles;
   std::uint32_t *hash_table;
   std::uint32_t hash_table_capacity;
 };
 
-constexpr std::size_t kTqrjHashTaskBytes =
-    std::size_t{kQuotients} * sizeof(TqrjHashTask);
-constexpr std::size_t kTqrjHashCounterBytes =
+constexpr std::size_t kSharedLookupHashTaskBytes =
+    std::size_t{kRegions} * sizeof(SharedLookupHashTask);
+constexpr std::size_t kSharedLookupHashCounterBytes =
     6u * sizeof(std::uint32_t);
-static_assert(kTqrjHashTaskBytes + kTqrjHashCounterBytes <=
+static_assert(kSharedLookupHashTaskBytes + kSharedLookupHashCounterBytes <=
               std::size_t{kLocalRankEntries} * sizeof(std::uint32_t));
 
-__device__ __forceinline__ void tqrj_enqueue_hash_task(
-    std::uint32_t quotient, std::uint32_t pending_rows,
-    TqrjHashTask *tasks, std::uint32_t *task_count) {
+__device__ __forceinline__ void shared_lookup_enqueue_hash_task(
+    std::uint32_t region, std::uint32_t pending_rows,
+    SharedLookupHashTask *tasks, std::uint32_t *task_count) {
   const std::uint32_t ticket = atomicAdd(task_count, 1u);
-  tasks[ticket] = {quotient, pending_rows, 0u, 0u};
+  tasks[ticket] = {region, pending_rows, 0u, 0u};
 }
 
-__device__ __forceinline__ std::uint32_t tqrj_pending_rows(
+__device__ __forceinline__ std::uint32_t shared_lookup_pending_rows(
     std::uint32_t q, const std::uint32_t *raw_offsets,
     std::uint32_t pending_batches) {
   std::uint32_t total = 0u;
   for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
     const std::size_t oi =
-        std::size_t{batch} * (kQuotients + 1u) + q;
+        std::size_t{batch} * (kRegions + 1u) + q;
     total += raw_offsets[oi + 1u] - raw_offsets[oi];
   }
   return total;
 }
 
-__device__ __forceinline__ void tqrj_write_result(
+__device__ __forceinline__ void shared_lookup_write_result(
     std::uint32_t key, std::uint32_t query_index,
     unsigned long long winner, std::uint32_t *out_values,
     std::uint8_t *out_found, ResidentRows arena,
@@ -472,20 +472,20 @@ __device__ __forceinline__ void tqrj_write_result(
       canonical_cell_ranks, occupied_levels, query_ids);
 }
 
-__host__ __device__ constexpr std::uint32_t tqrj_hash_tile_count(
+__host__ __device__ constexpr std::uint32_t shared_lookup_hash_tile_count(
     std::uint32_t rows) {
-  return (rows + kTqrjHashTileRows - 1u) / kTqrjHashTileRows;
+  return (rows + kSharedLookupHashTileRows - 1u) / kSharedLookupHashTileRows;
 }
 
 // Size overflow storage from actual queries.
-__host__ __device__ constexpr std::uint64_t tqrj_hash_seed(
+__host__ __device__ constexpr std::uint64_t shared_lookup_hash_seed(
     std::uint32_t attempt) {
   return attempt == 0u ? 0x6a09e667f3bcc909ull
       : attempt == 1u ? 0x243f6a8885a308d3ull
       : 0x13198a2e03707344ull;
 }
 
-__host__ __device__ __forceinline__ std::uint64_t tqrj_hash_mix(
+__host__ __device__ __forceinline__ std::uint64_t shared_lookup_hash_mix(
     std::uint64_t value) {
   value ^= value >> 30u;
   value *= 0xbf58476d1ce4e5b9ull;
@@ -494,60 +494,60 @@ __host__ __device__ __forceinline__ std::uint64_t tqrj_hash_mix(
   return value ^ (value >> 31u);
 }
 
-__host__ __device__ __forceinline__ std::uint64_t tqrj_hash_key(
+__host__ __device__ __forceinline__ std::uint64_t shared_lookup_hash_key(
     std::uint32_t key, std::uint64_t seed) {
-  return tqrj_hash_mix(static_cast<std::uint64_t>(key) ^ seed);
+  return shared_lookup_hash_mix(static_cast<std::uint64_t>(key) ^ seed);
 }
 
-__host__ __device__ constexpr std::uint32_t tqrj_hash_capacity(
+__host__ __device__ constexpr std::uint32_t shared_lookup_hash_capacity(
     std::uint32_t rows) {
   if (!rows) return 0u;
   const std::uint64_t proportional =
       (std::uint64_t{13u} * rows + 7u) / 8u;
   return static_cast<std::uint32_t>(
-      (proportional + kTqrjHashCapacityAlignment - 1u) &
-      ~std::uint64_t{kTqrjHashCapacityAlignment - 1u});
+      (proportional + kSharedLookupHashCapacityAlignment - 1u) &
+      ~std::uint64_t{kSharedLookupHashCapacityAlignment - 1u});
 }
 
-__host__ __device__ __forceinline__ std::uint32_t tqrj_hash_slot(
+__host__ __device__ __forceinline__ std::uint32_t shared_lookup_hash_slot(
     std::uint64_t hash, std::uint32_t capacity) {
   return static_cast<std::uint32_t>(
       (static_cast<std::uint64_t>(static_cast<std::uint32_t>(hash)) *
        capacity) >> 32u);
 }
 
-__host__ __device__ __forceinline__ std::uint32_t tqrj_hash_entry(
+__host__ __device__ __forceinline__ std::uint32_t shared_lookup_hash_entry(
     std::uint32_t owner, std::uint64_t hash) {
   const std::uint32_t fingerprint = static_cast<std::uint32_t>(
-      hash >> (64u - kTqrjHashFingerprintBits));
-  return (fingerprint << kTqrjHashOwnerBits) | (owner + 1u);
+      hash >> (64u - kSharedLookupHashFingerprintBits));
+  return (fingerprint << kSharedLookupHashOwnerBits) | (owner + 1u);
 }
 
 __host__ __device__ __forceinline__ std::uint32_t
-tqrj_hash_entry_owner(std::uint32_t entry) {
-  return (entry & kTqrjHashOwnerMask) - 1u;
+shared_lookup_hash_entry_owner(std::uint32_t entry) {
+  return (entry & kSharedLookupHashOwnerMask) - 1u;
 }
 
 __host__ __device__ __forceinline__ std::uint32_t
-tqrj_hash_entry_fingerprint(std::uint32_t entry) {
-  return entry >> kTqrjHashOwnerBits;
+shared_lookup_hash_entry_fingerprint(std::uint32_t entry) {
+  return entry >> kSharedLookupHashOwnerBits;
 }
 
 // Confirm fingerprint matches with complete keys.
 template <class EqualOwner>
-__device__ __forceinline__ std::uint32_t tqrj_hash_insert_owner(
+__device__ __forceinline__ std::uint32_t shared_lookup_hash_insert_owner(
     std::uint32_t query, std::uint64_t hash, std::uint32_t *table,
     std::uint32_t capacity, std::uint32_t maximum_probes,
     std::uint32_t *failure, EqualOwner equal_owner) {
-  const std::uint32_t desired = tqrj_hash_entry(query, hash);
+  const std::uint32_t desired = shared_lookup_hash_entry(query, hash);
   const std::uint32_t fingerprint =
-      tqrj_hash_entry_fingerprint(desired);
-  std::uint32_t slot = tqrj_hash_slot(hash, capacity);
+      shared_lookup_hash_entry_fingerprint(desired);
+  std::uint32_t slot = shared_lookup_hash_slot(hash, capacity);
   for (std::uint32_t probe = 0u; probe < maximum_probes; ++probe) {
     const std::uint32_t previous = atomicCAS(table + slot, 0u, desired);
     if (!previous) return query;
-    if (tqrj_hash_entry_fingerprint(previous) == fingerprint) {
-      const std::uint32_t owner = tqrj_hash_entry_owner(previous);
+    if (shared_lookup_hash_entry_fingerprint(previous) == fingerprint) {
+      const std::uint32_t owner = shared_lookup_hash_entry_owner(previous);
       if (equal_owner(owner)) return owner;
     }
     if (++slot == capacity) slot = 0u;
@@ -557,17 +557,17 @@ __device__ __forceinline__ std::uint32_t tqrj_hash_insert_owner(
 }
 
 template <class EqualOwner>
-__device__ __forceinline__ std::uint32_t tqrj_hash_find_owner(
+__device__ __forceinline__ std::uint32_t shared_lookup_hash_find_owner(
     std::uint64_t hash, const std::uint32_t *table,
     std::uint32_t capacity, EqualOwner equal_owner) {
-  const std::uint32_t fingerprint = tqrj_hash_entry_fingerprint(
-      tqrj_hash_entry(0u, hash));
-  std::uint32_t slot = tqrj_hash_slot(hash, capacity);
+  const std::uint32_t fingerprint = shared_lookup_hash_entry_fingerprint(
+      shared_lookup_hash_entry(0u, hash));
+  std::uint32_t slot = shared_lookup_hash_slot(hash, capacity);
   for (std::uint32_t probe = 0u; probe < capacity; ++probe) {
     const std::uint32_t entry = table[slot];
     if (!entry) return kInvalid;
-    if (tqrj_hash_entry_fingerprint(entry) == fingerprint) {
-      const std::uint32_t owner = tqrj_hash_entry_owner(entry);
+    if (shared_lookup_hash_entry_fingerprint(entry) == fingerprint) {
+      const std::uint32_t owner = shared_lookup_hash_entry_owner(entry);
       if (equal_owner(owner)) return owner;
     }
     if (++slot == capacity) slot = 0u;
@@ -575,23 +575,23 @@ __device__ __forceinline__ std::uint32_t tqrj_hash_find_owner(
   return kInvalid;
 }
 
-__device__ __forceinline__ std::uint32_t tqrj_hash_insert(
+__device__ __forceinline__ std::uint32_t shared_lookup_hash_insert(
     const std::uint32_t *grouped_queries, std::uint32_t query,
     std::uint32_t *table, std::uint32_t capacity,
     std::uint64_t seed, std::uint32_t maximum_probes,
     std::uint32_t *failure) {
   const std::uint32_t key = grouped_queries[query];
-  return tqrj_hash_insert_owner(query, tqrj_hash_key(key, seed), table,
+  return shared_lookup_hash_insert_owner(query, shared_lookup_hash_key(key, seed), table,
       capacity, maximum_probes, failure, [=] __device__ (std::uint32_t owner) {
         return grouped_queries[owner] == key;
       });
 }
 
-__device__ __forceinline__ std::uint32_t tqrj_hash_find(
+__device__ __forceinline__ std::uint32_t shared_lookup_hash_find(
     std::uint32_t key, const std::uint32_t *grouped_queries,
     const std::uint32_t *table, std::uint32_t capacity,
     std::uint64_t seed) {
-  return tqrj_hash_find_owner(tqrj_hash_key(key, seed), table, capacity,
+  return shared_lookup_hash_find_owner(shared_lookup_hash_key(key, seed), table, capacity,
       [=] __device__ (std::uint32_t owner) {
         return grouped_queries[owner] == key;
       });
@@ -599,38 +599,38 @@ __device__ __forceinline__ std::uint32_t tqrj_hash_find(
 
 // Share block matching; adapters define record semantics.
 template <class Access>
-__device__ __forceinline__ void tqrj_direct_lookup(
-    Access access, const std::uint32_t *active_quotients,
+__device__ __forceinline__ void shared_lookup_direct_lookup(
+    Access access, const std::uint32_t *active_regions,
     const std::uint32_t *active_counts, const std::uint32_t *active_count,
     const std::uint32_t *query_bases, const std::uint32_t *raw_offsets,
-    std::uint32_t pending_batches, TqrjHashTask *hash_tasks,
+    std::uint32_t pending_batches, SharedLookupHashTask *hash_tasks,
     std::uint32_t *hash_task_count) {
   using BlockScan = cub::BlockScan<std::uint32_t, kThreads>;
   __shared__ typename BlockScan::TempStorage scan_storage;
-  __shared__ std::uint32_t directory_counts[kTqrjDirectoryBins];
-  __shared__ std::uint16_t directory_offsets[kTqrjDirectoryBins + 1u];
+  __shared__ std::uint32_t directory_counts[kSharedLookupDirectoryBins];
+  __shared__ std::uint16_t directory_offsets[kSharedLookupDirectoryBins + 1u];
   __shared__ __align__(4)
-      std::uint16_t directory_suffixes[kTqrjDirectCapacity];
-  __shared__ unsigned long long winners[kTqrjDirectCapacity];
+      std::uint16_t directory_suffixes[kSharedLookupDirectCapacity];
+  __shared__ unsigned long long winners[kSharedLookupDirectCapacity];
   __shared__ typename Access::ReadState read_state;
   __shared__ typename Access::DirectoryOwners directory_owners;
   __shared__ std::uint32_t pending_rows;
 
   const std::uint32_t task = blockIdx.x;
   if (task >= *active_count) return;
-  const std::uint32_t q = active_quotients[task];
+  const std::uint32_t q = active_regions[task];
   const std::uint32_t query_begin = query_bases[q];
   const std::uint32_t query_count = active_counts[task];
   if (threadIdx.x == 0u) {
-    pending_rows = tqrj_pending_rows(q, raw_offsets, pending_batches);
+    pending_rows = shared_lookup_pending_rows(q, raw_offsets, pending_batches);
     access.load_read_state(read_state);
   }
   __syncthreads();
 
-  if (query_count > kTqrjDirectCapacity ||
-      pending_rows > kTqrjDirectPendingRows) {
+  if (query_count > kSharedLookupDirectCapacity ||
+      pending_rows > kSharedLookupDirectPendingRows) {
     if (threadIdx.x == 0u)
-      tqrj_enqueue_hash_task(
+      shared_lookup_enqueue_hash_task(
           q, pending_rows, hash_tasks, hash_task_count);
     return;
   }
@@ -650,15 +650,15 @@ __device__ __forceinline__ void tqrj_direct_lookup(
   BlockScan(scan_storage).ExclusiveSum(interval_count, interval_begin);
   directory_offsets[threadIdx.x] =
       static_cast<std::uint16_t>(interval_begin);
-  if (threadIdx.x + 1u == kTqrjDirectoryBins)
-    directory_offsets[kTqrjDirectoryBins] =
+  if (threadIdx.x + 1u == kSharedLookupDirectoryBins)
+    directory_offsets[kSharedLookupDirectoryBins] =
         static_cast<std::uint16_t>(interval_begin + interval_count);
   directory_counts[threadIdx.x] = 0u;
   const bool crowded = __syncthreads_or(
-      interval_count > kTqrjDirectIntervalLimit);
+      interval_count > kSharedLookupDirectIntervalLimit);
   if (crowded) {
     if (threadIdx.x == 0u)
-      tqrj_enqueue_hash_task(
+      shared_lookup_enqueue_hash_task(
           q, pending_rows, hash_tasks, hash_task_count);
     return;
   }
@@ -684,7 +684,7 @@ __device__ __forceinline__ void tqrj_direct_lookup(
   for (std::uint32_t batch = warp; batch < pending_batches;
        batch += kWarps) {
     const std::size_t oi =
-        std::size_t{batch} * (kQuotients + 1u) + q;
+        std::size_t{batch} * (kRegions + 1u) + q;
     const std::uint32_t begin = raw_offsets[oi];
     const std::uint32_t end = raw_offsets[oi + 1u];
     for (std::uint32_t base = begin; base < end; base += 32u) {
@@ -699,7 +699,7 @@ __device__ __forceinline__ void tqrj_direct_lookup(
         matched = owner != kInvalid;
         if (matched) token = access.pending_token(candidate);
       }
-      tqrj_warp_atomic_max(matched, owner, token, winners);
+      shared_lookup_warp_atomic_max(matched, owner, token, winners);
     }
   }
   __syncthreads();
@@ -718,18 +718,18 @@ __device__ __forceinline__ void tqrj_direct_lookup(
 
 // Share global matching with format-specific owner storage.
 template <class Access>
-__device__ __forceinline__ void tqrj_hash_lookup(
-    Access access, TqrjHashTask *tasks, const std::uint32_t *task_count,
+__device__ __forceinline__ void shared_lookup_hash_lookup(
+    Access access, SharedLookupHashTask *tasks, const std::uint32_t *task_count,
     const std::uint32_t *query_bases, const std::uint32_t *query_counts,
-    TqrjHashTile *query_tiles, TqrjHashTile *pending_tiles,
+    SharedLookupHashTile *query_tiles, SharedLookupHashTile *pending_tiles,
     std::uint32_t *counters, std::uint32_t *hash_table,
     std::uint32_t maximum_hash_entries, unsigned long long *winners,
     const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
     std::uint32_t *query_owners) {
   const cooperative_groups::grid_group grid =
       cooperative_groups::this_grid();
-  __shared__ std::uint32_t section_prefixes[kBatchesPerEpoch + 1u];
-  __shared__ TqrjHashTask shared_task;
+  __shared__ std::uint32_t region_prefixes[kBatchesPerEpoch + 1u];
+  __shared__ SharedLookupHashTask shared_task;
   __shared__ std::uint32_t shared_a, shared_b;
   __shared__ typename Access::ReadState read_state;
 
@@ -743,31 +743,31 @@ __device__ __forceinline__ void tqrj_hash_lookup(
   for (std::uint32_t task_index = blockIdx.x;
        task_index < tasks_in_queue; task_index += gridDim.x) {
     if (threadIdx.x == 0u) {
-      const TqrjHashTask task = tasks[task_index];
-      const std::uint32_t query_count = query_counts[task.quotient];
-      shared_a = tqrj_hash_tile_count(query_count);
-      shared_b = tqrj_hash_tile_count(task.pending_rows);
+      const SharedLookupHashTask task = tasks[task_index];
+      const std::uint32_t query_count = query_counts[task.region];
+      shared_a = shared_lookup_hash_tile_count(query_count);
+      shared_b = shared_lookup_hash_tile_count(task.pending_rows);
       tasks[task_index].query_tile_base = atomicAdd(counters, shared_a);
       tasks[task_index].pending_tile_base = atomicAdd(counters + 1u, shared_b);
       atomicAdd(counters + 2u, query_count);
     }
     __syncthreads();
-    const TqrjHashTask task = tasks[task_index];
+    const SharedLookupHashTask task = tasks[task_index];
     for (std::uint32_t tile = threadIdx.x; tile < shared_a;
          tile += blockDim.x)
       query_tiles[task.query_tile_base + tile] =
-          {task_index, tile * kTqrjHashTileRows};
+          {task_index, tile * kSharedLookupHashTileRows};
     for (std::uint32_t tile = threadIdx.x; tile < shared_b;
          tile += blockDim.x)
       pending_tiles[task.pending_tile_base + tile] =
-          {task_index, tile * kTqrjHashTileRows};
+          {task_index, tile * kSharedLookupHashTileRows};
     __syncthreads();
   }
   grid.sync();
 
   const std::uint32_t query_tile_count = counters[0];
   const std::uint32_t pending_tile_count = counters[1];
-  const std::uint32_t hash_capacity = tqrj_hash_capacity(counters[2]);
+  const std::uint32_t hash_capacity = shared_lookup_hash_capacity(counters[2]);
   if (global_thread == 0u) {
     counters[4] = 0u;
     counters[5] = hash_capacity > maximum_hash_entries ? 1u : 0u;
@@ -776,27 +776,27 @@ __device__ __forceinline__ void tqrj_hash_lookup(
   if (counters[5]) return;
 
   // The last retry may probe the complete table.
-  for (std::uint32_t attempt = 0u; attempt < kTqrjHashAttempts; ++attempt) {
+  for (std::uint32_t attempt = 0u; attempt < kSharedLookupHashAttempts; ++attempt) {
     if (global_thread == 0u) counters[3] = 0u;
     for (std::uint32_t slot = global_thread; slot < hash_capacity;
          slot += global_stride)
       hash_table[slot] = 0u;
     grid.sync();
-    const std::uint64_t seed = tqrj_hash_seed(attempt);
+    const std::uint64_t seed = shared_lookup_hash_seed(attempt);
     const std::uint32_t probe_limit =
-        attempt + 1u == kTqrjHashAttempts
-            ? hash_capacity : kTqrjHashProbeLimit;
+        attempt + 1u == kSharedLookupHashAttempts
+            ? hash_capacity : kSharedLookupHashProbeLimit;
     for (std::uint32_t tile_index = blockIdx.x;
          tile_index < query_tile_count; tile_index += gridDim.x) {
-      const TqrjHashTile tile = query_tiles[tile_index];
-      const TqrjHashTask task = tasks[tile.task];
-      const std::uint32_t query_begin = query_bases[task.quotient];
-      const std::uint32_t query_count = query_counts[task.quotient];
-      for (std::uint32_t local = threadIdx.x; local < kTqrjHashTileRows;
+      const SharedLookupHashTile tile = query_tiles[tile_index];
+      const SharedLookupHashTask task = tasks[tile.task];
+      const std::uint32_t query_begin = query_bases[task.region];
+      const std::uint32_t query_count = query_counts[task.region];
+      for (std::uint32_t local = threadIdx.x; local < kSharedLookupHashTileRows;
            local += blockDim.x) {
         const std::uint32_t row = tile.begin + local;
         const std::uint32_t query_index = query_begin + row;
-        // All lanes must join native duplicate aggregation.
+        // All lanes must join the duplicate aggregation.
         const std::uint32_t owner = access.insert_hash(
             row < query_count, query_index, hash_table, hash_capacity, seed,
             probe_limit, counters + 3u);
@@ -816,11 +816,11 @@ __device__ __forceinline__ void tqrj_hash_lookup(
   // Initialize only query slots owned by hash tasks.
   for (std::uint32_t tile_index = blockIdx.x;
        tile_index < query_tile_count; tile_index += gridDim.x) {
-    const TqrjHashTile tile = query_tiles[tile_index];
-    const TqrjHashTask task = tasks[tile.task];
-    const std::uint32_t query_begin = query_bases[task.quotient];
-    const std::uint32_t query_count = query_counts[task.quotient];
-    for (std::uint32_t local = threadIdx.x; local < kTqrjHashTileRows;
+    const SharedLookupHashTile tile = query_tiles[tile_index];
+    const SharedLookupHashTask task = tasks[tile.task];
+    const std::uint32_t query_begin = query_bases[task.region];
+    const std::uint32_t query_count = query_counts[task.region];
+    for (std::uint32_t local = threadIdx.x; local < kSharedLookupHashTileRows;
          local += blockDim.x) {
       const std::uint32_t row = tile.begin + local;
       if (row >= query_count) continue;
@@ -830,23 +830,23 @@ __device__ __forceinline__ void tqrj_hash_lookup(
   }
   grid.sync();
 
-  const std::uint64_t selected_seed = tqrj_hash_seed(counters[4]);
+  const std::uint64_t selected_seed = shared_lookup_hash_seed(counters[4]);
   for (std::uint32_t tile_index = blockIdx.x;
        tile_index < pending_tile_count; tile_index += gridDim.x) {
-    const TqrjHashTile tile = pending_tiles[tile_index];
+    const SharedLookupHashTile tile = pending_tiles[tile_index];
     if (threadIdx.x == 0u) {
       shared_task = tasks[tile.task];
       std::uint32_t prefix = 0u;
-      section_prefixes[0] = 0u;
+      region_prefixes[0] = 0u;
       for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
         const std::size_t oi = std::size_t{batch} *
-            (kQuotients + 1u) + shared_task.quotient;
+            (kRegions + 1u) + shared_task.region;
         prefix += raw_offsets[oi + 1u] - raw_offsets[oi];
-        section_prefixes[batch + 1u] = prefix;
+        region_prefixes[batch + 1u] = prefix;
       }
     }
     __syncthreads();
-    for (std::uint32_t local = threadIdx.x; local < kTqrjHashTileRows;
+    for (std::uint32_t local = threadIdx.x; local < kSharedLookupHashTileRows;
          local += blockDim.x) {
       const std::uint32_t row = tile.begin + local;
       bool matched = false;
@@ -856,23 +856,23 @@ __device__ __forceinline__ void tqrj_hash_lookup(
         std::uint32_t low = 0u, high = pending_batches;
         while (low + 1u < high) {
           const std::uint32_t middle = (low + high) >> 1u;
-          if (section_prefixes[middle] <= row)
+          if (region_prefixes[middle] <= row)
             low = middle;
           else
             high = middle;
         }
         const std::uint32_t batch = low;
         const std::size_t oi = std::size_t{batch} *
-            (kQuotients + 1u) + shared_task.quotient;
+            (kRegions + 1u) + shared_task.region;
         const std::uint32_t position =
-            raw_offsets[oi] + row - section_prefixes[batch];
+            raw_offsets[oi] + row - region_prefixes[batch];
         const auto candidate = access.pending_record(batch, position);
         owner = access.find_hash(candidate, hash_table, hash_capacity,
                                  selected_seed);
         matched = owner != kInvalid;
         if (matched) token = access.pending_token(candidate);
       }
-      tqrj_warp_atomic_max(matched, owner, token, winners);
+      shared_lookup_warp_atomic_max(matched, owner, token, winners);
     }
     __syncthreads();
   }
@@ -883,11 +883,11 @@ __device__ __forceinline__ void tqrj_hash_lookup(
   __syncthreads();
   for (std::uint32_t tile_index = blockIdx.x;
        tile_index < query_tile_count; tile_index += gridDim.x) {
-    const TqrjHashTile tile = query_tiles[tile_index];
-    const TqrjHashTask task = tasks[tile.task];
-    const std::uint32_t query_begin = query_bases[task.quotient];
-    const std::uint32_t query_count = query_counts[task.quotient];
-    for (std::uint32_t local = threadIdx.x; local < kTqrjHashTileRows;
+    const SharedLookupHashTile tile = query_tiles[tile_index];
+    const SharedLookupHashTask task = tasks[tile.task];
+    const std::uint32_t query_begin = query_bases[task.region];
+    const std::uint32_t query_count = query_counts[task.region];
+    for (std::uint32_t local = threadIdx.x; local < kSharedLookupHashTileRows;
          local += blockDim.x) {
       const std::uint32_t row = tile.begin + local;
       if (row >= query_count) continue;
@@ -901,7 +901,7 @@ __device__ __forceinline__ void tqrj_hash_lookup(
   }
 }
 
-struct NativeTqrjAccess {
+struct SharedLookupAccess {
   const std::uint32_t *heads;
   std::uint32_t *out_values;
   std::uint8_t *out_found;
@@ -916,7 +916,7 @@ struct NativeTqrjAccess {
 
   struct ReadState { std::uint64_t occupied_levels; };
   struct DirectoryOwners {
-    // Use suffix positions as native owner IDs.
+    // Use suffix positions as owner IDs.
     __device__ __forceinline__ void set(std::uint32_t, std::uint32_t) {}
   };
   struct Query {
@@ -936,13 +936,13 @@ struct NativeTqrjAccess {
     return {raw_keys, batch * batch_stride + row};
   }
   __device__ __forceinline__ unsigned long long pending_token(Pending candidate) const {
-    return tqrj_pending_token(raw_payloads[candidate.record]);
+    return shared_lookup_pending_token(raw_payloads[candidate.record]);
   }
   template <class Candidate>
   __device__ __forceinline__ std::uint32_t direct_owner(const Candidate &candidate,
       const std::uint16_t *offsets, const std::uint16_t *suffixes,
       const DirectoryOwners &, std::uint32_t) const {
-    return tqrj_directory_find(offsets, suffixes, key_suffix(candidate.head4()));
+    return shared_lookup_directory_find(offsets, suffixes, key_suffix(candidate.head4()));
   }
   __device__ __forceinline__ std::uint32_t insert_hash(bool valid, std::uint32_t grouped,
       std::uint32_t *table, std::uint32_t capacity, std::uint64_t seed,
@@ -954,39 +954,39 @@ struct NativeTqrjAccess {
     const std::uint32_t leader = static_cast<std::uint32_t>(__ffs(peers) - 1);
     std::uint32_t owner = kInvalid;
     if ((threadIdx.x & 31u) == leader)
-      owner = tqrj_hash_insert(heads, grouped, table, capacity, seed, probes, failure);
+      owner = shared_lookup_hash_insert(heads, grouped, table, capacity, seed, probes, failure);
     return __shfl_sync(peers, owner, leader);
   }
   __device__ __forceinline__ std::uint32_t find_hash(Pending candidate,
       const std::uint32_t *table, std::uint32_t capacity, std::uint64_t seed) const {
-    return tqrj_hash_find(candidate.head4(), heads, table, capacity, seed);
+    return shared_lookup_hash_find(candidate.head4(), heads, table, capacity, seed);
   }
   __device__ __forceinline__ void write_result(Query query, std::uint32_t grouped,
       unsigned long long winner, const ReadState &state) const {
-    tqrj_write_result(query.head4(), grouped, winner, out_values, out_found,
+    shared_lookup_write_result(query.head4(), grouped, winner, out_values, out_found,
         arena, descriptors, cell_ranks, state.occupied_levels, query_ids);
   }
 };
 
-struct TqrjDirectLaunch {
-  const std::uint32_t *active_quotients, *active_counts, *active_count;
+struct SharedLookupDirectLaunch {
+  const std::uint32_t *active_regions, *active_counts, *active_count;
   const std::uint32_t *query_bases, *raw_offsets;
   std::uint32_t pending_batches;
-  TqrjHashTask *hash_tasks;
+  SharedLookupHashTask *hash_tasks;
   std::uint32_t *hash_task_count;
 };
 
 template <class Access>
-__global__ void tqrj_direct_lookup_kernel(Access access, TqrjDirectLaunch work) {
-  tqrj_direct_lookup(access, work.active_quotients, work.active_counts,
+__global__ void shared_lookup_direct_lookup_kernel(Access access, SharedLookupDirectLaunch work) {
+  shared_lookup_direct_lookup(access, work.active_regions, work.active_counts,
       work.active_count, work.query_bases, work.raw_offsets,
       work.pending_batches, work.hash_tasks, work.hash_task_count);
 }
 
-struct TqrjHashLaunch {
-  TqrjHashTask *tasks;
+struct SharedLookupHashLaunch {
+  SharedLookupHashTask *tasks;
   const std::uint32_t *task_count, *query_bases, *query_counts;
-  TqrjHashTile *query_tiles, *pending_tiles;
+  SharedLookupHashTile *query_tiles, *pending_tiles;
   std::uint32_t *counters, *hash_table;
   std::uint32_t maximum_hash_entries;
   unsigned long long *winners;
@@ -996,16 +996,15 @@ struct TqrjHashLaunch {
 
   template <class Access>
   __device__ __forceinline__ void run(Access access) const {
-    tqrj_hash_lookup(access, tasks, task_count, query_bases, query_counts,
+    shared_lookup_hash_lookup(access, tasks, task_count, query_bases, query_counts,
         query_tiles, pending_tiles, counters, hash_table, maximum_hash_entries,
         winners, raw_offsets, pending_batches, query_owners);
   }
 };
 
-// Preserve the distinct native and sparse launch bounds.
-__global__ void tqrj_hash_lookup_kernel(
-    NativeTqrjAccess access, TqrjHashLaunch work) {
+__global__ void shared_lookup_hash_lookup_kernel(
+    SharedLookupAccess access, SharedLookupHashLaunch work) {
   work.run(access);
 }
 
-}  // namespace gpulsmopt2_detail
+}  // namespace celllsm

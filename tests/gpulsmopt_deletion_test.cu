@@ -9,7 +9,7 @@
 // must not reappear, and the oldest ordinary output must shed its tombstones.
 struct GPULSMOptDeletionTestAccess {
   static std::size_t shortcut_capacity(GPULSMOpt &index) {
-    return index.sealed_workspace_ ? index.sealed_workspace_->capacity() : 0u;
+    return index.large_batch_workspace_ ? index.large_batch_workspace_->capacity() : 0u;
   }
   static std::uint64_t stored(GPULSMOpt &index) {
     index.resolve_publication_receipt();
@@ -21,7 +21,7 @@ struct GPULSMOptDeletionTestAccess {
     const auto mask = index.host_occupied_level_mask_;
     if (!mask) return 0u;
     const unsigned level = 63u - __builtin_clzll(mask);
-    const auto snapshot = index.read_sealed_manifest();
+    const auto snapshot = index.read_manifest_snapshot();
     const auto generation = snapshot.manifests[snapshot.active]
         .levels[level].storage_generation;
     const auto begin = index.level_begin(level) +
@@ -32,13 +32,13 @@ struct GPULSMOptDeletionTestAccess {
                             flags.size() * sizeof(std::uint32_t),
                             cudaMemcpyDeviceToHost));
     return std::count_if(flags.begin(), flags.end(), [](std::uint32_t word) {
-      return (word & (gpulsmopt2_detail::kTombstone << 16u)) != 0;
+      return (word & (celllsm::kTombstone << 16u)) != 0;
     });
   }
 };
 
 namespace {
-template <class T> using Buffer = gpulsm_sparse::Buffer<T>;
+template <class T> using Buffer = celllsm::Buffer<T>;
 
 void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);

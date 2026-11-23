@@ -1,16 +1,16 @@
 #pragma once
 
-// Range sum: per-section pieces, newer rows resolved on chip or in a
-// global pass for crowded sections, then summed against the oldest run.
+// Range sum: per-region pieces, newer rows resolved on chip or in a
+// global pass for crowded regions, then summed against the oldest run.
 
 #include "pending.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
 constexpr std::uint32_t kRangeSchedulerBlocks = 256u;
-constexpr std::uint32_t kSectionRangeThreads = 128u;
+constexpr std::uint32_t kRegionRangeThreads = 128u;
 
-constexpr std::uint32_t kSectionOwnerMinimumReuse = 4u;
+constexpr std::uint32_t kRegionOwnerMinimumReuse = 4u;
 constexpr std::uint32_t kRangeThreadWork = 8u;
 constexpr std::uint32_t kRangeSubgroupWork = 512u;
 constexpr std::uint32_t kRangeOnChipNewerRows = 128u;
@@ -25,27 +25,27 @@ static_assert(sizeof(TaggedRow) == 12u);
 
 struct RangeFragment {
   std::uint32_t query;
-  std::uint32_t quotient;
+  std::uint32_t region;
 };
 
 static_assert(sizeof(RangeFragment) == 8u);
 
-struct SectionRangeFragment {
+struct RegionRangeFragment {
   std::uint32_t original_index;
   std::uint16_t low_suffix;
   std::uint16_t high_suffix;
 };
 
-static_assert(sizeof(SectionRangeFragment) == 8u);
+static_assert(sizeof(RegionRangeFragment) == 8u);
 
-struct SectionRangeTask {
-  std::uint32_t quotient;
+struct RegionRangeTask {
+  std::uint32_t region;
   std::uint32_t begin;
   std::uint32_t end;
 };
 
-static_assert(sizeof(SectionRangeTask) == 12u);
-constexpr std::uint32_t kSectionTaskFragments = kSectionRangeThreads;
+static_assert(sizeof(RegionRangeTask) == 12u);
+constexpr std::uint32_t kRegionTaskFragments = kRegionRangeThreads;
 
 struct RangeFragmentBounds {
   std::uint32_t update_begin;
@@ -137,8 +137,8 @@ struct RangeHotTokenRow {
     }
     const std::uint32_t level = locator >> 16u;
     const std::uint32_t position = locator & 0xffffu;
-    const Descriptor section = descriptors[descriptor_index(key >> 16u, level)];
-    return arena[section.offset() + position];
+    const Descriptor region = descriptors[descriptor_index(key >> 16u, level)];
+    return arena[region.offset() + position];
   }
 };
 
@@ -147,8 +147,8 @@ __global__ void count_range_hot_newer_rows_kernel(
     const Descriptor *descriptors, const std::uint64_t *occupied_mask,
     std::uint64_t *counts) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kQuotients) return;
-  if (q == kQuotients) {
+  if (q > kRegions) return;
+  if (q == kRegions) {
     counts[q] = 0u;
     return;
   }
@@ -156,24 +156,24 @@ __global__ void count_range_hot_newer_rows_kernel(
   std::uint64_t physical = 0u;
   for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
     const std::size_t index =
-        std::size_t{batch} * (kQuotients + 1u) + q;
+        std::size_t{batch} * (kRegions + 1u) + q;
     physical += raw_offsets[index + 1u] - raw_offsets[index];
   }
   for (std::uint32_t level = 0u; level < manifest.active_levels; ++level)
-    if (level != manifest.foundation_level &&
+    if (level != manifest.oldest_level &&
         level_is_occupied(manifest.occupied_level_mask, level))
       physical += descriptors[descriptor_index(q, level)].count();
   counts[q] = physical > kRangeOnChipNewerRows ? physical : 0u;
 }
 
 __global__ void make_range_hot_window_offsets_kernel(
-    const std::uint64_t *global_offsets, std::uint32_t quotient_begin,
-    std::uint32_t quotient_count, std::uint64_t window_base,
+    const std::uint64_t *global_offsets, std::uint32_t region_begin,
+    std::uint32_t region_count, std::uint64_t window_base,
     std::uint32_t *window_offsets) {
   const std::uint32_t local = blockIdx.x * blockDim.x + threadIdx.x;
-  if (local > quotient_count) return;
+  if (local > region_count) return;
   window_offsets[local] = static_cast<std::uint32_t>(
-      global_offsets[quotient_begin + local] - window_base);
+      global_offsets[region_begin + local] - window_base);
 }
 
 __global__ void emit_range_hot_tokens_kernel(
@@ -181,16 +181,16 @@ __global__ void emit_range_hot_tokens_kernel(
     std::uint32_t batch_stride, std::uint32_t pending_batches,
     ResidentRows arena, const Descriptor *descriptors,
     const std::uint64_t *occupied_mask, const std::uint64_t *hot_counts,
-    const std::uint64_t *hot_offsets, std::uint32_t quotient_begin,
-    std::uint32_t quotient_end, std::uint64_t window_base,
+    const std::uint64_t *hot_offsets, std::uint32_t region_begin,
+    std::uint32_t region_end, std::uint64_t window_base,
     std::uint64_t *tokens) {
-  const std::uint32_t q = quotient_begin + blockIdx.x;
-  if (q >= quotient_end || !hot_counts[q]) return;
+  const std::uint32_t q = region_begin + blockIdx.x;
+  if (q >= region_end || !hot_counts[q]) return;
   const DeviceManifestSnapshot manifest = load_query_manifest(occupied_mask);
   std::uint64_t cursor = hot_offsets[q] - window_base;
   for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
     const std::size_t offset_index =
-        std::size_t{batch} * (kQuotients + 1u) + q;
+        std::size_t{batch} * (kRegions + 1u) + q;
     const std::uint32_t begin = raw_offsets[offset_index];
     const std::uint32_t end = raw_offsets[offset_index + 1u];
     for (std::uint32_t position = begin + threadIdx.x;
@@ -202,13 +202,13 @@ __global__ void emit_range_hot_tokens_kernel(
     cursor += end - begin;
   }
   for (std::uint32_t level = 0u; level < manifest.active_levels; ++level) {
-    if (level == manifest.foundation_level ||
+    if (level == manifest.oldest_level ||
         !level_is_occupied(manifest.occupied_level_mask, level))
       continue;
-    const Descriptor section = descriptors[descriptor_index(q, level)];
-    const ResidentRows rows = arena + section.offset();
+    const Descriptor region = descriptors[descriptor_index(q, level)];
+    const ResidentRows rows = arena + region.offset();
     for (std::uint32_t position = threadIdx.x;
-         position < section.count(); position += blockDim.x) {
+         position < region.count(); position += blockDim.x) {
       const std::uint32_t locator = (level << 16u) | position;
       tokens[cursor + position] = range_hot_token(
           full_key(q, rows[position].key), locator);
@@ -219,11 +219,11 @@ __global__ void emit_range_hot_tokens_kernel(
 
 __global__ void build_range_hot_descriptors_kernel(
     const std::uint32_t *keys, const std::uint32_t *selected_count,
-    std::uint32_t quotient_begin, std::uint32_t quotient_end,
+    std::uint32_t region_begin, std::uint32_t region_end,
     std::uint64_t output_base, Descriptor *descriptors) {
-  const std::uint32_t q = quotient_begin +
+  const std::uint32_t q = region_begin +
       blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= quotient_end) return;
+  if (q >= region_end) return;
   const std::uint32_t count = *selected_count;
   const std::uint64_t low_key = std::uint64_t{q} << 16u;
   const std::uint64_t high_key = std::uint64_t{q + 1u} << 16u;
@@ -266,18 +266,18 @@ struct RangeSumSink {
   __device__ State operator()(State a, State b) const { return a + b; }
 };
 
-__device__ __forceinline__ std::uint32_t section_range_row_count(
+__device__ __forceinline__ std::uint32_t region_range_row_count(
     std::uint32_t low, std::uint32_t high, ResidentRows arena,
-    Descriptor section) {
-  const ResidentRows rows = arena + section.offset();
-  return upper_bound_rows(rows, section.count(), high) -
-      lower_bound_rows(rows, section.count(), low);
+    Descriptor region) {
+  const ResidentRows rows = arena + region.offset();
+  return upper_bound_rows(rows, region.count(), high) -
+      lower_bound_rows(rows, region.count(), low);
 }
 
 // Scan base rows against the resolved newer run.
 template <class Sink>
 __device__ __forceinline__ typename Sink::State
-enumerate_visible_section(
+enumerate_visible_region(
     std::uint32_t low, std::uint32_t high,
     const Row *current, std::uint32_t current_count,
     ResidentRows arena, Descriptor base,
@@ -366,9 +366,9 @@ __device__ __forceinline__ void enumerate_range_source_tiles(
     const std::uint32_t interval_begin = union_begins[interval];
     const std::uint32_t interval_end = union_ends[interval];
     for (std::uint32_t tile_begin = interval_begin;
-         tile_begin < interval_end; tile_begin += kSectionRangeThreads) {
+         tile_begin < interval_end; tile_begin += kRegionRangeThreads) {
       const std::uint32_t tile_end =
-          min(tile_begin + kSectionRangeThreads, interval_end);
+          min(tile_begin + kRegionRangeThreads, interval_end);
       if (tile_begin + threadIdx.x < tile_end) {
         Row row = source.load(tile_begin + threadIdx.x);
         if (hide_with_newer && newer_count) {
@@ -450,28 +450,28 @@ struct WidenFragmentCount {
 };
 
 __device__ __forceinline__ void emit_range_fragment(
-    std::uint32_t index, std::uint32_t query, std::uint32_t quotient,
+    std::uint32_t index, std::uint32_t query, std::uint32_t region,
     std::uint32_t low, std::uint32_t high, RangeFragment *fragments,
-    std::uint32_t *section_keys, SectionRangeFragment *section_fragments,
-    bool section_owned) {
-  if (section_owned) {
-    const std::uint32_t q_low = quotient << 16u;
+    std::uint32_t *region_keys, RegionRangeFragment *region_fragments,
+    bool region_owned) {
+  if (region_owned) {
+    const std::uint32_t q_low = region << 16u;
     const std::uint32_t clipped_low = max(low, q_low);
     const std::uint32_t clipped_high = min(high, q_low | 0xffffu);
-    section_keys[index] = q_low | (clipped_low & 0xffffu);
-    section_fragments[index] = {
+    region_keys[index] = q_low | (clipped_low & 0xffffu);
+    region_fragments[index] = {
         index, static_cast<std::uint16_t>(clipped_low),
         static_cast<std::uint16_t>(clipped_high)};
   } else {
-    fragments[index] = {query, quotient};
+    fragments[index] = {query, region};
   }
 }
 
 __global__ void adaptive_emit_range_fragments_kernel(
     const std::uint32_t *low, const std::uint32_t *high,
     const std::uint32_t *offsets, std::uint32_t query_count,
-    RangeFragment *fragments, std::uint32_t *section_keys,
-    SectionRangeFragment *section_fragments, bool section_owned) {
+    RangeFragment *fragments, std::uint32_t *region_keys,
+    RegionRangeFragment *region_fragments, bool region_owned) {
   constexpr std::uint32_t kWarps = kThreads / 32u;
   constexpr std::uint32_t kThreadFragments = 4u;
   const std::uint32_t lane = threadIdx.x & 31u;
@@ -483,7 +483,7 @@ __global__ void adaptive_emit_range_fragments_kernel(
          local < count; local += gridDim.x * blockDim.x)
       emit_range_fragment(
           local, 0u, first + local, low[0u], high[0u], fragments,
-          section_keys, section_fragments, section_owned);
+          region_keys, region_fragments, region_owned);
     return;
   }
 
@@ -504,8 +504,8 @@ __global__ void adaptive_emit_range_fragments_kernel(
       for (std::uint32_t local = 0u; local < count; ++local)
         emit_range_fragment(
             query_offset + local, query, first + local, query_low,
-            query_high, fragments, section_keys, section_fragments,
-            section_owned);
+            query_high, fragments, region_keys, region_fragments,
+            region_owned);
     }
 
     unsigned wide = __ballot_sync(
@@ -525,8 +525,8 @@ __global__ void adaptive_emit_range_fragments_kernel(
       for (std::uint32_t local = lane; local < wide_count; local += 32u)
         emit_range_fragment(
             wide_offset + local, wide_query, first + local, wide_low,
-            wide_high, fragments, section_keys, section_fragments,
-            section_owned);
+            wide_high, fragments, region_keys, region_fragments,
+            region_owned);
       wide &= ~(1u << owner);
     }
   }
@@ -619,61 +619,61 @@ __global__ void adaptive_reduce_range_partials_kernel(
   }
 }
 
-__global__ void find_section_fragment_offsets_kernel(
-    const std::uint32_t *sorted_sections, std::uint32_t count,
+__global__ void find_region_fragment_offsets_kernel(
+    const std::uint32_t *sorted_regions, std::uint32_t count,
     std::uint32_t *offsets) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kQuotients) return;
-  if (q == kQuotients) {
+  if (q > kRegions) return;
+  if (q == kRegions) {
     offsets[q] = count;
     return;
   }
   std::uint32_t lo = 0u, hi = count;
   while (lo < hi) {
     const std::uint32_t mid = (lo + hi) >> 1u;
-    const std::uint32_t section = sorted_sections[mid] >> 16u;
-    if (section < q) lo = mid + 1u;
+    const std::uint32_t region = sorted_regions[mid] >> 16u;
+    if (region < q) lo = mid + 1u;
     else hi = mid;
   }
   offsets[q] = lo;
 }
 
-__global__ void count_section_range_tasks_kernel(
-    const std::uint32_t *section_offsets, std::uint32_t *task_counts) {
+__global__ void count_region_range_tasks_kernel(
+    const std::uint32_t *region_offsets, std::uint32_t *task_counts) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kQuotients) return;
-  if (q == kQuotients) {
+  if (q > kRegions) return;
+  if (q == kRegions) {
     task_counts[q] = 0u;
     return;
   }
-  const std::uint32_t begin = section_offsets[q];
-  const std::uint32_t end = section_offsets[q + 1u];
+  const std::uint32_t begin = region_offsets[q];
+  const std::uint32_t end = region_offsets[q + 1u];
   const std::uint32_t count = end - begin;
   task_counts[q] =
-      (count + kSectionTaskFragments - 1u) / kSectionTaskFragments;
+      (count + kRegionTaskFragments - 1u) / kRegionTaskFragments;
 }
 
-__global__ void emit_section_range_tasks_kernel(
-    const std::uint32_t *section_offsets,
-    const std::uint32_t *task_offsets, SectionRangeTask *tasks) {
+__global__ void emit_region_range_tasks_kernel(
+    const std::uint32_t *region_offsets,
+    const std::uint32_t *task_offsets, RegionRangeTask *tasks) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kQuotients) return;
-  const std::uint32_t begin = section_offsets[q];
-  const std::uint32_t end = section_offsets[q + 1u];
+  if (q >= kRegions) return;
+  const std::uint32_t begin = region_offsets[q];
+  const std::uint32_t end = region_offsets[q + 1u];
   const std::uint32_t local_tasks = task_offsets[q + 1u] - task_offsets[q];
   const std::uint32_t task_base = task_offsets[q];
   for (std::uint32_t tile = 0u; tile < local_tasks; ++tile) {
     const std::uint32_t tile_begin =
-        begin + tile * kSectionTaskFragments;
+        begin + tile * kRegionTaskFragments;
     tasks[task_base + tile] =
-        {q, tile_begin, min(tile_begin + kSectionTaskFragments, end)};
+        {q, tile_begin, min(tile_begin + kRegionTaskFragments, end)};
   }
 }
 
 template <class Sink>
-__global__ void cooperative_section_owned_range_kernel(
-    const SectionRangeFragment *fragments,
-    const SectionRangeTask *tasks,
+__global__ void cooperative_region_owned_range_kernel(
+    const RegionRangeFragment *fragments,
+    const RegionRangeTask *tasks,
     const std::uint32_t *task_count, ResidentRows arena,
     const Descriptor *descriptors, const std::uint16_t *local_rank,
     const Row *hot_rows, const Descriptor *hot_descriptors, bool hot_ready,
@@ -683,28 +683,28 @@ __global__ void cooperative_section_owned_range_kernel(
     typename Sink::State *aggregate_partials,
     const std::uint64_t *query_occupied_level_mask) {
   constexpr std::uint32_t kCapacity = kRangeOnChipNewerRows;
-  using BlockScan = cub::BlockScan<std::uint32_t, kSectionRangeThreads>;
+  using BlockScan = cub::BlockScan<std::uint32_t, kRegionRangeThreads>;
   union Workspace {
     Row merged[kCapacity];
     TaggedRow tagged[kCapacity];
-    Row tile[kSectionRangeThreads];
+    Row tile[kRegionRangeThreads];
   };
   __shared__ Row current[kCapacity];
   __shared__ Workspace workspace;
   __shared__ typename BlockScan::TempStorage scan_storage;
-  __shared__ Descriptor section_descriptors[kMaximumLevels];
-  __shared__ std::uint32_t foundation_cell_ranks[kFoundationCells + 1u];
-  __shared__ RangeFragmentBounds fragment_bounds[kSectionTaskFragments];
-  __shared__ std::uint32_t fragment_work[kSectionTaskFragments];
-  __shared__ typename Sink::State fragment_sums[kSectionTaskFragments];
-  __shared__ std::uint32_t source_begins[kSectionTaskFragments];
-  __shared__ std::uint32_t source_ends[kSectionTaskFragments];
-  __shared__ std::uint32_t union_begins[kSectionTaskFragments];
-  __shared__ std::uint32_t union_ends[kSectionTaskFragments];
-  __shared__ std::uint8_t fragment_slots[kSectionTaskFragments];
-  __shared__ std::uint8_t fragment_widths[kSectionTaskFragments];
+  __shared__ Descriptor region_descriptors[kMaximumLevels];
+  __shared__ std::uint32_t oldest_cell_ranks[kCellsPerRegion + 1u];
+  __shared__ RangeFragmentBounds fragment_bounds[kRegionTaskFragments];
+  __shared__ std::uint32_t fragment_work[kRegionTaskFragments];
+  __shared__ typename Sink::State fragment_sums[kRegionTaskFragments];
+  __shared__ std::uint32_t source_begins[kRegionTaskFragments];
+  __shared__ std::uint32_t source_ends[kRegionTaskFragments];
+  __shared__ std::uint32_t union_begins[kRegionTaskFragments];
+  __shared__ std::uint32_t union_ends[kRegionTaskFragments];
+  __shared__ std::uint8_t fragment_slots[kRegionTaskFragments];
+  __shared__ std::uint8_t fragment_widths[kRegionTaskFragments];
   __shared__ std::uint16_t wave_fragment_begins[33u];
-  __shared__ std::uint32_t quotient_shared;
+  __shared__ std::uint32_t region_shared;
   __shared__ std::uint32_t fragment_begin_shared;
   __shared__ std::uint32_t fragment_end_shared;
   __shared__ std::uint32_t current_count_shared;
@@ -718,7 +718,7 @@ __global__ void cooperative_section_owned_range_kernel(
   const DeviceManifestSnapshot manifest =
       load_query_manifest(query_occupied_level_mask);
   const std::uint32_t active_levels = manifest.active_levels;
-  const std::uint32_t foundation_level = manifest.foundation_level;
+  const std::uint32_t oldest_level = manifest.oldest_level;
   const std::uint64_t occupied_levels = manifest.occupied_level_mask;
 
   for (std::uint32_t task_index = blockIdx.x;;
@@ -726,8 +726,8 @@ __global__ void cooperative_section_owned_range_kernel(
     if (threadIdx.x == 0u) {
       task_valid_shared = task_index < *task_count;
       if (task_valid_shared) {
-        const SectionRangeTask task = tasks[task_index];
-        quotient_shared = task.quotient;
+        const RegionRangeTask task = tasks[task_index];
+        region_shared = task.region;
         fragment_begin_shared = task.begin;
         fragment_end_shared = task.end;
       }
@@ -735,12 +735,12 @@ __global__ void cooperative_section_owned_range_kernel(
     __syncthreads();
     if (!task_valid_shared) return;
 
-    const std::uint32_t q = quotient_shared;
+    const std::uint32_t q = region_shared;
     const std::uint32_t fragment_begin = fragment_begin_shared;
     const std::uint32_t fragment_end = fragment_end_shared;
     const std::uint32_t fragment_count = fragment_end - fragment_begin;
     if (threadIdx.x < active_levels) {
-      section_descriptors[threadIdx.x] =
+      region_descriptors[threadIdx.x] =
           level_is_occupied(occupied_levels, threadIdx.x)
           ? descriptors[descriptor_index(q, threadIdx.x)] : Descriptor{};
     }
@@ -750,26 +750,26 @@ __global__ void cooperative_section_owned_range_kernel(
       current_count_shared = 0u;
       for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
         const std::size_t offset =
-            std::size_t{batch} * (kQuotients + 1u) + q;
+            std::size_t{batch} * (kRegions + 1u) + q;
         pending_count_shared += raw_offsets[offset + 1u] - raw_offsets[offset];
       }
     }
     if (threadIdx.x < 32u) {
       bool ranked = false;
       Descriptor descriptor{};
-      if (local_rank && foundation_level < active_levels) {
-        descriptor = descriptors[descriptor_index(q, foundation_level)];
+      if (local_rank && oldest_level < active_levels) {
+        descriptor = descriptors[descriptor_index(q, oldest_level)];
         ranked = descriptor.count() && cell_rank_supported(descriptor.count());
       }
       if (threadIdx.x == 0u) {
         ranks_valid_shared = ranked;
-        foundation_cell_ranks[kFoundationCells] = descriptor.count();
+        oldest_cell_ranks[kCellsPerRegion] = descriptor.count();
       }
       if (ranked)
-        for (std::uint32_t cell = threadIdx.x; cell < kFoundationCells;
+        for (std::uint32_t cell = threadIdx.x; cell < kCellsPerRegion;
              cell += 32u)
-          foundation_cell_ranks[cell] =
-              local_rank[std::size_t{q} * kFoundationCells + cell];
+          oldest_cell_ranks[cell] =
+              local_rank[std::size_t{q} * kCellsPerRegion + cell];
     }
     __syncthreads();
 
@@ -871,9 +871,9 @@ __global__ void cooperative_section_owned_range_kernel(
 
     if (!use_hot) {
       for (std::uint32_t level = 0u; level < active_levels; ++level) {
-        if (level == foundation_level ||
+        if (level == oldest_level ||
             !level_is_occupied(occupied_levels, level)) continue;
-        const Descriptor descriptor = section_descriptors[level];
+        const Descriptor descriptor = region_descriptors[level];
         const std::uint32_t source_count = descriptor.count();
         if (!source_count) continue;
         const ResidentRows source = arena + descriptor.offset();
@@ -928,32 +928,32 @@ __global__ void cooperative_section_owned_range_kernel(
         ? hot_rows + hot_descriptor_shared.offset() : current;
     const std::uint32_t newer_count = use_hot
         ? hot_descriptor_shared.count() : current_count_shared;
-    const Descriptor foundation = foundation_level < active_levels
-        ? section_descriptors[foundation_level] : Descriptor{};
+    const Descriptor oldest = oldest_level < active_levels
+        ? region_descriptors[oldest_level] : Descriptor{};
 
     for (std::uint32_t local = threadIdx.x; local < fragment_count;
          local += blockDim.x) {
-      const SectionRangeFragment fragment = fragments[fragment_begin + local];
+      const RegionRangeFragment fragment = fragments[fragment_begin + local];
       RangeFragmentBounds bounds{};
       bounds.update_begin = lower_bound_rows(
           newer, newer_count, fragment.low_suffix);
       bounds.update_end = upper_bound_rows(
           newer, newer_count, fragment.high_suffix);
       std::uint32_t base_work = 0u;
-      if (foundation.count()) {
-        const Descriptor descriptor = foundation;
+      if (oldest.count()) {
+        const Descriptor descriptor = oldest;
         const ResidentRows rows = arena + descriptor.offset();
         if (ranks_valid_shared) {
           const std::uint32_t low_cell =
-              std::uint32_t{fragment.low_suffix} / kFoundationCellKeys;
-          const std::uint32_t low_begin = foundation_cell_ranks[low_cell];
-          const std::uint32_t low_end = foundation_cell_ranks[low_cell + 1u];
+              std::uint32_t{fragment.low_suffix} / kKeysPerCell;
+          const std::uint32_t low_begin = oldest_cell_ranks[low_cell];
+          const std::uint32_t low_end = oldest_cell_ranks[low_cell + 1u];
           bounds.base_begin = low_begin + lower_bound_rows(
               rows + low_begin, low_end - low_begin, fragment.low_suffix);
           const std::uint32_t high_cell =
-              std::uint32_t{fragment.high_suffix} / kFoundationCellKeys;
-          const std::uint32_t high_begin = foundation_cell_ranks[high_cell];
-          const std::uint32_t high_end = foundation_cell_ranks[high_cell + 1u];
+              std::uint32_t{fragment.high_suffix} / kKeysPerCell;
+          const std::uint32_t high_begin = oldest_cell_ranks[high_cell];
+          const std::uint32_t high_end = oldest_cell_ranks[high_cell + 1u];
           bounds.base_end = high_begin + upper_bound_rows(
               rows + high_begin, high_end - high_begin, fragment.high_suffix);
         } else {
@@ -981,7 +981,7 @@ __global__ void cooperative_section_owned_range_kernel(
         std::uint32_t slot = (cursor + width - 1u) & ~(width - 1u);
         if ((slot >> 5u) != ((slot + width - 1u) >> 5u))
           slot = (slot + 31u) & ~31u;
-        if (slot + width > kSectionRangeThreads) {
+        if (slot + width > kRegionRangeThreads) {
           ++wave;
           wave_fragment_begins[wave] = fragment;
           slot = 0u;
@@ -1008,8 +1008,8 @@ __global__ void cooperative_section_owned_range_kernel(
         wave_fragment_begins, wave_count_shared, union_begins, union_ends,
         &union_count_shared, workspace.tile, fragment_sums);
 
-    if (foundation.count()) {
-      const ResidentRows rows = arena + foundation.offset();
+    if (oldest.count()) {
+      const ResidentRows rows = arena + oldest.offset();
       for (std::uint32_t local = threadIdx.x; local < fragment_count;
            local += blockDim.x) {
         source_begins[local] = fragment_bounds[local].base_begin;
@@ -1026,7 +1026,7 @@ __global__ void cooperative_section_owned_range_kernel(
 
     for (std::uint32_t local = threadIdx.x; local < fragment_count;
          local += blockDim.x) {
-      const SectionRangeFragment fragment = fragments[fragment_begin + local];
+      const RegionRangeFragment fragment = fragments[fragment_begin + local];
       aggregate_partials[fragment.original_index] = fragment_sums[local];
     }
     __syncthreads();
@@ -1058,7 +1058,7 @@ __global__ void warp_range_fragment_kernel(
   const DeviceManifestSnapshot manifest =
       load_query_manifest(query_occupied_level_mask);
   const std::uint32_t active_levels = manifest.active_levels;
-  const std::uint32_t foundation_level = manifest.foundation_level;
+  const std::uint32_t oldest_level = manifest.oldest_level;
   const std::uint64_t occupied_levels = manifest.occupied_level_mask;
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t warp = threadIdx.x >> 5u;
@@ -1070,7 +1070,7 @@ __global__ void warp_range_fragment_kernel(
   if (lane == 0u) {
     const RangeFragment fragment = fragments[fragment_index];
     query = fragment.query;
-    q = fragment.quotient;
+    q = fragment.region;
   }
   query = __shfl_sync(full_mask, query, 0u);
   q = __shfl_sync(full_mask, q, 0u);
@@ -1096,11 +1096,11 @@ __global__ void warp_range_fragment_kernel(
   hot_bits = __shfl_sync(full_mask, hot_bits, 0u);
   const Descriptor hot_descriptor{hot_bits};
   if (hot_descriptor.count()) {
-    const Descriptor foundation = foundation_level < active_levels
-        ? descriptors[descriptor_index(q, foundation_level)] : Descriptor{};
-    unsigned long long value = enumerate_visible_section<Sink>(
+    const Descriptor oldest = oldest_level < active_levels
+        ? descriptors[descriptor_index(q, oldest_level)] : Descriptor{};
+    unsigned long long value = enumerate_visible_region<Sink>(
         low_suffix, high_suffix, hot_rows + hot_descriptor.offset(),
-        hot_descriptor.count(), arena, foundation,
+        hot_descriptor.count(), arena, oldest,
         lane, 32u);
     for (std::uint32_t offset = 16u; offset; offset >>= 1u)
       value = Sink{}(value,
@@ -1113,7 +1113,7 @@ __global__ void warp_range_fragment_kernel(
   if (pending_batches) {
     std::uint32_t pending_count = 0u;
     for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
-      const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+      const std::size_t oi = std::size_t{batch} * (kRegions + 1u) + q;
       const std::uint32_t begin = raw_offsets[oi];
       const std::uint32_t end = raw_offsets[oi + 1u];
       for (std::uint32_t chunk = begin; chunk < end; chunk += 32u) {
@@ -1174,7 +1174,7 @@ __global__ void warp_range_fragment_kernel(
 
   bool class_overflow = false;
   for (std::uint32_t level = 0u; level < active_levels; ++level) {
-    if (level == foundation_level ||
+    if (level == oldest_level ||
         !level_is_occupied(occupied_levels, level)) continue;
     unsigned long long descriptor_bits = 0ull;
     if (lane == 0u)
@@ -1249,21 +1249,21 @@ __global__ void warp_range_fragment_kernel(
     return;
   }
 
-  const Descriptor foundation = foundation_level < active_levels
-      ? descriptors[descriptor_index(q, foundation_level)] : Descriptor{};
+  const Descriptor oldest = oldest_level < active_levels
+      ? descriptors[descriptor_index(q, oldest_level)] : Descriptor{};
   std::uint32_t work = 0u;
   if (lane == 0u)
-    work = current_count + section_range_row_count(
-        low_suffix, high_suffix, arena, foundation);
+    work = current_count + region_range_row_count(
+        low_suffix, high_suffix, arena, oldest);
   work = __shfl_sync(full_mask, work, 0u);
   const std::uint32_t worker_width = work <= kRangeThreadWork ? 1u
       : work <= kRangeSubgroupWork ? 8u : 32u;
   const unsigned worker_mask = __ballot_sync(full_mask, lane < worker_width);
   typename Sink::State local = Sink::identity();
   if (lane < worker_width) {
-    local = enumerate_visible_section<Sink>(
+    local = enumerate_visible_region<Sink>(
         low_suffix, high_suffix, current, current_count, arena,
-        foundation, lane, worker_width);
+        oldest, lane, worker_width);
     for (std::uint32_t offset = worker_width / 2u; offset; offset >>= 1u)
       local += __shfl_down_sync(worker_mask, local, offset, worker_width);
   }
@@ -1272,4 +1272,4 @@ __global__ void warp_range_fragment_kernel(
   }
 }
 
-}  // namespace gpulsmopt2_detail
+}  // namespace celllsm

@@ -6,7 +6,7 @@
 #include "device_memory.cuh"
 #include "layout.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
 constexpr std::uint32_t kBulkRootSinkItemsPerThread = 8u;
 constexpr std::uint32_t kBulkRootSinkTileRows =
@@ -58,7 +58,7 @@ __global__ void deposit_bulk_root_sink_kernel(
     const std::uint32_t *sorted_values,
     std::uint32_t count,
     const std::uint32_t *tile_offsets,
-    std::uint32_t *quotient_end_markers,
+    std::uint32_t *region_end_markers,
     Output output_rows,
     std::uint64_t destination, bool tombstone) {
   constexpr std::uint32_t kWarpSize = 32u;
@@ -72,7 +72,7 @@ __global__ void deposit_bulk_root_sink_kernel(
   const std::uint32_t warp = threadIdx.x / kWarpSize;
   std::uint32_t keys[kBulkRootSinkItemsPerThread];
   bool terminal[kBulkRootSinkItemsPerThread];
-  bool quotient_terminal[kBulkRootSinkItemsPerThread];
+  bool region_terminal[kBulkRootSinkItemsPerThread];
   if (threadIdx.x == 0u) group_offsets[0] = 0u;
   #pragma unroll
   for (std::uint32_t item = 0u;
@@ -89,7 +89,7 @@ __global__ void deposit_bulk_root_sink_kernel(
     const bool final = position + 1u == count;
     terminal[item] = position < count &&
         (final || keys[item] != next);
-    quotient_terminal[item] = terminal[item] &&
+    region_terminal[item] = terminal[item] &&
         (final || (keys[item] >> 16u) != (next >> 16u));
     const std::uint32_t mask = __ballot_sync(~0u, terminal[item]);
     if (lane == 0u) {
@@ -121,19 +121,14 @@ __global__ void deposit_bulk_root_sink_kernel(
     output_rows.store(output, make_row(
         keys[item], tombstone ? 0u : sorted_values[position],
         tombstone ? kTombstone : 0u));
-    if (quotient_terminal[item]) {
-      const std::uint32_t quotient = keys[item] >> 16u;
-      quotient_end_markers[quotient + 1u] = output_rank + 1u;
+    if (region_terminal[item]) {
+      const std::uint32_t region = keys[item] >> 16u;
+      region_end_markers[region + 1u] = output_rank + 1u;
     }
   }
 }
 
-}  // namespace gpulsmopt2_detail
 
-namespace gpulsm_sparse {
-
-constexpr std::uint32_t kSections = gpulsmopt2_detail::kQuotients;
-constexpr std::uint32_t kLevels = gpulsmopt2_detail::kMaximumLevels;
 
 // Plan final radix-4 roots before materialization.
 struct PlannedRoot {
@@ -149,7 +144,7 @@ struct ForestPlan {
   std::uint64_t output_mask{};
   std::uint64_t final_mask{};
   std::uint32_t output_count{};
-  std::array<PlannedRoot, kLevels> outputs{};
+  std::array<PlannedRoot, kMaximumLevels> outputs{};
 };
 
 struct PlannerNode {
@@ -163,7 +158,7 @@ struct PlannerNode {
 inline ForestPlan plan_forest(
     std::uint64_t old_mask, std::uint64_t complete_epochs,
     const std::vector<std::uint32_t> &tier_slots) {
-  std::array<PlannerNode, kLevels> levels{};
+  std::array<PlannerNode, kMaximumLevels> levels{};
   std::uint32_t level_base = 0u;
   for (std::uint32_t tier = 0u; tier < tier_slots.size(); ++tier) {
     const std::uint32_t slots = tier_slots[tier];
@@ -265,36 +260,36 @@ inline ForestPlan plan_forest(
 }
 
 __global__ void build_epoch_counts_and_ranks(
-    const gpulsmopt2_detail::Row *rows,
-    const std::uint32_t *section_offsets, std::uint32_t *section_counts,
+    const Row *rows,
+    const std::uint32_t *region_offsets, std::uint32_t *region_counts,
     std::uint16_t *cell_ranks) {
-  const std::uint32_t section = blockIdx.x;
+  const std::uint32_t region = blockIdx.x;
   const std::uint32_t cell = threadIdx.x;
-  const std::uint32_t begin = section_offsets[section];
+  const std::uint32_t begin = region_offsets[region];
   const std::uint32_t count =
-      section_offsets[section + 1u] - begin;
+      region_offsets[region + 1u] - begin;
   if (!cell) {
-    section_counts[section] = count;
-    if (!section) section_counts[kSections] = 0u;
+    region_counts[region] = count;
+    if (!region) region_counts[kRegions] = 0u;
   }
-  cell_ranks[std::size_t{section} *
-                 gpulsmopt2_detail::kFoundationCells + cell] =
-      static_cast<std::uint16_t>(gpulsmopt2_detail::lower_bound_rows(
+  cell_ranks[std::size_t{region} *
+                 kCellsPerRegion + cell] =
+      static_cast<std::uint16_t>(lower_bound_rows(
           rows + begin, count,
-          cell * gpulsmopt2_detail::kFoundationCellKeys));
+          cell * kKeysPerCell));
 }
 
-// Share native sorting, compaction, and scratch storage.
-template <bool WithEpoch> class NativeRootWorkspace {
+// Sort, keep the last version of each key, and write a run directly.
+template <bool WithEpoch> class DirectRunWorkspace {
  public:
-  explicit NativeRootWorkspace(std::uint32_t capacity)
-      : NativeRootWorkspace(capacity, Buffer<std::uint8_t>(required_bytes(capacity))) {}
+  explicit DirectRunWorkspace(std::uint32_t capacity)
+      : DirectRunWorkspace(capacity, Buffer<std::uint8_t>(required_bytes(capacity))) {}
 
-  NativeRootWorkspace(std::uint32_t capacity, std::uint8_t *storage,
+  DirectRunWorkspace(std::uint32_t capacity, std::uint8_t *storage,
                       std::size_t storage_bytes)
       : capacity_(capacity), layout_(storage_layout(capacity)), storage_(storage) {
     if (!storage || storage_bytes < layout_.total_bytes)
-      throw std::length_error("native root workspace backing storage");
+      throw std::length_error("direct run workspace backing storage");
   }
 
   static std::size_t required_bytes(std::size_t capacity) {
@@ -304,9 +299,9 @@ template <bool WithEpoch> class NativeRootWorkspace {
   std::size_t bytes() const { return layout_.total_bytes; }
   std::uint32_t *sorted_keys() const { return view<std::uint32_t>(layout_.sorted_keys); }
   std::uint32_t *sorted_values() const { return view<std::uint32_t>(layout_.sorted_values); }
-  std::uint32_t *section_offsets() const { return view<std::uint32_t>(layout_.section_offsets); }
-  std::uint32_t *section_counts() const { return view<std::uint32_t>(layout_.section_counts); }
-  gpulsmopt2_detail::Row *epoch_rows() const { return view<gpulsmopt2_detail::Row>(layout_.epoch_rows); }
+  std::uint32_t *region_offsets() const { return view<std::uint32_t>(layout_.region_offsets); }
+  std::uint32_t *region_counts() const { return view<std::uint32_t>(layout_.region_counts); }
+  Row *epoch_rows() const { return view<Row>(layout_.epoch_rows); }
   std::uint16_t *epoch_ranks() const { return view<std::uint16_t>(layout_.epoch_ranks); }
 
   std::uint32_t prepare(const std::uint32_t *keys, const std::uint32_t *values,
@@ -314,7 +309,7 @@ template <bool WithEpoch> class NativeRootWorkspace {
                         bool materialize_epoch,
                         cudaStream_t stream) {
     if (!count || count > capacity_ || (materialize_epoch && !WithEpoch))
-      throw std::length_error("native root workspace capacity");
+      throw std::length_error("direct run workspace capacity");
     count_ = count;
     tombstone_ = tombstone;
     const std::uint32_t tiles = tile_count(count);
@@ -322,14 +317,14 @@ template <bool WithEpoch> class NativeRootWorkspace {
     if (tombstone_) {
       check(cub::DeviceRadixSort::SortKeys(
           view<std::uint8_t>(layout_.temporary), bytes, keys, sorted_keys(),
-          count, 0, 32, stream), "sort native deletion keys");
+          count, 0, 32, stream), "sort direct-run deletion keys");
     } else {
       check(cub::DeviceRadixSort::SortPairs(
           view<std::uint8_t>(layout_.temporary), bytes, keys, sorted_keys(),
-          values, sorted_values(), count, 0, 32, stream), "sort native root");
+          values, sorted_values(), count, 0, 32, stream), "sort direct run");
     }
-    gpulsmopt2_detail::count_bulk_root_sink_tiles_kernel<<<
-        tiles, gpulsmopt2_detail::kThreads, 0, stream>>>(
+    count_bulk_root_sink_tiles_kernel<<<
+        tiles, kThreads, 0, stream>>>(
         sorted_keys(), count, view<std::uint32_t>(layout_.tile_counts));
     check(cudaMemsetAsync(view<std::uint32_t>(layout_.tile_counts) + tiles,
                           0, sizeof(std::uint32_t), stream), "clear tile sentinel");
@@ -338,20 +333,20 @@ template <bool WithEpoch> class NativeRootWorkspace {
         view<std::uint8_t>(layout_.temporary), bytes,
         view<std::uint32_t>(layout_.tile_counts),
         view<std::uint32_t>(layout_.tile_offsets), tiles + 1u, stream),
-        "scan native root winners");
+        "scan direct run winners");
     if constexpr (WithEpoch) {
       if (materialize_epoch) {
-        deposit(EpochOutput{epoch_rows()}, 0u, section_offsets(), stream);
+        deposit(EpochOutput{epoch_rows()}, 0u, region_offsets(), stream);
         build_epoch_counts_and_ranks<<<
-            kSections, gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
-            epoch_rows(), section_offsets(), section_counts(), epoch_ranks());
+            kRegions, kCellsPerRegion, 0, stream>>>(
+            epoch_rows(), region_offsets(), region_counts(), epoch_ranks());
       }
     }
     std::uint32_t selected{};
     check(cudaMemcpyAsync(&selected,
         view<std::uint32_t>(layout_.tile_offsets) + tiles, sizeof(selected),
-        cudaMemcpyDeviceToHost, stream), "read native root winner count");
-    check(cudaStreamSynchronize(stream), "wait native root preparation");
+        cudaMemcpyDeviceToHost, stream), "read direct run winner count");
+    check(cudaStreamSynchronize(stream), "wait direct run preparation");
     return selected;
   }
 
@@ -359,64 +354,64 @@ template <bool WithEpoch> class NativeRootWorkspace {
   void deposit(Output output, std::uint64_t destination,
                std::uint32_t *offsets, cudaStream_t stream) const {
     auto *markers = view<std::uint32_t>(layout_.temporary);
-    check(cudaMemsetAsync(markers, 0, (kSections + 1u) * sizeof(std::uint32_t),
-                          stream), "clear native root section markers");
-    gpulsmopt2_detail::deposit_bulk_root_sink_kernel<<<
-        tile_count(count_), gpulsmopt2_detail::kThreads, 0, stream>>>(
+    check(cudaMemsetAsync(markers, 0, (kRegions + 1u) * sizeof(std::uint32_t),
+                          stream), "clear direct run region markers");
+    deposit_bulk_root_sink_kernel<<<
+        tile_count(count_), kThreads, 0, stream>>>(
         sorted_keys(), sorted_values(), count_,
         view<std::uint32_t>(layout_.tile_offsets), markers, output, destination,
         tombstone_);
-    std::size_t bytes = layout_.quotient_scan_bytes;
+    std::size_t bytes = layout_.region_scan_bytes;
     check(cub::DeviceScan::InclusiveScan(
-        view<std::uint8_t>(layout_.quotient_scan_temporary), bytes,
-        markers, offsets, gpulsmopt2_detail::BulkRootSinkMaximum{},
-        kSections + 1u, stream), "scan native root sections");
+        view<std::uint8_t>(layout_.region_scan_temporary), bytes,
+        markers, offsets, BulkRootSinkMaximum{},
+        kRegions + 1u, stream), "scan direct run regions");
   }
 
   struct EpochOutput {
-    gpulsmopt2_detail::Row *rows;
-    __device__ void store(std::uint64_t position, gpulsmopt2_detail::Row row) const {
+    Row *rows;
+    __device__ void store(std::uint64_t position, Row row) const {
       rows[position] = row;
     }
   };
  private:
-  NativeRootWorkspace(std::uint32_t capacity, Buffer<std::uint8_t> storage)
-      : NativeRootWorkspace(capacity, storage.data(), storage.bytes()) {
+  DirectRunWorkspace(std::uint32_t capacity, Buffer<std::uint8_t> storage)
+      : DirectRunWorkspace(capacity, storage.data(), storage.bytes()) {
     owned_storage_ = std::move(storage);
   }
   template <class T> T *view(std::size_t offset) const {
     return reinterpret_cast<T *>(storage_ + offset);
   }
   static std::uint32_t tile_count(std::size_t count) {
-    return static_cast<std::uint32_t>((count + gpulsmopt2_detail::kBulkRootSinkTileRows - 1u) /
-                                     gpulsmopt2_detail::kBulkRootSinkTileRows);
+    return static_cast<std::uint32_t>((count + kBulkRootSinkTileRows - 1u) /
+                                     kBulkRootSinkTileRows);
   }
   struct StorageLayout {
     std::size_t sorted_keys{}, sorted_values{}, temporary{};
-    std::size_t quotient_scan_temporary{}, tile_counts{}, tile_offsets{};
-    std::size_t section_offsets{}, section_counts{}, epoch_rows{}, epoch_ranks{};
-    std::size_t sort_bytes{}, scan_bytes{}, quotient_scan_bytes{}, total_bytes{};
+    std::size_t region_scan_temporary{}, tile_counts{}, tile_offsets{};
+    std::size_t region_offsets{}, region_counts{}, epoch_rows{}, epoch_ranks{};
+    std::size_t sort_bytes{}, scan_bytes{}, region_scan_bytes{}, total_bytes{};
   };
   static StorageLayout storage_layout(std::size_t capacity) {
     if (!capacity || capacity > std::numeric_limits<std::uint32_t>::max())
-      throw std::length_error("native root workspace capacity");
+      throw std::length_error("direct run workspace capacity");
     StorageLayout layout{};
     std::uint32_t *rows = nullptr;
     check(cub::DeviceRadixSort::SortPairs(
         nullptr, layout.sort_bytes, rows, rows, rows, rows,
-        static_cast<std::uint32_t>(capacity), 0, 32), "size native root sort");
+        static_cast<std::uint32_t>(capacity), 0, 32), "size direct run sort");
     std::size_t key_sort_bytes = 0u;
     check(cub::DeviceRadixSort::SortKeys(
         nullptr, key_sort_bytes, rows, rows,
-        static_cast<std::uint32_t>(capacity), 0, 32), "size native deletion sort");
+        static_cast<std::uint32_t>(capacity), 0, 32), "size direct-run deletion sort");
     layout.sort_bytes = std::max(layout.sort_bytes, key_sort_bytes);
     check(cub::DeviceScan::ExclusiveSum(
         nullptr, layout.scan_bytes, rows, rows, tile_count(capacity) + 1u),
-        "size native root scan");
+        "size direct run scan");
     check(cub::DeviceScan::InclusiveScan(
-        nullptr, layout.quotient_scan_bytes, rows, rows,
-        gpulsmopt2_detail::BulkRootSinkMaximum{}, kSections + 1u),
-        "size native root section scan");
+        nullptr, layout.region_scan_bytes, rows, rows,
+        BulkRootSinkMaximum{}, kRegions + 1u),
+        "size direct run region scan");
     std::size_t offset = 0u;
     const auto place = [&](std::size_t bytes, std::size_t alignment = 256u) {
       offset = (offset + alignment - 1u) / alignment * alignment;
@@ -427,18 +422,18 @@ template <bool WithEpoch> class NativeRootWorkspace {
     layout.sorted_keys = place(capacity * sizeof(std::uint32_t));
     layout.sorted_values = place(capacity * sizeof(std::uint32_t));
     layout.temporary = place(0u);
-    const std::size_t marker_bytes = (kSections + 1u) * sizeof(std::uint32_t);
+    const std::size_t marker_bytes = (kRegions + 1u) * sizeof(std::uint32_t);
     const std::size_t scan_offset = (marker_bytes + 255u) & ~std::size_t{255u};
-    layout.quotient_scan_temporary = layout.temporary + scan_offset;
+    layout.region_scan_temporary = layout.temporary + scan_offset;
     offset += std::max({layout.sort_bytes, layout.scan_bytes,
-                       scan_offset + layout.quotient_scan_bytes});
+                       scan_offset + layout.region_scan_bytes});
     layout.tile_counts = place((tile_count(capacity) + 1u) * sizeof(std::uint32_t), 4u);
     layout.tile_offsets = place((tile_count(capacity) + 1u) * sizeof(std::uint32_t), 4u);
     if constexpr (WithEpoch) {
-      layout.section_offsets = place(marker_bytes);
-      layout.section_counts = place(marker_bytes);
-      layout.epoch_rows = place(capacity * sizeof(gpulsmopt2_detail::Row));
-      layout.epoch_ranks = place(gpulsmopt2_detail::kLocalRankEntries * sizeof(std::uint16_t));
+      layout.region_offsets = place(marker_bytes);
+      layout.region_counts = place(marker_bytes);
+      layout.epoch_rows = place(capacity * sizeof(Row));
+      layout.epoch_ranks = place(kLocalRankEntries * sizeof(std::uint16_t));
     }
     layout.total_bytes = offset;
     return layout;
@@ -450,7 +445,7 @@ template <bool WithEpoch> class NativeRootWorkspace {
   std::uint8_t *storage_{};
 };
 
-struct SealedForestCommand {
+struct LargeBatchCommand {
   std::uint64_t expected_mask{};
   std::uint64_t consumed_mask{};
   std::uint64_t output_mask{};
@@ -458,17 +453,17 @@ struct SealedForestCommand {
   std::uint64_t output_generation_bits{};
 };
 
-struct SealedForestReceipt {
+struct LargeBatchReceipt {
   std::uint64_t occupied_mask{};
   std::uint32_t status{};
 };
 
 // Publish all materialized roots in one commit.
-__global__ void publish_sealed_forest(
-    const SealedForestCommand *command,
-    gpulsmopt2_detail::DeviceManifest *manifests,
+__global__ void publish_large_batch_kernel(
+    const LargeBatchCommand *command,
+    DeviceManifest *manifests,
     std::uint32_t *active_manifest, std::uint64_t *query_mask,
-    SealedForestReceipt *receipt) {
+    LargeBatchReceipt *receipt) {
   if (blockIdx.x) return;
   const std::uint32_t active = atomicAdd(active_manifest, 0u) & 1u;
   const auto *current = manifests + active;
@@ -480,11 +475,11 @@ __global__ void publish_sealed_forest(
     }
     return;
   }
-  for (std::uint32_t level = threadIdx.x; level < kLevels;
+  for (std::uint32_t level = threadIdx.x; level < kMaximumLevels;
        level += blockDim.x) {
     const std::uint64_t bit = std::uint64_t{1u} << level;
     if (command->output_mask & bit) {
-      gpulsmopt2_detail::DeviceLevelState state{};
+      DeviceLevelState state{};
       state.storage_generation =
           (command->output_generation_bits & bit) != 0u;
       next->levels[level] = state;
@@ -500,8 +495,8 @@ __global__ void publish_sealed_forest(
     next->active_levels = command->final_mask
         ? 64u - static_cast<std::uint32_t>(__clzll(command->final_mask))
         : 0u;
-    next->foundation_level = next->active_levels
-        ? next->active_levels - 1u : kLevels;
+    next->oldest_level = next->active_levels
+        ? next->active_levels - 1u : kMaximumLevels;
     next->generation = current->generation + 1u;
     receipt->occupied_mask = command->final_mask;
     receipt->status = 0u;
@@ -512,4 +507,4 @@ __global__ void publish_sealed_forest(
   }
 }
 
-}  // namespace gpulsm_sparse
+}  // namespace celllsm

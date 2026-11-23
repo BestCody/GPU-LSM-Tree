@@ -1,15 +1,15 @@
 #pragma once
 
-// Epoch publication: per-section newest-wins dedupe of the pending
+// Epoch publication: per-region newest-wins dedupe of the pending
 // batches, the publication plan, run metadata and the manifest switch.
 
 #include "pending.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
 constexpr std::uint32_t kLocalEpochItemsPerThread = 5u;
 constexpr std::uint32_t kLocalEpochCapacity =
-    kFoundationCompactionThreads * kLocalEpochItemsPerThread;
+    kMergeThreads * kLocalEpochItemsPerThread;
 
 constexpr std::uint32_t kCanonicalResolverSuffixes = 1u << 16u;
 
@@ -20,22 +20,22 @@ __device__ __forceinline__ std::uint64_t pack_canonical_epoch_job(
 
 __global__ void count_canonical_epoch_jobs_kernel(
     const std::uint32_t *raw_offsets, std::uint32_t pending_batches,
-    std::uint32_t *section_counts, std::uint64_t *epoch_jobs,
+    std::uint32_t *region_counts, std::uint64_t *epoch_jobs,
     std::uint32_t *local_job_count,
     std::uint32_t *oversized_job_count) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q > kQuotients) return;
-  if (q == kQuotients) {
-    section_counts[q] = 0u;
+  if (q > kRegions) return;
+  if (q == kRegions) {
+    region_counts[q] = 0u;
     return;
   }
   std::uint32_t count = 0u;
   for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
     const std::size_t base =
-        std::size_t{batch} * (kQuotients + 1u) + q;
+        std::size_t{batch} * (kRegions + 1u) + q;
     count += raw_offsets[base + 1u] - raw_offsets[base];
   }
-  section_counts[q] = count;
+  region_counts[q] = count;
   if (!count) return;
   const std::uint64_t job = pack_canonical_epoch_job(q, count);
   if (count <= kLocalEpochCapacity) {
@@ -43,17 +43,17 @@ __global__ void count_canonical_epoch_jobs_kernel(
     epoch_jobs[position] = job;
   } else {
     const std::uint32_t position = atomicAdd(oversized_job_count, 1u);
-    epoch_jobs[kQuotients - 1u - position] = job;
+    epoch_jobs[kRegions - 1u - position] = job;
   }
 }
 
-__global__ void sum_canonical_section_counts_kernel(
-    const std::uint32_t *section_counts, std::uint32_t *total_count) {
+__global__ void sum_canonical_region_counts_kernel(
+    const std::uint32_t *region_counts, std::uint32_t *total_count) {
   __shared__ std::uint32_t partials[kThreads];
   std::uint32_t total = 0u;
-  for (std::uint32_t q = threadIdx.x; q < kQuotients;
+  for (std::uint32_t q = threadIdx.x; q < kRegions;
        q += blockDim.x)
-    total += section_counts[q];
+    total += region_counts[q];
   partials[threadIdx.x] = total;
   __syncthreads();
   for (std::uint32_t stride = blockDim.x >> 1u; stride; stride >>= 1u) {
@@ -77,10 +77,10 @@ __device__ __forceinline__ void store_canonical_epoch_row(
 
 template <std::uint32_t Items>
 using ActiveEpochBlockSort = cub::BlockRadixSort<
-    std::uint32_t, kFoundationCompactionThreads, Items, std::uint32_t>;
+    std::uint32_t, kMergeThreads, Items, std::uint32_t>;
 
 using ActiveEpochBlockScan =
-    cub::BlockScan<std::uint32_t, kFoundationCompactionThreads>;
+    cub::BlockScan<std::uint32_t, kMergeThreads>;
 
 union ActiveEpochResolutionStorage {
   typename ActiveEpochBlockSort<1u>::TempStorage sort_1;
@@ -93,7 +93,7 @@ __device__ __forceinline__ void resolve_canonical_epoch_active_job(
     std::uint32_t q, std::uint32_t raw_count,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, const std::uint32_t *raw_section_offsets,
+    std::uint32_t pending_batches, const std::uint32_t *raw_region_offsets,
     Row *output_rows, ResidentRows resident_rows,
     std::uint64_t resident_begin, std::uint32_t *resolved_counts,
     std::uint16_t *cell_ranks,
@@ -116,7 +116,7 @@ __device__ __forceinline__ void resolve_canonical_epoch_active_job(
            input_local >= batch_prefix[batch + 1u])
       ++batch;
     const std::size_t base =
-        std::size_t{batch} * (kQuotients + 1u) + q;
+        std::size_t{batch} * (kRegions + 1u) + q;
     const std::uint32_t source = static_cast<std::uint32_t>(
         std::size_t{batch} * batch_stride + raw_offsets[base] +
         input_local - batch_prefix[batch]);
@@ -171,7 +171,7 @@ __device__ __forceinline__ void resolve_canonical_epoch_active_job(
   }
   __syncthreads();
 
-  const std::uint32_t output_begin = raw_section_offsets[q];
+  const std::uint32_t output_begin = raw_region_offsets[q];
   for (std::uint32_t group = threadIdx.x;
        group < output_count_shared; group += blockDim.x) {
     const std::uint32_t source = static_cast<std::uint32_t>(
@@ -181,28 +181,28 @@ __device__ __forceinline__ void resolve_canonical_epoch_active_job(
     store_canonical_epoch_row<ResidentOutput>(
         output_rows, resident_rows, resident_begin,
         output_begin + group, row);
-    atomicAdd(cell_counts + suffix / kFoundationCellKeys, 1u);
+    atomicAdd(cell_counts + suffix / kKeysPerCell, 1u);
   }
   __syncthreads();
 
-  const std::uint32_t cell_count = threadIdx.x < kFoundationCells
+  const std::uint32_t cell_count = threadIdx.x < kCellsPerRegion
       ? cell_counts[threadIdx.x] : 0u;
   std::uint32_t cell_prefix = 0u, ignored = 0u;
   ActiveEpochBlockScan(scan_storage).ExclusiveSum(
       cell_count, cell_prefix, ignored);
-  if (cell_ranks && threadIdx.x < kFoundationCells)
-    cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
+  if (cell_ranks && threadIdx.x < kCellsPerRegion)
+    cell_ranks[std::size_t{q} * kCellsPerRegion + threadIdx.x] =
         static_cast<std::uint16_t>(cell_prefix);
 }
 
 template <bool ResidentOutput>
-__global__ __launch_bounds__(kFoundationCompactionThreads, 5)
+__global__ __launch_bounds__(kMergeThreads, 5)
 void resolve_canonical_epoch_active_jobs_kernel(
     const std::uint64_t *epoch_jobs,
     const std::uint32_t *local_job_count, std::uint32_t *next_job,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, const std::uint32_t *raw_section_offsets,
+    std::uint32_t pending_batches, const std::uint32_t *raw_region_offsets,
     Row *output_rows, ResidentRows resident_rows,
     std::uint64_t resident_begin, std::uint32_t *resolved_counts,
     std::uint16_t *cell_ranks) {
@@ -212,7 +212,7 @@ void resolve_canonical_epoch_active_jobs_kernel(
   __shared__ typename BlockScan::TempStorage scan_storage;
   __shared__ std::uint32_t batch_prefix[kBatchesPerEpoch + 1u];
   __shared__ std::uint16_t sorted_suffixes[kLocalEpochCapacity];
-  __shared__ std::uint32_t cell_counts[kFoundationCells];
+  __shared__ std::uint32_t cell_counts[kCellsPerRegion];
   __shared__ std::uint32_t output_count_shared;
   __shared__ std::uint64_t job_shared;
 
@@ -238,7 +238,7 @@ void resolve_canonical_epoch_active_jobs_kernel(
       batch_prefix[0] = 0u;
       for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
         const std::size_t base =
-            std::size_t{batch} * (kQuotients + 1u) + q;
+            std::size_t{batch} * (kRegions + 1u) + q;
         total += raw_offsets[base + 1u] - raw_offsets[base];
         batch_prefix[batch + 1u] = total;
       }
@@ -247,18 +247,18 @@ void resolve_canonical_epoch_active_jobs_kernel(
         batch_prefix[batch + 1u] = total;
       output_count_shared = 0u;
     }
-    if (threadIdx.x < kFoundationCells)
+    if (threadIdx.x < kCellsPerRegion)
       cell_counts[threadIdx.x] = 0u;
     __syncthreads();
 
 #define GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(Items)                         \
     resolve_canonical_epoch_active_job<Items, ResidentOutput>(            \
         q, raw_count, raw_keys, raw_payloads, raw_offsets, batch_stride,  \
-        pending_batches, raw_section_offsets, output_rows, resident_rows, \
+        pending_batches, raw_region_offsets, output_rows, resident_rows, \
         resident_begin, resolved_counts, cell_ranks, resolution_storage,  \
         scan_storage, batch_prefix, sorted_suffixes, cell_counts,          \
         output_count_shared)
-    if (raw_count <= kFoundationCompactionThreads)
+    if (raw_count <= kMergeThreads)
       GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(1u);
     else
       GPULSMOPT_RESOLVE_ACTIVE_EPOCH_JOB(5u);
@@ -273,7 +273,7 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
     const std::uint32_t *overflow_count, std::uint32_t *next_overflow,
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
-    std::uint32_t pending_batches, const std::uint32_t *raw_section_offsets,
+    std::uint32_t pending_batches, const std::uint32_t *raw_region_offsets,
     Row *output_rows, ResidentRows resident_rows,
     std::uint64_t resident_begin, std::uint32_t *resolved_counts,
     std::uint16_t *cell_ranks,
@@ -281,7 +281,7 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
     std::uint32_t *oversized_workspace_locks,
     std::uint32_t oversized_workspace_slots) {
   using BlockScan = cub::BlockScan<
-      std::uint32_t, kFoundationCompactionThreads>;
+      std::uint32_t, kMergeThreads>;
   __shared__ typename BlockScan::TempStorage scan_storage;
   __shared__ std::uint32_t q_shared;
   for (;;) {
@@ -289,7 +289,7 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
       const std::uint32_t ticket = atomicAdd(next_overflow, 1u);
       q_shared = ticket < *overflow_count
           ? static_cast<std::uint32_t>(
-                overflow_jobs[kQuotients - 1u - ticket])
+                overflow_jobs[kRegions - 1u - ticket])
           : kInvalid;
     }
     __syncthreads();
@@ -311,7 +311,7 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
 
     for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
       const std::size_t base =
-          std::size_t{batch} * (kQuotients + 1u) + q;
+          std::size_t{batch} * (kRegions + 1u) + q;
       const std::uint32_t begin = raw_offsets[base];
       const std::uint32_t end = raw_offsets[base + 1u];
       for (std::uint32_t position = begin + threadIdx.x;
@@ -337,7 +337,7 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
     if (threadIdx.x == 0u) resolved_counts[q] = output_count;
     __syncthreads();
 
-    const std::uint32_t output_begin = raw_section_offsets[q];
+    const std::uint32_t output_begin = raw_region_offsets[q];
     std::uint32_t local = 0u;
     for (std::uint32_t suffix = suffix_begin;
          suffix < suffix_begin + 256u; ++suffix) {
@@ -352,18 +352,18 @@ __global__ void resolve_canonical_epoch_oversized_kernel(
     __syncthreads();
 
     std::uint32_t cell_count = 0u;
-    if (threadIdx.x < kFoundationCells) {
+    if (threadIdx.x < kCellsPerRegion) {
       const std::uint32_t cell_begin =
-          threadIdx.x * kFoundationCellKeys;
+          threadIdx.x * kKeysPerCell;
       for (std::uint32_t suffix = cell_begin;
-           suffix < cell_begin + kFoundationCellKeys; ++suffix)
+           suffix < cell_begin + kKeysPerCell; ++suffix)
         cell_count += winners[suffix] != 0ull;
     }
     std::uint32_t cell_prefix = 0u, ignored = 0u;
     BlockScan(scan_storage).ExclusiveSum(
         cell_count, cell_prefix, ignored);
-    if (cell_ranks && threadIdx.x < kFoundationCells)
-      cell_ranks[std::size_t{q} * kFoundationCells + threadIdx.x] =
+    if (cell_ranks && threadIdx.x < kCellsPerRegion)
+      cell_ranks[std::size_t{q} * kCellsPerRegion + threadIdx.x] =
           static_cast<std::uint16_t>(cell_prefix);
     __syncthreads();
     if (threadIdx.x == 0u)
@@ -382,7 +382,7 @@ __global__ void initialize_device_manifest_kernel(
   if (count) {
     manifest.occupied_level_mask = std::uint64_t{1} << level;
     manifest.active_levels = level + 1u;
-    manifest.foundation_level = level;
+    manifest.oldest_level = level;
     manifest.generation = 1u;
     DeviceLevelState state{};
     state.storage_generation = storage_generation;
@@ -450,11 +450,11 @@ __global__ void choose_canonical_publication_path_kernel(
           ? (std::uint64_t{1} << destination_tier_begin) - 1u : 0u;
   next.source_count = 1u + static_cast<std::uint32_t>(
       __popcll(occupied & source_mask));
-  const bool destination_is_foundation = valid_rollover ||
+  const bool destination_is_oldest = valid_rollover ||
       (destination < kMaximumLevels &&
-      (manifest->foundation_level == kMaximumLevels ||
-       destination > manifest->foundation_level));
-  next.keep_tombstones = !destination_is_foundation;
+      (manifest->oldest_level == kMaximumLevels ||
+       destination > manifest->oldest_level));
+  next.keep_tombstones = !destination_is_oldest;
   next.output_generation = valid_rollover
       ? (manifest->levels[destination].storage_generation ^ 1u) & 1u
       : 0u;
@@ -477,31 +477,31 @@ __global__ void choose_canonical_publication_path_kernel(
 
 __global__ void build_canonical_rank_from_run_kernel(
     ResidentRows arena, std::uint64_t run_begin,
-    const std::uint32_t *quotient_offsets, std::uint32_t level,
+    const std::uint32_t *region_offsets, std::uint32_t level,
     std::uint16_t *cell_ranks) {
   const std::uint32_t q = blockIdx.x;
   const std::uint32_t cell = threadIdx.x;
-  const std::uint32_t begin = quotient_offsets[q];
-  const std::uint32_t count = quotient_offsets[q + 1u] - begin;
+  const std::uint32_t begin = region_offsets[q];
+  const std::uint32_t count = region_offsets[q + 1u] - begin;
   const std::uint32_t rank = lower_bound_rows(
-      arena + run_begin + begin, count, cell * kFoundationCellKeys);
+      arena + run_begin + begin, count, cell * kKeysPerCell);
   cell_ranks[std::size_t{level} * kLocalRankEntries +
-             std::size_t{q} * kFoundationCells + cell] =
+             std::size_t{q} * kCellsPerRegion + cell] =
       static_cast<std::uint16_t>(rank);
 }
 
 template <bool SeparateCounts>
 __global__ void finalize_canonical_metadata_kernel(
-    const std::uint32_t *quotient_offsets,
-    const std::uint32_t *section_counts, const std::uint32_t *selected_count,
+    const std::uint32_t *region_offsets,
+    const std::uint32_t *region_counts, const std::uint32_t *selected_count,
     ResidentPublicationPlan *plan, Descriptor *descriptors) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kQuotients || plan->status) return;
+  if (q >= kRegions || plan->status) return;
   const std::uint32_t level = plan->destination_level;
-  const std::uint32_t offset = quotient_offsets[q];
+  const std::uint32_t offset = region_offsets[q];
   std::uint32_t count;
-  if constexpr (SeparateCounts) count = section_counts[q];
-  else count = quotient_offsets[q + 1u] - offset;
+  if constexpr (SeparateCounts) count = region_counts[q];
+  else count = region_offsets[q + 1u] - offset;
   const Descriptor descriptor = Descriptor::make(
       plan->output_begin + offset, count);
   const std::size_t mapping = descriptor_index(q, level);
@@ -509,21 +509,18 @@ __global__ void finalize_canonical_metadata_kernel(
   if (q == 0u) {
     std::uint64_t total;
     if constexpr (SeparateCounts) total = *selected_count;
-    else total = quotient_offsets[kQuotients];
+    else total = region_offsets[kRegions];
     plan->survivor_count = total;
     if (total > plan->output_capacity)
       atomicOr(&plan->status, kPublicationOutputOverflow);
   }
 }
 
-}  // namespace gpulsmopt2_detail
-
-namespace gpulsm_sparse {
 
 // Switch to the next manifest after an epoch publication.
 __global__ void publish_manifest_kernel(
-    gpulsmopt2_detail::ResidentPublicationPlan *plan,
-    gpulsmopt2_detail::DeviceManifest *manifests,
+    ResidentPublicationPlan *plan,
+    DeviceManifest *manifests,
     std::uint32_t *active_manifest,
     std::uint64_t *query_occupied_level_mask) {
   if (blockIdx.x || plan->status) return;
@@ -534,16 +531,16 @@ __global__ void publish_manifest_kernel(
       ? ~std::uint64_t{0}
       : ((std::uint64_t{1u} << destination) - 1u);
   for (std::uint32_t level = threadIdx.x;
-       level < gpulsmopt2_detail::kMaximumLevels; level += blockDim.x) {
+       level < kMaximumLevels; level += blockDim.x) {
     if (level == destination) continue;
     next->levels[level] = level < destination
-        ? gpulsmopt2_detail::DeviceLevelState{}
+        ? DeviceLevelState{}
         : current->levels[level];
   }
   __syncthreads();
   if (!threadIdx.x) {
     next->occupied_level_mask = current->occupied_level_mask & ~consumed;
-    gpulsmopt2_detail::DeviceLevelState ordinary{};
+    DeviceLevelState ordinary{};
     ordinary.storage_generation = plan->output_generation;
     next->levels[destination] = ordinary;
     if (plan->survivor_count)
@@ -554,9 +551,9 @@ __global__ void publish_manifest_kernel(
         ? 64u - static_cast<std::uint32_t>(
                     __clzll(next->occupied_level_mask))
         : 0u;
-    next->foundation_level = next->active_levels
+    next->oldest_level = next->active_levels
         ? next->active_levels - 1u
-        : gpulsmopt2_detail::kMaximumLevels;
+        : kMaximumLevels;
     next->generation = current->generation + 1u;
   }
   __syncthreads();
@@ -570,4 +567,4 @@ __global__ void publish_manifest_kernel(
   }
 }
 
-}  // namespace gpulsm_sparse
+}  // namespace celllsm

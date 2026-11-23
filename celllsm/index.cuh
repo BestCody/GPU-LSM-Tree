@@ -11,20 +11,20 @@
 #include "range.cuh"
 #include "successor.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
 struct PinnedReceipts {
   ResidentPublicationPlan publication;
   std::uint64_t range_total;
   std::uint64_t range_hot_total;
-  std::uint64_t range_hot_offsets[kQuotients + 1u];
+  std::uint64_t range_hot_offsets[kRegions + 1u];
 };
 
 static_assert(sizeof(PinnedReceipts) ==
               sizeof(ResidentPublicationPlan) +
-                  (kQuotients + 3u) * sizeof(std::uint64_t));
+                  (kRegions + 3u) * sizeof(std::uint64_t));
 
-}  // namespace gpulsmopt2_detail
+}  // namespace celllsm
 
 class GPULSMOpt {
 public:
@@ -37,49 +37,49 @@ public:
 
   explicit GPULSMOpt(const DictionaryConfig &config)
       : batch_capacity_(std::min(
-            gpulsmopt2_detail::kMaximumOperationTile,
+            celllsm::kMaximumOperationTile,
             std::max<std::size_t>(1u, config.batch_capacity))),
-        publication_capacity_(gpulsmopt2_detail::initial_storage_capacity(
+        publication_capacity_(celllsm::initial_storage_capacity(
             config.max_elements, batch_capacity_)),
-        level_zero_capacity_(gpulsmopt2_detail::initial_level_capacity(
+        level_zero_capacity_(celllsm::initial_level_capacity(
             config.level_zero_capacity,
-            batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch,
+            batch_capacity_ * celllsm::kBatchesPerEpoch,
             publication_capacity_)),
         level_pool_capacity_(
-            gpulsmopt2_detail::preassigned_level_pool_capacity(
+            celllsm::preassigned_level_pool_capacity(
                 publication_capacity_, level_zero_capacity_)),
         canonical_regular_level_count_(
-            gpulsmopt2_detail::canonical_regular_level_count(
+            celllsm::canonical_regular_level_count(
                 publication_capacity_, level_zero_capacity_)),
-        canonical_level_count_(gpulsmopt2_detail::canonical_level_count(
+        canonical_level_count_(celllsm::canonical_level_count(
             publication_capacity_, level_zero_capacity_)),
         resident_merge_capacity_(
-            gpulsmopt2_detail::select_canonical_merge_capacity(
+            celllsm::select_canonical_merge_capacity(
                 std::min(
-                    gpulsmopt2_detail::kMaximumMergeSources,
+                    celllsm::kMaximumMergeSources,
                     std::max(2u, canonical_level_count_ + 1u)))),
         maximum_resident_jobs_(
-            gpulsmopt2_detail::maximum_resident_merge_jobs(
+            celllsm::maximum_resident_merge_jobs(
                 publication_capacity_, resident_merge_capacity_)),
-        arena_key_flags_(gpulsmopt2_detail::maximum_resident_elements<
-                             gpulsmopt2_detail::Row>(),
+        arena_key_flags_(celllsm::maximum_resident_elements<
+                             celllsm::Row>(),
                          level_pool_capacity_),
-        arena_values_(gpulsmopt2_detail::maximum_resident_elements<
-                          gpulsmopt2_detail::Row>(),
+        arena_values_(celllsm::maximum_resident_elements<
+                          celllsm::Row>(),
                       level_pool_capacity_),
         pinned_receipts_(1u),
         phase_workspace_(phase_workspace_maximum_bytes(
                              publication_capacity_, batch_capacity_),
                          phase_workspace_initial_bytes(batch_capacity_)),
         operation_workspace_(),
-        sealed_workspace_(),
+        large_batch_workspace_(),
         raw_keys_(),
-        publication_keys_a_(gpulsmopt2_detail::kMaximumPublicationRows,
+        publication_keys_a_(celllsm::kMaximumPublicationRows,
             std::min(publication_capacity_,
-                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)),
-        publication_rows_a_(gpulsmopt2_detail::kMaximumPublicationRows,
+                batch_capacity_ * celllsm::kBatchesPerEpoch)),
+        publication_rows_a_(celllsm::kMaximumPublicationRows,
             std::min(publication_capacity_,
-                batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)) {
+                batch_capacity_ * celllsm::kBatchesPerEpoch)) {
     initialize_static_workspace_views();
     CUDA_CHECK(cudaEventCreateWithFlags(&operation_done_,
                                          cudaEventDisableTiming));
@@ -89,7 +89,7 @@ public:
     std::size_t admission_scan_bytes{};
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, admission_scan_bytes, admission_counts_.data(),
-        raw_offsets_.data(), gpulsmopt2_detail::kQuotients + 1u, 0));
+        raw_offsets_.data(), celllsm::kRegions + 1u, 0));
     admission_temp_.resize(admission_scan_bytes);
     const DeviceCapabilities capabilities = query_device_capabilities();
     initialize_resident_workspace(capabilities);
@@ -133,9 +133,9 @@ public:
     }
     const std::uint32_t n = static_cast<std::uint32_t>(count);
     const std::size_t phase_restore_bytes = phase_workspace_.size();
-    const std::size_t bulk_bytes = gpulsm_sparse::NativeRootWorkspace<false>::required_bytes(count);
+    const std::size_t bulk_bytes = celllsm::DirectRunWorkspace<false>::required_bytes(count);
     phase_workspace_.grow(bulk_bytes);
-    gpulsm_sparse::NativeRootWorkspace<false> workspace(
+    celllsm::DirectRunWorkspace<false> workspace(
         n, phase_workspace_.data(), phase_workspace_.size());
     const std::uint32_t base_count = workspace.prepare(keys, values, n, false, false, stream);
 
@@ -146,16 +146,16 @@ public:
     if (base_count > capacity)
       throw std::bad_alloc();
     workspace.deposit(resident_rows(), destination,
-                      foundation_source_offsets_.data(), stream);
-    gpulsmopt2_detail::ResidentPublicationPlan build_plan{};
+                      scratch_region_offsets_.data(), stream);
+    celllsm::ResidentPublicationPlan build_plan{};
     build_plan.destination_level = level;
     build_plan.output_begin = destination;
     build_plan.output_capacity = capacity;
-    build_plan.status = gpulsmopt2_detail::kPublicationSuccess;
-    finalize_direct_root(build_plan, foundation_source_offsets_.data(), stream);
+    build_plan.status = celllsm::kPublicationSuccess;
+    finalize_direct_root(build_plan, scratch_region_offsets_.data(), stream);
     level_counts_[level] = base_count;
     host_occupied_level_mask_ = std::uint64_t{1} << level;
-    gpulsmopt2_detail::initialize_device_manifest_kernel<<<1, 1, 0, stream>>>(
+    celllsm::initialize_device_manifest_kernel<<<1, 1, 0, stream>>>(
         device_manifests_.data(), active_device_manifest_.data(),
         query_occupied_level_mask_.data(), level, base_count, 0u);
     CUDA_CHECK(cudaGetLastError());
@@ -163,7 +163,7 @@ public:
     // separate sorting kernels during bulk build, after the initial run has
     // been copied. Reuse the build workspace; this does not change the index.
     if (count >= epoch_row_capacity() &&
-        sealed_workspace_capacity(publication_capacity_, level_zero_capacity_) >
+        large_batch_workspace_capacity(publication_capacity_, level_zero_capacity_) >
             level_zero_capacity_) {
       const auto warm_rows = static_cast<std::uint32_t>(std::min<std::size_t>(
           {count, epoch_row_capacity(), std::size_t{1u} << 20u}));
@@ -190,11 +190,11 @@ public:
 
 
   void lookup(const DeviceLookupBatch &batch, cudaStream_t stream,
-              bool quotients_grouped = false) {
+              bool regions_grouped = false) {
     std::lock_guard<std::mutex> lock(operation_mutex_);
     resolve_publication_receipt();
     prepare_failed_epoch_for_reads(stream);
-    lookup_locked(batch, stream, quotients_grouped);
+    lookup_locked(batch, stream, regions_grouped);
   }
 
 
@@ -217,7 +217,7 @@ public:
     std::lock_guard<std::mutex> lock(operation_mutex_);
     auto *self = const_cast<GPULSMOpt *>(this);
     self->resolve_publication_receipt();
-    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    celllsm::ResidentPublicationPlan plan{};
     CUDA_CHECK(cudaMemcpy(
         &plan, self->resident_plan_.data(), sizeof(plan),
         cudaMemcpyDeviceToHost));
@@ -238,7 +238,7 @@ private:
     bool needs_signature_rebuild() const {
       return state_ == State::failed_needs_signatures;
     }
-    const gpulsmopt2_detail::ResidentPublicationPlan &failure() const {
+    const celllsm::ResidentPublicationPlan &failure() const {
       return failure_;
     }
     void await_receipt() { state_ = State::awaiting_receipt; }
@@ -247,7 +247,7 @@ private:
       state_ = State::accepting;
       return true;
     }
-    void fail(const gpulsmopt2_detail::ResidentPublicationPlan &receipt,
+    void fail(const celllsm::ResidentPublicationPlan &receipt,
               bool signatures_intact = false) {
       failure_ = receipt;
       state_ = signatures_intact ? State::failed_signatures_queued
@@ -263,22 +263,22 @@ private:
       failed_needs_signatures, failed_signatures_queued
     };
     State state_ = State::accepting;
-    gpulsmopt2_detail::ResidentPublicationPlan failure_{};
+    celllsm::ResidentPublicationPlan failure_{};
   };
 
   std::size_t epoch_row_capacity() const {
     return std::min(level_zero_capacity_,
-        batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch);
+        batch_capacity_ * celllsm::kBatchesPerEpoch);
   }
 
-  template <class AdmitTile, class AdmitSealed>
+  template <class AdmitTile, class AdmitLargeBatch>
   void admit_batches(std::uint64_t count, cudaStream_t stream,
-                     AdmitTile admit_one, AdmitSealed admit_sealed) {
+                     AdmitTile admit_one, AdmitLargeBatch admit_large_batch) {
     begin_operation(stream);
     std::uint64_t consumed = 0u;
     while (consumed < count) {
       if (!pending_batches_) {
-        consumed += admit_sealed(consumed, count - consumed);
+        consumed += admit_large_batch(consumed, count - consumed);
         if (consumed == count) break;
       }
       // Fit each epoch in its smallest destination.
@@ -302,7 +302,7 @@ private:
   struct AdmissionTile {
     std::uint32_t slot, count;
     std::uint32_t *keys;
-    gpulsmopt2_detail::RawPayload *payloads;
+    celllsm::RawPayload *payloads;
     std::uint32_t *offsets;
     std::uint64_t *signatures;
   };
@@ -310,7 +310,7 @@ private:
 
   AdmissionTile begin_admission_tile(std::uint32_t count, bool tombstones) {
     const std::uint32_t slot = pending_batches_;
-    if (slot >= gpulsmopt2_detail::kBatchesPerEpoch)
+    if (slot >= celllsm::kBatchesPerEpoch)
       throw std::logic_error("GPULSMOpt pending slot overflow");
     pending_records_ += count;
     pending_has_tombstones_ |= tombstones;
@@ -318,16 +318,16 @@ private:
             raw_keys_.data() + std::size_t{slot} * batch_capacity_,
             raw_payloads_.data() + std::size_t{slot} * batch_capacity_,
             raw_offsets_.data() +
-                std::size_t{slot} * (gpulsmopt2_detail::kQuotients + 1u),
+                std::size_t{slot} * (celllsm::kRegions + 1u),
             raw_signatures_.data() +
-                std::size_t{slot} * gpulsmopt2_detail::kQuotients};
+                std::size_t{slot} * celllsm::kRegions};
   }
 
   void commit_admission_signatures(const AdmissionTile &tile,
                                    cudaStream_t stream) {
-    gpulsmopt2_detail::commit_admission_metadata_kernel<<<
-        gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::commit_admission_metadata_kernel<<<
+        celllsm::kRegions / celllsm::kThreads,
+        celllsm::kThreads, 0, stream>>>(
             admission_counts_.data(), tile.signatures,
             raw_epoch_signatures_.data());
   }
@@ -336,12 +336,12 @@ private:
     CUDA_CHECK(cudaGetLastError());
     raw_batch_counts_[tile.slot] = tile.count;
     ++pending_batches_;
-    if (pending_batches_ == gpulsmopt2_detail::kBatchesPerEpoch ||
+    if (pending_batches_ == celllsm::kBatchesPerEpoch ||
         pending_records_ == epoch_row_capacity())
       publish_epoch(stream);
   }
 
-  gpulsmopt2_detail::TqrjLookupWorkspace borrow_tqrj_lookup_workspace(
+  celllsm::SharedLookupWorkspace borrow_shared_lookup_workspace(
       std::uint32_t maximum_query_tiles) {
     std::uint8_t *operation_storage = operation_workspace_.data();
     std::uint32_t *query_ids = reinterpret_cast<std::uint32_t *>(
@@ -349,44 +349,44 @@ private:
     // Reuse reservation ranks after scatter.
     std::uint32_t *reservation_ranks =
         reinterpret_cast<std::uint32_t *>(
-            operation_storage + tqrj_hash_table_offset(batch_capacity_));
+            operation_storage + shared_lookup_hash_table_offset(batch_capacity_));
     std::uint8_t *hash_task_storage =
-        operation_storage + tqrj_hash_task_offset(batch_capacity_);
-    gpulsmopt2_detail::TqrjHashTile *query_tiles =
-        reinterpret_cast<gpulsmopt2_detail::TqrjHashTile *>(
-            operation_storage + tqrj_hash_tile_offset(batch_capacity_));
+        operation_storage + shared_lookup_hash_task_offset(batch_capacity_);
+    celllsm::SharedLookupHashTile *query_tiles =
+        reinterpret_cast<celllsm::SharedLookupHashTile *>(
+            operation_storage + shared_lookup_hash_tile_offset(batch_capacity_));
 
-    gpulsmopt2_detail::TqrjLookupWorkspace workspace{};
+    celllsm::SharedLookupWorkspace workspace{};
     workspace.grouped_queries = publication_keys_a_.data();
     workspace.query_ids = query_ids;
     workspace.reservation_ranks = reservation_ranks;
-    workspace.active_quotients = range_hot_window_offsets_.data();
-    workspace.active_query_counts = foundation_section_output_counts_.data();
-    workspace.active_query_offsets = foundation_source_offsets_.data();
-    workspace.active_quotient_count = range_hot_selected_count_.data();
+    workspace.active_regions = range_hot_window_offsets_.data();
+    workspace.active_query_counts = scratch_region_counts_.data();
+    workspace.active_query_offsets = scratch_region_offsets_.data();
+    workspace.active_region_count = range_hot_selected_count_.data();
     workspace.query_bases = reinterpret_cast<std::uint32_t *>(
-        operation_storage + tqrj_hash_query_bases_offset(batch_capacity_));
+        operation_storage + shared_lookup_hash_query_bases_offset(batch_capacity_));
     workspace.hash_tasks =
-        reinterpret_cast<gpulsmopt2_detail::TqrjHashTask *>(
+        reinterpret_cast<celllsm::SharedLookupHashTask *>(
             hash_task_storage);
     workspace.hash_counters = reinterpret_cast<std::uint32_t *>(
-        hash_task_storage + gpulsmopt2_detail::kTqrjHashTaskBytes);
+        hash_task_storage + celllsm::kSharedLookupHashTaskBytes);
     workspace.hash_task_count = publication_selected_count_.data();
     workspace.hash_winners = reinterpret_cast<unsigned long long *>(
         publication_rows_a_.data());
     workspace.hash_query_tiles = query_tiles;
     workspace.hash_pending_tiles = query_tiles + maximum_query_tiles;
     workspace.hash_table = reinterpret_cast<std::uint32_t *>(
-        operation_storage + tqrj_hash_table_offset(batch_capacity_));
+        operation_storage + shared_lookup_hash_table_offset(batch_capacity_));
     workspace.hash_table_capacity =
-        tqrj_hash_maximum_entries(batch_capacity_);
+        shared_lookup_hash_maximum_entries(batch_capacity_);
     return workspace;
   }
 
   template <bool WithFound>
   void lookup_tiles_locked(const DeviceLookupBatch &batch,
                            cudaStream_t stream) {
-    using namespace gpulsmopt2_detail;
+    using namespace celllsm;
     constexpr std::size_t bytes_per_tile =
         kLookupTileRows * (sizeof(std::uint32_t) + sizeof(std::uint16_t) +
                            (WithFound ? sizeof(std::uint8_t) : 0u)) +
@@ -437,24 +437,24 @@ private:
 
   LookupPlan plan_lookup(std::uint64_t count) const {
     const std::uint64_t dense_threshold =
-        std::uint64_t{pending_batches_} * gpulsmopt2_detail::kQuotients *
-        gpulsmopt2_detail::kTqrjDenseRowsPerSection;
+        std::uint64_t{pending_batches_} * celllsm::kRegions *
+        celllsm::kSharedLookupDenseRowsPerRegion;
     const bool dense =
-        pending_batches_ >= gpulsmopt2_detail::kTqrjMinimumBatches &&
+        pending_batches_ >= celllsm::kSharedLookupMinimumBatches &&
         std::uint64_t{pending_records_} >= dense_threshold;
     const bool shared = dense &&
-        count >= gpulsmopt2_detail::kQuotients * 4u &&
-        count <= tqrj_maximum_queries(batch_capacity_);
+        count >= celllsm::kRegions * 4u &&
+        count <= shared_lookup_maximum_queries(batch_capacity_);
     return {shared,
-            count > gpulsmopt2_detail::kMaximumOperationTile && !shared};
+            count > celllsm::kMaximumOperationTile && !shared};
   }
 
   template <class LookupChunk>
   static void for_lookup_chunks(std::uint64_t count, LookupChunk lookup_chunk) {
     for (std::uint64_t first = 0u; first < count;
-         first += gpulsmopt2_detail::kMaximumOperationTile) {
+         first += celllsm::kMaximumOperationTile) {
       lookup_chunk(first, std::min<std::uint64_t>(
-          count - first, gpulsmopt2_detail::kMaximumOperationTile));
+          count - first, celllsm::kMaximumOperationTile));
     }
   }
 
@@ -465,20 +465,20 @@ private:
 
   PointLookupQueries prepare_point_lookup(
       const std::uint32_t *keys, std::uint32_t count,
-      bool quotients_grouped, cudaStream_t stream) {
-    if (count < gpulsmopt2_detail::kQuotients * 4u || quotients_grouped)
+      bool regions_grouped, cudaStream_t stream) {
+    if (count < celllsm::kRegions * 4u || regions_grouped)
       return {keys, nullptr};
     const auto workspace = ensure_radix_workspace(count);
-    gpulsmopt2_detail::count_quotients_kernel<false><<<
-        blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::count_regions_kernel<false><<<
+        blocks(count), celllsm::kThreads, 0, stream>>>(
         keys, count, admission_counts_.data(), workspace.input_ids);
     std::size_t scan_bytes = admission_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         admission_temp_.data(), scan_bytes, admission_counts_.data(),
-        workspace.quotient_offsets, gpulsmopt2_detail::kQuotients + 1u, stream));
-    gpulsmopt2_detail::scatter_query_records_kernel<<<
-        blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
-        keys, count, workspace.quotient_offsets, workspace.input_ids,
+        workspace.region_offsets, celllsm::kRegions + 1u, stream));
+    celllsm::scatter_query_records_kernel<<<
+        blocks(count), celllsm::kThreads, 0, stream>>>(
+        keys, count, workspace.region_offsets, workspace.input_ids,
         radix_keys_.data(), radix_ids_out_.data());
     CUDA_CHECK(cudaMemsetAsync(
         admission_counts_.data(), 0,
@@ -486,48 +486,48 @@ private:
     return {radix_keys_.data(), radix_ids_out_.data()};
   }
 
-  gpulsmopt2_detail::TqrjLookupWorkspace prepare_shared_lookup(
+  celllsm::SharedLookupWorkspace prepare_shared_lookup(
       const std::uint32_t *keys, std::uint32_t count, cudaStream_t stream) {
     // Order scratch growth with begin_operation first.
     ensure_publication_capacity(count, stream);
-    if (operation_workspace_.size() < tqrj_hash_workspace_bytes(batch_capacity_) ||
-        count > tqrj_maximum_queries(batch_capacity_))
-      throw std::length_error("insufficient idle publication workspace for TQRJ");
+    if (operation_workspace_.size() < shared_lookup_hash_workspace_bytes(batch_capacity_) ||
+        count > shared_lookup_maximum_queries(batch_capacity_))
+      throw std::length_error("insufficient idle publication workspace for shared lookup");
     const std::uint32_t active_capacity = std::min(
-        count, gpulsmopt2_detail::kQuotients);
+        count, celllsm::kRegions);
     const std::uint32_t maximum_query_tiles =
-        gpulsmopt2_detail::tqrj_hash_tile_count(count) + active_capacity;
+        celllsm::shared_lookup_hash_tile_count(count) + active_capacity;
     const std::uint32_t maximum_pending_tiles =
-        gpulsmopt2_detail::tqrj_hash_tile_count(pending_records_) + active_capacity;
-    if (maximum_query_tiles > tqrj_maximum_tiles(batch_capacity_) ||
-        maximum_pending_tiles > tqrj_maximum_tiles(batch_capacity_))
-      throw std::length_error("insufficient recycled tile workspace for TQRJ");
-    auto workspace = borrow_tqrj_lookup_workspace(maximum_query_tiles);
+        celllsm::shared_lookup_hash_tile_count(pending_records_) + active_capacity;
+    if (maximum_query_tiles > shared_lookup_maximum_tiles(batch_capacity_) ||
+        maximum_pending_tiles > shared_lookup_maximum_tiles(batch_capacity_))
+      throw std::length_error("insufficient recycled tile workspace for shared lookup");
+    auto workspace = borrow_shared_lookup_workspace(maximum_query_tiles);
     CUDA_CHECK(cudaMemsetAsync(
-        workspace.active_quotient_count, 0, sizeof(std::uint32_t), stream));
+        workspace.active_region_count, 0, sizeof(std::uint32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(
         workspace.hash_task_count, 0, sizeof(std::uint32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(
         workspace.hash_counters, 0,
-        gpulsmopt2_detail::kTqrjHashCounterBytes, stream));
-    gpulsmopt2_detail::count_quotients_kernel<true><<<
-        blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        celllsm::kSharedLookupHashCounterBytes, stream));
+    celllsm::count_regions_kernel<true><<<
+        blocks(count), celllsm::kThreads, 0, stream>>>(
         keys, count, admission_counts_.data(), workspace.reservation_ranks,
-        workspace.active_quotients, workspace.active_quotient_count);
-    gpulsmopt2_detail::materialize_lookup_active_counts_kernel<<<
-        blocks(active_capacity + 1u), gpulsmopt2_detail::kThreads, 0, stream>>>(
-        workspace.active_quotients, workspace.active_quotient_count,
+        workspace.active_regions, workspace.active_region_count);
+    celllsm::materialize_lookup_active_counts_kernel<<<
+        blocks(active_capacity + 1u), celllsm::kThreads, 0, stream>>>(
+        workspace.active_regions, workspace.active_region_count,
         admission_counts_.data(), active_capacity, workspace.active_query_counts);
     std::size_t scan_bytes = admission_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         admission_temp_.data(), scan_bytes, workspace.active_query_counts,
         workspace.active_query_offsets, active_capacity + 1u, stream));
-    gpulsmopt2_detail::publish_lookup_active_bases_kernel<<<
-        blocks(active_capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
-        workspace.active_quotients, workspace.active_quotient_count,
+    celllsm::publish_lookup_active_bases_kernel<<<
+        blocks(active_capacity), celllsm::kThreads, 0, stream>>>(
+        workspace.active_regions, workspace.active_region_count,
         workspace.active_query_offsets, active_capacity, workspace.query_bases);
-    gpulsmopt2_detail::scatter_query_records_kernel<<<
-        blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::scatter_query_records_kernel<<<
+        blocks(count), celllsm::kThreads, 0, stream>>>(
         keys, count, workspace.query_bases, workspace.reservation_ranks,
         workspace.grouped_queries, workspace.query_ids);
     return workspace;
@@ -543,39 +543,39 @@ private:
     void *parameters[] = {static_cast<void *>(&arguments)...};
     CUDA_CHECK(cudaLaunchCooperativeKernel(
         reinterpret_cast<const void *>(kernel), dim3(workers),
-        dim3(gpulsmopt2_detail::kTqrjHashThreads), parameters, 0u, stream));
+        dim3(celllsm::kSharedLookupHashThreads), parameters, 0u, stream));
   }
 
-  void finish_shared_lookup(const gpulsmopt2_detail::TqrjLookupWorkspace &workspace,
+  void finish_shared_lookup(const celllsm::SharedLookupWorkspace &workspace,
                             std::uint32_t count, cudaStream_t stream) {
     const std::uint32_t active_capacity = std::min(
-        count, gpulsmopt2_detail::kQuotients);
-    gpulsmopt2_detail::reset_lookup_quotient_counts_kernel<<<
-        blocks(active_capacity), gpulsmopt2_detail::kThreads, 0, stream>>>(
-        workspace.active_quotients, workspace.active_quotient_count,
+        count, celllsm::kRegions);
+    celllsm::reset_lookup_region_counts_kernel<<<
+        blocks(active_capacity), celllsm::kThreads, 0, stream>>>(
+        workspace.active_regions, workspace.active_region_count,
         active_capacity, admission_counts_.data());
   }
 
-  bool use_tile_lookup(std::size_t count, bool quotients_grouped) const {
-    if (quotients_grouped || pending_batches_ ||
-        count < gpulsmopt2_detail::kMinimumTileLookupQueries ||
+  bool use_tile_lookup(std::size_t count, bool regions_grouped) const {
+    if (regions_grouped || pending_batches_ ||
+        count < celllsm::kMinimumTileLookupQueries ||
         !host_occupied_level_mask_ ||
         (host_occupied_level_mask_ & (host_occupied_level_mask_ - 1u)))
       return false;
     const auto level = static_cast<std::uint32_t>(
         __builtin_ctzll(host_occupied_level_mask_));
     return level_counts_[level] >=
-        gpulsmopt2_detail::kMinimumTileLookupResidentRows;
+        celllsm::kMinimumTileLookupResidentRows;
   }
 
 
   void lookup_locked(const DeviceLookupBatch &batch, cudaStream_t stream,
-                     bool quotients_grouped) {
+                     bool regions_grouped) {
     if (!batch.count) return;
     if (!batch.queries || !batch.out_values)
       throw std::invalid_argument("invalid GPULSMOpt lookup");
     // Choose tiles before dividing large lookup windows.
-    if (use_tile_lookup(batch.count, quotients_grouped)) {
+    if (use_tile_lookup(batch.count, regions_grouped)) {
       if (batch.out_found) lookup_tiles_locked<true>(batch, stream);
       else lookup_tiles_locked<false>(batch, stream);
       return;
@@ -587,43 +587,43 @@ private:
             batch.queries + first, static_cast<std::size_t>(count),
             batch.out_values + first,
             batch.out_found ? batch.out_found + first : nullptr},
-            stream, quotients_grouped);
+            stream, regions_grouped);
       });
       return;
     }
     const std::uint32_t count = static_cast<std::uint32_t>(batch.count);
     begin_operation(stream);
     if (plan.shared_pending) {
-      using namespace gpulsmopt2_detail;
-      const std::uint32_t active_capacity = std::min(count, kQuotients);
+      using namespace celllsm;
+      const std::uint32_t active_capacity = std::min(count, kRegions);
       auto workspace = prepare_shared_lookup(batch.queries, count, stream);
-      const NativeTqrjAccess access{
+      const SharedLookupAccess access{
           workspace.grouped_queries, batch.out_values, batch.out_found,
           raw_keys_.data(), raw_payloads_.data(),
           static_cast<std::uint32_t>(batch_capacity_), resident_rows(),
           descriptors_.data(), workspace.query_ids,
           canonical_cell_ranks_.data(), query_occupied_level_mask_.data()};
-      const TqrjDirectLaunch direct{
-          workspace.active_quotients, workspace.active_query_counts,
-          workspace.active_quotient_count, workspace.query_bases,
+      const SharedLookupDirectLaunch direct{
+          workspace.active_regions, workspace.active_query_counts,
+          workspace.active_region_count, workspace.query_bases,
           raw_offsets_.data(), pending_batches_, workspace.hash_tasks,
           workspace.hash_task_count};
-      tqrj_direct_lookup_kernel<<<active_capacity, kThreads, 0, stream>>>(access, direct);
-      const TqrjHashLaunch hash{
+      shared_lookup_direct_lookup_kernel<<<active_capacity, kThreads, 0, stream>>>(access, direct);
+      const SharedLookupHashLaunch hash{
           workspace.hash_tasks, workspace.hash_task_count, workspace.query_bases,
           admission_counts_.data(), workspace.hash_query_tiles,
           workspace.hash_pending_tiles, workspace.hash_counters,
           workspace.hash_table, workspace.hash_table_capacity,
           workspace.hash_winners, raw_offsets_.data(), pending_batches_,
           batch.out_values};
-      launch_lookup_hash(tqrj_hash_lookup_kernel, tqrj_hash_worker_blocks_,
+      launch_lookup_hash(shared_lookup_hash_lookup_kernel, shared_lookup_hash_worker_blocks_,
                          stream, access, hash);
       finish_shared_lookup(workspace, count, stream);
     } else {
       const auto prepared = prepare_point_lookup(
-          batch.queries, count, quotients_grouped, stream);
-      gpulsmopt2_detail::canonical_lookup_with_pending_kernel<<<
-          blocks(count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+          batch.queries, count, regions_grouped, stream);
+      celllsm::canonical_lookup_with_pending_kernel<<<
+          blocks(count), celllsm::kThreads, 0, stream>>>(
           prepared.keys, batch.out_values, batch.out_found, count,
           raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
           static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
@@ -640,12 +640,12 @@ private:
     if (!batch.query_count) return;
     if (!batch.lo || !batch.hi || !batch.out_sums)
       throw std::invalid_argument("invalid GPULSMOpt range input");
-    if (batch.query_count > gpulsmopt2_detail::kMaximumOperationTile) {
+    if (batch.query_count > celllsm::kMaximumOperationTile) {
       for (std::size_t begin = 0u; begin < batch.query_count;
-           begin += gpulsmopt2_detail::kMaximumOperationTile) {
+           begin += celllsm::kMaximumOperationTile) {
         const std::size_t count = std::min(
             batch.query_count - begin,
-            gpulsmopt2_detail::kMaximumOperationTile);
+            celllsm::kMaximumOperationTile);
         range_locked(DeviceRangeOutputBatch{
             batch.lo + begin, batch.hi + begin, count,
             batch.out_sums + begin}, stream);
@@ -662,30 +662,30 @@ private:
       CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
           nullptr, hot_scan_bytes, range_hot_counts_.data(),
           range_hot_offsets_.data(),
-          gpulsmopt2_detail::kQuotients + 1u, stream));
+          celllsm::kRegions + 1u, stream));
       if (range_hot_temp_.size() < hot_scan_bytes)
         range_hot_temp_.resize(hot_scan_bytes);
       CUDA_CHECK(cudaMemsetAsync(
           range_hot_descriptors_.data(), 0,
           range_hot_descriptors_.size() *
-              sizeof(gpulsmopt2_detail::Descriptor), stream));
-      gpulsmopt2_detail::count_range_hot_newer_rows_kernel<<<
-          blocks(gpulsmopt2_detail::kQuotients + 1u),
-          gpulsmopt2_detail::kThreads, 0, stream>>>(
+              sizeof(celllsm::Descriptor), stream));
+      celllsm::count_range_hot_newer_rows_kernel<<<
+          blocks(celllsm::kRegions + 1u),
+          celllsm::kThreads, 0, stream>>>(
               raw_offsets_.data(), pending_batches_, descriptors_.data(),
               query_occupied_level_mask_.data(), range_hot_counts_.data());
       CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
           range_hot_temp_.data(), hot_scan_bytes, range_hot_counts_.data(),
           range_hot_offsets_.data(),
-          gpulsmopt2_detail::kQuotients + 1u, stream));
+          celllsm::kRegions + 1u, stream));
       CUDA_CHECK(cudaMemcpyAsync(
           range_hot_total_receipt(),
-          range_hot_offsets_.data() + gpulsmopt2_detail::kQuotients,
+          range_hot_offsets_.data() + celllsm::kRegions,
           sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream));
     }
     const bool needs_wide_total = query_count >
         std::numeric_limits<std::uint32_t>::max() /
-            gpulsmopt2_detail::kQuotients;
+            celllsm::kRegions;
     std::size_t scan_bytes{};
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, scan_bytes, range_fragment_counts_.data(),
@@ -693,20 +693,20 @@ private:
     std::size_t reduce_bytes{};
     if (needs_wide_total) {
       using WideCountIterator = cub::TransformInputIterator<
-          std::uint64_t, gpulsmopt2_detail::WidenFragmentCount,
+          std::uint64_t, celllsm::WidenFragmentCount,
           const std::uint32_t *>;
       const WideCountIterator counts(
           range_fragment_counts_.data(),
-          gpulsmopt2_detail::WidenFragmentCount{});
+          celllsm::WidenFragmentCount{});
       CUDA_CHECK(cub::DeviceReduce::Sum(
           nullptr, reduce_bytes, counts, range_fragment_total_.data(),
           query_count, stream));
     }
     ensure_range_fragment_query_capacity(
         query_count, std::max(scan_bytes, reduce_bytes));
-    gpulsmopt2_detail::count_range_fragments_kernel<<<
+    celllsm::count_range_fragments_kernel<<<
         blocks(std::size_t{query_count} + 1u),
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        celllsm::kThreads, 0, stream>>>(
             batch.lo, batch.hi, query_count,
             range_fragment_counts_.data());
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
@@ -714,15 +714,15 @@ private:
         range_fragment_offsets_.data(), query_count + 1u, stream));
     std::uint32_t fragment_count{};
     if (query_count == 1u) {
-      fragment_count = gpulsmopt2_detail::kQuotients;
+      fragment_count = celllsm::kRegions;
       if (may_have_crowded_newer) CUDA_CHECK(cudaStreamSynchronize(stream));
     } else if (needs_wide_total) {
       using WideCountIterator = cub::TransformInputIterator<
-          std::uint64_t, gpulsmopt2_detail::WidenFragmentCount,
+          std::uint64_t, celllsm::WidenFragmentCount,
           const std::uint32_t *>;
       const WideCountIterator counts(
           range_fragment_counts_.data(),
-          gpulsmopt2_detail::WidenFragmentCount{});
+          celllsm::WidenFragmentCount{});
       CUDA_CHECK(cub::DeviceReduce::Sum(
           range_query_temp_, reduce_bytes, counts,
           range_fragment_total_.data(), query_count, stream));
@@ -746,7 +746,7 @@ private:
     }
     const std::uint64_t hot_total = may_have_crowded_newer
         ? range_hot_total_receipt()[0] : 0u;
-    if (hot_total) materialize_range_hot_sections(hot_total, stream);
+    if (hot_total) materialize_range_hot_regions(hot_total, stream);
     const bool hot_ready = hot_total != 0u;
     if (!fragment_count) {
       CUDA_CHECK(cudaMemsetAsync(batch.out_sums, 0,
@@ -756,74 +756,74 @@ private:
       end_operation(stream);
       return;
     }
-    const bool use_section_owners = query_count > 1u &&
+    const bool use_region_owners = query_count > 1u &&
         std::uint64_t{fragment_count} >=
-            std::uint64_t{gpulsmopt2_detail::kQuotients} *
-                gpulsmopt2_detail::kSectionOwnerMinimumReuse;
-    std::size_t section_sort_bytes{}, task_scan_bytes{};
-    if (use_section_owners) {
+            std::uint64_t{celllsm::kRegions} *
+                celllsm::kRegionOwnerMinimumReuse;
+    std::size_t region_sort_bytes{}, task_scan_bytes{};
+    if (use_region_owners) {
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          nullptr, section_sort_bytes, range_section_keys_in_.data(),
-          range_section_keys_out_.data(),
-          range_section_fragments_in_.data(),
-          range_section_fragments_out_.data(), fragment_count, 0,
+          nullptr, region_sort_bytes, range_region_keys_in_.data(),
+          range_region_keys_out_.data(),
+          range_region_fragments_in_.data(),
+          range_region_fragments_out_.data(), fragment_count, 0,
           32, stream));
       CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-          nullptr, task_scan_bytes, range_section_task_counts_.data(),
-          range_section_task_offsets_.data(),
-          gpulsmopt2_detail::kQuotients + 1u, stream));
-      ensure_range_section_capacity(
-          fragment_count, std::max(section_sort_bytes, task_scan_bytes));
+          nullptr, task_scan_bytes, range_region_task_counts_.data(),
+          range_region_task_offsets_.data(),
+          celllsm::kRegions + 1u, stream));
+      ensure_range_region_capacity(
+          fragment_count, std::max(region_sort_bytes, task_scan_bytes));
     } else {
       ensure_range_fragment_capacity(fragment_count);
     }
-    gpulsmopt2_detail::adaptive_emit_range_fragments_kernel<<<
-        gpulsmopt2_detail::kRangeSchedulerBlocks,
-        gpulsmopt2_detail::kThreads, 0,
+    celllsm::adaptive_emit_range_fragments_kernel<<<
+        celllsm::kRangeSchedulerBlocks,
+        celllsm::kThreads, 0,
         stream>>>(
             batch.lo, batch.hi, range_fragment_offsets_.data(), query_count,
-            use_section_owners ? nullptr : range_fragments_.data(),
-            use_section_owners ? range_section_keys_in_.data() : nullptr,
-            use_section_owners ? range_section_fragments_in_.data() : nullptr,
-            use_section_owners);
-    if (use_section_owners) {
+            use_region_owners ? nullptr : range_fragments_.data(),
+            use_region_owners ? range_region_keys_in_.data() : nullptr,
+            use_region_owners ? range_region_fragments_in_.data() : nullptr,
+            use_region_owners);
+    if (use_region_owners) {
       CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-          range_section_temp_, section_sort_bytes,
-          range_section_keys_in_.data(), range_section_keys_out_.data(),
-          range_section_fragments_in_.data(),
-          range_section_fragments_out_.data(), fragment_count, 0,
+          range_region_temp_, region_sort_bytes,
+          range_region_keys_in_.data(), range_region_keys_out_.data(),
+          range_region_fragments_in_.data(),
+          range_region_fragments_out_.data(), fragment_count, 0,
           32, stream));
-      gpulsmopt2_detail::find_section_fragment_offsets_kernel<<<
-          blocks(gpulsmopt2_detail::kQuotients + 1u),
-          gpulsmopt2_detail::kThreads, 0, stream>>>(
-          range_section_keys_out_.data(), fragment_count,
-              range_section_offsets_.data());
-      gpulsmopt2_detail::count_section_range_tasks_kernel<<<
-          blocks(gpulsmopt2_detail::kQuotients + 1u),
-          gpulsmopt2_detail::kThreads, 0, stream>>>(
-              range_section_offsets_.data(),
-              range_section_task_counts_.data());
+      celllsm::find_region_fragment_offsets_kernel<<<
+          blocks(celllsm::kRegions + 1u),
+          celllsm::kThreads, 0, stream>>>(
+          range_region_keys_out_.data(), fragment_count,
+              range_region_offsets_.data());
+      celllsm::count_region_range_tasks_kernel<<<
+          blocks(celllsm::kRegions + 1u),
+          celllsm::kThreads, 0, stream>>>(
+              range_region_offsets_.data(),
+              range_region_task_counts_.data());
       CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-          range_section_temp_, task_scan_bytes,
-          range_section_task_counts_.data(),
-          range_section_task_offsets_.data(),
-          gpulsmopt2_detail::kQuotients + 1u, stream));
-      gpulsmopt2_detail::emit_section_range_tasks_kernel<<<
-          blocks(gpulsmopt2_detail::kQuotients),
-          gpulsmopt2_detail::kThreads, 0, stream>>>(
-              range_section_offsets_.data(),
-              range_section_task_offsets_.data(),
-              range_section_tasks_.data());
-      launch_section_ranges(stream, hot_ready);
+          range_region_temp_, task_scan_bytes,
+          range_region_task_counts_.data(),
+          range_region_task_offsets_.data(),
+          celllsm::kRegions + 1u, stream));
+      celllsm::emit_region_range_tasks_kernel<<<
+          blocks(celllsm::kRegions),
+          celllsm::kThreads, 0, stream>>>(
+              range_region_offsets_.data(),
+              range_region_task_offsets_.data(),
+              range_region_tasks_.data());
+      launch_region_ranges(stream, hot_ready);
     } else {
       launch_fragment_ranges(
           fragment_count, query_count, batch, stream, hot_ready);
     }
     CUDA_CHECK(cudaMemsetAsync(range_reduction_completion_.data(), 0,
                                sizeof(std::uint32_t), stream));
-    gpulsmopt2_detail::adaptive_reduce_range_partials_kernel<<<
-        gpulsmopt2_detail::kRangeSchedulerBlocks,
-        gpulsmopt2_detail::kThreads, 0,
+    celllsm::adaptive_reduce_range_partials_kernel<<<
+        celllsm::kRangeSchedulerBlocks,
+        celllsm::kThreads, 0,
         stream>>>(
             range_fragment_offsets_.data(), query_count,
             range_fragment_partials_.data(), batch.out_sums,
@@ -842,8 +842,8 @@ private:
     begin_operation(stream);
 
     const bool prepare_pending = pending_records_ &&
-        batch.count >= gpulsmopt2_detail::kSuccessorSharedPendingQueries;
-    const gpulsmopt2_detail::Row *prepared_pending_rows = nullptr;
+        batch.count >= celllsm::kSuccessorSharedPendingQueries;
+    const celllsm::Row *prepared_pending_rows = nullptr;
     const std::uint32_t *prepared_pending_offsets = nullptr;
     const std::uint32_t *prepared_pending_counts = nullptr;
     if (prepare_pending) {
@@ -851,14 +851,14 @@ private:
       launch_canonical_epoch_resolution(
           stream, false, 0u, nullptr, false);
       prepared_pending_rows = publication_rows_a_.data();
-      prepared_pending_offsets = foundation_source_offsets_.data();
-      prepared_pending_counts = foundation_section_output_counts_.data();
+      prepared_pending_offsets = scratch_region_offsets_.data();
+      prepared_pending_counts = scratch_region_counts_.data();
     }
 
     constexpr std::size_t region_words =
-        gpulsmopt2_detail::kQuotients + 1u;
+        celllsm::kRegions + 1u;
     constexpr std::size_t chunk_words =
-        gpulsmopt2_detail::kSuccessorRegionChunks;
+        celllsm::kSuccessorRegionChunks;
     constexpr std::size_t required_words = region_words + 2u * chunk_words;
     if (operation_workspace_.size() < required_words * sizeof(std::uint32_t))
       throw std::length_error("insufficient GPULSMOpt successor workspace");
@@ -866,19 +866,19 @@ private:
         operation_workspace_.data());
     auto *chunk_first = next_regions + region_words;
     auto *chunk_carry = chunk_first + chunk_words;
-    gpulsmopt2_detail::build_successor_region_index_kernel<<<
-        gpulsmopt2_detail::kSuccessorRegionChunks,
-        gpulsmopt2_detail::kSuccessorRegionChunk, 0, stream>>>(
+    celllsm::build_successor_region_index_kernel<<<
+        celllsm::kSuccessorRegionChunks,
+        celllsm::kSuccessorRegionChunk, 0, stream>>>(
             raw_offsets_.data(), pending_batches_, descriptors_.data(),
             query_occupied_level_mask_.data(), next_regions, chunk_first);
-    gpulsmopt2_detail::build_successor_chunk_carry_kernel<<<1, 1, 0, stream>>>(
+    celllsm::build_successor_chunk_carry_kernel<<<1, 1, 0, stream>>>(
         chunk_first, chunk_carry, next_regions);
-    gpulsmopt2_detail::finish_successor_region_index_kernel<<<
-        gpulsmopt2_detail::kSuccessorRegionChunks,
-        gpulsmopt2_detail::kSuccessorRegionChunk, 0, stream>>>(
+    celllsm::finish_successor_region_index_kernel<<<
+        celllsm::kSuccessorRegionChunks,
+        celllsm::kSuccessorRegionChunk, 0, stream>>>(
             next_regions, chunk_carry);
-    gpulsmopt2_detail::successor_with_pending_kernel<<<
-        blocks(batch.count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::successor_with_pending_kernel<<<
+        blocks(batch.count), celllsm::kThreads, 0, stream>>>(
         batch.queries, static_cast<std::uint32_t>(batch.count), batch.out_keys,
         raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
         static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
@@ -902,8 +902,8 @@ public:
         arena_key_flags_.size() * sizeof(std::uint32_t) +
         arena_values_.size() * sizeof(std::uint32_t) +
         static_workspace_.size() + phase_workspace_.size() +
-        (sealed_workspace_ ? sealed_workspace_->bytes() : 0u) +
-        publication_rows_a_.size() * sizeof(gpulsmopt2_detail::Row) +
+        (large_batch_workspace_ ? large_batch_workspace_->bytes() : 0u) +
+        publication_rows_a_.size() * sizeof(celllsm::Row) +
         publication_keys_a_.size() * sizeof(std::uint32_t) +
         resident_scan_temp_.size() * sizeof(std::uint8_t) +
         admission_temp_.size() * sizeof(std::uint8_t) +
@@ -911,7 +911,7 @@ public:
             sizeof(std::uint64_t) +
         range_hot_temp_.size() * sizeof(std::uint8_t) +
         range_query_storage_.size() + range_fragment_storage_.size() +
-        range_section_storage_.size();
+        range_region_storage_.size();
     if (retained > std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("GPULSMOpt memory accounting overflow");
     return static_cast<std::size_t>(retained);
@@ -948,13 +948,13 @@ private:
             static_cast<std::size_t>(optin_shared_memory)};
   }
 
-  gpulsmopt2_detail::ResidentRows resident_rows() {
+  celllsm::ResidentRows resident_rows() {
     return {arena_key_flags_.data(), arena_values_.data()};
   }
 
   static int blocks(std::size_t count) {
-    return static_cast<int>((count + gpulsmopt2_detail::kThreads - 1u) /
-                            gpulsmopt2_detail::kThreads);
+    return static_cast<int>((count + celllsm::kThreads - 1u) /
+                            celllsm::kThreads);
   }
 
 
@@ -1015,21 +1015,21 @@ private:
     }
     if (!canonical_rollover_epoch_ranks_)
       canonical_rollover_epoch_ranks_ = std::make_unique<
-          gpulsmopt2_detail::Buffer<std::uint16_t>>(
-              gpulsmopt2_detail::kLocalRankEntries);
+          celllsm::Buffer<std::uint16_t>>(
+              celllsm::kLocalRankEntries);
   }
 
-  std::uint32_t foundation_level() const {
+  std::uint32_t oldest_level() const {
     return host_occupied_level_mask_
         ? 63u - static_cast<std::uint32_t>(
                     __builtin_clzll(host_occupied_level_mask_))
-        : gpulsmopt2_detail::kMaximumLevels;
+        : celllsm::kMaximumLevels;
   }
 
   void initialize_resident_workspace(
       const DeviceCapabilities &capabilities) {
-    std::array<gpulsmopt2_detail::LevelStorageSpan,
-               gpulsmopt2_detail::kMaximumLevels> spans{};
+    std::array<celllsm::LevelStorageSpan,
+               celllsm::kMaximumLevels> spans{};
     std::uint64_t cursor = 0u;
     std::size_t capacity = level_zero_capacity_;
     for (std::uint32_t level = 0u;
@@ -1054,25 +1054,25 @@ private:
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         nullptr, bytes, resident_tile_job_counts_.data(),
         resident_tile_job_offsets_.data(),
-        gpulsmopt2_detail::kPlanningTiles + 1u, 0));
+        celllsm::kPlanningTiles + 1u, 0));
     maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
     bytes = 0u;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
-        nullptr, bytes, foundation_section_output_counts_.data(),
-        foundation_source_offsets_.data(),
-        gpulsmopt2_detail::kQuotients + 1u, 0));
+        nullptr, bytes, scratch_region_counts_.data(),
+        scratch_region_offsets_.data(),
+        celllsm::kRegions + 1u, 0));
     maximum_scan_bytes = std::max(maximum_scan_bytes, bytes);
     resident_scan_temp_.resize(maximum_scan_bytes);
 
     if (!capabilities.cooperative_launch)
       throw std::runtime_error(
-          "GPULSMOpt TQRJ requires cooperative kernel launch support");
+          "GPULSMOpt shared lookup requires cooperative kernel launch support");
     int blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm, gpulsmopt2_detail::tqrj_hash_lookup_kernel,
-        gpulsmopt2_detail::kTqrjHashThreads, 0u));
+        &blocks_per_sm, celllsm::shared_lookup_hash_lookup_kernel,
+        celllsm::kSharedLookupHashThreads, 0u));
     // Size the hash grid from device occupancy.
-    tqrj_hash_worker_blocks_ = static_cast<std::uint32_t>(
+    shared_lookup_hash_worker_blocks_ = static_cast<std::uint32_t>(
         std::max(1, std::min(4, blocks_per_sm)) *
         capabilities.multiprocessors);
     blocks_per_sm = 0;
@@ -1082,10 +1082,10 @@ private:
     blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
-        gpulsmopt2_detail::cooperative_section_owned_range_kernel<
-            gpulsmopt2_detail::RangeSumSink>,
-        gpulsmopt2_detail::kSectionRangeThreads, 0u));
-    range_section_blocks_ = static_cast<std::uint32_t>(
+        celllsm::cooperative_region_owned_range_kernel<
+            celllsm::RangeSumSink>,
+        celllsm::kRegionRangeThreads, 0u));
+    range_region_blocks_ = static_cast<std::uint32_t>(
         std::max(1, blocks_per_sm) * capabilities.multiprocessors);
   }
 
@@ -1094,23 +1094,23 @@ private:
     int blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
-        gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<false>,
-        gpulsmopt2_detail::kFoundationCompactionThreads, 0u));
+        celllsm::resolve_canonical_epoch_oversized_kernel<false>,
+        celllsm::kMergeThreads, 0u));
     canonical_epoch_resolver_blocks_ = static_cast<std::uint32_t>(
         std::max(1, blocks_per_sm) * capabilities.multiprocessors);
     canonical_epoch_workspace_slots_ = static_cast<std::uint32_t>(
         canonical_epoch_workspace_.size() /
-        gpulsmopt2_detail::kCanonicalResolverSuffixes);
+        celllsm::kCanonicalResolverSuffixes);
     canonical_epoch_workspace_slots_ =
         std::max(1u, canonical_epoch_workspace_slots_);
 
     const std::uint32_t maximum_sources = std::min(
-        gpulsmopt2_detail::kMaximumMergeSources,
+        celllsm::kMaximumMergeSources,
         std::max(2u, canonical_level_count_ + 1u));
     cudaFuncAttributes tournament_attributes{};
     CUDA_CHECK(cudaFuncGetAttributes(
         &tournament_attributes,
-        gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel));
+        celllsm::canonical_tournament_carry_jobs_kernel));
     const std::size_t optin_shared_bytes = std::max<std::size_t>(
         capabilities.shared_memory,
         capabilities.optin_shared_memory);
@@ -1123,18 +1123,18 @@ private:
     canonical_tournament_blocks_.fill(0u);
     std::size_t tournament_attribute_bytes = 0u;
     for (std::uint32_t source_count =
-             gpulsmopt2_detail::kCanonicalTournamentMinimumSources;
+             celllsm::kCanonicalTournamentMinimumSources;
          source_count <= maximum_sources; ++source_count) {
       const auto active_blocks = [&](std::uint32_t capacity) {
         const std::size_t shared_bytes =
-            gpulsmopt2_detail::canonical_tournament_workspace_bytes(
+            celllsm::canonical_tournament_workspace_bytes(
                 capacity, source_count);
         if (shared_bytes > maximum_dynamic_shared_bytes) return 0;
         int blocks = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks,
-            gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
-            gpulsmopt2_detail::kFoundationCompactionThreads,
+            celllsm::canonical_tournament_carry_jobs_kernel,
+            celllsm::kMergeThreads,
             shared_bytes));
         return blocks;
       };
@@ -1145,7 +1145,7 @@ private:
             "unsupported GPULSMOpt tournament source shape");
       std::uint32_t low = resident_merge_capacity_;
       std::uint32_t high =
-          gpulsmopt2_detail::kCanonicalTournamentCapacityCeiling;
+          celllsm::kCanonicalTournamentCapacityCeiling;
       while (low < high) {
         const std::uint32_t middle =
             low + (high - low + 1u) / 2u;
@@ -1155,10 +1155,10 @@ private:
           high = middle - 1u;
       }
       const std::size_t shared_bytes =
-          gpulsmopt2_detail::canonical_tournament_workspace_bytes(
+          celllsm::canonical_tournament_workspace_bytes(
               low, source_count);
       const std::uint32_t capacity =
-          gpulsmopt2_detail::canonical_tournament_capacity(
+          celllsm::canonical_tournament_capacity(
               shared_bytes, source_count, 1u);
       if (!capacity)
         throw std::logic_error(
@@ -1170,19 +1170,19 @@ private:
           std::max(tournament_attribute_bytes, shared_bytes);
     }
     CUDA_CHECK(cudaFuncSetAttribute(
-        gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
+        celllsm::canonical_tournament_carry_jobs_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(tournament_attribute_bytes)));
     for (std::uint32_t source_count =
-             gpulsmopt2_detail::kCanonicalTournamentMinimumSources;
+             celllsm::kCanonicalTournamentMinimumSources;
          source_count <= maximum_sources; ++source_count) {
       const std::size_t shared_bytes =
           canonical_tournament_shared_bytes_[source_count];
       blocks_per_sm = 0;
       CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &blocks_per_sm,
-          gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel,
-          gpulsmopt2_detail::kFoundationCompactionThreads,
+          celllsm::canonical_tournament_carry_jobs_kernel,
+          celllsm::kMergeThreads,
           shared_bytes));
       if (!blocks_per_sm)
         throw std::runtime_error(
@@ -1197,15 +1197,15 @@ private:
     CUDA_CHECK(cudaMemset(
         canonical_job_prefixes_.data(), 0,
         canonical_job_prefixes_.size() *
-            sizeof(gpulsmopt2_detail::CanonicalJobPrefix)));
+            sizeof(celllsm::CanonicalJobPrefix)));
     CUDA_CHECK(cudaMemset(
         canonical_next_job_.data(), 0, sizeof(std::uint32_t)));
   }
-  gpulsmopt2_detail::PinnedReceipts &pinned_receipts() {
+  celllsm::PinnedReceipts &pinned_receipts() {
     return *pinned_receipts_.data();
   }
 
-  gpulsmopt2_detail::ResidentPublicationPlan *publication_receipt() {
+  celllsm::ResidentPublicationPlan *publication_receipt() {
     return &pinned_receipts().publication;
   }
 
@@ -1226,7 +1226,7 @@ private:
     const std::size_t current =
         std::min(publication_keys_a_.size(), publication_rows_a_.size());
     if (count <= current) return;
-    if (count > gpulsmopt2_detail::kMaximumPublicationRows)
+    if (count > celllsm::kMaximumPublicationRows)
       throw std::bad_alloc();
     CUDA_CHECK(cudaStreamSynchronize(stream));
     publication_keys_a_.grow(count);
@@ -1237,14 +1237,14 @@ private:
     pending_batches_ = 0u;
     pending_records_ = 0u;
     pending_has_tombstones_ = false;
-    std::fill_n(raw_batch_counts_, gpulsmopt2_detail::kBatchesPerEpoch, 0u);
+    std::fill_n(raw_batch_counts_, celllsm::kBatchesPerEpoch, 0u);
   }
 
   void apply_publication_receipt() {
     if (!publication_.consume_receipt()) return;
-    const gpulsmopt2_detail::ResidentPublicationPlan &receipt =
+    const celllsm::ResidentPublicationPlan &receipt =
         publication_receipt()[0];
-    if (receipt.status != gpulsmopt2_detail::kPublicationSuccess) {
+    if (receipt.status != celllsm::kPublicationSuccess) {
       // Keep raw batches when publication fails.
       publication_.fail(receipt);
       return;
@@ -1253,7 +1253,7 @@ private:
     const std::uint32_t destination = receipt.destination_level;
     if (destination >= canonical_level_count_) {
       auto failure = receipt;
-      failure.status |= gpulsmopt2_detail::kPublicationLevelOverflow;
+      failure.status |= celllsm::kPublicationLevelOverflow;
       publication_.fail(failure);
       return;
     }
@@ -1295,7 +1295,7 @@ private:
     const auto &receipt = publication_.failure();
     const std::string reason =
         receipt.status &
-                gpulsmopt2_detail::kPublicationLevelOverflow
+                celllsm::kPublicationLevelOverflow
             ? "canonical carry capacity exhausted"
             : "publication failed";
     throw std::runtime_error(
@@ -1313,9 +1313,9 @@ private:
   void prepare_failed_epoch_for_reads(cudaStream_t stream) {
     if (!publication_.needs_signature_rebuild()) return;
     begin_operation(stream);
-    gpulsmopt2_detail::rebuild_epoch_signatures_kernel<<<
-        gpulsmopt2_detail::kQuotients / gpulsmopt2_detail::kThreads,
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::rebuild_epoch_signatures_kernel<<<
+        celllsm::kRegions / celllsm::kThreads,
+        celllsm::kThreads, 0, stream>>>(
             raw_signatures_.data(), raw_epoch_signatures_.data());
     CUDA_CHECK(cudaGetLastError());
     end_operation(stream);
@@ -1334,7 +1334,7 @@ private:
   void reset_updates(cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(descriptors_.data(), 0,
                                descriptors_.size() *
-                                   sizeof(gpulsmopt2_detail::Descriptor),
+                                   sizeof(celllsm::Descriptor),
                                stream));
     CUDA_CHECK(cudaMemsetAsync(raw_offsets_.data(), 0,
                                raw_offsets_.size() * sizeof(std::uint32_t),
@@ -1348,13 +1348,13 @@ private:
     reset_pending_batch_counts();
     publication_.reset();
     host_occupied_level_mask_ = 0u;
-    std::fill_n(level_counts_, gpulsmopt2_detail::kMaximumLevels, 0u);
-    gpulsmopt2_detail::initialize_device_manifest_kernel<<<1, 1, 0, stream>>>(
+    std::fill_n(level_counts_, celllsm::kMaximumLevels, 0u);
+    celllsm::initialize_device_manifest_kernel<<<1, 1, 0, stream>>>(
         device_manifests_.data(), active_device_manifest_.data(),
         query_occupied_level_mask_.data(), 0u, 0u, 0u);
   }
 
-  std::vector<std::uint32_t> sealed_tier_slots() const {
+  std::vector<std::uint32_t> tier_slot_counts() const {
     std::vector<std::uint32_t> result;
     std::uint32_t remaining = canonical_regular_level_count_;
     while (remaining) {
@@ -1367,10 +1367,10 @@ private:
     return result;
   }
 
-  static std::size_t sealed_workspace_capacity(
+  static std::size_t large_batch_workspace_capacity(
       std::size_t publication_capacity,
       std::size_t level_zero_capacity) {
-    return gpulsmopt2_detail::canonical_level_layout(
+    return celllsm::canonical_level_layout(
         publication_capacity, level_zero_capacity)
         .highest_regular_capacity;
   }
@@ -1386,22 +1386,7 @@ private:
         : storage_(storage) {}
 
     template <class T>
-    void append(gpulsmopt2_detail::Buffer<T> &view, std::size_t count) {
-      append_view<T>(view, count);
-    }
-
-    template <class T>
-    void append(gpulsm_sparse::Buffer<T> &view, std::size_t count) {
-      append_view<T>(view, count);
-    }
-
-    std::size_t bytes() const {
-      return align_phase_workspace(cursor_);
-    }
-
-   private:
-    template <class T, class BufferType>
-    void append_view(BufferType &view, std::size_t count) {
+    void append(celllsm::Buffer<T> &view, std::size_t count) {
       cursor_ = align_phase_workspace(cursor_);
       if (count > (std::numeric_limits<std::size_t>::max() - cursor_) /
                       sizeof(T))
@@ -1411,6 +1396,12 @@ private:
       cursor_ += count * sizeof(T);
     }
 
+    std::size_t bytes() const {
+      return align_phase_workspace(cursor_);
+    }
+
+   private:
+
     std::uint8_t *storage_{};
     std::size_t cursor_{};
   };
@@ -1418,70 +1409,70 @@ private:
   void initialize_static_workspace_views() {
     const auto append_views = [&](StaticWorkspaceBuilder &layout) {
       layout.append(
-          descriptors_, std::size_t{gpulsmopt2_detail::kQuotients} *
-              gpulsmopt2_detail::kMaximumLevels);
+          descriptors_, std::size_t{celllsm::kRegions} *
+              celllsm::kMaximumLevels);
       layout.append(device_manifests_, 2u);
       layout.append(active_device_manifest_, 1u);
       layout.append(query_occupied_level_mask_, 1u);
-      layout.append(sealed_device_command_, 1u);
-      layout.append(sealed_device_receipt_, 1u);
+      layout.append(large_batch_command_, 1u);
+      layout.append(large_batch_receipt_, 1u);
       layout.append(resident_plan_, 1u);
       layout.append(
-          level_storage_spans_, gpulsmopt2_detail::kMaximumLevels);
+          level_storage_spans_, celllsm::kMaximumLevels);
       layout.append(
           canonical_cell_ranks_,
           std::size_t{canonical_level_count_} *
-              gpulsmopt2_detail::kLocalRankEntries);
+              celllsm::kLocalRankEntries);
       layout.append(canonical_job_prefixes_, maximum_resident_jobs_);
       layout.append(canonical_next_job_, 1u);
       layout.append(
           raw_payloads_,
-          std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
+          std::size_t{celllsm::kBatchesPerEpoch} *
               batch_capacity_);
       layout.append(
           raw_offsets_,
-          std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
-              (gpulsmopt2_detail::kQuotients + 1u));
+          std::size_t{celllsm::kBatchesPerEpoch} *
+              (celllsm::kRegions + 1u));
       layout.append(
           raw_signatures_,
-          std::size_t{gpulsmopt2_detail::kBatchesPerEpoch} *
-              gpulsmopt2_detail::kQuotients);
+          std::size_t{celllsm::kBatchesPerEpoch} *
+              celllsm::kRegions);
       layout.append(
-          raw_epoch_signatures_, gpulsmopt2_detail::kQuotients);
+          raw_epoch_signatures_, celllsm::kRegions);
       layout.append(publication_selected_count_, 1u);
       layout.append(
-          foundation_source_offsets_,
-          gpulsmopt2_detail::kQuotients + 1u);
+          scratch_region_offsets_,
+          celllsm::kRegions + 1u);
       layout.append(
-          foundation_section_output_counts_,
-          gpulsmopt2_detail::kQuotients + 1u);
+          scratch_region_counts_,
+          celllsm::kRegions + 1u);
       layout.append(
-          balanced_merge_raw_counts_, gpulsmopt2_detail::kQuotients);
+          balanced_merge_raw_counts_, celllsm::kRegions);
       layout.append(
           resident_tile_job_counts_,
-          gpulsmopt2_detail::kPlanningTiles + 1u);
+          celllsm::kPlanningTiles + 1u);
       layout.append(
           resident_tile_job_offsets_,
-          gpulsmopt2_detail::kPlanningTiles + 1u);
+          celllsm::kPlanningTiles + 1u);
       layout.append(
           resident_job_raw_reservations_, maximum_resident_jobs_ + 1u);
       layout.append(balanced_merge_jobs_, maximum_resident_jobs_);
       layout.append(local_epoch_overflow_flag_, 1u);
       layout.append(
-          admission_counts_, gpulsmopt2_detail::kQuotients + 1u);
+          admission_counts_, celllsm::kRegions + 1u);
       layout.append(
-          range_partials_, gpulsmopt2_detail::kRangeSchedulerBlocks);
+          range_partials_, celllsm::kRangeSchedulerBlocks);
       layout.append(range_reduction_completion_, 1u);
       layout.append(range_fragment_total_, 1u);
       layout.append(
-          range_hot_counts_, gpulsmopt2_detail::kQuotients + 1u);
+          range_hot_counts_, celllsm::kRegions + 1u);
       layout.append(
-          range_hot_offsets_, gpulsmopt2_detail::kQuotients + 1u);
+          range_hot_offsets_, celllsm::kRegions + 1u);
       layout.append(
           range_hot_window_offsets_,
-          gpulsmopt2_detail::kQuotients + 1u);
+          celllsm::kRegions + 1u);
       layout.append(
-          range_hot_descriptors_, gpulsmopt2_detail::kQuotients);
+          range_hot_descriptors_, celllsm::kRegions);
       layout.append(range_hot_selected_count_, 1u);
     };
 
@@ -1496,7 +1487,7 @@ private:
 
   static std::size_t phase_operation_workspace_offset(std::size_t batch_capacity) {
     return align_phase_workspace(
-        gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity * sizeof(std::uint32_t));
+        celllsm::kBatchesPerEpoch * batch_capacity * sizeof(std::uint32_t));
   }
 
   static std::size_t phase_workspace_initial_bytes(std::size_t batch_capacity) {
@@ -1509,22 +1500,22 @@ private:
     return std::max(
         phase_operation_workspace_offset(batch_capacity) +
             operation_workspace_maximum_bytes(batch_capacity),
-        gpulsm_sparse::NativeRootWorkspace<false>::required_bytes(publication_capacity));
+        celllsm::DirectRunWorkspace<false>::required_bytes(publication_capacity));
   }
 
   void initialize_phase_workspace_views() {
     std::uint8_t *storage = phase_workspace_.data();
     raw_keys_.attach(reinterpret_cast<std::uint32_t *>(storage),
-        gpulsmopt2_detail::kBatchesPerEpoch * batch_capacity_);
+        celllsm::kBatchesPerEpoch * batch_capacity_);
     operation_workspace_.attach(
         storage + phase_operation_workspace_offset(batch_capacity_),
         operation_workspace_maximum_bytes(batch_capacity_),
         operation_workspace_initial_bytes(batch_capacity_));
   }
 
-  // Share resolved input for epoch and sealed publication.
+  // Share resolved input for epoch and large-batch publication.
   struct PublicationInput {
-    const gpulsmopt2_detail::Row *rows;
+    const celllsm::Row *rows;
     const std::uint32_t *offsets;
     const std::uint32_t *counts;
     const std::uint16_t *ranks;
@@ -1532,28 +1523,28 @@ private:
 
   template <bool SeparateCounts = false>
   void finalize_publication_metadata(
-      const std::uint32_t *section_offsets, cudaStream_t stream,
-      const std::uint32_t *section_counts = nullptr,
+      const std::uint32_t *region_offsets, cudaStream_t stream,
+      const std::uint32_t *region_counts = nullptr,
       const std::uint32_t *selected_count = nullptr) {
-    gpulsmopt2_detail::finalize_canonical_metadata_kernel<SeparateCounts><<<
-        blocks(gpulsmopt2_detail::kQuotients + 1u),
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
-        section_offsets, section_counts, selected_count,
+    celllsm::finalize_canonical_metadata_kernel<SeparateCounts><<<
+        blocks(celllsm::kRegions + 1u),
+        celllsm::kThreads, 0, stream>>>(
+        region_offsets, region_counts, selected_count,
         resident_plan_.data(), descriptors_.data());
   }
 
   void finalize_direct_root(
-      const gpulsmopt2_detail::ResidentPublicationPlan &plan,
-      const std::uint32_t *section_offsets, cudaStream_t stream) {
+      const celllsm::ResidentPublicationPlan &plan,
+      const std::uint32_t *region_offsets, cudaStream_t stream) {
     CUDA_CHECK(cudaMemcpyAsync(
         resident_plan_.data(), &plan, sizeof(plan),
         cudaMemcpyHostToDevice, stream));
-    gpulsmopt2_detail::build_canonical_rank_from_run_kernel<<<
-        gpulsmopt2_detail::kQuotients,
-        gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
-        resident_rows(), plan.output_begin, section_offsets,
+    celllsm::build_canonical_rank_from_run_kernel<<<
+        celllsm::kRegions,
+        celllsm::kCellsPerRegion, 0, stream>>>(
+        resident_rows(), plan.output_begin, region_offsets,
         plan.destination_level, canonical_cell_ranks_.data());
-    finalize_publication_metadata(section_offsets, stream);
+    finalize_publication_metadata(region_offsets, stream);
   }
 
   void validate_publication_sources(std::uint32_t source_count) const {
@@ -1574,19 +1565,19 @@ private:
     CUDA_CHECK(cudaMemsetAsync(
         canonical_job_prefixes_.data(), 0,
         canonical_job_prefixes_.size() *
-            sizeof(gpulsmopt2_detail::CanonicalJobPrefix),
+            sizeof(celllsm::CanonicalJobPrefix),
         stream));
     CUDA_CHECK(cudaMemsetAsync(
         canonical_next_job_.data(), 0, sizeof(std::uint32_t), stream));
-    gpulsmopt2_detail::count_canonical_merge_work_kernel<<<
-        blocks(gpulsmopt2_detail::kQuotients),
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::count_canonical_merge_work_kernel<<<
+        blocks(celllsm::kRegions),
+        celllsm::kThreads, 0, stream>>>(
         input.counts, descriptors_.data(),
         device_manifests_.data(), active_device_manifest_.data(),
         resident_plan_.data(), balanced_merge_raw_counts_.data());
-    gpulsmopt2_detail::count_canonical_planning_jobs_kernel<<<
-        gpulsmopt2_detail::kPlanningTiles,
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::count_canonical_planning_jobs_kernel<<<
+        celllsm::kPlanningTiles,
+        celllsm::kThreads, 0, stream>>>(
         balanced_merge_raw_counts_.data(), resident_plan_.data(),
         resident_tile_job_counts_.data());
     std::size_t scan_bytes = resident_scan_temp_.size();
@@ -1594,27 +1585,27 @@ private:
         resident_scan_temp_.data(), scan_bytes,
         resident_tile_job_counts_.data(),
         resident_tile_job_offsets_.data(),
-        gpulsmopt2_detail::kPlanningTiles + 1u, stream));
-    gpulsmopt2_detail::emit_canonical_planning_jobs_kernel<<<
-        gpulsmopt2_detail::kPlanningTiles,
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
+        celllsm::kPlanningTiles + 1u, stream));
+    celllsm::emit_canonical_planning_jobs_kernel<<<
+        celllsm::kPlanningTiles,
+        celllsm::kThreads, 0, stream>>>(
         balanced_merge_raw_counts_.data(),
         resident_tile_job_offsets_.data(), resident_plan_.data(),
         static_cast<std::uint32_t>(maximum_resident_jobs_),
         balanced_merge_jobs_.data(), resident_job_raw_reservations_.data());
-    gpulsmopt2_detail::validate_canonical_plan_kernel<<<1, 1, 0, stream>>>(
+    celllsm::validate_canonical_plan_kernel<<<1, 1, 0, stream>>>(
         resident_plan_.data(), resident_tile_job_offsets_.data(),
         static_cast<std::uint32_t>(maximum_resident_jobs_));
-    gpulsmopt2_detail::resolve_canonical_job_boundaries_kernel<<<
+    celllsm::resolve_canonical_job_boundaries_kernel<<<
         resident_planner_blocks_, 32u, 0, stream>>>(
         balanced_merge_raw_counts_.data(), balanced_merge_jobs_.data(),
         resident_job_raw_reservations_.data(), resident_plan_.data(),
         input.rows, input.offsets, input.counts, input.ranks,
         resident_rows(), descriptors_.data(), canonical_cell_ranks_.data(),
         device_manifests_.data(), active_device_manifest_.data());
-    gpulsmopt2_detail::canonical_tournament_carry_jobs_kernel<<<
+    celllsm::canonical_tournament_carry_jobs_kernel<<<
         canonical_tournament_blocks_[source_count],
-        gpulsmopt2_detail::kFoundationCompactionThreads,
+        celllsm::kMergeThreads,
         canonical_tournament_shared_bytes_[source_count], stream>>>(
         balanced_merge_jobs_.data(),
         resident_job_raw_reservations_.data(), resident_plan_.data(),
@@ -1623,29 +1614,29 @@ private:
         canonical_cell_ranks_.data(), device_manifests_.data(),
         active_device_manifest_.data(), canonical_job_prefixes_.data(),
         canonical_next_job_.data(), canonical_cell_counts_.data());
-    gpulsmopt2_detail::build_canonical_rank_from_counts_kernel<<<
-        gpulsmopt2_detail::kQuotients,
-        gpulsmopt2_detail::kFoundationCells, 0, stream>>>(
+    celllsm::build_canonical_rank_from_counts_kernel<<<
+        celllsm::kRegions,
+        celllsm::kCellsPerRegion, 0, stream>>>(
         canonical_cell_counts_.data(), resident_plan_.data(),
         canonical_level_count_, canonical_cell_ranks_.data(),
-        foundation_section_output_counts_.data());
+        scratch_region_counts_.data());
     scan_bytes = resident_scan_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         resident_scan_temp_.data(), scan_bytes,
-        foundation_section_output_counts_.data(),
-        foundation_source_offsets_.data(),
-        gpulsmopt2_detail::kQuotients + 1u, stream));
-    finalize_publication_metadata(foundation_source_offsets_.data(), stream);
+        scratch_region_counts_.data(),
+        scratch_region_offsets_.data(),
+        celllsm::kRegions + 1u, stream));
+    finalize_publication_metadata(scratch_region_offsets_.data(), stream);
   }
 
 
-  std::uint32_t build_sealed_root(
-      gpulsm_sparse::NativeRootWorkspace<true> &workspace,
+  std::uint32_t build_large_batch_run(
+      celllsm::DirectRunWorkspace<true> &workspace,
       std::uint32_t selected, std::uint64_t resident_sources,
       std::uint32_t level, std::uint32_t generation,
       bool merge, bool keep_tombstones,
       cudaStream_t stream) {
-    gpulsmopt2_detail::ResidentPublicationPlan plan{};
+    celllsm::ResidentPublicationPlan plan{};
     plan.selected_count = selected;
     plan.destination_level = level;
     plan.output_generation = generation;
@@ -1653,8 +1644,8 @@ private:
     if (merge) {
       plan.source_count = 1u + static_cast<std::uint32_t>(
           __builtin_popcountll(resident_sources));
-      if (plan.source_count > gpulsmopt2_detail::kMaximumMergeSources)
-        throw std::invalid_argument("invalid sealed carry sources");
+      if (plan.source_count > celllsm::kMaximumMergeSources)
+        throw std::invalid_argument("invalid large-batch carry sources");
       validate_publication_sources(plan.source_count);
       if (resident_sources) {
         plan.source_level_limit = 63u -
@@ -1663,7 +1654,7 @@ private:
             ? ~std::uint64_t{0}
             : (std::uint64_t{1u} << (plan.source_level_limit + 1u)) - 1u;
         if ((host_occupied_level_mask_ & source_prefix) != resident_sources)
-          throw std::invalid_argument("non-prefix sealed carry sources");
+          throw std::invalid_argument("non-prefix large-batch carry sources");
       }
       plan.job_capacity = canonical_job_capacities_[plan.source_count];
       plan.tournament_workspace_bytes = static_cast<std::uint32_t>(
@@ -1674,15 +1665,15 @@ private:
     plan.output_begin = level_begin(level) +
         std::uint64_t{generation} * plan.output_capacity;
     plan.status = selected > plan.output_capacity
-        ? gpulsmopt2_detail::kPublicationOutputOverflow
-        : gpulsmopt2_detail::kPublicationSuccess;
+        ? celllsm::kPublicationOutputOverflow
+        : celllsm::kPublicationSuccess;
 
     if (!merge) {
-      if (plan.status) throw std::length_error("sealed direct root capacity");
+      if (plan.status) throw std::length_error("large-batch direct root capacity");
       workspace.deposit(resident_rows(), plan.output_begin,
-                        workspace.section_offsets(), stream);
+                        workspace.region_offsets(), stream);
       plan.survivor_count = selected;
-      finalize_direct_root(plan, workspace.section_offsets(), stream);
+      finalize_direct_root(plan, workspace.region_offsets(), stream);
       CUDA_CHECK(cudaGetLastError());
       return selected;
     }
@@ -1691,21 +1682,21 @@ private:
         resident_plan_.data(), &plan, sizeof(plan),
         cudaMemcpyHostToDevice, stream));
     launch_publication_merge(
-        {workspace.epoch_rows(), workspace.section_offsets(),
-         workspace.section_counts(), workspace.epoch_ranks()},
+        {workspace.epoch_rows(), workspace.region_offsets(),
+         workspace.region_counts(), workspace.epoch_ranks()},
         plan.source_count, stream);
     CUDA_CHECK(cudaMemcpyAsync(
         &plan, resident_plan_.data(), sizeof(plan),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (plan.status)
-      throw std::runtime_error("sealed canonical carry failed");
+      throw std::runtime_error("large-batch canonical carry failed");
     return static_cast<std::uint32_t>(plan.survivor_count);
   }
 
-  static std::uint32_t next_sealed_output(
-      const gpulsm_sparse::ForestPlan &plan,
-      const std::array<bool, gpulsmopt2_detail::kMaximumLevels> &built) {
+  static std::uint32_t next_large_batch_output(
+      const celllsm::ForestPlan &plan,
+      const std::array<bool, celllsm::kMaximumLevels> &built) {
     for (std::uint32_t candidate = 0u;
          candidate < plan.output_count; ++candidate) {
       if (built[candidate]) continue;
@@ -1720,23 +1711,23 @@ private:
       }
       if (!has_unbuilt_reader) return candidate;
     }
-    throw std::logic_error("sealed slot-lifetime dependency cycle");
+    throw std::logic_error("large-batch slot-lifetime dependency cycle");
   }
 
-  std::uint32_t sealed_output_generation(
-      const gpulsm_sparse::ForestPlan &plan,
-      const gpulsm_sparse::PlannedRoot &root,
-      const gpulsmopt2_detail::DeviceManifest &manifest,
-      gpulsm_sparse::SealedForestCommand &command,
+  std::uint32_t large_batch_output_generation(
+      const celllsm::ForestPlan &plan,
+      const celllsm::PlannedRoot &root,
+      const celllsm::DeviceManifest &manifest,
+      celllsm::LargeBatchCommand &command,
       cudaStream_t stream) {
     if (root.destination >= canonical_level_count_)
-      throw std::overflow_error("sealed destination exceeds forest");
+      throw std::overflow_error("large-batch destination exceeds forest");
     const std::uint64_t bit = std::uint64_t{1u} << root.destination;
     std::uint32_t generation = 0u;
     if ((plan.old_mask & bit) && (root.resident_sources & bit)) {
       if (root.destination + 1u != canonical_level_count_)
         throw std::logic_error(
-            "sealed root overwrites its own nonterminal source");
+            "large-batch root overwrites its own nonterminal source");
       ensure_canonical_top_rollover_bank(stream);
       generation =
           (manifest.levels[root.destination].storage_generation ^ 1u) & 1u;
@@ -1747,29 +1738,29 @@ private:
   }
 
 
-  void commit_sealed_forest(
-      const gpulsm_sparse::ForestPlan &plan,
-      const gpulsm_sparse::SealedForestCommand &command,
+  void commit_large_batch(
+      const celllsm::ForestPlan &plan,
+      const celllsm::LargeBatchCommand &command,
       const std::array<std::uint32_t,
-                       gpulsmopt2_detail::kMaximumLevels> &output_counts,
+                       celllsm::kMaximumLevels> &output_counts,
       cudaStream_t stream) {
     CUDA_CHECK(cudaMemcpyAsync(
-        sealed_device_command_.data(), &command, sizeof(command),
+        large_batch_command_.data(), &command, sizeof(command),
         cudaMemcpyHostToDevice, stream));
-    gpulsm_sparse::publish_sealed_forest<<<
-        1, gpulsmopt2_detail::kMaximumLevels, 0, stream>>>(
-        sealed_device_command_.data(), device_manifests_.data(),
+    celllsm::publish_large_batch_kernel<<<
+        1, celllsm::kMaximumLevels, 0, stream>>>(
+        large_batch_command_.data(), device_manifests_.data(),
         active_device_manifest_.data(), query_occupied_level_mask_.data(),
-        sealed_device_receipt_.data());
-    gpulsm_sparse::SealedForestReceipt receipt{};
+        large_batch_receipt_.data());
+    celllsm::LargeBatchReceipt receipt{};
     CUDA_CHECK(cudaMemcpyAsync(
-        &receipt, sealed_device_receipt_.data(), sizeof(receipt),
+        &receipt, large_batch_receipt_.data(), sizeof(receipt),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (receipt.status || receipt.occupied_mask != plan.final_mask)
-      throw std::runtime_error("sealed forest publication rejected");
+      throw std::runtime_error("large-batch forest publication rejected");
     for (std::uint32_t level = 0u;
-         level < gpulsmopt2_detail::kMaximumLevels; ++level) {
+         level < celllsm::kMaximumLevels; ++level) {
       const std::uint64_t bit = std::uint64_t{1u} << level;
       if (plan.consumed_mask & bit) level_counts_[level] = 0u;
       if (plan.output_mask & bit) level_counts_[level] = output_counts[level];
@@ -1777,22 +1768,22 @@ private:
     host_occupied_level_mask_ = plan.final_mask;
   }
 
-  struct SealedAdmission {
-    gpulsm_sparse::ForestPlan plan;
+  struct LargeBatchAdmission {
+    celllsm::ForestPlan plan;
     std::uint64_t epoch_rows;
     std::uint64_t accepted_rows;
     std::uint64_t maximum_interval;
   };
 
   // Empty admissions skip planning and allocation.
-  std::optional<SealedAdmission> plan_sealed_admission(std::uint64_t count) {
+  std::optional<LargeBatchAdmission> plan_large_batch(std::uint64_t count) {
     if (pending_batches_ || !count) return std::nullopt;
     const std::uint64_t epoch_rows = epoch_row_capacity();
     const std::uint64_t complete_epochs = count / epoch_rows;
     if (!complete_epochs) return std::nullopt;
-    SealedAdmission admission{
-        gpulsm_sparse::plan_forest(
-            host_occupied_level_mask_, complete_epochs, sealed_tier_slots()),
+    LargeBatchAdmission admission{
+        celllsm::plan_forest(
+            host_occupied_level_mask_, complete_epochs, tier_slot_counts()),
         epoch_rows, complete_epochs * epoch_rows, 0u};
     bool fusion = false;
     for (std::uint32_t output = 0u; output < admission.plan.output_count; ++output) {
@@ -1805,13 +1796,13 @@ private:
     return admission;
   }
 
-  struct SealedManifestSnapshot {
-    gpulsmopt2_detail::DeviceManifest manifests[2]{};
+  struct HostManifestSnapshot {
+    celllsm::DeviceManifest manifests[2]{};
     std::uint32_t active{};
   };
 
-  SealedManifestSnapshot read_sealed_manifest() {
-    SealedManifestSnapshot snapshot;
+  HostManifestSnapshot read_manifest_snapshot() {
+    HostManifestSnapshot snapshot;
     CUDA_CHECK(cudaMemcpy(&snapshot.active, active_device_manifest_.data(),
                           sizeof(snapshot.active), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(snapshot.manifests, device_manifests_.data(),
@@ -1823,37 +1814,37 @@ private:
 
   // Build every planned root from its slice of the input, then publish them
   // together.
-  void execute_sealed_admission(
+  void execute_large_batch(
       const std::uint32_t *keys, const std::uint32_t *values,
       std::uint64_t count, bool tombstone,
-      const SealedAdmission &admission, const SealedManifestSnapshot &snapshot,
-      gpulsm_sparse::NativeRootWorkspace<true> &workspace,
+      const LargeBatchAdmission &admission, const HostManifestSnapshot &snapshot,
+      celllsm::DirectRunWorkspace<true> &workspace,
       cudaStream_t stream) {
     const auto &plan = admission.plan;
     const auto &manifests = snapshot.manifests;
     const std::uint32_t active = snapshot.active;
     const std::uint64_t epoch_rows = admission.epoch_rows;
-    gpulsm_sparse::SealedForestCommand command{};
+    celllsm::LargeBatchCommand command{};
     command.expected_mask = plan.old_mask;
     command.consumed_mask = plan.consumed_mask;
     command.output_mask = plan.output_mask;
     command.final_mask = plan.final_mask;
-    std::array<std::uint32_t, gpulsmopt2_detail::kMaximumLevels>
+    std::array<std::uint32_t, celllsm::kMaximumLevels>
         output_counts{};
-    std::array<bool, gpulsmopt2_detail::kMaximumLevels> built{};
+    std::array<bool, celllsm::kMaximumLevels> built{};
     for (std::uint32_t ordinal = 0u; ordinal < plan.output_count;
          ++ordinal) {
-      const std::uint32_t output = next_sealed_output(plan, built);
+      const std::uint32_t output = next_large_batch_output(plan, built);
       built[output] = true;
       const auto &root = plan.outputs[output];
       if (root.destination >= canonical_level_count_)
-        throw std::overflow_error("sealed destination exceeds forest");
+        throw std::overflow_error("large-batch destination exceeds forest");
       const std::uint64_t raw_begin = root.raw_begin * epoch_rows;
       const std::uint64_t raw_count = root.raw_epochs * epoch_rows;
       if (raw_begin > count || raw_count > count - raw_begin ||
           raw_count > level_capacity(root.destination))
-        throw std::length_error("invalid sealed root interval");
-      const std::uint32_t generation = sealed_output_generation(
+        throw std::length_error("invalid large-batch root interval");
+      const std::uint32_t generation = large_batch_output_generation(
           plan, root, manifests[active], command, stream);
       // Higher slots are older. Include other outputs of this operation,
       // not only runs that were present before it, in the retention decision.
@@ -1866,36 +1857,36 @@ private:
           static_cast<std::uint32_t>(raw_count), tombstone, merge, stream);
       // Empty outputs keep their planned slot to preserve the radix-4 slot
       // order. Their region counts are zero, so searches skip them.
-      output_counts[root.destination] = build_sealed_root(
+      output_counts[root.destination] = build_large_batch_run(
           workspace, selected, root.resident_sources,
           root.destination, generation, merge, keep_tombstones, stream);
     }
-    commit_sealed_forest(plan, command, output_counts, stream);
+    commit_large_batch(plan, command, output_counts, stream);
   }
 
-  std::size_t try_admit_sealed_inline(
+  std::size_t try_admit_large_batch(
       const std::uint32_t *keys, const std::uint32_t *values,
       std::size_t count, bool tombstone, cudaStream_t stream) {
-    const auto admission = plan_sealed_admission(count);
+    const auto admission = plan_large_batch(count);
     if (!admission) return 0u;
     const std::uint64_t maximum_interval = admission->maximum_interval;
     if (!maximum_interval || maximum_interval > std::numeric_limits<std::uint32_t>::max())
-      throw std::length_error("sealed interval exceeds 32 bits");
-    const std::size_t maximum_capacity = sealed_workspace_capacity(
+      throw std::length_error("large-batch interval exceeds 32 bits");
+    const std::size_t maximum_capacity = large_batch_workspace_capacity(
         publication_capacity_, level_zero_capacity_);
     if (maximum_capacity <= level_zero_capacity_ || maximum_interval > maximum_capacity)
       return 0u;
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (!sealed_workspace_ || maximum_interval > sealed_workspace_->capacity()) {
+    if (!large_batch_workspace_ || maximum_interval > large_batch_workspace_->capacity()) {
       // Release old scratch before allocating more.
-      sealed_workspace_.reset();
-      sealed_workspace_ = std::make_unique<gpulsm_sparse::NativeRootWorkspace<true>>(
+      large_batch_workspace_.reset();
+      large_batch_workspace_ = std::make_unique<celllsm::DirectRunWorkspace<true>>(
           static_cast<std::uint32_t>(maximum_interval));
     }
-    const auto snapshot = read_sealed_manifest();
-    execute_sealed_admission(keys, values, count, tombstone, *admission,
-                             snapshot, *sealed_workspace_, stream);
+    const auto snapshot = read_manifest_snapshot();
+    execute_large_batch(keys, values, count, tombstone, *admission,
+                             snapshot, *large_batch_workspace_, stream);
     return static_cast<std::size_t>(admission->accepted_rows);
   }
 
@@ -1910,7 +1901,7 @@ private:
                      count, tombstone, stream);
         },
         [&](std::uint64_t first, std::uint64_t count) -> std::uint64_t {
-          return try_admit_sealed_inline(
+          return try_admit_large_batch(
               keys + first, tombstone ? nullptr : values + first,
               count, tombstone, stream);
         });
@@ -1922,27 +1913,27 @@ private:
     const auto tile = begin_admission_tile(n, tombstone);
     CUDA_CHECK(cudaMemsetAsync(
         tile.signatures, 0,
-        gpulsmopt2_detail::kQuotients * sizeof(std::uint64_t), stream));
-    gpulsmopt2_detail::count_quotients_kernel<false><<<
-        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+        celllsm::kRegions * sizeof(std::uint64_t), stream));
+    celllsm::count_regions_kernel<false><<<
+        blocks(n), celllsm::kThreads, 0, stream>>>(
             keys, n, admission_counts_.data(), radix_ids_out_.data());
     std::size_t scan_bytes = admission_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         admission_temp_.data(), scan_bytes, admission_counts_.data(),
-        tile.offsets, gpulsmopt2_detail::kQuotients + 1u, stream));
+        tile.offsets, celllsm::kRegions + 1u, stream));
     if (tombstone) {
-      gpulsmopt2_detail::scatter_admission_records_kernel<true><<<
-          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+      celllsm::scatter_admission_records_kernel<true><<<
+          blocks(n), celllsm::kThreads, 0, stream>>>(
               keys, values, n, tile.slot, tile.offsets, radix_ids_out_.data(),
               tile.keys, tile.payloads);
     } else {
-      gpulsmopt2_detail::scatter_admission_records_kernel<false><<<
-          blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+      celllsm::scatter_admission_records_kernel<false><<<
+          blocks(n), celllsm::kThreads, 0, stream>>>(
               keys, values, n, tile.slot, tile.offsets, radix_ids_out_.data(),
               tile.keys, tile.payloads);
     }
-    gpulsmopt2_detail::build_admission_signatures_kernel<<<
-        blocks(n), gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::build_admission_signatures_kernel<<<
+        blocks(n), celllsm::kThreads, 0, stream>>>(
             tile.keys, n, tile.signatures);
     commit_admission_signatures(tile, stream);
     finish_admission_tile(tile, stream);
@@ -1952,22 +1943,22 @@ private:
   void launch_epoch_resolvers(cudaStream_t stream,
                                std::uint64_t resident_destination,
                                std::uint16_t *epoch_ranks) {
-    gpulsmopt2_detail::resolve_canonical_epoch_active_jobs_kernel<ResidentOutput><<<
+    celllsm::resolve_canonical_epoch_active_jobs_kernel<ResidentOutput><<<
         canonical_epoch_resolver_blocks_,
-        gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+        celllsm::kMergeThreads, 0, stream>>>(
             balanced_merge_raw_counts_.data(),
             publication_selected_count_.data(),
             canonical_next_job_.data(), raw_keys_.data(),
             raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             pending_batches_,
-            foundation_source_offsets_.data(),
+            scratch_region_offsets_.data(),
             publication_rows_a_.data(), resident_rows(),
-            resident_destination, foundation_section_output_counts_.data(),
+            resident_destination, scratch_region_counts_.data(),
             epoch_ranks);
-    gpulsmopt2_detail::resolve_canonical_epoch_oversized_kernel<ResidentOutput><<<
+    celllsm::resolve_canonical_epoch_oversized_kernel<ResidentOutput><<<
         canonical_epoch_resolver_blocks_,
-        gpulsmopt2_detail::kFoundationCompactionThreads, 0, stream>>>(
+        celllsm::kMergeThreads, 0, stream>>>(
             balanced_merge_raw_counts_.data(),
             local_epoch_overflow_flag_.data(),
             canonical_cell_counts_.data() +
@@ -1975,9 +1966,9 @@ private:
             raw_keys_.data(), raw_payloads_.data(), raw_offsets_.data(),
             static_cast<std::uint32_t>(batch_capacity_),
             pending_batches_,
-            foundation_source_offsets_.data(),
+            scratch_region_offsets_.data(),
             publication_rows_a_.data(), resident_rows(),
-            resident_destination, foundation_section_output_counts_.data(),
+            resident_destination, scratch_region_counts_.data(),
             epoch_ranks,
             reinterpret_cast<unsigned long long *>(
                 canonical_epoch_workspace_.data()),
@@ -2003,26 +1994,26 @@ private:
         std::size_t{canonical_epoch_workspace_slots_ + 1u} *
             sizeof(std::uint32_t),
         stream));
-    gpulsmopt2_detail::count_canonical_epoch_jobs_kernel<<<
-        blocks(gpulsmopt2_detail::kQuotients + 1u),
-        gpulsmopt2_detail::kThreads, 0, stream>>>(
+    celllsm::count_canonical_epoch_jobs_kernel<<<
+        blocks(celllsm::kRegions + 1u),
+        celllsm::kThreads, 0, stream>>>(
             raw_offsets_.data(), pending_batches_,
-            foundation_section_output_counts_.data(),
+            scratch_region_counts_.data(),
             balanced_merge_raw_counts_.data(),
             publication_selected_count_.data(),
             local_epoch_overflow_flag_.data());
     std::size_t scan_bytes = resident_scan_temp_.size();
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
         resident_scan_temp_.data(), scan_bytes,
-        foundation_section_output_counts_.data(),
-        foundation_source_offsets_.data(),
-        gpulsmopt2_detail::kQuotients + 1u, stream));
+        scratch_region_counts_.data(),
+        scratch_region_offsets_.data(),
+        celllsm::kRegions + 1u, stream));
     std::uint16_t *epoch_ranks = build_cell_ranks
         ? rank_output
             ? rank_output
             : canonical_cell_ranks_.data() +
                   std::size_t{destination_level} *
-                      gpulsmopt2_detail::kLocalRankEntries
+                      celllsm::kLocalRankEntries
         : nullptr;
     const std::uint64_t resident_destination =
         level_begin(destination_level);
@@ -2031,9 +2022,9 @@ private:
       launch_epoch_resolvers<true>(stream, resident_destination, epoch_ranks);
     else
       launch_epoch_resolvers<false>(stream, resident_destination, epoch_ranks);
-    gpulsmopt2_detail::sum_canonical_section_counts_kernel<<<
-        1, gpulsmopt2_detail::kThreads, 0, stream>>>(
-            foundation_section_output_counts_.data(),
+    celllsm::sum_canonical_region_counts_kernel<<<
+        1, celllsm::kThreads, 0, stream>>>(
+            scratch_region_counts_.data(),
             publication_selected_count_.data());
   }
 
@@ -2050,7 +2041,7 @@ private:
       failure.destination_level = destination;
       failure.source_count = source_count;
       failure.output_capacity = publication_capacity_;
-      failure.status = gpulsmopt2_detail::kPublicationLevelOverflow;
+      failure.status = celllsm::kPublicationLevelOverflow;
       CUDA_CHECK(cudaMemcpyAsync(
           resident_plan_.data(), &failure, sizeof(failure),
           cudaMemcpyHostToDevice, stream));
@@ -2065,7 +2056,7 @@ private:
         ? canonical_rollover_epoch_ranks_->data()
         : canonical_cell_ranks_.data() +
               std::size_t{epoch_rank_level} *
-                  gpulsmopt2_detail::kLocalRankEntries;
+                  celllsm::kLocalRankEntries;
     launch_canonical_epoch_resolution(
         stream, direct_epoch, destination, epoch_ranks);
     const std::uint32_t job_capacity =
@@ -2073,7 +2064,7 @@ private:
     const std::uint32_t tournament_workspace_bytes =
         static_cast<std::uint32_t>(
             canonical_tournament_shared_bytes_[source_count]);
-    gpulsmopt2_detail::choose_canonical_publication_path_kernel<<<
+    celllsm::choose_canonical_publication_path_kernel<<<
         1, 1, 0, stream>>>(
             publication_selected_count_.data(), device_manifests_.data(),
             active_device_manifest_.data(), level_storage_spans_.data(),
@@ -2084,17 +2075,17 @@ private:
 
     if (direct_epoch) {
       finalize_publication_metadata<true>(
-          foundation_source_offsets_.data(), stream,
-          foundation_section_output_counts_.data(),
+          scratch_region_offsets_.data(), stream,
+          scratch_region_counts_.data(),
           publication_selected_count_.data());
     } else {
       launch_publication_merge(
-          {publication_rows_a_.data(), foundation_source_offsets_.data(),
-           foundation_section_output_counts_.data(), epoch_ranks},
+          {publication_rows_a_.data(), scratch_region_offsets_.data(),
+           scratch_region_counts_.data(), epoch_ranks},
           source_count, stream);
     }
-    gpulsm_sparse::publish_manifest_kernel<<<
-        1, gpulsmopt2_detail::kMaximumLevels, 0, stream>>>(
+    celllsm::publish_manifest_kernel<<<
+        1, celllsm::kMaximumLevels, 0, stream>>>(
         resident_plan_.data(), device_manifests_.data(),
         active_device_manifest_.data(), query_occupied_level_mask_.data());
     CUDA_CHECK(cudaGetLastError());
@@ -2102,7 +2093,7 @@ private:
 
   void canonical_publication_parameters(
       std::uint32_t &destination, bool &direct_epoch) const {
-    destination = gpulsmopt2_detail::kMaximumLevels;
+    destination = celllsm::kMaximumLevels;
     std::uint32_t tier_begin = 0u;
     for (std::uint32_t begin = 0u;
          begin < canonical_regular_level_count_; begin += 3u) {
@@ -2118,7 +2109,7 @@ private:
         break;
       }
     }
-    if (destination == gpulsmopt2_detail::kMaximumLevels &&
+    if (destination == celllsm::kMaximumLevels &&
         canonical_regular_level_count_ < canonical_level_count_ &&
         !(host_occupied_level_mask_ &
           (std::uint64_t{1} << canonical_regular_level_count_))) {
@@ -2134,7 +2125,7 @@ private:
       std::uint32_t destination, bool top_level_rollover) const {
     if (top_level_rollover) {
       const std::uint64_t mask = destination >=
-              gpulsmopt2_detail::kMaximumLevels - 1u
+              celllsm::kMaximumLevels - 1u
           ? ~std::uint64_t{0}
           : (std::uint64_t{1u} << (destination + 1u)) - 1u;
       return host_occupied_level_mask_ & mask;
@@ -2172,12 +2163,12 @@ private:
   void publish_epoch(cudaStream_t stream) {
     if (pending_records_ > publication_capacity_) {
       // Preserve an epoch that cannot reserve output.
-      gpulsmopt2_detail::ResidentPublicationPlan failure{};
+      celllsm::ResidentPublicationPlan failure{};
       failure.selected_count =
           static_cast<std::uint32_t>(pending_records_);
       failure.output_capacity = publication_capacity_;
       failure.status =
-          gpulsmopt2_detail::kPublicationOutputOverflow;
+          celllsm::kPublicationOutputOverflow;
       publication_.fail(failure, true);
       return;
     }
@@ -2185,7 +2176,7 @@ private:
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(
         publication_receipt(), resident_plan_.data(),
-        sizeof(gpulsmopt2_detail::ResidentPublicationPlan),
+        sizeof(celllsm::ResidentPublicationPlan),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemsetAsync(
         raw_epoch_signatures_.data(), 0,
@@ -2201,14 +2192,14 @@ private:
     return (bytes + 255u) & ~std::size_t{255u};
   }
   static std::size_t operation_cell_counts_bytes() {
-    return std::size_t{gpulsmopt2_detail::kLocalRankEntries} *
+    return std::size_t{celllsm::kLocalRankEntries} *
         sizeof(std::uint32_t);
   }
   static std::size_t operation_epoch_workspace_rows(
       std::size_t batch_capacity) {
     return std::max<std::size_t>(
-        batch_capacity * gpulsmopt2_detail::kBatchesPerEpoch,
-        gpulsmopt2_detail::kCanonicalResolverSuffixes);
+        batch_capacity * celllsm::kBatchesPerEpoch,
+        celllsm::kCanonicalResolverSuffixes);
   }
   static std::size_t operation_epoch_workspace_offset() {
     return aligned_operation_bytes(operation_cell_counts_bytes());
@@ -2218,95 +2209,95 @@ private:
     return aligned_operation_bytes(
         operation_epoch_workspace_offset() +
         operation_epoch_workspace_rows(batch_capacity) *
-            sizeof(gpulsmopt2_detail::RawPayload));
+            sizeof(celllsm::RawPayload));
   }
   static std::size_t radix_workspace_bytes(std::size_t count) {
     return aligned_id_bytes(count) * 3u +
-        aligned_id_bytes(gpulsmopt2_detail::kQuotients + 1u);
+        aligned_id_bytes(celllsm::kRegions + 1u);
   }
-  static std::uint32_t tqrj_maximum_queries(std::size_t batch_capacity) {
+  static std::uint32_t shared_lookup_maximum_queries(std::size_t batch_capacity) {
     return static_cast<std::uint32_t>(
-        batch_capacity * gpulsmopt2_detail::kBatchesPerEpoch);
+        batch_capacity * celllsm::kBatchesPerEpoch);
   }
-  static std::uint32_t tqrj_hash_maximum_entries(
+  static std::uint32_t shared_lookup_hash_maximum_entries(
       std::size_t batch_capacity) {
-    return gpulsmopt2_detail::tqrj_hash_capacity(
-        tqrj_maximum_queries(batch_capacity));
+    return celllsm::shared_lookup_hash_capacity(
+        shared_lookup_maximum_queries(batch_capacity));
   }
-  static std::size_t tqrj_hash_table_offset(std::size_t batch_capacity) {
+  static std::size_t shared_lookup_hash_table_offset(std::size_t batch_capacity) {
     return aligned_operation_bytes(
-        std::size_t{tqrj_maximum_queries(batch_capacity)} *
+        std::size_t{shared_lookup_maximum_queries(batch_capacity)} *
         sizeof(std::uint32_t));
   }
-  static std::size_t tqrj_hash_task_offset(std::size_t batch_capacity) {
+  static std::size_t shared_lookup_hash_task_offset(std::size_t batch_capacity) {
     return aligned_operation_bytes(
-        tqrj_hash_table_offset(batch_capacity) +
-        std::size_t{tqrj_hash_maximum_entries(batch_capacity)} *
+        shared_lookup_hash_table_offset(batch_capacity) +
+        std::size_t{shared_lookup_hash_maximum_entries(batch_capacity)} *
             sizeof(std::uint32_t));
   }
-  static std::size_t tqrj_hash_counter_offset(
+  static std::size_t shared_lookup_hash_counter_offset(
       std::size_t batch_capacity) {
-    return tqrj_hash_task_offset(batch_capacity) +
-        gpulsmopt2_detail::kTqrjHashTaskBytes;
+    return shared_lookup_hash_task_offset(batch_capacity) +
+        celllsm::kSharedLookupHashTaskBytes;
   }
-  static std::size_t tqrj_hash_tile_offset(std::size_t batch_capacity) {
+  static std::size_t shared_lookup_hash_tile_offset(std::size_t batch_capacity) {
     return aligned_operation_bytes(
-        tqrj_hash_counter_offset(batch_capacity) +
-        gpulsmopt2_detail::kTqrjHashCounterBytes);
+        shared_lookup_hash_counter_offset(batch_capacity) +
+        celllsm::kSharedLookupHashCounterBytes);
   }
-  static std::uint32_t tqrj_maximum_tiles(
+  static std::uint32_t shared_lookup_maximum_tiles(
       std::size_t batch_capacity) {
-    const std::uint32_t queries = tqrj_maximum_queries(batch_capacity);
+    const std::uint32_t queries = shared_lookup_maximum_queries(batch_capacity);
     const std::uint32_t active =
-        std::min(queries, gpulsmopt2_detail::kQuotients);
-    return gpulsmopt2_detail::tqrj_hash_tile_count(queries) + active;
+        std::min(queries, celllsm::kRegions);
+    return celllsm::shared_lookup_hash_tile_count(queries) + active;
   }
-  static std::size_t tqrj_hash_query_bases_offset(
+  static std::size_t shared_lookup_hash_query_bases_offset(
       std::size_t batch_capacity) {
     return aligned_operation_bytes(
-        tqrj_hash_tile_offset(batch_capacity) +
-        std::size_t{2u * tqrj_maximum_tiles(batch_capacity)} *
-            sizeof(gpulsmopt2_detail::TqrjHashTile));
+        shared_lookup_hash_tile_offset(batch_capacity) +
+        std::size_t{2u * shared_lookup_maximum_tiles(batch_capacity)} *
+            sizeof(celllsm::SharedLookupHashTile));
   }
-  static std::size_t tqrj_hash_workspace_bytes(
+  static std::size_t shared_lookup_hash_workspace_bytes(
       std::size_t batch_capacity) {
-    return tqrj_hash_query_bases_offset(batch_capacity) +
-        aligned_id_bytes(gpulsmopt2_detail::kQuotients + 1u);
+    return shared_lookup_hash_query_bases_offset(batch_capacity) +
+        aligned_id_bytes(celllsm::kRegions + 1u);
   }
   static std::size_t operation_workspace_initial_bytes(
       std::size_t batch_capacity) {
     return std::max(
         operation_radix_storage_offset(batch_capacity) +
             radix_workspace_bytes(batch_capacity),
-        tqrj_hash_workspace_bytes(batch_capacity));
+        shared_lookup_hash_workspace_bytes(batch_capacity));
   }
   static std::size_t operation_workspace_maximum_bytes(
       std::size_t batch_capacity) {
     return std::max(
         operation_radix_storage_offset(batch_capacity) +
-            radix_workspace_bytes(gpulsmopt2_detail::kMaximumOperationTile),
-        tqrj_hash_workspace_bytes(batch_capacity));
+            radix_workspace_bytes(celllsm::kMaximumOperationTile),
+        shared_lookup_hash_workspace_bytes(batch_capacity));
   }
   void initialize_operation_workspace_views() {
     std::uint8_t *storage = operation_workspace_.data();
     canonical_cell_counts_.attach(
         reinterpret_cast<std::uint32_t *>(storage),
-        gpulsmopt2_detail::kLocalRankEntries);
+        celllsm::kLocalRankEntries);
     canonical_epoch_workspace_.attach(
-        reinterpret_cast<gpulsmopt2_detail::RawPayload *>(
+        reinterpret_cast<celllsm::RawPayload *>(
             storage + operation_epoch_workspace_offset()),
         operation_epoch_workspace_rows(batch_capacity_));
   }
   struct RadixWorkspaceView {
     std::uint32_t *input_ids;
-    std::uint32_t *quotient_offsets;
+    std::uint32_t *region_offsets;
   };
 
   RadixWorkspaceView ensure_radix_workspace(std::size_t count) {
     const std::size_t capacity = std::max(radix_keys_.size(), count);
     const std::size_t ids_bytes = aligned_id_bytes(capacity);
     const std::size_t query_offset_bytes =
-        aligned_id_bytes(gpulsmopt2_detail::kQuotients + 1u);
+        aligned_id_bytes(celllsm::kRegions + 1u);
     const std::size_t required = ids_bytes * 3u + query_offset_bytes;
     const std::size_t radix_offset =
         operation_radix_storage_offset(batch_capacity_);
@@ -2321,43 +2312,43 @@ private:
     return {reinterpret_cast<std::uint32_t *>(storage + ids_bytes * 2u),
             reinterpret_cast<std::uint32_t *>(storage + ids_bytes * 3u)};
   }
-  void materialize_range_hot_sections(std::uint64_t total,
+  void materialize_range_hot_regions(std::uint64_t total,
                                       cudaStream_t stream) {
     if (!total) return;
-    if (total > gpulsmopt2_detail::kMaximumPublicationRows)
+    if (total > celllsm::kMaximumPublicationRows)
       throw std::length_error("GPULSMOpt crowded range input is too large");
 
     struct Window {
-      std::uint32_t quotient_begin;
-      std::uint32_t quotient_end;
+      std::uint32_t region_begin;
+      std::uint32_t region_end;
       std::uint64_t input_begin;
       std::uint32_t input_count;
     };
     std::vector<Window> windows;
-    if (total <= gpulsmopt2_detail::kRangeHotWindowRows) {
-      windows.push_back({0u, gpulsmopt2_detail::kQuotients, 0u,
+    if (total <= celllsm::kRangeHotWindowRows) {
+      windows.push_back({0u, celllsm::kRegions, 0u,
                          static_cast<std::uint32_t>(total)});
     } else {
       CUDA_CHECK(cudaMemcpyAsync(
           range_hot_offsets_receipt(), range_hot_offsets_.data(),
-          (gpulsmopt2_detail::kQuotients + 1u) * sizeof(std::uint64_t),
+          (celllsm::kRegions + 1u) * sizeof(std::uint64_t),
           cudaMemcpyDeviceToHost, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
       const std::uint64_t *offsets = range_hot_offsets_receipt();
       std::uint32_t begin = 0u;
-      while (begin < gpulsmopt2_detail::kQuotients &&
+      while (begin < celllsm::kRegions &&
              offsets[begin] < total) {
         const std::uint64_t base = offsets[begin];
         std::uint32_t end = begin;
-        while (end < gpulsmopt2_detail::kQuotients &&
+        while (end < celllsm::kRegions &&
                offsets[end + 1u] - base <=
-                   gpulsmopt2_detail::kRangeHotWindowRows)
+                   celllsm::kRangeHotWindowRows)
           ++end;
         if (end == begin) ++end;
         const std::uint64_t count = offsets[end] - base;
         if (count > std::numeric_limits<int>::max())
           throw std::length_error(
-              "one GPULSMOpt crowded section exceeds the GPU sort limit");
+              "one GPULSMOpt crowded region exceeds the GPU sort limit");
         windows.push_back({begin, end, base,
                            static_cast<std::uint32_t>(count)});
         begin = end;
@@ -2382,14 +2373,14 @@ private:
           nullptr, sort_bytes, range_hot_tokens_a_.data(),
           range_hot_tokens_b_.data(),
           static_cast<int>(window.input_count),
-          static_cast<int>(window.quotient_end - window.quotient_begin),
+          static_cast<int>(window.region_end - window.region_begin),
           range_hot_window_offsets_.data(),
           range_hot_window_offsets_.data() + 1u, 32, 48, stream));
       using KeyIterator = cub::TransformInputIterator<
-          std::uint32_t, gpulsmopt2_detail::RangeHotTokenKey,
+          std::uint32_t, celllsm::RangeHotTokenKey,
           const std::uint64_t *>;
       const KeyIterator keys(range_hot_tokens_b_.data(),
-                             gpulsmopt2_detail::RangeHotTokenKey{});
+                             celllsm::RangeHotTokenKey{});
       auto *winner_tokens = reinterpret_cast<std::uint64_t *>(
           publication_rows_a_.data() + window.input_begin);
       std::size_t reduce_bytes{};
@@ -2398,9 +2389,9 @@ private:
           publication_keys_a_.data() + window.input_begin,
           range_hot_tokens_b_.data(), winner_tokens,
           range_hot_selected_count_.data(),
-          gpulsmopt2_detail::RangeHotNewestToken{
+          celllsm::RangeHotNewestToken{
               raw_payloads_.data(), static_cast<std::uint32_t>(
-                  batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)},
+                  batch_capacity_ * celllsm::kBatchesPerEpoch)},
           window.input_count, stream));
       required_temp = std::max(required_temp,
                                std::max(sort_bytes, reduce_bytes));
@@ -2409,36 +2400,36 @@ private:
       range_hot_temp_.resize(required_temp);
 
     for (const Window &window : windows) {
-      const std::uint32_t quotient_count =
-          window.quotient_end - window.quotient_begin;
-      gpulsmopt2_detail::make_range_hot_window_offsets_kernel<<<
-          blocks(std::size_t{quotient_count} + 1u),
-          gpulsmopt2_detail::kThreads, 0, stream>>>(
-              range_hot_offsets_.data(), window.quotient_begin,
-              quotient_count, window.input_begin,
+      const std::uint32_t region_count =
+          window.region_end - window.region_begin;
+      celllsm::make_range_hot_window_offsets_kernel<<<
+          blocks(std::size_t{region_count} + 1u),
+          celllsm::kThreads, 0, stream>>>(
+              range_hot_offsets_.data(), window.region_begin,
+              region_count, window.input_begin,
               range_hot_window_offsets_.data());
-      gpulsmopt2_detail::emit_range_hot_tokens_kernel<<<
-          quotient_count, gpulsmopt2_detail::kThreads, 0, stream>>>(
+      celllsm::emit_range_hot_tokens_kernel<<<
+          region_count, celllsm::kThreads, 0, stream>>>(
               raw_keys_.data(), raw_offsets_.data(),
               static_cast<std::uint32_t>(batch_capacity_), pending_batches_,
               resident_rows(), descriptors_.data(),
               query_occupied_level_mask_.data(), range_hot_counts_.data(),
-              range_hot_offsets_.data(), window.quotient_begin,
-              window.quotient_end, window.input_begin,
+              range_hot_offsets_.data(), window.region_begin,
+              window.region_end, window.input_begin,
               range_hot_tokens_a_.data());
       std::size_t workspace_bytes = range_hot_temp_.size();
       CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortKeys(
           range_hot_temp_.data(), workspace_bytes,
           range_hot_tokens_a_.data(), range_hot_tokens_b_.data(),
           static_cast<int>(window.input_count),
-          static_cast<int>(quotient_count),
+          static_cast<int>(region_count),
           range_hot_window_offsets_.data(),
           range_hot_window_offsets_.data() + 1u, 32, 48, stream));
       using KeyIterator = cub::TransformInputIterator<
-          std::uint32_t, gpulsmopt2_detail::RangeHotTokenKey,
+          std::uint32_t, celllsm::RangeHotTokenKey,
           const std::uint64_t *>;
       const KeyIterator keys(range_hot_tokens_b_.data(),
-                             gpulsmopt2_detail::RangeHotTokenKey{});
+                             celllsm::RangeHotTokenKey{});
       auto *winner_tokens = reinterpret_cast<std::uint64_t *>(
           publication_rows_a_.data() + window.input_begin);
       workspace_bytes = range_hot_temp_.size();
@@ -2447,41 +2438,41 @@ private:
           publication_keys_a_.data() + window.input_begin,
           range_hot_tokens_b_.data(), winner_tokens,
           range_hot_selected_count_.data(),
-          gpulsmopt2_detail::RangeHotNewestToken{
+          celllsm::RangeHotNewestToken{
               raw_payloads_.data(), static_cast<std::uint32_t>(
-                  batch_capacity_ * gpulsmopt2_detail::kBatchesPerEpoch)},
+                  batch_capacity_ * celllsm::kBatchesPerEpoch)},
           window.input_count, stream));
-      gpulsmopt2_detail::materialize_range_hot_winners_kernel<<<
-          blocks(window.input_count), gpulsmopt2_detail::kThreads, 0,
+      celllsm::materialize_range_hot_winners_kernel<<<
+          blocks(window.input_count), celllsm::kThreads, 0,
           stream>>>(
               publication_rows_a_.data() + window.input_begin,
               range_hot_selected_count_.data(), raw_payloads_.data(),
               resident_rows(), descriptors_.data());
-      gpulsmopt2_detail::build_range_hot_descriptors_kernel<<<
-          blocks(quotient_count), gpulsmopt2_detail::kThreads, 0, stream>>>(
+      celllsm::build_range_hot_descriptors_kernel<<<
+          blocks(region_count), celllsm::kThreads, 0, stream>>>(
               publication_keys_a_.data() + window.input_begin,
-              range_hot_selected_count_.data(), window.quotient_begin,
-              window.quotient_end, window.input_begin,
+              range_hot_selected_count_.data(), window.region_begin,
+              window.region_end, window.input_begin,
               range_hot_descriptors_.data());
     }
     CUDA_CHECK(cudaGetLastError());
   }
-  void launch_section_ranges(cudaStream_t stream, bool hot_ready) {
-    const std::uint16_t *foundation_ranks = canonical_cell_ranks_.data();
-    const std::uint32_t foundation = foundation_level();
-    if (foundation != gpulsmopt2_detail::kMaximumLevels)
-      foundation_ranks = canonical_cell_ranks_.data() +
-          std::size_t{foundation} *
-              gpulsmopt2_detail::kLocalRankEntries;
-    gpulsmopt2_detail::cooperative_section_owned_range_kernel<
-        gpulsmopt2_detail::RangeSumSink>
-        <<<range_section_blocks_, gpulsmopt2_detail::kSectionRangeThreads,
+  void launch_region_ranges(cudaStream_t stream, bool hot_ready) {
+    const std::uint16_t *oldest_ranks = canonical_cell_ranks_.data();
+    const std::uint32_t oldest = oldest_level();
+    if (oldest != celllsm::kMaximumLevels)
+      oldest_ranks = canonical_cell_ranks_.data() +
+          std::size_t{oldest} *
+              celllsm::kLocalRankEntries;
+    celllsm::cooperative_region_owned_range_kernel<
+        celllsm::RangeSumSink>
+        <<<range_region_blocks_, celllsm::kRegionRangeThreads,
            0, stream>>>(
-            range_section_fragments_out_.data(),
-            range_section_tasks_.data(),
-            range_section_task_offsets_.data() +
-                gpulsmopt2_detail::kQuotients,
-            resident_rows(), descriptors_.data(), foundation_ranks,
+            range_region_fragments_out_.data(),
+            range_region_tasks_.data(),
+            range_region_task_offsets_.data() +
+                celllsm::kRegions,
+            resident_rows(), descriptors_.data(), oldest_ranks,
             publication_rows_a_.data(),
             range_hot_descriptors_.data(), hot_ready,
             raw_keys_.data(),
@@ -2494,8 +2485,8 @@ private:
                               std::uint32_t query_count,
                               const DeviceRangeOutputBatch &batch,
                               cudaStream_t stream, bool hot_ready) {
-    gpulsmopt2_detail::warp_range_fragment_kernel<
-        gpulsmopt2_detail::RangeSumSink>
+    celllsm::warp_range_fragment_kernel<
+        celllsm::RangeSumSink>
         <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
             range_fragments_.data(), fragment_count,
             range_fragment_offsets_.data() + query_count,
@@ -2511,7 +2502,7 @@ private:
     return (bytes + 255u) & ~std::size_t{255u};
   }
   template <class T>
-  static void attach_range_view(gpulsmopt2_detail::Buffer<T> &view,
+  static void attach_range_view(celllsm::Buffer<T> &view,
                                 std::uint8_t *storage,
                                 std::size_t &offset,
                                 std::size_t count) {
@@ -2540,7 +2531,7 @@ private:
         range_fragment_partials_.size() >= count) return;
     std::size_t bytes = 0u;
     bytes += aligned_range_bytes(
-        count * sizeof(gpulsmopt2_detail::RangeFragment));
+        count * sizeof(celllsm::RangeFragment));
     bytes += aligned_range_bytes(count * sizeof(unsigned long long));
     range_fragment_storage_.resize(bytes);
     std::uint8_t *storage = range_fragment_storage_.data();
@@ -2548,40 +2539,40 @@ private:
     attach_range_view(range_fragments_, storage, offset, count);
     attach_range_view(range_fragment_partials_, storage, offset, count);
   }
-  void ensure_range_section_capacity(std::size_t count,
+  void ensure_range_region_capacity(std::size_t count,
                                      std::size_t temp_bytes) {
-    if (range_section_keys_in_.size() >= count &&
+    if (range_region_keys_in_.size() >= count &&
         range_fragment_partials_.size() >= count &&
-        range_section_temp_bytes_ >= temp_bytes) return;
-    constexpr std::size_t sections =
-        gpulsmopt2_detail::kQuotients + 1u;
-    const std::size_t maximum_tasks = gpulsmopt2_detail::kQuotients +
-        (count + gpulsmopt2_detail::kSectionTaskFragments - 1u) /
-            gpulsmopt2_detail::kSectionTaskFragments;
+        range_region_temp_bytes_ >= temp_bytes) return;
+    constexpr std::size_t regions =
+        celllsm::kRegions + 1u;
+    const std::size_t maximum_tasks = celllsm::kRegions +
+        (count + celllsm::kRegionTaskFragments - 1u) /
+            celllsm::kRegionTaskFragments;
     std::size_t bytes = 0u;
     bytes += aligned_range_bytes(count * sizeof(std::uint32_t)) * 2u;
     bytes += aligned_range_bytes(
-        count * sizeof(gpulsmopt2_detail::SectionRangeFragment)) * 2u;
+        count * sizeof(celllsm::RegionRangeFragment)) * 2u;
     bytes += aligned_range_bytes(count * sizeof(unsigned long long));
-    bytes += aligned_range_bytes(sections * sizeof(std::uint32_t)) * 3u;
+    bytes += aligned_range_bytes(regions * sizeof(std::uint32_t)) * 3u;
     bytes += aligned_range_bytes(
-        maximum_tasks * sizeof(gpulsmopt2_detail::SectionRangeTask));
+        maximum_tasks * sizeof(celllsm::RegionRangeTask));
     bytes += aligned_range_bytes(temp_bytes);
-    range_section_storage_.resize(bytes);
-    std::uint8_t *storage = range_section_storage_.data();
+    range_region_storage_.resize(bytes);
+    std::uint8_t *storage = range_region_storage_.data();
     std::size_t offset = 0u;
-    attach_range_view(range_section_keys_in_, storage, offset, count);
-    attach_range_view(range_section_keys_out_, storage, offset, count);
-    attach_range_view(range_section_fragments_in_, storage, offset, count);
-    attach_range_view(range_section_fragments_out_, storage, offset, count);
+    attach_range_view(range_region_keys_in_, storage, offset, count);
+    attach_range_view(range_region_keys_out_, storage, offset, count);
+    attach_range_view(range_region_fragments_in_, storage, offset, count);
+    attach_range_view(range_region_fragments_out_, storage, offset, count);
     attach_range_view(range_fragment_partials_, storage, offset, count);
-    attach_range_view(range_section_offsets_, storage, offset, sections);
-    attach_range_view(range_section_task_offsets_, storage, offset, sections);
-    attach_range_view(range_section_task_counts_, storage, offset, sections);
-    attach_range_view(range_section_tasks_, storage, offset, maximum_tasks);
+    attach_range_view(range_region_offsets_, storage, offset, regions);
+    attach_range_view(range_region_task_offsets_, storage, offset, regions);
+    attach_range_view(range_region_task_counts_, storage, offset, regions);
+    attach_range_view(range_region_tasks_, storage, offset, maximum_tasks);
     offset = aligned_range_bytes(offset);
-    range_section_temp_ = storage + offset;
-    range_section_temp_bytes_ = temp_bytes;
+    range_region_temp_ = storage + offset;
+    range_region_temp_bytes_ = temp_bytes;
   }
   std::size_t batch_capacity_{};
   std::size_t publication_capacity_{};
@@ -2589,8 +2580,8 @@ private:
   std::size_t level_pool_capacity_{};
   std::uint32_t canonical_regular_level_count_{};
   std::uint32_t canonical_level_count_{};
-  std::array<gpulsmopt2_detail::LevelStorageSpan,
-             gpulsmopt2_detail::kMaximumLevels>
+  std::array<celllsm::LevelStorageSpan,
+             celllsm::kMaximumLevels>
       level_storage_spans_host_{};
   std::uint32_t resident_merge_capacity_{};
   std::size_t maximum_resident_jobs_{};
@@ -2601,102 +2592,102 @@ private:
   bool pending_has_tombstones_{};
   PublicationLifecycle publication_;
   std::uint8_t *range_query_temp_{};
-  std::uint8_t *range_section_temp_{};
-  std::size_t range_section_temp_bytes_{};
+  std::uint8_t *range_region_temp_{};
+  std::size_t range_region_temp_bytes_{};
   cudaEvent_t operation_done_{};
   std::array<std::uint32_t,
-             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+             celllsm::kMaximumMergeSources + 1u>
       canonical_tournament_blocks_{};
   std::array<std::uint32_t,
-             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+             celllsm::kMaximumMergeSources + 1u>
       canonical_job_capacities_{};
   std::uint32_t canonical_epoch_resolver_blocks_{};
   std::uint32_t canonical_epoch_workspace_slots_{};
-  std::uint32_t tqrj_hash_worker_blocks_{};
+  std::uint32_t shared_lookup_hash_worker_blocks_{};
   std::array<std::size_t,
-             gpulsmopt2_detail::kMaximumMergeSources + 1u>
+             celllsm::kMaximumMergeSources + 1u>
       canonical_tournament_shared_bytes_{};
   std::uint32_t resident_planner_blocks_{};
-  std::uint32_t range_section_blocks_{};
+  std::uint32_t range_region_blocks_{};
 
-  gpulsmopt2_detail::VirtualBuffer<std::uint32_t> arena_key_flags_;
-  gpulsmopt2_detail::VirtualBuffer<std::uint32_t> arena_values_;
-  gpulsmopt2_detail::Buffer<std::uint8_t> static_workspace_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor> descriptors_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::DeviceManifest>
+  celllsm::VirtualBuffer<std::uint32_t> arena_key_flags_;
+  celllsm::VirtualBuffer<std::uint32_t> arena_values_;
+  celllsm::Buffer<std::uint8_t> static_workspace_;
+  celllsm::Buffer<celllsm::Descriptor> descriptors_;
+  celllsm::Buffer<celllsm::DeviceManifest>
       device_manifests_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> active_device_manifest_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> query_occupied_level_mask_;
-  gpulsm_sparse::Buffer<gpulsm_sparse::SealedForestCommand>
-      sealed_device_command_;
-  gpulsm_sparse::Buffer<gpulsm_sparse::SealedForestReceipt>
-      sealed_device_receipt_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::ResidentPublicationPlan>
+  celllsm::Buffer<std::uint32_t> active_device_manifest_;
+  celllsm::Buffer<std::uint64_t> query_occupied_level_mask_;
+  celllsm::Buffer<celllsm::LargeBatchCommand>
+      large_batch_command_;
+  celllsm::Buffer<celllsm::LargeBatchReceipt>
+      large_batch_receipt_;
+  celllsm::Buffer<celllsm::ResidentPublicationPlan>
       resident_plan_;
-  gpulsmopt2_detail::PinnedBuffer<gpulsmopt2_detail::PinnedReceipts>
+  celllsm::PinnedBuffer<celllsm::PinnedReceipts>
       pinned_receipts_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::LevelStorageSpan>
+  celllsm::Buffer<celllsm::LevelStorageSpan>
       level_storage_spans_;
-  gpulsmopt2_detail::Buffer<std::uint16_t> canonical_cell_ranks_;
-  std::unique_ptr<gpulsmopt2_detail::Buffer<std::uint16_t>>
+  celllsm::Buffer<std::uint16_t> canonical_cell_ranks_;
+  std::unique_ptr<celllsm::Buffer<std::uint16_t>>
       canonical_rollover_epoch_ranks_;
-  gpulsmopt2_detail::VirtualBuffer<std::uint8_t> phase_workspace_;
-  gpulsmopt2_detail::VirtualBuffer<std::uint8_t> operation_workspace_;
-  std::unique_ptr<gpulsm_sparse::NativeRootWorkspace<true>> sealed_workspace_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> canonical_cell_counts_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::CanonicalJobPrefix>
+  celllsm::VirtualBuffer<std::uint8_t> phase_workspace_;
+  celllsm::VirtualBuffer<std::uint8_t> operation_workspace_;
+  std::unique_ptr<celllsm::DirectRunWorkspace<true>> large_batch_workspace_;
+  celllsm::Buffer<std::uint32_t> canonical_cell_counts_;
+  celllsm::Buffer<celllsm::CanonicalJobPrefix>
       canonical_job_prefixes_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> canonical_next_job_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> raw_keys_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawPayload> raw_payloads_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> raw_offsets_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> raw_signatures_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> raw_epoch_signatures_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RawPayload>
+  celllsm::Buffer<std::uint32_t> canonical_next_job_;
+  celllsm::Buffer<std::uint32_t> raw_keys_;
+  celllsm::Buffer<celllsm::RawPayload> raw_payloads_;
+  celllsm::Buffer<std::uint32_t> raw_offsets_;
+  celllsm::Buffer<std::uint64_t> raw_signatures_;
+  celllsm::Buffer<std::uint64_t> raw_epoch_signatures_;
+  celllsm::Buffer<celllsm::RawPayload>
       canonical_epoch_workspace_;
-  gpulsmopt2_detail::VirtualBuffer<std::uint32_t> publication_keys_a_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> publication_selected_count_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> foundation_source_offsets_,
-      foundation_section_output_counts_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> balanced_merge_raw_counts_,
+  celllsm::VirtualBuffer<std::uint32_t> publication_keys_a_;
+  celllsm::Buffer<std::uint32_t> publication_selected_count_;
+  celllsm::Buffer<std::uint32_t> scratch_region_offsets_,
+      scratch_region_counts_;
+  celllsm::Buffer<std::uint64_t> balanced_merge_raw_counts_,
       resident_job_raw_reservations_;
-  gpulsmopt2_detail::Buffer<std::uint32_t>
+  celllsm::Buffer<std::uint32_t>
       resident_tile_job_counts_, resident_tile_job_offsets_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::BalancedMergeJob>
+  celllsm::Buffer<celllsm::BalancedMergeJob>
       balanced_merge_jobs_;
-  gpulsmopt2_detail::Buffer<std::uint8_t> resident_scan_temp_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> local_epoch_overflow_flag_;
-  gpulsmopt2_detail::VirtualBuffer<gpulsmopt2_detail::Row>
+  celllsm::Buffer<std::uint8_t> resident_scan_temp_;
+  celllsm::Buffer<std::uint32_t> local_epoch_overflow_flag_;
+  celllsm::VirtualBuffer<celllsm::Row>
       publication_rows_a_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> admission_counts_;
-  gpulsmopt2_detail::Buffer<std::uint8_t> admission_temp_;
-  std::uint32_t level_counts_[gpulsmopt2_detail::kMaximumLevels]{};
-  std::uint32_t raw_batch_counts_[gpulsmopt2_detail::kBatchesPerEpoch]{};
-  gpulsmopt2_detail::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
+  celllsm::Buffer<std::uint32_t> admission_counts_;
+  celllsm::Buffer<std::uint8_t> admission_temp_;
+  std::uint32_t level_counts_[celllsm::kMaximumLevels]{};
+  std::uint32_t raw_batch_counts_[celllsm::kBatchesPerEpoch]{};
+  celllsm::Buffer<std::uint32_t> radix_keys_, radix_ids_out_;
 
-  gpulsmopt2_detail::Buffer<unsigned long long> range_partials_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> range_reduction_completion_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> range_fragment_total_;
-  gpulsmopt2_detail::Buffer<std::uint64_t> range_hot_counts_,
+  celllsm::Buffer<unsigned long long> range_partials_;
+  celllsm::Buffer<std::uint32_t> range_reduction_completion_;
+  celllsm::Buffer<std::uint64_t> range_fragment_total_;
+  celllsm::Buffer<std::uint64_t> range_hot_counts_,
       range_hot_offsets_, range_hot_tokens_a_, range_hot_tokens_b_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> range_hot_window_offsets_,
+  celllsm::Buffer<std::uint32_t> range_hot_window_offsets_,
       range_hot_selected_count_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::Descriptor>
+  celllsm::Buffer<celllsm::Descriptor>
       range_hot_descriptors_;
-  gpulsmopt2_detail::Buffer<std::uint8_t> range_hot_temp_;
+  celllsm::Buffer<std::uint8_t> range_hot_temp_;
   std::size_t range_hot_token_capacity_{};
-  gpulsmopt2_detail::Buffer<std::uint8_t> range_query_storage_,
-      range_fragment_storage_, range_section_storage_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> range_fragment_counts_,
+  celllsm::Buffer<std::uint8_t> range_query_storage_,
+      range_fragment_storage_, range_region_storage_;
+  celllsm::Buffer<std::uint32_t> range_fragment_counts_,
       range_fragment_offsets_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::RangeFragment> range_fragments_;
-  gpulsmopt2_detail::Buffer<unsigned long long> range_fragment_partials_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> range_section_keys_in_,
-      range_section_keys_out_, range_section_offsets_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::SectionRangeFragment>
-      range_section_fragments_in_, range_section_fragments_out_;
-  gpulsmopt2_detail::Buffer<gpulsmopt2_detail::SectionRangeTask>
-      range_section_tasks_;
-  gpulsmopt2_detail::Buffer<std::uint32_t> range_section_task_counts_,
-      range_section_task_offsets_;
+  celllsm::Buffer<celllsm::RangeFragment> range_fragments_;
+  celllsm::Buffer<unsigned long long> range_fragment_partials_;
+  celllsm::Buffer<std::uint32_t> range_region_keys_in_,
+      range_region_keys_out_, range_region_offsets_;
+  celllsm::Buffer<celllsm::RegionRangeFragment>
+      range_region_fragments_in_, range_region_fragments_out_;
+  celllsm::Buffer<celllsm::RegionRangeTask>
+      range_region_tasks_;
+  celllsm::Buffer<std::uint32_t> range_region_task_counts_,
+      range_region_task_offsets_;
 };

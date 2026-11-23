@@ -1,10 +1,10 @@
 #pragma once
 
-// Pending batches: unsorted, grouped by section, with per-section filters.
+// Pending batches: unsorted, grouped by region, with per-region filters.
 
 #include "layout.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
 __host__ __device__ __forceinline__ std::uint32_t raw_age(
     std::uint32_t logical_position, std::uint32_t batch_stride) {
@@ -74,7 +74,7 @@ __device__ RawAssignment load_pending_raw_ordinal(
     std::uint32_t batch_stride, std::uint32_t pending_batches,
     std::uint32_t q, std::uint32_t ordinal) {
   for (std::uint32_t batch = 0u; batch < pending_batches; ++batch) {
-    const std::size_t oi = std::size_t{batch} * (kQuotients + 1u) + q;
+    const std::size_t oi = std::size_t{batch} * (kRegions + 1u) + q;
     const std::uint32_t begin = offsets[oi];
     const std::uint32_t count = offsets[oi + 1u] - begin;
     if (ordinal < count) {
@@ -94,27 +94,27 @@ __device__ __forceinline__ std::uint64_t pending_signature_bits(
   return (1ull << (first >> 26u)) | (1ull << (second >> 26u));
 }
 
-// Share reservations; track active sections only for TQRJ.
+// Share reservations; track active regions only for shared lookup.
 template <bool TrackActive = false>
-__global__ void count_quotients_kernel(
+__global__ void count_regions_kernel(
     const std::uint32_t *keys, std::uint32_t count,
-    std::uint32_t *quotient_counts, std::uint32_t *reservation_ranks,
-    std::uint32_t *active_quotients = nullptr,
+    std::uint32_t *region_counts, std::uint32_t *reservation_ranks,
+    std::uint32_t *active_regions = nullptr,
     std::uint32_t *active_count = nullptr) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned active = __ballot_sync(0xffffffffu, i < count);
   if (i >= count) return;
-  const std::uint32_t quotient = keys[i] >> 16u;
-  const unsigned peers = __match_any_sync(active, quotient);
+  const std::uint32_t region = keys[i] >> 16u;
+  const unsigned peers = __match_any_sync(active, region);
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t leader = __ffs(peers) - 1u;
   std::uint32_t base = 0u;
   if (lane == leader) {
-    base = atomicAdd(quotient_counts + quotient, __popc(peers));
+    base = atomicAdd(region_counts + region, __popc(peers));
     if constexpr (TrackActive) {
       if (!base) {
         const std::uint32_t ticket = atomicAdd(active_count, 1u);
-        active_quotients[ticket] = quotient;
+        active_regions[ticket] = region;
       }
     }
   }
@@ -124,14 +124,14 @@ __global__ void count_quotients_kernel(
 }
 
 __global__ void build_admission_signatures_kernel(
-    const std::uint32_t *section_grouped_keys, std::uint32_t count,
+    const std::uint32_t *region_grouped_keys, std::uint32_t count,
     std::uint64_t *batch_signatures) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
-  const std::uint32_t key = section_grouped_keys[i];
-  const std::uint32_t quotient = key >> 16u;
+  const std::uint32_t key = region_grouped_keys[i];
+  const std::uint32_t region = key >> 16u;
   const unsigned active = __activemask();
-  const unsigned peers = __match_any_sync(active, quotient);
+  const unsigned peers = __match_any_sync(active, region);
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t leader = __ffs(peers) - 1u;
   const std::uint64_t bits = pending_signature_bits(key);
@@ -144,7 +144,7 @@ __global__ void build_admission_signatures_kernel(
         static_cast<unsigned long long>(low) |
         (static_cast<unsigned long long>(high) << 32u);
     atomicOr(reinterpret_cast<unsigned long long *>(
-                 batch_signatures + quotient), aggregate);
+                 batch_signatures + region), aggregate);
   }
 }
 
@@ -152,7 +152,7 @@ __global__ void commit_admission_metadata_kernel(
     std::uint32_t *counts, const std::uint64_t *batch_signatures,
     std::uint64_t *epoch_signatures) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kQuotients) return;
+  if (q >= kRegions) return;
   const std::uint64_t signature = batch_signatures[q];
   if (signature)
     atomicOr(reinterpret_cast<unsigned long long *>(epoch_signatures + q),
@@ -165,11 +165,11 @@ __global__ void rebuild_epoch_signatures_kernel(
     const std::uint64_t *batch_signatures,
     std::uint64_t *epoch_signatures) {
   const std::uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (q >= kQuotients) return;
+  if (q >= kRegions) return;
   std::uint64_t aggregate = 0u;
   for (std::uint32_t batch = 0u; batch < kBatchesPerEpoch; ++batch)
     aggregate |= batch_signatures[
-        std::size_t{batch} * kQuotients + q];
+        std::size_t{batch} * kRegions + q];
   epoch_signatures[q] = aggregate;
 }
 
@@ -187,8 +187,8 @@ __global__ void scatter_admission_records_kernel(
   const std::uint32_t rank = reservation_ranks[i];
   std::uint32_t value = 0u;
   if constexpr (!Tombstone) value = values[i];
-  const std::uint32_t quotient = key >> 16u;
-  const std::uint32_t output = offsets[quotient] + rank;
+  const std::uint32_t region = key >> 16u;
+  const std::uint32_t output = offsets[region] + rank;
   destination_keys[output] = key;
   const std::uint32_t metadata =
       (batch_slot << kBatchPositionBits) | i |
@@ -196,4 +196,4 @@ __global__ void scatter_admission_records_kernel(
   store_raw_payload(destination_payloads, output, value, metadata);
 }
 
-}  // namespace gpulsmopt2_detail
+}  // namespace celllsm

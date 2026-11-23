@@ -66,7 +66,7 @@ constexpr size_t level_zero_capacity() {
       size_t{1} << static_cast<size_t>(PAPER_LSM_BATCH_LOG);
   batch = batch < paper_batch ? batch : paper_batch;
 #endif
-  return batch * gpulsmopt2_detail::kBatchesPerEpoch;
+  return batch * celllsm::kBatchesPerEpoch;
 }
 
 inline void check_cuda(cudaError_t err) {
@@ -168,23 +168,23 @@ public:
          std::to_string(gpulsmopt_adapter_detail::batch_capacity())},
         {"level_zero_capacity",
          std::to_string(gpulsmopt_adapter_detail::level_zero_capacity())},
-        {"structure", "canonical_quotient_run_radix4_carry"},
+        {"structure", "canonical_region_run_radix4_carry"},
         {"carry_fanout", "4"},
         {"carry_merge", "general_tournament_with_shared_memory_fallback"},
         {"tournament_workspace", "elastic_by_job_shape"},
-        {"epoch_resolution", "quotient_local_direct_with_oversized_fallback"},
+        {"epoch_resolution", "region_local_direct_with_oversized_fallback"},
         {"publication_graph", "disabled"},
         {"epoch_trigger", "record_budget_or_batch_limit"},
-        {"sealed_workspace", "lazy"},
+        {"large_batch_workspace", "lazy"},
         {"lookup_routing", "automatic_large_single_run"},
-        {"resident_directory", "quotient_offsets_and_128_cell_starts"},
+        {"resident_directory", "region_offsets_and_128_cell_starts"},
         {"range", "visible_row_fragments"},
         {"epoch_batches",
          std::to_string(static_cast<size_t>(
-             gpulsmopt2_detail::kBatchesPerEpoch))},
+             celllsm::kBatchesPerEpoch))},
         {"maximum_levels",
          std::to_string(static_cast<size_t>(
-             gpulsmopt2_detail::kMaximumLevels))},
+             celllsm::kMaximumLevels))},
     };
   }
 

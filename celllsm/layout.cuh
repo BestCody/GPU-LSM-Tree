@@ -1,11 +1,11 @@
 #pragma once
 
-// Run rows, the per-(section, level) directory, the level manifest and
+// Run rows, the per-(region, level) directory, the level manifest and
 // row searches shared by every read path.
 
 #include "config.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
 struct Row {
   std::uint32_t value;
@@ -87,7 +87,7 @@ struct DeviceLevelState {
 struct DeviceManifest {
   std::uint64_t occupied_level_mask{};
   std::uint32_t active_levels{};
-  std::uint32_t foundation_level{kMaximumLevels};
+  std::uint32_t oldest_level{kMaximumLevels};
   std::uint32_t generation{};
   DeviceLevelState levels[kMaximumLevels]{};
 };
@@ -129,7 +129,7 @@ static_assert(sizeof(ResidentPublicationPlan) == 80u);
 struct DeviceManifestSnapshot {
   std::uint64_t occupied_level_mask{};
   std::uint32_t active_levels{};
-  std::uint32_t foundation_level{kMaximumLevels};
+  std::uint32_t oldest_level{kMaximumLevels};
 };
 
 __device__ __forceinline__ DeviceManifestSnapshot load_active_manifest(
@@ -139,7 +139,7 @@ __device__ __forceinline__ DeviceManifestSnapshot load_active_manifest(
   const std::uint32_t index = __ldg(active_manifest) & 1u;
   const DeviceManifest *manifest = manifests + index;
   return {manifest->occupied_level_mask, manifest->active_levels,
-          manifest->foundation_level};
+          manifest->oldest_level};
 }
 
 __device__ __forceinline__ DeviceManifestSnapshot load_query_manifest(
@@ -221,4 +221,4 @@ __device__ __forceinline__ std::uint32_t upper_bound_rows(
   return lo;
 }
 
-}  // namespace gpulsmopt2_detail
+}  // namespace celllsm

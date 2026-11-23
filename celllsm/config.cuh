@@ -36,15 +36,15 @@
   } while (false)
 #endif
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
-constexpr std::uint32_t kQuotients = 1u << 16u;
+constexpr std::uint32_t kRegions = 1u << 16u;
 constexpr std::uint32_t kMaximumLevels = 64u;
 constexpr std::uint32_t kBatchesPerEpoch = 16u;
 constexpr std::uint32_t kBatchPositionBits = 20u;
 constexpr std::uint32_t kLocalRankBits = 7u;
 constexpr std::uint32_t kLocalRankEntries =
-    kQuotients * (1u << kLocalRankBits);
+    kRegions * (1u << kLocalRankBits);
 constexpr std::uint32_t kThreads = 256u;
 
 constexpr std::uint32_t kInvalid = 0xffffffffu;
@@ -61,16 +61,16 @@ constexpr std::uint64_t kDescriptorOffsetMask =
     (std::uint64_t{1} << kDescriptorOffsetBits) - 1u;
 static_assert(kMaximumPublicationRows <= kDescriptorOffsetMask);
 
-constexpr std::uint32_t kFoundationCompactionThreads = 256u;
+constexpr std::uint32_t kMergeThreads = 256u;
 
-constexpr std::uint32_t kFoundationCells = 128u;
-constexpr std::uint32_t kFoundationCellKeys = 512u;
-// A full section ends at the descriptor count.
+constexpr std::uint32_t kCellsPerRegion = 128u;
+constexpr std::uint32_t kKeysPerCell = 512u;
+// A full region ends at the descriptor count.
 __host__ __device__ constexpr bool cell_rank_supported(
     std::uint64_t count) {
-  return count <= kQuotients;
+  return count <= kRegions;
 }
-static_assert((kFoundationCells - 1u) * kFoundationCellKeys <=
+static_assert((kCellsPerRegion - 1u) * kKeysPerCell <=
               std::numeric_limits<std::uint16_t>::max());
 
 inline std::size_t initial_storage_capacity(
@@ -147,4 +147,4 @@ inline std::uint32_t canonical_level_count(
   return canonical_level_layout(maximum_raw_rows, epoch_capacity).level_count;
 }
 
-}  // namespace gpulsmopt2_detail
+}  // namespace celllsm

@@ -4,7 +4,7 @@
 
 #include "config.cuh"
 
-namespace gpulsmopt2_detail {
+namespace celllsm {
 
 template <class T> inline std::size_t maximum_resident_elements() {
   std::size_t free_bytes{}, total_bytes{};
@@ -12,36 +12,6 @@ template <class T> inline std::size_t maximum_resident_elements() {
   (void)free_bytes;
   return total_bytes / sizeof(T);
 }
-
-template <class T> class Buffer {
-public:
-  Buffer() = default;
-  explicit Buffer(std::size_t count) { resize(count); }
-  Buffer(const Buffer &) = delete;
-  Buffer &operator=(const Buffer &) = delete;
-  ~Buffer() { if (pointer_ && owns_) cudaFree(pointer_); }
-  void resize(std::size_t count) {
-    if (pointer_ && owns_) CUDA_CHECK(cudaFree(pointer_));
-    pointer_ = nullptr;
-    count_ = count;
-    owns_ = true;
-    if (count)
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&pointer_),
-                            count * sizeof(T)));
-  }
-  void attach(T *pointer, std::size_t count) {
-    if (pointer_ && owns_) CUDA_CHECK(cudaFree(pointer_));
-    pointer_ = pointer;
-    count_ = count;
-    owns_ = false;
-  }
-  T *data() { return pointer_; }
-  std::size_t size() const { return count_; }
-private:
-  T *pointer_{};
-  std::size_t count_{};
-  bool owns_{true};
-};
 
 // Pinned receipts support asynchronous publication.
 template <class T> class PinnedBuffer {
@@ -90,7 +60,7 @@ inline void check_driver(CUresult result, const char *file, int line) {
 }
 
 #define GPULSMOPT_CU_CHECK(call) \
-  ::gpulsmopt2_detail::check_driver((call), __FILE__, __LINE__)
+  ::celllsm::check_driver((call), __FILE__, __LINE__)
 
 struct VmmFunctions {
   decltype(&cuMemAddressReserve) reserve{};
@@ -313,9 +283,6 @@ private:
   std::size_t maximum_count_{};
 };
 
-}  // namespace gpulsmopt2_detail
-
-namespace gpulsm_sparse {
 
 inline void check(cudaError_t error, const char *where) {
   if (error != cudaSuccess)
@@ -327,7 +294,7 @@ template <class T>
 class Buffer {
  public:
   Buffer() = default;
-  explicit Buffer(std::size_t count) { reset(count); }
+  explicit Buffer(std::size_t count) { resize(count); }
   Buffer(const Buffer &) = delete;
   Buffer &operator=(const Buffer &) = delete;
   Buffer(Buffer &&other) noexcept { swap(other); }
@@ -340,7 +307,7 @@ class Buffer {
   }
   ~Buffer() { clear(); }
 
-  void reset(std::size_t count) {
+  void resize(std::size_t count) {
     clear();
     owns_ = true;
     count_ = count;
@@ -377,4 +344,4 @@ class Buffer {
   bool owns_{true};
 };
 
-}  // namespace gpulsm_sparse
+}  // namespace celllsm
