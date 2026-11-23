@@ -145,37 +145,35 @@ __device__ __forceinline__ void canonical_lookup_resident_only(
       query_index, false, 0u, out_values, out_found, query_ids);
 }
 
-// Match the newest batch, then its newest matching row.
-template <bool FilterSignatures, class Match>
+
+// Newest pending version of `key`: batches newest first, and within a batch
+// the newest matching row. Filters skip batches that cannot hold the key.
 __device__ __forceinline__ bool find_pending_lookup_winner(
-    std::uint32_t head, const std::uint32_t *offsets,
-    const RawPayload *payloads, std::uint32_t batch_stride,
-    std::uint32_t batch_count, Match match, RawPayload &winner,
-    const std::uint64_t *batch_signatures = nullptr,
-    const std::uint64_t *epoch_signatures = nullptr) {
-  const std::uint32_t region = head >> 16u;
-  const std::uint64_t signature_bits = pending_signature_bits(head);
-  if constexpr (FilterSignatures) {
-    if (!batch_count ||
-        (epoch_signatures[region] & signature_bits) != signature_bits)
-      return false;
-  }
+    std::uint32_t key, const std::uint32_t *keys,
+    const std::uint32_t *offsets, const RawPayload *payloads,
+    std::uint32_t batch_stride, std::uint32_t batch_count,
+    const std::uint64_t *batch_signatures,
+    const std::uint64_t *epoch_signatures, RawPayload &winner) {
+  const std::uint32_t region = key >> 16u;
+  const std::uint32_t suffix = key_suffix(key);
+  const std::uint64_t signature_bits = pending_signature_bits(key);
+  if (!batch_count ||
+      (epoch_signatures[region] & signature_bits) != signature_bits)
+    return false;
   for (int batch = static_cast<int>(batch_count) - 1; batch >= 0; --batch) {
     const std::uint32_t slot = static_cast<std::uint32_t>(batch);
-    if constexpr (FilterSignatures) {
-      const std::uint64_t signature =
-          batch_signatures[std::size_t{slot} * kRegions + region];
-      if ((signature & signature_bits) != signature_bits) continue;
-    }
+    const std::uint64_t signature =
+        batch_signatures[std::size_t{slot} * kRegions + region];
+    if ((signature & signature_bits) != signature_bits) continue;
     const std::size_t offset = std::size_t{slot} * (kRegions + 1u) + region;
     const std::uint32_t begin = offsets[offset], end = offsets[offset + 1u];
     bool found = false;
     std::uint32_t newest = 0u;
     for (std::uint32_t local = begin; local < end; ++local) {
       const std::uint32_t record = slot * batch_stride + local;
-      if (!match(slot, local, record)) continue;
+      if (key_suffix(keys[record]) != suffix) continue;
       const RawPayload payload = payloads[record];
-      const std::uint32_t age = payload.metadata & Match::kAgeMask;
+      const std::uint32_t age = raw_position(payload);
       if (!found || age > newest) {
         winner = payload;
         newest = age;
@@ -186,16 +184,6 @@ __device__ __forceinline__ bool find_pending_lookup_winner(
   }
   return false;
 }
-
-struct PendingKeyMatch {
-  static constexpr std::uint32_t kAgeMask = ~kRawTombstone;
-  const std::uint32_t *keys;
-  std::uint32_t suffix;
-  __device__ __forceinline__ bool operator()(
-      std::uint32_t, std::uint32_t, std::uint32_t record) const {
-    return key_suffix(keys[record]) == suffix;
-  }
-};
 
 __device__ __forceinline__ void canonical_lookup_point_with_pending(
     std::uint32_t key, std::uint32_t i, std::uint32_t *out_values,
@@ -208,10 +196,9 @@ __device__ __forceinline__ void canonical_lookup_point_with_pending(
     const std::uint32_t *query_ids,
     const std::uint64_t *occupied_mask) {
   RawPayload winner{};
-  if (find_pending_lookup_winner<true>(
-          key, raw_offsets, raw_payloads, batch_stride, pending_batches,
-          PendingKeyMatch{raw_keys, key_suffix(key)}, winner,
-          batch_signatures, epoch_signatures)) {
+  if (find_pending_lookup_winner(
+          key, raw_keys, raw_offsets, raw_payloads, batch_stride,
+          pending_batches, batch_signatures, epoch_signatures, winner)) {
     const bool live = (winner.metadata & kRawTombstone) == 0u;
     emit_lookup_result(i, live, winner.value, out_values, out_found, query_ids);
     return;
@@ -533,12 +520,15 @@ shared_lookup_hash_entry_fingerprint(std::uint32_t entry) {
   return entry >> kSharedLookupHashOwnerBits;
 }
 
-// Confirm fingerprint matches with complete keys.
-template <class EqualOwner>
-__device__ __forceinline__ std::uint32_t shared_lookup_hash_insert_owner(
-    std::uint32_t query, std::uint64_t hash, std::uint32_t *table,
-    std::uint32_t capacity, std::uint32_t maximum_probes,
-    std::uint32_t *failure, EqualOwner equal_owner) {
+// Insert grouped query `query`, or return the query that already owns an
+// equal key. Fingerprints reject; complete keys confirm.
+__device__ __forceinline__ std::uint32_t shared_lookup_hash_insert(
+    const std::uint32_t *grouped_queries, std::uint32_t query,
+    std::uint32_t *table, std::uint32_t capacity,
+    std::uint64_t seed, std::uint32_t maximum_probes,
+    std::uint32_t *failure) {
+  const std::uint32_t key = grouped_queries[query];
+  const std::uint64_t hash = shared_lookup_hash_key(key, seed);
   const std::uint32_t desired = shared_lookup_hash_entry(query, hash);
   const std::uint32_t fingerprint =
       shared_lookup_hash_entry_fingerprint(desired);
@@ -548,7 +538,7 @@ __device__ __forceinline__ std::uint32_t shared_lookup_hash_insert_owner(
     if (!previous) return query;
     if (shared_lookup_hash_entry_fingerprint(previous) == fingerprint) {
       const std::uint32_t owner = shared_lookup_hash_entry_owner(previous);
-      if (equal_owner(owner)) return owner;
+      if (grouped_queries[owner] == key) return owner;
     }
     if (++slot == capacity) slot = 0u;
   }
@@ -556,10 +546,12 @@ __device__ __forceinline__ std::uint32_t shared_lookup_hash_insert_owner(
   return kInvalid;
 }
 
-template <class EqualOwner>
-__device__ __forceinline__ std::uint32_t shared_lookup_hash_find_owner(
-    std::uint64_t hash, const std::uint32_t *table,
-    std::uint32_t capacity, EqualOwner equal_owner) {
+// The grouped query that owns `key`, or kInvalid.
+__device__ __forceinline__ std::uint32_t shared_lookup_hash_find(
+    std::uint32_t key, const std::uint32_t *grouped_queries,
+    const std::uint32_t *table, std::uint32_t capacity,
+    std::uint64_t seed) {
+  const std::uint64_t hash = shared_lookup_hash_key(key, seed);
   const std::uint32_t fingerprint = shared_lookup_hash_entry_fingerprint(
       shared_lookup_hash_entry(0u, hash));
   std::uint32_t slot = shared_lookup_hash_slot(hash, capacity);
@@ -568,39 +560,34 @@ __device__ __forceinline__ std::uint32_t shared_lookup_hash_find_owner(
     if (!entry) return kInvalid;
     if (shared_lookup_hash_entry_fingerprint(entry) == fingerprint) {
       const std::uint32_t owner = shared_lookup_hash_entry_owner(entry);
-      if (equal_owner(owner)) return owner;
+      if (grouped_queries[owner] == key) return owner;
     }
     if (++slot == capacity) slot = 0u;
   }
   return kInvalid;
 }
 
-__device__ __forceinline__ std::uint32_t shared_lookup_hash_insert(
-    const std::uint32_t *grouped_queries, std::uint32_t query,
-    std::uint32_t *table, std::uint32_t capacity,
-    std::uint64_t seed, std::uint32_t maximum_probes,
-    std::uint32_t *failure) {
-  const std::uint32_t key = grouped_queries[query];
-  return shared_lookup_hash_insert_owner(query, shared_lookup_hash_key(key, seed), table,
-      capacity, maximum_probes, failure, [=] __device__ (std::uint32_t owner) {
-        return grouped_queries[owner] == key;
-      });
-}
+// The arrays the shared lookup reads and writes. `queries` is grouped by
+// region; query_ids maps each grouped position to the caller's position.
+struct SharedLookupView {
+  const std::uint32_t *queries;
+  std::uint32_t *out_values;
+  std::uint8_t *out_found;
+  const std::uint32_t *raw_keys;
+  const RawPayload *raw_payloads;
+  std::uint32_t batch_stride;
+  ResidentRows arena;
+  const Descriptor *descriptors;
+  const std::uint32_t *query_ids;
+  const std::uint16_t *cell_ranks;
+  const std::uint64_t *occupied_mask;
+};
 
-__device__ __forceinline__ std::uint32_t shared_lookup_hash_find(
-    std::uint32_t key, const std::uint32_t *grouped_queries,
-    const std::uint32_t *table, std::uint32_t capacity,
-    std::uint64_t seed) {
-  return shared_lookup_hash_find_owner(shared_lookup_hash_key(key, seed), table, capacity,
-      [=] __device__ (std::uint32_t owner) {
-        return grouped_queries[owner] == key;
-      });
-}
-
-// Share block matching; adapters define record semantics.
-template <class Access>
+// One block per active region: index the region's query suffixes in shared
+// memory and scan each pending row once. Regions with too many queries or
+// pending rows are queued for the hash path.
 __device__ __forceinline__ void shared_lookup_direct_lookup(
-    Access access, const std::uint32_t *active_regions,
+    const SharedLookupView &view, const std::uint32_t *active_regions,
     const std::uint32_t *active_counts, const std::uint32_t *active_count,
     const std::uint32_t *query_bases, const std::uint32_t *raw_offsets,
     std::uint32_t pending_batches, SharedLookupHashTask *hash_tasks,
@@ -612,8 +599,7 @@ __device__ __forceinline__ void shared_lookup_direct_lookup(
   __shared__ __align__(4)
       std::uint16_t directory_suffixes[kSharedLookupDirectCapacity];
   __shared__ unsigned long long winners[kSharedLookupDirectCapacity];
-  __shared__ typename Access::ReadState read_state;
-  __shared__ typename Access::DirectoryOwners directory_owners;
+  __shared__ std::uint64_t occupied_levels;
   __shared__ std::uint32_t pending_rows;
 
   const std::uint32_t task = blockIdx.x;
@@ -623,7 +609,8 @@ __device__ __forceinline__ void shared_lookup_direct_lookup(
   const std::uint32_t query_count = active_counts[task];
   if (threadIdx.x == 0u) {
     pending_rows = shared_lookup_pending_rows(q, raw_offsets, pending_batches);
-    access.load_read_state(read_state);
+    occupied_levels =
+        load_query_manifest(view.occupied_mask).occupied_level_mask;
   }
   __syncthreads();
 
@@ -641,7 +628,7 @@ __device__ __forceinline__ void shared_lookup_direct_lookup(
   for (std::uint32_t local = threadIdx.x; local < query_count;
        local += blockDim.x) {
     const std::uint32_t suffix =
-        key_suffix(access.heads[query_begin + local]);
+        key_suffix(view.queries[query_begin + local]);
     atomicAdd(directory_counts + (suffix >> 8u), 1u);
   }
   __syncthreads();
@@ -666,13 +653,12 @@ __device__ __forceinline__ void shared_lookup_direct_lookup(
   for (std::uint32_t local = threadIdx.x; local < query_count;
        local += blockDim.x) {
     const std::uint32_t suffix =
-        key_suffix(access.heads[query_begin + local]);
+        key_suffix(view.queries[query_begin + local]);
     const std::uint32_t interval = suffix >> 8u;
     const std::uint32_t rank = atomicAdd(
         directory_counts + interval, 1u);
     const std::uint32_t position = directory_offsets[interval] + rank;
     directory_suffixes[position] = static_cast<std::uint16_t>(suffix);
-    directory_owners.set(position, local);
     winners[local] = 0ull;
   }
   __syncthreads();
@@ -693,11 +679,12 @@ __device__ __forceinline__ void shared_lookup_direct_lookup(
       std::uint32_t owner = kInvalid;
       unsigned long long token = 0ull;
       if (position < end) {
-        const auto candidate = access.pending_record(batch, position);
-        owner = access.direct_owner(candidate, directory_offsets,
-            directory_suffixes, directory_owners, query_begin);
+        const std::uint32_t record = batch * view.batch_stride + position;
+        owner = shared_lookup_directory_find(directory_offsets,
+            directory_suffixes, key_suffix(view.raw_keys[record]));
         matched = owner != kInvalid;
-        if (matched) token = access.pending_token(candidate);
+        if (matched)
+          token = shared_lookup_pending_token(view.raw_payloads[record]);
       }
       shared_lookup_warp_atomic_max(matched, owner, token, winners);
     }
@@ -707,19 +694,22 @@ __device__ __forceinline__ void shared_lookup_direct_lookup(
   for (std::uint32_t local = threadIdx.x; local < query_count;
        local += blockDim.x) {
     const std::uint32_t query_index = query_begin + local;
-    const auto query = access.query(query_index);
-    const std::uint32_t owner = access.direct_owner(query, directory_offsets,
-        directory_suffixes, directory_owners, query_begin);
+    const std::uint32_t key = view.queries[query_index];
+    const std::uint32_t owner = shared_lookup_directory_find(
+        directory_offsets, directory_suffixes, key_suffix(key));
     const unsigned long long winner = owner == kInvalid
         ? 0ull : winners[owner];
-    access.write_result(query, query_index, winner, read_state);
+    shared_lookup_write_result(
+        key, query_index, winner, view.out_values, view.out_found, view.arena,
+        view.descriptors, view.cell_ranks, occupied_levels, view.query_ids);
   }
 }
 
-// Share global matching with format-specific owner storage.
-template <class Access>
+// Queued regions, across the whole grid: hash their queries, scan their
+// pending rows against the table, then write every answer.
 __device__ __forceinline__ void shared_lookup_hash_lookup(
-    Access access, SharedLookupHashTask *tasks, const std::uint32_t *task_count,
+    const SharedLookupView &view, SharedLookupHashTask *tasks,
+    const std::uint32_t *task_count,
     const std::uint32_t *query_bases, const std::uint32_t *query_counts,
     SharedLookupHashTile *query_tiles, SharedLookupHashTile *pending_tiles,
     std::uint32_t *counters, std::uint32_t *hash_table,
@@ -731,7 +721,7 @@ __device__ __forceinline__ void shared_lookup_hash_lookup(
   __shared__ std::uint32_t region_prefixes[kBatchesPerEpoch + 1u];
   __shared__ SharedLookupHashTask shared_task;
   __shared__ std::uint32_t shared_a, shared_b;
-  __shared__ typename Access::ReadState read_state;
+  __shared__ std::uint64_t occupied_levels;
 
   const std::uint32_t tasks_in_queue = *task_count;
   if (!tasks_in_queue) return;
@@ -796,12 +786,22 @@ __device__ __forceinline__ void shared_lookup_hash_lookup(
            local += blockDim.x) {
         const std::uint32_t row = tile.begin + local;
         const std::uint32_t query_index = query_begin + row;
-        // All lanes must join the duplicate aggregation.
-        const std::uint32_t owner = access.insert_hash(
-            row < query_count, query_index, hash_table, hash_capacity, seed,
-            probe_limit, counters + 3u);
-        if (row < query_count)
-          query_owners[access.query_ids[query_index]] = owner;
+        const bool valid = row < query_count;
+        // Every lane joins the vote: equal keys in a warp insert once,
+        // through their lowest lane, and share the resulting owner.
+        const std::uint32_t key = valid ? view.queries[query_index] : 0u;
+        const unsigned active = __ballot_sync(0xffffffffu, valid);
+        if (!valid) continue;
+        const unsigned peers = __match_any_sync(active, key);
+        const std::uint32_t leader =
+            static_cast<std::uint32_t>(__ffs(peers) - 1);
+        std::uint32_t owner = kInvalid;
+        if ((threadIdx.x & 31u) == leader)
+          owner = shared_lookup_hash_insert(
+              view.queries, query_index, hash_table, hash_capacity, seed,
+              probe_limit, counters + 3u);
+        owner = __shfl_sync(peers, owner, leader);
+        query_owners[view.query_ids[query_index]] = owner;
       }
     }
     grid.sync();
@@ -866,11 +866,13 @@ __device__ __forceinline__ void shared_lookup_hash_lookup(
             (kRegions + 1u) + shared_task.region;
         const std::uint32_t position =
             raw_offsets[oi] + row - region_prefixes[batch];
-        const auto candidate = access.pending_record(batch, position);
-        owner = access.find_hash(candidate, hash_table, hash_capacity,
-                                 selected_seed);
+        const std::uint32_t record = batch * view.batch_stride + position;
+        owner = shared_lookup_hash_find(view.raw_keys[record], view.queries,
+                                        hash_table, hash_capacity,
+                                        selected_seed);
         matched = owner != kInvalid;
-        if (matched) token = access.pending_token(candidate);
+        if (matched)
+          token = shared_lookup_pending_token(view.raw_payloads[record]);
       }
       shared_lookup_warp_atomic_max(matched, owner, token, winners);
     }
@@ -879,7 +881,8 @@ __device__ __forceinline__ void shared_lookup_hash_lookup(
   grid.sync();
 
   if (threadIdx.x == 0u)
-    access.load_read_state(read_state);
+    occupied_levels =
+        load_query_manifest(view.occupied_mask).occupied_level_mask;
   __syncthreads();
   for (std::uint32_t tile_index = blockIdx.x;
        tile_index < query_tile_count; tile_index += gridDim.x) {
@@ -892,81 +895,15 @@ __device__ __forceinline__ void shared_lookup_hash_lookup(
       const std::uint32_t row = tile.begin + local;
       if (row >= query_count) continue;
       const std::uint32_t query_index = query_begin + row;
-      const std::uint32_t owner = query_owners[access.query_ids[query_index]];
-      const unsigned long long winner = winners[owner];
-      access.write_result(access.query(query_index), query_index, winner,
-                          read_state);
+      const std::uint32_t owner = query_owners[view.query_ids[query_index]];
+      shared_lookup_write_result(
+          view.queries[query_index], query_index, winners[owner],
+          view.out_values, view.out_found, view.arena, view.descriptors,
+          view.cell_ranks, occupied_levels, view.query_ids);
     }
     __syncthreads();
   }
 }
-
-struct SharedLookupAccess {
-  const std::uint32_t *heads;
-  std::uint32_t *out_values;
-  std::uint8_t *out_found;
-  const std::uint32_t *raw_keys;
-  const RawPayload *raw_payloads;
-  std::uint32_t batch_stride;
-  ResidentRows arena;
-  const Descriptor *descriptors;
-  const std::uint32_t *query_ids;
-  const std::uint16_t *cell_ranks;
-  const std::uint64_t *occupied_mask;
-
-  struct ReadState { std::uint64_t occupied_levels; };
-  struct DirectoryOwners {
-    // Use suffix positions as owner IDs.
-    __device__ __forceinline__ void set(std::uint32_t, std::uint32_t) {}
-  };
-  struct Query {
-    std::uint32_t head;
-    __device__ __forceinline__ std::uint32_t head4() const { return head; }
-  };
-  struct Pending {
-    const std::uint32_t *keys;
-    std::uint32_t record;
-    __device__ __forceinline__ std::uint32_t head4() const { return keys[record]; }
-  };
-  __device__ __forceinline__ void load_read_state(ReadState &state) const {
-    state.occupied_levels = load_query_manifest(occupied_mask).occupied_level_mask;
-  }
-  __device__ __forceinline__ Query query(std::uint32_t grouped) const { return {heads[grouped]}; }
-  __device__ __forceinline__ Pending pending_record(std::uint32_t batch, std::uint32_t row) const {
-    return {raw_keys, batch * batch_stride + row};
-  }
-  __device__ __forceinline__ unsigned long long pending_token(Pending candidate) const {
-    return shared_lookup_pending_token(raw_payloads[candidate.record]);
-  }
-  template <class Candidate>
-  __device__ __forceinline__ std::uint32_t direct_owner(const Candidate &candidate,
-      const std::uint16_t *offsets, const std::uint16_t *suffixes,
-      const DirectoryOwners &, std::uint32_t) const {
-    return shared_lookup_directory_find(offsets, suffixes, key_suffix(candidate.head4()));
-  }
-  __device__ __forceinline__ std::uint32_t insert_hash(bool valid, std::uint32_t grouped,
-      std::uint32_t *table, std::uint32_t capacity, std::uint64_t seed,
-      std::uint32_t probes, std::uint32_t *failure) const {
-    const std::uint32_t key = valid ? heads[grouped] : 0u;
-    const unsigned active = __ballot_sync(0xffffffffu, valid);
-    if (!valid) return kInvalid;
-    const unsigned peers = __match_any_sync(active, key);
-    const std::uint32_t leader = static_cast<std::uint32_t>(__ffs(peers) - 1);
-    std::uint32_t owner = kInvalid;
-    if ((threadIdx.x & 31u) == leader)
-      owner = shared_lookup_hash_insert(heads, grouped, table, capacity, seed, probes, failure);
-    return __shfl_sync(peers, owner, leader);
-  }
-  __device__ __forceinline__ std::uint32_t find_hash(Pending candidate,
-      const std::uint32_t *table, std::uint32_t capacity, std::uint64_t seed) const {
-    return shared_lookup_hash_find(candidate.head4(), heads, table, capacity, seed);
-  }
-  __device__ __forceinline__ void write_result(Query query, std::uint32_t grouped,
-      unsigned long long winner, const ReadState &state) const {
-    shared_lookup_write_result(query.head4(), grouped, winner, out_values, out_found,
-        arena, descriptors, cell_ranks, state.occupied_levels, query_ids);
-  }
-};
 
 struct SharedLookupDirectLaunch {
   const std::uint32_t *active_regions, *active_counts, *active_count;
@@ -976,9 +913,9 @@ struct SharedLookupDirectLaunch {
   std::uint32_t *hash_task_count;
 };
 
-template <class Access>
-__global__ void shared_lookup_direct_lookup_kernel(Access access, SharedLookupDirectLaunch work) {
-  shared_lookup_direct_lookup(access, work.active_regions, work.active_counts,
+__global__ void shared_lookup_direct_lookup_kernel(
+    SharedLookupView view, SharedLookupDirectLaunch work) {
+  shared_lookup_direct_lookup(view, work.active_regions, work.active_counts,
       work.active_count, work.query_bases, work.raw_offsets,
       work.pending_batches, work.hash_tasks, work.hash_task_count);
 }
@@ -993,18 +930,15 @@ struct SharedLookupHashLaunch {
   const std::uint32_t *raw_offsets;
   std::uint32_t pending_batches;
   std::uint32_t *query_owners;
-
-  template <class Access>
-  __device__ __forceinline__ void run(Access access) const {
-    shared_lookup_hash_lookup(access, tasks, task_count, query_bases, query_counts,
-        query_tiles, pending_tiles, counters, hash_table, maximum_hash_entries,
-        winners, raw_offsets, pending_batches, query_owners);
-  }
 };
 
 __global__ void shared_lookup_hash_lookup_kernel(
-    SharedLookupAccess access, SharedLookupHashLaunch work) {
-  work.run(access);
+    SharedLookupView view, SharedLookupHashLaunch work) {
+  shared_lookup_hash_lookup(view, work.tasks, work.task_count,
+      work.query_bases, work.query_counts, work.query_tiles,
+      work.pending_tiles, work.counters, work.hash_table,
+      work.maximum_hash_entries, work.winners, work.raw_offsets,
+      work.pending_batches, work.query_owners);
 }
 
 }  // namespace celllsm

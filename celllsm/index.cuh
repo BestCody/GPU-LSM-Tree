@@ -449,15 +449,6 @@ private:
             count > celllsm::kMaximumOperationTile && !shared};
   }
 
-  template <class LookupChunk>
-  static void for_lookup_chunks(std::uint64_t count, LookupChunk lookup_chunk) {
-    for (std::uint64_t first = 0u; first < count;
-         first += celllsm::kMaximumOperationTile) {
-      lookup_chunk(first, std::min<std::uint64_t>(
-          count - first, celllsm::kMaximumOperationTile));
-    }
-  }
-
   struct PointLookupQueries {
     const std::uint32_t *keys;
     const std::uint32_t *ids;
@@ -582,13 +573,16 @@ private:
     }
     const LookupPlan plan = plan_lookup(batch.count);
     if (plan.chunked) {
-      for_lookup_chunks(batch.count, [&](std::uint64_t first, std::uint64_t count) {
+      for (std::uint64_t first = 0u; first < batch.count;
+           first += celllsm::kMaximumOperationTile) {
+        const std::uint64_t count = std::min<std::uint64_t>(
+            batch.count - first, celllsm::kMaximumOperationTile);
         lookup_locked(DeviceLookupBatch{
             batch.queries + first, static_cast<std::size_t>(count),
             batch.out_values + first,
             batch.out_found ? batch.out_found + first : nullptr},
             stream, regions_grouped);
-      });
+      }
       return;
     }
     const std::uint32_t count = static_cast<std::uint32_t>(batch.count);
@@ -597,7 +591,7 @@ private:
       using namespace celllsm;
       const std::uint32_t active_capacity = std::min(count, kRegions);
       auto workspace = prepare_shared_lookup(batch.queries, count, stream);
-      const SharedLookupAccess access{
+      const SharedLookupView view{
           workspace.grouped_queries, batch.out_values, batch.out_found,
           raw_keys_.data(), raw_payloads_.data(),
           static_cast<std::uint32_t>(batch_capacity_), resident_rows(),
@@ -608,7 +602,7 @@ private:
           workspace.active_region_count, workspace.query_bases,
           raw_offsets_.data(), pending_batches_, workspace.hash_tasks,
           workspace.hash_task_count};
-      shared_lookup_direct_lookup_kernel<<<active_capacity, kThreads, 0, stream>>>(access, direct);
+      shared_lookup_direct_lookup_kernel<<<active_capacity, kThreads, 0, stream>>>(view, direct);
       const SharedLookupHashLaunch hash{
           workspace.hash_tasks, workspace.hash_task_count, workspace.query_bases,
           admission_counts_.data(), workspace.hash_query_tiles,
@@ -617,7 +611,7 @@ private:
           workspace.hash_winners, raw_offsets_.data(), pending_batches_,
           batch.out_values};
       launch_lookup_hash(shared_lookup_hash_lookup_kernel, shared_lookup_hash_worker_blocks_,
-                         stream, access, hash);
+                         stream, view, hash);
       finish_shared_lookup(workspace, count, stream);
     } else {
       const auto prepared = prepare_point_lookup(
@@ -1082,8 +1076,7 @@ private:
     blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm,
-        celllsm::cooperative_region_owned_range_kernel<
-            celllsm::RangeSumSink>,
+        celllsm::cooperative_region_owned_range_kernel,
         celllsm::kRegionRangeThreads, 0u));
     range_region_blocks_ = static_cast<std::uint32_t>(
         std::max(1, blocks_per_sm) * capabilities.multiprocessors);
@@ -2464,8 +2457,7 @@ private:
       oldest_ranks = canonical_cell_ranks_.data() +
           std::size_t{oldest} *
               celllsm::kLocalRankEntries;
-    celllsm::cooperative_region_owned_range_kernel<
-        celllsm::RangeSumSink>
+    celllsm::cooperative_region_owned_range_kernel
         <<<range_region_blocks_, celllsm::kRegionRangeThreads,
            0, stream>>>(
             range_region_fragments_out_.data(),
@@ -2485,8 +2477,7 @@ private:
                               std::uint32_t query_count,
                               const DeviceRangeOutputBatch &batch,
                               cudaStream_t stream, bool hot_ready) {
-    celllsm::warp_range_fragment_kernel<
-        celllsm::RangeSumSink>
+    celllsm::warp_range_fragment_kernel
         <<<(fragment_count + 3u) / 4u, 128, 0, stream>>>(
             range_fragments_.data(), fragment_count,
             range_fragment_offsets_.data() + query_count,

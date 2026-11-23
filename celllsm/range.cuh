@@ -256,16 +256,6 @@ __global__ void materialize_range_hot_winners_kernel(
   rows[index] = transform(token);
 }
 
-// The enumeration visits records before this output sink.
-struct RangeSumSink {
-  using State = unsigned long long;
-  __device__ static State identity() { return 0ull; }
-  __device__ static State emit(State state, const Row &row) {
-    return state + row.value;
-  }
-  __device__ State operator()(State a, State b) const { return a + b; }
-};
-
 __device__ __forceinline__ std::uint32_t region_range_row_count(
     std::uint32_t low, std::uint32_t high, ResidentRows arena,
     Descriptor region) {
@@ -275,14 +265,13 @@ __device__ __forceinline__ std::uint32_t region_range_row_count(
 }
 
 // Scan base rows against the resolved newer run.
-template <class Sink>
-__device__ __forceinline__ typename Sink::State
+__device__ __forceinline__ unsigned long long
 enumerate_visible_region(
     std::uint32_t low, std::uint32_t high,
     const Row *current, std::uint32_t current_count,
     ResidentRows arena, Descriptor base,
     std::uint32_t group_lane, std::uint32_t group_size) {
-  typename Sink::State result = Sink::identity();
+  unsigned long long result = 0ull;
   const std::uint32_t update_begin =
       lower_bound_rows(current, current_count, low);
   const std::uint32_t update_end =
@@ -291,7 +280,7 @@ enumerate_visible_region(
        index < update_end; index += group_size) {
     const Row row = current[index];
     if ((row.flags & kTombstone) == 0u)
-      result = Sink::emit(result, row);
+      result += row.value;
   }
 
   const ResidentRows rows = arena + base.offset();
@@ -315,7 +304,7 @@ enumerate_visible_region(
     const bool covered =
         update < update_end && current[update].key == row.key;
     if (!covered && (row.flags & kTombstone) == 0u)
-      result = Sink::emit(result, row);
+      result += row.value;
   }
   return result;
 }
@@ -330,7 +319,6 @@ struct RangeTileSource {
   }
 };
 
-template <class Sink>
 __device__ __forceinline__ void enumerate_range_source_tiles(
     std::uint32_t fragment_count, RangeTileSource source,
     const Row *newer, std::uint32_t newer_count, bool hide_with_newer,
@@ -342,7 +330,7 @@ __device__ __forceinline__ void enumerate_range_source_tiles(
     std::uint32_t wave_count,
     std::uint32_t *union_begins, std::uint32_t *union_ends,
     std::uint32_t *union_count, Row *row_tile,
-    typename Sink::State *fragment_sums) {
+    unsigned long long *fragment_sums) {
   if (threadIdx.x == 0u) {
     std::uint32_t count = 0u;
     for (std::uint32_t fragment = 0u; fragment < fragment_count;
@@ -403,23 +391,21 @@ __device__ __forceinline__ void enumerate_range_source_tiles(
               max(source_begins[fragment], tile_begin);
           const std::uint32_t consume_end =
               min(source_ends[fragment], tile_end);
-          typename Sink::State local = Sink::identity();
+          unsigned long long local = 0ull;
           for (std::uint32_t position = consume_begin + group_lane;
                position < consume_end; position += width) {
             const Row row = row_tile[position - tile_begin];
             if ((row.flags & kTombstone) == 0u)
-              local = Sink::emit(local, row);
+              local += row.value;
           }
           const std::uint32_t warp_slot = slot & 31u;
           const unsigned mask = width == 32u ? 0xffffffffu
               : ((1u << width) - 1u) << warp_slot;
           for (std::uint32_t offset = width >> 1u; offset;
                offset >>= 1u)
-            local = Sink{}(local, __shfl_down_sync(
-                mask, local, offset, width));
+            local += __shfl_down_sync(mask, local, offset, width);
           if (!group_lane)
-            fragment_sums[fragment] = Sink{}(
-                fragment_sums[fragment], local);
+            fragment_sums[fragment] += local;
         }
       }
       __syncthreads();
@@ -670,7 +656,6 @@ __global__ void emit_region_range_tasks_kernel(
   }
 }
 
-template <class Sink>
 __global__ void cooperative_region_owned_range_kernel(
     const RegionRangeFragment *fragments,
     const RegionRangeTask *tasks,
@@ -680,7 +665,7 @@ __global__ void cooperative_region_owned_range_kernel(
     const std::uint32_t *raw_keys, const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches,
-    typename Sink::State *aggregate_partials,
+    unsigned long long *aggregate_partials,
     const std::uint64_t *query_occupied_level_mask) {
   constexpr std::uint32_t kCapacity = kRangeOnChipNewerRows;
   using BlockScan = cub::BlockScan<std::uint32_t, kRegionRangeThreads>;
@@ -696,7 +681,7 @@ __global__ void cooperative_region_owned_range_kernel(
   __shared__ std::uint32_t oldest_cell_ranks[kCellsPerRegion + 1u];
   __shared__ RangeFragmentBounds fragment_bounds[kRegionTaskFragments];
   __shared__ std::uint32_t fragment_work[kRegionTaskFragments];
-  __shared__ typename Sink::State fragment_sums[kRegionTaskFragments];
+  __shared__ unsigned long long fragment_sums[kRegionTaskFragments];
   __shared__ std::uint32_t source_begins[kRegionTaskFragments];
   __shared__ std::uint32_t source_ends[kRegionTaskFragments];
   __shared__ std::uint32_t union_begins[kRegionTaskFragments];
@@ -966,7 +951,7 @@ __global__ void cooperative_region_owned_range_kernel(
       }
       fragment_bounds[local] = bounds;
       fragment_work[local] = bounds.update_end - bounds.update_begin + base_work;
-      fragment_sums[local] = Sink::identity();
+      fragment_sums[local] = 0ull;
     }
     __syncthreads();
 
@@ -1001,7 +986,7 @@ __global__ void cooperative_region_owned_range_kernel(
       source_ends[local] = fragment_bounds[local].update_end;
     }
     __syncthreads();
-    enumerate_range_source_tiles<Sink>(
+    enumerate_range_source_tiles(
         fragment_count,
         RangeTileSource{newer, {}, true}, newer, newer_count, false,
         source_begins, source_ends, fragment_slots, fragment_widths,
@@ -1016,7 +1001,7 @@ __global__ void cooperative_region_owned_range_kernel(
         source_ends[local] = fragment_bounds[local].base_end;
       }
       __syncthreads();
-      enumerate_range_source_tiles<Sink>(
+      enumerate_range_source_tiles(
           fragment_count,
           RangeTileSource{nullptr, rows, false}, newer, newer_count, true,
           source_begins, source_ends, fragment_slots, fragment_widths,
@@ -1033,7 +1018,6 @@ __global__ void cooperative_region_owned_range_kernel(
   }
 }
 
-template <class Sink>
 __global__ void warp_range_fragment_kernel(
     const RangeFragment *fragments, std::uint32_t fragment_count,
     const std::uint32_t *device_fragment_count,
@@ -1045,7 +1029,7 @@ __global__ void warp_range_fragment_kernel(
     const RawPayload *raw_payloads,
     const std::uint32_t *raw_offsets, std::uint32_t batch_stride,
     std::uint32_t pending_batches,
-    typename Sink::State *aggregate_partials,
+    unsigned long long *aggregate_partials,
     const std::uint64_t *query_occupied_level_mask) {
   constexpr std::uint32_t kWarps = 4u;
   constexpr std::uint32_t kUpdateCapacity = 128u;
@@ -1098,13 +1082,12 @@ __global__ void warp_range_fragment_kernel(
   if (hot_descriptor.count()) {
     const Descriptor oldest = oldest_level < active_levels
         ? descriptors[descriptor_index(q, oldest_level)] : Descriptor{};
-    unsigned long long value = enumerate_visible_region<Sink>(
+    unsigned long long value = enumerate_visible_region(
         low_suffix, high_suffix, hot_rows + hot_descriptor.offset(),
         hot_descriptor.count(), arena, oldest,
         lane, 32u);
     for (std::uint32_t offset = 16u; offset; offset >>= 1u)
-      value = Sink{}(value,
-          __shfl_down_sync(full_mask, value, offset));
+      value += __shfl_down_sync(full_mask, value, offset);
     if (lane == 0u) aggregate_partials[fragment_index] = value;
     return;
   }
@@ -1259,9 +1242,9 @@ __global__ void warp_range_fragment_kernel(
   const std::uint32_t worker_width = work <= kRangeThreadWork ? 1u
       : work <= kRangeSubgroupWork ? 8u : 32u;
   const unsigned worker_mask = __ballot_sync(full_mask, lane < worker_width);
-  typename Sink::State local = Sink::identity();
+  unsigned long long local = 0ull;
   if (lane < worker_width) {
-    local = enumerate_visible_region<Sink>(
+    local = enumerate_visible_region(
         low_suffix, high_suffix, current, current_count, arena,
         oldest, lane, worker_width);
     for (std::uint32_t offset = worker_width / 2u; offset; offset >>= 1u)
